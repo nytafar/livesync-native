@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LiveSync</string>
+    <string name="channel_status">Sync status</string>
+    <string name="channel_status_description">The always-on status of your synced vaults</string>
+</resources>

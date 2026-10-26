@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!-- Generated UniFFI bindings are not ours to lint. -->
+    <issue id="all">
+        <ignore path="build/generated/**" />
+    </issue>
+    <!-- Version-bump nags: versions are pinned to what compileSdk 35 supports. -->
+    <issue id="GradleDependency" severity="informational" />
+    <issue id="NewerVersionAvailable" severity="informational" />
+    <issue id="AndroidGradlePluginVersion" severity="informational" />
+    <issue id="OldTargetApi" severity="informational" />
+    <!-- aapt2 does not resolve an unqualified adaptive icon; keep -v26. -->
+    <issue id="ObsoleteSdkInt">
+        <ignore path="src/main/res/mipmap-anydpi-v26" />
+    </issue>
+    <!-- A phone app; no ChromeOS (x86_64) build. -->
+    <issue id="ChromeOsAbiSupport" severity="ignore" />
+</lint>
