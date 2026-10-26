@@ -6,6 +6,7 @@ pub mod codec;
 pub mod doc;
 pub mod gate;
 pub mod path;
+pub mod splitter;
 
 pub use doc::{ChunkDoc, FileDoc, FileKind};
 pub use gate::Refusal;

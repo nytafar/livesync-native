@@ -1,5 +1,6 @@
 //! Tests driven by fixtures from `tools/golden` (upstream commonlib 0.2.1).
-use livesync_model::{chunk, codec, path};
+use livesync_model::splitter::{chunk_file, SplitParams};
+use livesync_model::{chunk, codec, path, FileKind};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -69,4 +70,139 @@ fn classification_matches_upstream() {
             assert!(path::classify_path(p).is_some(), "{p}");
         }
     }
+}
+
+/// Inputs for `splitter.json`, regenerated exactly as `tools/golden/generate.mjs` does.
+const VOCAB: [&str; 28] = [
+    "the ",
+    "and ",
+    "of ",
+    "note ",
+    "LiveSync ",
+    " ",
+    " ",
+    "\n",
+    "\n\n",
+    "# Heading\n",
+    "- [ ] task\n",
+    "[[link]] ",
+    "æøå ",
+    "ÆØÅ ",
+    "Straße ",
+    "日本語の",
+    "テキスト",
+    "😀",
+    "🎉 ",
+    "ü",
+    "€",
+    "\t",
+    "x",
+    "é",
+    "```js\nconst a = 1;\n```\n",
+    "| a | b |\n",
+    "> quote\n",
+    "CRLF\r\n",
+];
+
+fn xorshift(mut s: u32) -> impl FnMut() -> u32 {
+    move || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    }
+}
+
+fn make_input(recipe: &Value) -> Vec<u8> {
+    let n = || recipe["bytes"].as_u64().unwrap() as usize;
+    let mut out = match recipe["kind"].as_str().unwrap() {
+        "literal" => recipe["text"].as_str().unwrap().as_bytes().to_vec(),
+        "repeat" => recipe["unit"]
+            .as_str()
+            .unwrap()
+            .repeat(recipe["count"].as_u64().unwrap() as usize)
+            .into_bytes(),
+        "vocab" => {
+            let mut r = xorshift(recipe["seed"].as_u64().unwrap() as u32);
+            let mut s = String::new();
+            while s.len() < n() {
+                s.push_str(VOCAB[(r() as usize) % VOCAB.len()]);
+            }
+            s.into_bytes()
+        }
+        "random" => {
+            let mut r = xorshift(recipe["seed"].as_u64().unwrap() as u32);
+            (0..n()).map(|_| (r() & 0xff) as u8).collect()
+        }
+        "fill" => vec![recipe["value"].as_u64().unwrap() as u8; n()],
+        other => panic!("unknown recipe {other}"),
+    };
+    if let Some(p) = recipe.get("prefix").and_then(Value::as_str) {
+        let mut v = p.as_bytes().to_vec();
+        v.append(&mut out);
+        out = v;
+    }
+    out
+}
+
+fn fnv1a(b: &[u8]) -> u32 {
+    b.iter()
+        .fold(0x811c_9dc5u32, |h, &x| (h ^ x as u32).wrapping_mul(0x0100_0193))
+}
+
+#[test]
+fn splitter_matches_upstream() {
+    let cases = fixture("splitter.json");
+    assert!(cases.len() >= 30);
+    let (mut text, mut binary) = (0, 0);
+    for c in cases {
+        let path = c["path"].as_str().unwrap();
+        let input = make_input(&c["recipe"]);
+        assert_eq!(
+            input.len() as u64,
+            c["inputBytes"].as_u64().unwrap(),
+            "{path}: recipe drift"
+        );
+        assert_eq!(
+            fnv1a(&input) as u64,
+            c["inputFnv1a"].as_u64().unwrap(),
+            "{path}: recipe drift"
+        );
+        let params = SplitParams {
+            custom_chunk_size: c["customChunkSize"].as_f64().unwrap(),
+            minimum_chunk_size: c["minimumChunkSize"].as_u64().unwrap() as usize,
+        };
+        let out = chunk_file(path, &input, &params);
+        match c["type"].as_str().unwrap() {
+            "plain" => {
+                text += 1;
+                assert_eq!(out.kind, FileKind::Plain, "{path}");
+            }
+            _ => {
+                binary += 1;
+                assert_eq!(out.kind, FileKind::Binary, "{path}");
+            }
+        }
+        assert!(!out.lossy);
+        assert_eq!(out.size, input.len() as u64);
+        let want: Vec<(u64, &str)> = c["pieces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| (p["len"].as_u64().unwrap(), p["id"].as_str().unwrap()))
+            .collect();
+        let got: Vec<(u64, &str)> = out
+            .chunks
+            .iter()
+            .map(|(id, data)| {
+                let len = match out.kind {
+                    FileKind::Plain => data.len() as u64,
+                    FileKind::Binary => codec::base64_decode(data).unwrap().len() as u64,
+                };
+                (len, id.as_str())
+            })
+            .collect();
+        assert_eq!(got, want, "{path}");
+    }
+    assert!(text >= 20 && binary >= 8, "text {text} binary {binary}");
 }
