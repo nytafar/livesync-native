@@ -17,6 +17,6 @@ mod scopesync;
 pub mod vaultfs;
 pub mod watcher;
 
-pub use engine::{Engine, EngineConfig, EngineError, GateReport, PullReport, Status, SyncReport};
+pub use engine::{AccessCheck, Engine, EngineConfig, EngineError, GateReport, PullReport, Status, SyncReport};
 pub use index::{FileRow, Index, LocalIssue, State};
 pub use push::PushReport;

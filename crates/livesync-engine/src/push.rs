@@ -222,14 +222,42 @@ struct PassCtx {
     new_files: HashMap<String, String>,
     /// Per-document failures in a row.
     consecutive_failures: u32,
-    /// The first full pass after a full fetch (`meta.reconcile_pending`).
+    /// The reconcile pass after a full fetch is pending (`meta.reconcile_pending`).
     reconcile: bool,
+    /// Some file could not be read or pushed in this pass: the reconcile
+    /// pass is not complete.
+    incomplete: bool,
+    /// The file `push_local` is working on: (document path, content hash).
+    attempt: Option<(String, String)>,
+    /// Paths and content hashes whose push failed in this pass: a vanished
+    /// file renamed to one of them is not deleted yet.
+    failed_paths: HashSet<String>,
+    failed_hashes: HashSet<String>,
+}
+
+/// How to treat a file with no known revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoBase {
+    /// A new file in normal operation.
+    New,
+    /// A file with no row, in the reconcile pass after a full fetch (a
+    /// fresh index next to an existing vault).
+    Reconcile,
+    /// A tracked file whose revision a rebuild or full fetch forgot.
+    Reset,
 }
 
 /// Whether an error ends the whole pass rather than just this document.
 fn pass_fatal(e: &EngineError) -> bool {
     match e {
         EngineError::Remote(RemoteError::Transport { .. } | RemoteError::Url(_)) => true,
+        // The server or its proxy is down or throttling: not this document.
+        EngineError::Remote(RemoteError::Http {
+            status: 502 | 503 | 504 | 429 | 408,
+            ..
+        }) => true,
+        // A 400, 403, 413 or 500 for one document, an undecodable answer,
+        // a revision that was not stored: this document only.
         EngineError::Remote(_) | EngineError::Other(_) => false,
         EngineError::Refused(_) | EngineError::Index(_) | EngineError::Busy(_) => true,
     }
@@ -437,6 +465,11 @@ impl Engine {
         issues_seen: &mut HashSet<String>,
     ) -> Result<()> {
         ctx.consecutive_failures += 1;
+        ctx.incomplete = true;
+        if let Some((path, hash)) = ctx.attempt.take() {
+            ctx.failed_paths.insert(path);
+            ctx.failed_hashes.insert(hash);
+        }
         if pass_fatal(&e) || ctx.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
             return Err(e);
         }
@@ -547,6 +580,7 @@ impl Engine {
         }
         let mut ctx = PassCtx {
             reconcile: self.with_index(|ix| ix.get_meta(meta::RECONCILE))?.is_some(),
+            incomplete: !walk.unreadable.is_empty(),
             ..Default::default()
         };
         for (f, row) in work {
@@ -578,7 +612,9 @@ impl Engine {
         if deferred.is_empty() {
             self.with_index(|ix| ix.retain_issues(&issues_seen))?;
         }
-        if ctx.reconcile {
+        // The reconcile pass is over once every file was looked at (files
+        // still being written are recent, so its rule would not apply).
+        if ctx.reconcile && !ctx.incomplete {
             self.with_index(|ix| ix.delete_meta(meta::RECONCILE))?;
         }
         self.finish_pass(&rep, true)?;
@@ -649,7 +685,10 @@ impl Engine {
         let mut issues_seen: HashSet<String> = HashSet::new();
         self.note_unreadable(&unreadable, &mut issues_seen, &mut rep)?;
         rep.scanned = files.len() as u64;
-        let mut ctx = PassCtx::default();
+        let mut ctx = PassCtx {
+            reconcile: self.with_index(|ix| ix.get_meta(meta::RECONCILE))?.is_some(),
+            ..Default::default()
+        };
         for (_, f) in files {
             let row = self.row_for_local(&f.rel)?;
             if let Some(r) = &row {
@@ -768,6 +807,7 @@ impl Engine {
                 warn!("{rel}: {note}");
                 self.with_index(|ix| ix.set_issue(rel, "unreadable", &note, vaultfs::now_ms()))?;
                 rep.issues += 1;
+                ctx.incomplete = true;
                 return Ok(Some(rel.to_string()));
             }
         };
@@ -828,6 +868,7 @@ impl Engine {
                 return Ok(Some(rel.to_string()));
             }
         }
+        ctx.attempt = Some((doc_path.clone(), hash.clone()));
         let doc_id = row
             .as_ref()
             .filter(|r| r.path == doc_path || crate::index::fold_key(&r.path) == crate::index::fold_key(&doc_path))
@@ -868,13 +909,23 @@ impl Engine {
             "eden": {},
         });
         let base = row.as_ref().and_then(|r| r.base_rev.clone());
-        let written = match self.write_meta(doc, base.as_deref(), ctx.reconcile).await? {
+        let no_base = match &row {
+            None if ctx.reconcile => NoBase::Reconcile,
+            None => NoBase::New,
+            Some(_) => NoBase::Reset,
+        };
+        let written = match self.write_meta(doc, base.as_deref(), no_base).await? {
             MetaWrite::Written(w) => w,
             MetaWrite::DeletedElsewhere => {
-                self.remove_deleted_elsewhere(rel, &doc_id, row.as_ref(), &hash, rep)?;
+                ctx.attempt = None;
+                if !self.remove_deleted_elsewhere(rel, &doc_id, row.as_ref(), &hash, rep)? {
+                    // Not settled yet: the reconcile pass must come back to it.
+                    ctx.incomplete = true;
+                }
                 return Ok(issue);
             }
         };
+        ctx.attempt = None;
         let state = if written.branched {
             State::Conflicted
         } else {
@@ -938,6 +989,8 @@ impl Engine {
     /// With no known base, the remote deleted exactly this content after
     /// the local copy last changed: the copy is stale (for example a vault
     /// folder kept across an app reinstall). Remove it, as a pull would have.
+    /// Returns false when the file was left in place for now (no recovered
+    /// copy could be saved).
     fn remove_deleted_elsewhere(
         &self,
         rel: &str,
@@ -945,14 +998,24 @@ impl Engine {
         row: Option<&FileRow>,
         hash: &str,
         rep: &mut PushReport,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let abs = self.inner.cfg.vault.join(rel);
         // Keep a copy in the state directory first: a removal decided on
         // mtimes must never be the end of the only copy.
         match std::fs::read(&abs) {
-            Ok(bytes) if vaultfs::hash_bytes(&bytes) == hash => self.save_recovered(rel, &bytes),
-            Ok(_) => return Ok(()), // changed since it was read: next pass
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(bytes) if vaultfs::hash_bytes(&bytes) == hash => {
+                if !self.save_recovered(rel, &bytes) {
+                    let note = "deleted on another device after this copy last changed, but no copy could be kept in the state directory; the local file is left alone";
+                    warn!("{rel}: {note}");
+                    self.with_index(|ix| ix.set_issue(rel, "stale-copy", note, vaultfs::now_ms()))?;
+                    rep.issues += 1;
+                    return Ok(false);
+                }
+            }
+            // Changed since it was read (a fresh edit, newer than the
+            // deletion): the next pass pushes it.
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
             Err(e) => return Err(EngineError::Other(format!("reading {rel}: {e}"))),
         }
         match vaultfs::remove_if_matches(&self.inner.cfg.vault, &abs, hash) {
@@ -964,15 +1027,17 @@ impl Engine {
                         ix.delete_doc(&r.doc_id)?;
                     }
                     ix.remove_pending(doc_id)
-                })
+                })?;
+                Ok(true)
             }
+            // An edit landed meanwhile: a fresh change, newer than the
+            // deletion, which the next pass pushes.
             Ok(RemoveOutcome::Raced { displaced }) => {
                 warn!("{rel}: edited while its stale copy was being removed; the edit is kept");
                 self.put_back(rel, displaced, None);
-                Ok(())
+                Ok(true)
             }
-            // Changed since it was read: the next pass looks again.
-            Ok(RemoveOutcome::Diverged { .. }) => Ok(()),
+            Ok(RemoveOutcome::Diverged { .. }) => Ok(true),
             Err(e) => Err(EngineError::Other(format!("removing the stale copy of {rel}: {e}"))),
         }
     }
@@ -1046,7 +1111,7 @@ impl Engine {
     }
 
     /// Write file metadata against `base` (D4), or with unknown ancestry.
-    async fn write_meta(&self, doc: Value, base: Option<&str>, reconcile: bool) -> Result<MetaWrite> {
+    async fn write_meta(&self, doc: Value, base: Option<&str>, no_base: NoBase) -> Result<MetaWrite> {
         match base {
             Some(b) => {
                 let mut d = doc.clone();
@@ -1075,7 +1140,7 @@ impl Engine {
                     }
                 }
             }
-            None => self.write_unknown_ancestry(doc, reconcile).await,
+            None => self.write_unknown_ancestry(doc, no_base).await,
         }
     }
 
@@ -1131,13 +1196,16 @@ impl Engine {
 
     /// No known base: read the current document first.
     ///
-    /// A soft-deleted document is replaced by the local file (upstream's
-    /// "latest" mode), except in the reconcile pass after a full fetch (a
-    /// fresh index next to an existing vault), where the local copy may
-    /// predate the deletion: there a file older than the deletion with the
-    /// deleted content is stale, and one with other content becomes a
-    /// conflict beside the deletion.
-    async fn write_unknown_ancestry(&self, doc: Value, reconcile: bool) -> Result<MetaWrite> {
+    /// A soft-deleted document is replaced by a new local file (upstream's
+    /// "latest" mode). A file older than the deletion is judged instead:
+    ///
+    /// - in the reconcile pass after a full fetch (`NoBase::Reconcile`, a
+    ///   fresh index next to an existing vault) the deleted content itself
+    ///   is a stale copy (removed locally), anything else a conflict;
+    /// - a tracked file that lost its revision (`NoBase::Reset`) was kept by
+    ///   the pull side on purpose: it becomes a conflict beside the deletion,
+    ///   never a removal.
+    async fn write_unknown_ancestry(&self, doc: Value, no_base: NoBase) -> Result<MetaWrite> {
         let id = doc["_id"].as_str().unwrap_or_default().to_string();
         for _ in 0..3 {
             match self.inner.couch.fetch_doc(&id, true).await? {
@@ -1147,7 +1215,7 @@ impl Engine {
                     if soft_deleted {
                         let deleted_at = cur.get("mtime").and_then(Value::as_i64).unwrap_or(0);
                         let ours = doc.get("mtime").and_then(Value::as_i64).unwrap_or(0);
-                        if !reconcile || ours > deleted_at {
+                        if no_base == NoBase::New || ours > deleted_at {
                             // A new file at a deleted path (or one restored
                             // from the trash), or one changed after the
                             // deletion: a new life, as upstream's "latest".
@@ -1163,16 +1231,14 @@ impl Engine {
                                 PutOutcome::Conflict => continue,
                             }
                         }
-                        if same_content(&cur, &doc) {
+                        if no_base == NoBase::Reconcile && same_content(&cur, &doc) {
                             // The very content that was deleted, and not
                             // changed since: it was deleted elsewhere.
                             return Ok(MetaWrite::DeletedElsewhere);
                         }
                         // Older than the deletion but different from what
                         // was deleted: keep both, as a conflict.
-                        warn!(
-                            "{id}: deleted on another device, but this copy differs from what was deleted; kept as a conflicting revision"
-                        );
+                        warn!("{id}: deleted on another device, but this copy is kept as a conflicting revision beside the deletion");
                         return Ok(MetaWrite::Written(self.write_root(&doc).await?));
                     }
                     if same_content(&cur, &doc) {
@@ -1265,7 +1331,19 @@ impl Engine {
         let mut fates: Vec<(FileRow, Fate)> = Vec::new();
         let mut unknown: Vec<FileRow> = Vec::new();
         for r in gone {
-            if let Some(d) = hints.dest(&r.path) {
+            let dest = hints.dest(&r.path);
+            let failed_dest = dest.as_ref().is_some_and(|d| ctx.failed_paths.contains(d))
+                || r.disk_hash.as_ref().is_some_and(|h| ctx.failed_hashes.contains(h));
+            if failed_dest {
+                // Renamed, but the new name could not be pushed: deleting
+                // the old document now would leave the note nowhere else.
+                info!(
+                    "{}: renamed, but its new name could not be pushed yet; the old document is kept for now",
+                    r.path
+                );
+                continue;
+            }
+            if let Some(d) = dest {
                 let fate = self.fate_of(&d);
                 fates.push((r, fate));
             } else if let Some(d) = r.disk_hash.as_ref().and_then(|h| ctx.new_files.get(h)) {
@@ -1527,6 +1605,7 @@ impl Engine {
         let settle = self.inner.cfg.settle;
         let mut watched: HashSet<PathBuf> = HashSet::new();
         let mut started = false;
+        let mut was_enabled = false;
         let mut hints = RenameHints::default();
         let mut queue: HashMap<String, Settling> = HashMap::new();
         let mut full_due = true;
@@ -1562,7 +1641,14 @@ impl Engine {
             // wait after a rebuild) and the registration. Queued paths and
             // a due full pass stay queued meanwhile.
             if !self.inner.push_enabled.load(Ordering::SeqCst) {
+                was_enabled = false;
                 continue;
+            }
+            if !was_enabled {
+                // Pushes resume (first start, or an owed fetch completed):
+                // look at everything now, not at the next periodic rescan.
+                was_enabled = true;
+                full_due = true;
             }
             if !started {
                 let n = self.watch_tree(&mut *watcher, "", &mut watched);
