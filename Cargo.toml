@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/livesync-model", "crates/livesync-remote", "crates/livesync-engine", "crates/lsync"]
+members = [
+    "crates/livesync-model",
+    "crates/livesync-remote",
+    "crates/livesync-engine",
+    "crates/lsync",
+    "crates/livesync-ffi",
+    "crates/uniffi-bindgen",
+]
 
 [workspace.package]
 edition = "2021"

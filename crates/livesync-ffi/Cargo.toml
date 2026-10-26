@@ -1,0 +1,27 @@
+[package]
+name = "livesync-ffi"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "UniFFI surface over the LiveSync engine for the Android app: one host, N profiles"
+
+[lib]
+# cdylib for the app (liblivesync_ffi.so), lib for the tests.
+crate-type = ["cdylib", "lib"]
+name = "livesync_ffi"
+
+[dependencies]
+livesync-engine = { version = "0.1.0", path = "../livesync-engine" }
+livesync-model = { version = "0.1.0", path = "../livesync-model" }
+livesync-remote = { version = "0.1.0", path = "../livesync-remote" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+uniffi = { version = "0.32.2", default-features = false }
+
+[dev-dependencies]
+axum = "0.8.9"
+tempfile = "3.27.0"

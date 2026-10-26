@@ -1,0 +1,6 @@
+[bindings.kotlin]
+package_name = "no.nyta.livesync.core"
+cdylib_name = "livesync_ffi"
+# The JNA cleaner works on every API level; java.lang.ref.Cleaner needs API 33
+# and would trip lint's NewApi check at minSdk 30.
+disable_java_cleaner = true
