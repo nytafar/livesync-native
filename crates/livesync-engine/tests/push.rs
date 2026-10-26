@@ -1144,6 +1144,16 @@ async fn a_conflicted_copy_survives_a_deletion_that_resolves_the_conflict() {
     let row = env.row("w.md").unwrap();
     assert_eq!(row.state, State::Dirty);
     assert!(row.note.unwrap().contains("local copy kept"));
+    // Codex C1: replaying the deletion (a full fetch) keeps the promise.
+    let e = env.engine();
+    e.request_full_fetch().unwrap();
+    e.sync_once().await.unwrap();
+    assert_eq!(
+        env.read("w.md").unwrap(),
+        b"ours\n",
+        "a replayed deletion removed the kept copy"
+    );
+    assert!(env.deleted("w.md"));
 }
 
 /// M2: one document the server refuses does not stall the others, nor
@@ -1187,7 +1197,7 @@ async fn a_server_outage_ends_the_pass_instead_of_flagging_every_file() {
     env.mock.state.lock().unwrap().fail_writes = 100;
     assert!(env.engine().push_all(false).await.is_err());
     let st = env.engine().status().unwrap();
-    assert!(st.local_issues.len() < 3, "{:?}", st.local_issues);
+    assert!(st.local_issues.is_empty(), "{:?}", st.local_issues);
     env.mock.state.lock().unwrap().fail_writes = 0;
     let rep = env.engine().sync_once().await.unwrap();
     assert_eq!(rep.push.pushed, 6, "{rep:?}");
@@ -1378,4 +1388,125 @@ async fn widening_finds_documents_with_mixed_case_ids() {
     assert!(env.read("Notes/Mixed.md").is_none());
     env.engine_with(only(&["other", "notes"])).sync_once().await.unwrap();
     assert_eq!(env.read("Notes/Mixed.md").unwrap(), b"old client");
+}
+
+/// M3: in the daemon, a safety stop stays visible through later partial
+/// passes (a save elsewhere); only a full pass without it clears it.
+#[tokio::test]
+async fn a_safety_stop_survives_partial_passes() {
+    let env = Env::new().await;
+    for i in 0..30 {
+        env.write(&format!("d/f{i}.md"), format!("{i}").as_bytes());
+    }
+    env.write("other.md", b"x");
+    env.engine().sync_once().await.unwrap();
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::remove_dir_all(env.vault().join("d")).unwrap();
+    wait_until("stop", || engine.status().unwrap().safety_stop.is_some()).await;
+    env.write("new.md", b"saved meanwhile");
+    wait_until("partial pass", || env.remote("new.md").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        engine.status().unwrap().safety_stop.is_some(),
+        "cleared by a partial pass"
+    );
+    assert!(!env.deleted("d/f0.md"));
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// Codex C2: the reconcile pass stays pending while a file could not be
+/// looked at, so a stale copy read later is still judged by its rule.
+#[tokio::test]
+async fn reconciliation_stays_pending_until_every_file_was_looked_at() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new().await;
+    env.mock.put_text("gone.md", &["old note"]);
+    env.mock.soft_delete("gone.md");
+    env.write("gone.md", b"old note");
+    set_mtime(&env, "gone.md", 1_700_000_000);
+    let f = env.vault().join("gone.md");
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let rep = env.engine().sync_once().await;
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+    rep.unwrap();
+    assert!(env.meta("reconcile_pending").is_some());
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted_locally, 1, "{rep:?}");
+    assert!(env.deleted("gone.md"), "revived after the reconcile flag was dropped");
+    assert!(env.meta("reconcile_pending").is_none());
+}
+
+/// Codex C2: once a refetch completes in the running daemon, a full pass
+/// runs at once (orphans go back now, not at the next periodic rescan).
+#[tokio::test]
+async fn the_daemon_rescans_as_soon_as_pushes_resume() {
+    let env = Env::new().await;
+    env.mock.put_text("a.md", &["a"]);
+    env.mock.put_text("dropped.md", &["dropped"]);
+    let engine = env.engine_with(|c| {
+        c.rebuild_quiet = Duration::from_millis(500);
+        c.regate_interval = Duration::from_millis(300);
+        c.rescan_interval = Duration::from_secs(3600);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("initial pull", || env.read("dropped.md").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    simulate_rebuild(&env, &[("a.md", "a")]);
+    wait_until("orphan pushed back", || env.remote("dropped.md").is_some()).await;
+    assert!(env.meta("needs_full_fetch").is_none());
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// Codex C3: a rename whose destination the server refuses does not delete
+/// the source; both happen once the destination is accepted.
+#[tokio::test]
+async fn a_rename_whose_destination_fails_keeps_the_source() {
+    let env = Env::new().await;
+    env.write("a.md", b"note");
+    env.write("other.md", b"x");
+    env.engine().sync_once().await.unwrap();
+    env.mock.state.lock().unwrap().reject_puts.insert("b.md".into());
+    env.mv("a.md", "b.md");
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.failed, 1, "{rep:?}");
+    assert!(
+        !env.deleted("a.md"),
+        "the source was deleted while its destination failed"
+    );
+    env.mock.state.lock().unwrap().reject_puts.clear();
+    env.engine().sync_once().await.unwrap();
+    assert_eq!(env.remote("b.md").unwrap(), b"note");
+    assert!(env.deleted("a.md"));
+}
+
+/// Codex C4: no recovered copy, no removal.
+#[tokio::test]
+async fn a_stale_copy_stays_when_its_recovered_copy_cannot_be_saved() {
+    let env = Env::new().await;
+    env.mock.put_text("gone.md", &["old note"]);
+    env.mock.soft_delete("gone.md");
+    env.write("gone.md", b"old note");
+    set_mtime(&env, "gone.md", 1_700_000_000);
+    std::fs::create_dir_all(env.dir.path().join("state")).unwrap();
+    std::fs::write(env.dir.path().join("state/recovered"), b"not a folder").unwrap();
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted_locally, 0, "{rep:?}");
+    assert_eq!(env.read("gone.md").unwrap(), b"old note");
+    assert!(env.deleted("gone.md"), "nor revived");
 }

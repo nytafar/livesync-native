@@ -1270,6 +1270,9 @@ impl Engine {
             b.note = Some(
                 "deleted on another device while this device's version was in conflict; local copy kept (delete it here to accept the deletion)".into(),
             );
+            // No hash to match any more: a replayed deletion (a full fetch,
+            // a rebuild) or a remote change sees a diverged file and keeps it.
+            b.disk_hash = None;
             return self.with_index(|ix| {
                 ix.upsert(&b)?;
                 ix.remove_pending(id)
@@ -1852,17 +1855,27 @@ impl Engine {
                     self.save_recovered(rel, &d);
                 }
             }
-            Err(_) => self.save_recovered(rel, &content),
+            Err(_) => {
+                self.save_recovered(rel, &content);
+            }
         }
     }
 
-    pub(crate) fn save_recovered(&self, rel: &str, content: &[u8]) {
+    /// Save content to the state directory's `recovered/` folder. Returns
+    /// whether it was saved.
+    pub(crate) fn save_recovered(&self, rel: &str, content: &[u8]) -> bool {
         let dir = self.inner.state_dir.join("recovered");
         let name = format!("{}-{}", vaultfs::now_ms(), rel.replace('/', "%2F"));
         let p = dir.join(name);
         match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&p, content)) {
-            Ok(()) => warn!("{rel}: a displaced local edit was saved to {}", p.display()),
-            Err(e) => warn!("{rel}: could not save a displaced local edit: {e}"),
+            Ok(()) => {
+                warn!("{rel}: a copy was saved to {}", p.display());
+                true
+            }
+            Err(e) => {
+                warn!("{rel}: could not save a copy to {}: {e}", dir.display());
+                false
+            }
         }
     }
 
