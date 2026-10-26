@@ -11,6 +11,7 @@ use crate::profile::{paths_overlap, ProfileConfig};
 use crate::status::{self, GateResult, ProfileStatus};
 use crate::{logging, LiveSyncError};
 use livesync_engine::engine::status_from_index;
+use livesync_engine::engine::AccessCheck;
 use livesync_engine::{Engine, Index};
 use livesync_remote::Couch;
 use std::collections::HashMap;
@@ -50,7 +51,18 @@ const RETRY_MAX: Duration = Duration::from_secs(15 * 60);
 /// A run this long counts as healthy: the next failure starts the delays over.
 const HEALTHY_RUN: Duration = Duration::from_secs(10 * 60);
 
+/// The front-end's answer to "is the whole vault still visible to this
+/// process?" (Android: all-files access is still granted). Asked before any
+/// pass that could delete remote documents; while it reports a problem,
+/// missing files are never treated as deleted (the engine's `AccessCheck`).
+#[uniffi::export(callback_interface)]
+pub trait VaultAccess: Send + Sync {
+    /// `None` when the vault is fully accessible, otherwise the reason.
+    fn problem(&self, vault_path: String) -> Option<String>;
+}
+
 type Listener = Arc<Mutex<Option<Box<dyn StatusListener>>>>;
+type Access = Arc<Mutex<Option<Arc<dyn VaultAccess>>>>;
 
 /// State shared between a profile's slot and its supervisor task.
 struct Shared {
@@ -60,6 +72,7 @@ struct Shared {
     /// Cuts a retry delay short.
     wake: Notify,
     listener: Listener,
+    access: Access,
 }
 
 impl Shared {
@@ -86,10 +99,21 @@ pub struct LiveSync {
     rt: tokio::runtime::Runtime,
     slots: Mutex<HashMap<String, Slot>>,
     listener: Listener,
+    access: Access,
 }
 
-fn open_engine(cfg: &ProfileConfig) -> Result<Engine, LiveSyncError> {
-    let ec = cfg.engine_config().map_err(|msg| LiveSyncError::Invalid { msg })?;
+fn open_engine(cfg: &ProfileConfig, access: &Access) -> Result<Engine, LiveSyncError> {
+    let mut ec = cfg.engine_config().map_err(|msg| LiveSyncError::Invalid { msg })?;
+    // Read at every check, so a check installed after the start still applies.
+    let access = access.clone();
+    let vault = cfg.vault_path.clone();
+    ec.access_check = Some(AccessCheck::new(move || {
+        let check = access.lock().unwrap().clone();
+        match check.and_then(|c| c.problem(vault.clone())) {
+            None => Ok(()),
+            Some(why) => Err(why),
+        }
+    }));
     let couch = Couch::new(&cfg.remote()).map_err(|e| LiveSyncError::Invalid { msg: e.to_string() })?;
     std::fs::create_dir_all(&cfg.state_dir).map_err(|e| LiveSyncError::Other {
         msg: format!("cannot create the state folder: {e}"),
@@ -105,7 +129,8 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
         }
         shared.set_state(RunState::Starting, None);
         let cfg = shared.cfg.clone();
-        let opened = tokio::task::spawn_blocking(move || open_engine(&cfg)).await;
+        let access = shared.access.clone();
+        let opened = tokio::task::spawn_blocking(move || open_engine(&cfg, &access)).await;
         let failure = match opened {
             Ok(Ok(engine)) => {
                 *shared.engine.lock().unwrap() = Some(engine.clone());
@@ -211,7 +236,14 @@ impl LiveSync {
             rt,
             slots: Mutex::new(HashMap::new()),
             listener: Arc::new(Mutex::new(None)),
+            access: Arc::new(Mutex::new(None)),
         }))
+    }
+
+    /// Install the vault access check every engine asks before a pass that
+    /// could delete remote documents (see [`VaultAccess`]).
+    pub fn set_vault_access(&self, access: Box<dyn VaultAccess>) {
+        *self.access.lock().unwrap() = Some(Arc::from(access));
     }
 
     /// Receive run-state changes of every profile.
@@ -258,6 +290,7 @@ impl LiveSync {
             state: Mutex::new((RunState::Starting, None)),
             wake: Notify::new(),
             listener: self.listener.clone(),
+            access: self.access.clone(),
         });
         let span = tracing::info_span!("profile", id = %cfg.id);
         let task = self.rt.spawn(supervise(shared.clone(), rx).instrument(span));
@@ -370,7 +403,8 @@ impl LiveSync {
         test.state_dir = scratch.join("state").display().to_string();
         let result = self.rt.block_on(async {
             let t = test.clone();
-            let engine = match tokio::task::spawn_blocking(move || open_engine(&t)).await {
+            let access = self.access.clone();
+            let engine = match tokio::task::spawn_blocking(move || open_engine(&t, &access)).await {
                 Ok(Ok(e)) => e,
                 Ok(Err(e)) => return GateResult::with(crate::GateOutcome::Failed, e.to_string()),
                 Err(e) => return GateResult::with(crate::GateOutcome::Failed, e.to_string()),
@@ -418,7 +452,7 @@ impl LiveSync {
         };
         let cfg = slot.shared.cfg.clone();
         self.stop_slot(slot);
-        let r = open_engine(&cfg).and_then(|e| Ok(e.request_full_fetch()?));
+        let r = open_engine(&cfg, &self.access).and_then(|e| Ok(e.request_full_fetch()?));
         if let Err(e) = &r {
             warn!("profile {profile_id}: full fetch not scheduled: {e}");
         } else {

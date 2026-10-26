@@ -4,7 +4,9 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import android.os.Environment
 import no.nyta.livesync.core.LiveSync
+import no.nyta.livesync.core.VaultAccess
 import no.nyta.livesync.profile.ProfileStore
 import no.nyta.livesync.secret.KeystoreCipher
 import no.nyta.livesync.secret.SecretStore
@@ -23,6 +25,12 @@ class LiveSyncApp : Application() {
             // lookup by name finds it already mapped.
             System.loadLibrary("livesync_ffi")
             val host = LiveSync(File(filesDir, "logs").path)
+            // Without all-files access the vault looks empty; never let that
+            // read as "everything was deleted".
+            host.setVaultAccess(object : VaultAccess {
+                override fun problem(vaultPath: String): String? =
+                    if (Environment.isExternalStorageManager()) null else "all-files access is not granted"
+            })
             Core(host, profiles, secrets, File(cacheDir, "connect-test"))
         }
     }

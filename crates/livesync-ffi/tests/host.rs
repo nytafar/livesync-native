@@ -252,3 +252,49 @@ fn logs_reach_the_ring_and_the_file() {
     assert!(text.contains("hello from the app"));
     assert!(files.iter().all(|f| f.starts_with(&dir.display().to_string())));
 }
+
+#[derive(Clone, Default)]
+struct Access(Arc<Mutex<Option<String>>>);
+
+impl livesync_ffi::VaultAccess for Access {
+    fn problem(&self, _vault_path: String) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+fn soft_deleted(env: &Env, id: &str) -> bool {
+    env.mock
+        .doc(id)
+        .map(|d| d["deleted"] == serde_json::json!(true) || d["_deleted"] == serde_json::json!(true))
+        .unwrap_or(false)
+}
+
+#[test]
+fn a_failing_access_check_keeps_local_deletions_off_the_server() {
+    let env = Env::new();
+    let access = Access::default();
+    env.host.set_vault_access(Box::new(access.clone()));
+    env.mock.put_text("keep.md", &["kept"]);
+    let mut p = env.profile("acc", "vault-acc");
+    p.pull_only = false;
+    env.host.start(p.clone()).unwrap();
+    wait_until("keep.md", Duration::from_secs(20), || read(&p, "keep.md").is_some());
+    wait_until("registration", Duration::from_secs(20), || {
+        env.status(&p).registered_ms.is_some()
+    });
+
+    // All-files access revoked: the file looks gone, but must not be deleted remotely.
+    *access.0.lock().unwrap() = Some("all-files access is not granted".into());
+    std::fs::remove_file(Path::new(&p.vault_path).join("keep.md")).unwrap();
+    env.host.sync_now("acc".into()).unwrap();
+    std::thread::sleep(Duration::from_secs(6));
+    assert!(!soft_deleted(&env, "keep.md"), "deleted while the access check failed");
+
+    // Access is back: the deletion is real and goes through.
+    *access.0.lock().unwrap() = None;
+    env.host.sync_now("acc".into()).unwrap();
+    wait_until("the soft delete", Duration::from_secs(30), || {
+        soft_deleted(&env, "keep.md")
+    });
+    env.host.stop_all();
+}
