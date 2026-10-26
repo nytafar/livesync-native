@@ -1509,4 +1509,15 @@ async fn a_stale_copy_stays_when_its_recovered_copy_cannot_be_saved() {
     assert_eq!(rep.push.deleted_locally, 0, "{rep:?}");
     assert_eq!(env.read("gone.md").unwrap(), b"old note");
     assert!(env.deleted("gone.md"), "nor revived");
+    // Codex (second round): the reconcile pass stays pending, so the next
+    // sync does not revive the deletion either.
+    assert!(env.meta("reconcile_pending").is_some());
+    env.engine().sync_once().await.unwrap();
+    assert!(env.deleted("gone.md"), "revived on the next sync");
+    // Once a copy can be kept, the stale file goes.
+    std::fs::remove_file(env.dir.path().join("state/recovered")).unwrap();
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted_locally, 1, "{rep:?}");
+    assert!(env.read("gone.md").is_none());
+    assert!(env.meta("reconcile_pending").is_none());
 }

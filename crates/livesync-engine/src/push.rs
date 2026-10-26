@@ -918,7 +918,10 @@ impl Engine {
             MetaWrite::Written(w) => w,
             MetaWrite::DeletedElsewhere => {
                 ctx.attempt = None;
-                self.remove_deleted_elsewhere(rel, &doc_id, row.as_ref(), &hash, rep)?;
+                if !self.remove_deleted_elsewhere(rel, &doc_id, row.as_ref(), &hash, rep)? {
+                    // Not settled yet: the reconcile pass must come back to it.
+                    ctx.incomplete = true;
+                }
                 return Ok(issue);
             }
         };
@@ -986,6 +989,8 @@ impl Engine {
     /// With no known base, the remote deleted exactly this content after
     /// the local copy last changed: the copy is stale (for example a vault
     /// folder kept across an app reinstall). Remove it, as a pull would have.
+    /// Returns false when the file was left in place for now (no recovered
+    /// copy could be saved).
     fn remove_deleted_elsewhere(
         &self,
         rel: &str,
@@ -993,7 +998,7 @@ impl Engine {
         row: Option<&FileRow>,
         hash: &str,
         rep: &mut PushReport,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let abs = self.inner.cfg.vault.join(rel);
         // Keep a copy in the state directory first: a removal decided on
         // mtimes must never be the end of the only copy.
@@ -1004,11 +1009,13 @@ impl Engine {
                     warn!("{rel}: {note}");
                     self.with_index(|ix| ix.set_issue(rel, "stale-copy", note, vaultfs::now_ms()))?;
                     rep.issues += 1;
-                    return Ok(());
+                    return Ok(false);
                 }
             }
-            Ok(_) => return Ok(()), // changed since it was read: next pass
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // Changed since it was read (a fresh edit, newer than the
+            // deletion): the next pass pushes it.
+            Ok(_) => return Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
             Err(e) => return Err(EngineError::Other(format!("reading {rel}: {e}"))),
         }
         match vaultfs::remove_if_matches(&self.inner.cfg.vault, &abs, hash) {
@@ -1020,15 +1027,17 @@ impl Engine {
                         ix.delete_doc(&r.doc_id)?;
                     }
                     ix.remove_pending(doc_id)
-                })
+                })?;
+                Ok(true)
             }
+            // An edit landed meanwhile: a fresh change, newer than the
+            // deletion, which the next pass pushes.
             Ok(RemoveOutcome::Raced { displaced }) => {
                 warn!("{rel}: edited while its stale copy was being removed; the edit is kept");
                 self.put_back(rel, displaced, None);
-                Ok(())
+                Ok(true)
             }
-            // Changed since it was read: the next pass looks again.
-            Ok(RemoveOutcome::Diverged { .. }) => Ok(()),
+            Ok(RemoveOutcome::Diverged { .. }) => Ok(true),
             Err(e) => Err(EngineError::Other(format!("removing the stale copy of {rel}: {e}"))),
         }
     }
