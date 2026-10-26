@@ -357,6 +357,11 @@ fn absolute(p: &std::path::Path) -> Result<PathBuf> {
 }
 
 fn engine_for(cfg: &FileConfig, profile: &str, push: &PushOpts) -> Result<Engine> {
+    // After a rebuild elsewhere, how long the remote must stay unchanged
+    // before the refetch counts as complete (default 30 s; tests shorten it).
+    let quiet = std::env::var("LSYNC_REBUILD_QUIET_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
     let r = config::resolve(cfg, profile, true)?;
     let couch = Couch::new(&r.remote)?;
     let mut ec = EngineConfig::new(absolute(&r.vault)?, r.state_dir.join("index.sqlite"));
@@ -366,6 +371,9 @@ fn engine_for(cfg: &FileConfig, profile: &str, push: &PushOpts) -> Result<Engine
     ec.device_name = r.device_name;
     ec.allow_mass_delete = push.allow_mass_delete;
     ec.remove_out_of_scope_copies = push.remove_out_of_scope_copies;
+    if let Some(q) = quiet {
+        ec.rebuild_quiet = std::time::Duration::from_secs(q);
+    }
     if let Some(c) = r.concurrency {
         ec.concurrency = c.max(1);
     }

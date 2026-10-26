@@ -308,10 +308,16 @@ impl Mock {
 
     /// Store a document as a child of a specific revision, creating a branch
     /// (what a second client's edit of the same base looks like).
-    pub fn put_branch(&self, mut doc: Value, parent: &str) -> String {
+    pub fn put_branch(&self, doc: Value, parent: &str) -> String {
+        self.put_branch_with(doc, parent, &rand_hex())
+    }
+
+    /// `put_branch` with a chosen revision hash (to decide the winner: the
+    /// higher hash wins between leaves at the same position).
+    pub fn put_branch_with(&self, mut doc: Value, parent: &str, hash: &str) -> String {
         let (n, h) = parent.split_once('-').unwrap();
         let n: u64 = n.parse().unwrap();
-        let r = rand_hex();
+        let r = hash.to_string();
         doc["_rev"] = json!(format!("{}-{r}", n + 1));
         doc["_revisions"] = json!({"start": n + 1, "ids": [r, h]});
         self.state.lock().unwrap().import(doc);

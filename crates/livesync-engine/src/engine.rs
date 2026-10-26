@@ -1279,6 +1279,14 @@ impl Engine {
                         b.note = None;
                         changed = true;
                     }
+                    // Another device branched off, and our revision won:
+                    // the file is right, but the conflict must be reported.
+                    if b.state == State::Clean && !doc.conflicts.is_empty() {
+                        b.state = State::Conflicted;
+                        b.note = Some(conflict_note(&doc));
+                        changed = true;
+                        self.inner.report.lock().unwrap().conflicted += 1;
+                    }
                     if b.state == State::Dirty {
                         let local = match vaultfs::read_state(&self.inner.cfg.vault.join(&b.path)) {
                             Ok(l) => l,

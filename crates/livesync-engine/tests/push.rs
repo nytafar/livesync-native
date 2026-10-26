@@ -699,3 +699,27 @@ async fn the_daemon_pushes_saves_renames_and_trash_moves_as_they_happen() {
     let n = env.mock.state.lock().unwrap().trees["remote.md"].revs.len();
     assert_eq!(n, 2);
 }
+
+#[tokio::test]
+async fn a_branch_that_loses_to_our_revision_is_still_reported() {
+    let env = Env::new().await;
+    env.write("w.md", b"base\n");
+    env.engine().sync_once().await.unwrap();
+    let base = env.row("w.md").unwrap().base_rev.unwrap();
+    env.write("w.md", b"ours\n");
+    env.engine().sync_once().await.unwrap();
+    // Another device's edit of the same base, with a revision hash that
+    // loses to ours: the winner is still our revision.
+    let ch = env.mock.put_chunks(&["theirs\n"]);
+    let mut d = env.doc("w.md");
+    d["children"] = json!(ch);
+    d["size"] = json!(7);
+    env.mock.put_branch_with(d, &base, "00000000000000000000000000000000");
+    let ours = env.row("w.md").unwrap().base_rev.unwrap();
+    assert_eq!(env.doc("w.md")["_rev"].as_str().unwrap(), ours);
+    env.engine().sync_once().await.unwrap();
+    assert_eq!(env.read("w.md").unwrap(), b"ours\n");
+    let row = env.row("w.md").unwrap();
+    assert_eq!(row.state, State::Conflicted, "{row:?}");
+    assert_eq!(env.engine().status().unwrap().conflicted.len(), 1);
+}
