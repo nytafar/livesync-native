@@ -35,7 +35,9 @@ class MainActivity : ComponentActivity() {
         val app = application as LiveSyncApp
         // Make sure the service runs whenever a profile is active (also after
         // a force-stop, which cancels the boot start and the sticky restart).
-        if (app.profiles.all().any { !it.paused }) SyncService.start(this, "app opened")
+        if (runCatching { app.profiles.all().any { !it.paused } }.getOrDefault(false)) {
+            SyncService.start(this, "app opened")
+        }
         setContent {
             LiveSyncTheme {
                 Surface(Modifier.fillMaxSize()) { AppRoot(app) }

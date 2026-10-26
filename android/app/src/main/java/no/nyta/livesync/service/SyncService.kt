@@ -18,7 +18,6 @@ import androidx.core.content.ContextCompat
 import no.nyta.livesync.Core
 import no.nyta.livesync.LiveSyncApp
 import no.nyta.livesync.R
-import no.nyta.livesync.core.LiveSyncException
 import no.nyta.livesync.core.ProfileConfig
 import no.nyta.livesync.core.RunState
 import no.nyta.livesync.core.StatusListener
@@ -61,6 +60,7 @@ class SyncService : Service() {
         goForeground()
         handler.post {
             val core = app.core.getOrNull() ?: return@post
+            // Called on a Rust thread: only hand over to the worker, never throw.
             core.engine.setListener(object : StatusListener {
                 override fun onStateChanged(profileId: String, state: RunState, message: String?) {
                     handler.post { updateNotification() }
@@ -101,7 +101,7 @@ class SyncService : Service() {
                 for (id in ids) {
                     try {
                         core.engine.syncNow(id)
-                    } catch (e: LiveSyncException) {
+                    } catch (e: Exception) {
                         core.log("sync now for $id: ${e.message}", "warn")
                     }
                 }
@@ -126,7 +126,11 @@ class SyncService : Service() {
         val wanted = profiles.filter { !it.paused }.associateBy { it.id }
         for (id in started.keys.toList()) {
             if (id !in wanted) {
-                core.engine.stop(id)
+                try {
+                    core.engine.stop(id)
+                } catch (e: Exception) {
+                    core.log("stopping $id: ${e.message}", "error")
+                }
                 started.remove(id)
                 core.log("profile $id stopped")
             }
@@ -135,7 +139,8 @@ class SyncService : Service() {
         for (p in wanted.values) {
             val cfg = try {
                 core.configFor(p)
-            } catch (e: Core.MissingSecretException) {
+            } catch (e: Exception) {
+                // No stored password, or the Keystore key is gone.
                 problems[p.id] = e.message ?: "no password"
                 continue
             }
@@ -146,7 +151,8 @@ class SyncService : Service() {
                 started[p.id] = cfg
                 problems.remove(p.id)
                 core.log("profile ${p.id} started (${if (p.pullOnly) "pull-only" else "two-way"})")
-            } catch (e: LiveSyncException) {
+            } catch (e: Exception) {
+                // LiveSyncException (refused, invalid) or InternalException (a bug).
                 problems[p.id] = e.message ?: e.javaClass.simpleName
                 core.log("profile ${p.id} not started: ${e.message}", "error")
             }
@@ -264,7 +270,11 @@ class SyncService : Service() {
         val core = app.core.getOrNull()
         handler.post {
             core?.log("service destroyed; stopping engines")
-            core?.engine?.stopAll()
+            try {
+                core?.engine?.stopAll()
+            } catch (e: Exception) {
+                core?.log("stopping engines: ${e.message}", "error")
+            }
             started.clear()
         }
         worker.quitSafely()

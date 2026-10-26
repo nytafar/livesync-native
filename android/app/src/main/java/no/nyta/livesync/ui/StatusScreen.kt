@@ -70,7 +70,7 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
             profile = p
             if (p != null) {
                 status = withContext(Dispatchers.IO) { runCatching { core.status(p) }.getOrNull() }
-                logs = withContext(Dispatchers.IO) { core.engine.recentLogLines(LOG_LINES) }
+                logs = withContext(Dispatchers.IO) { runCatching { core.engine.recentLogLines(LOG_LINES) }.getOrDefault(logs) }
             }
             delay(2000)
         }
@@ -79,8 +79,9 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
 
     fun update(reason: String, change: (Profile) -> Profile) {
         scope.launch {
-            withContext(Dispatchers.IO) { app.profiles.update(p.id, change) }
-            profile = app.profiles.get(p.id)
+            profile = withContext(Dispatchers.IO) {
+                runCatching { app.profiles.update(p.id, change) }.getOrNull() ?: app.profiles.get(p.id)
+            }
             SyncService.start(ctx, reason)
             onChanged()
         }
@@ -261,9 +262,11 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
                         }
                         Confirm.Remove -> scope.launch {
                             withContext(Dispatchers.IO) {
-                                app.profiles.update(p.id) { it.copy(paused = true) }
-                                core.engine.stop(p.id)
-                                app.secrets.removeProfile(p.id)
+                                runCatching {
+                                    app.profiles.update(p.id) { it.copy(paused = true) }
+                                    core.engine.stop(p.id)
+                                }
+                                runCatching { app.secrets.removeProfile(p.id) }
                                 app.profiles.remove(p.id)
                                 core.log("profile ${p.id} removed")
                             }

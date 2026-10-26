@@ -298,3 +298,24 @@ fn a_failing_access_check_keeps_local_deletions_off_the_server() {
     });
     env.host.stop_all();
 }
+
+struct Throwing;
+
+impl StatusListener for Throwing {
+    fn on_state_changed(&self, _profile_id: String, _state: RunState, _message: Option<String>) {
+        panic!("a foreign callback failed");
+    }
+}
+
+#[test]
+fn a_failing_listener_does_not_stop_syncing() {
+    let env = Env::new();
+    env.host.set_listener(Box::new(Throwing));
+    env.mock.put_text("x.md", &["x"]);
+    let p = env.profile("thr", "vault-thr");
+    env.host.start(p.clone()).unwrap();
+    wait_until("x.md", Duration::from_secs(20), || read(&p, "x.md").is_some());
+    assert_eq!(env.status(&p).run_state, RunState::Running);
+    env.host.stop("thr".into());
+    assert_eq!(env.status(&p).run_state, RunState::Stopped);
+}

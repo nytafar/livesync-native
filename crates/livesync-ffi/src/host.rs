@@ -15,6 +15,7 @@ use livesync_engine::engine::AccessCheck;
 use livesync_engine::{Engine, Index};
 use livesync_remote::Couch;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -61,8 +62,14 @@ pub trait VaultAccess: Send + Sync {
     fn problem(&self, vault_path: String) -> Option<String>;
 }
 
-type Listener = Arc<Mutex<Option<Box<dyn StatusListener>>>>;
+type Listener = Arc<Mutex<Option<Arc<dyn StatusListener>>>>;
 type Access = Arc<Mutex<Option<Arc<dyn VaultAccess>>>>;
+
+/// Lock, recovering from poisoning: a panic elsewhere must not wedge every
+/// later call (the data behind these locks is always left consistent).
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// State shared between a profile's slot and its supervisor task.
 struct Shared {
@@ -77,14 +84,20 @@ struct Shared {
 
 impl Shared {
     fn set_state(&self, state: RunState, message: Option<String>) {
-        *self.state.lock().unwrap() = (state, message.clone());
-        if let Some(l) = self.listener.lock().unwrap().as_ref() {
-            l.on_state_changed(self.cfg.id.clone(), state, message);
+        *lock(&self.state) = (state, message.clone());
+        // Call outside the lock, and never let a failing foreign callback
+        // (a panic once it crosses back) take the supervisor down.
+        let listener = lock(&self.listener).clone();
+        if let Some(l) = listener {
+            let id = self.cfg.id.clone();
+            if std::panic::catch_unwind(AssertUnwindSafe(|| l.on_state_changed(id, state, message))).is_err() {
+                warn!("the status listener failed");
+            }
         }
     }
 
     fn engine(&self) -> Option<Engine> {
-        self.engine.lock().unwrap().clone()
+        lock(&self.engine).clone()
     }
 }
 
@@ -108,10 +121,14 @@ fn open_engine(cfg: &ProfileConfig, access: &Access) -> Result<Engine, LiveSyncE
     let access = access.clone();
     let vault = cfg.vault_path.clone();
     ec.access_check = Some(AccessCheck::new(move || {
-        let check = access.lock().unwrap().clone();
-        match check.and_then(|c| c.problem(vault.clone())) {
-            None => Ok(()),
-            Some(why) => Err(why),
+        let Some(check) = lock(&access).clone() else {
+            return Ok(());
+        };
+        // A check that fails to answer counts as "no access": the safe side.
+        match std::panic::catch_unwind(AssertUnwindSafe(|| check.problem(vault.clone()))) {
+            Ok(None) => Ok(()),
+            Ok(Some(why)) => Err(why),
+            Err(_) => Err("the vault access check failed".into()),
         }
     }));
     let couch = Couch::new(&cfg.remote()).map_err(|e| LiveSyncError::Invalid { msg: e.to_string() })?;
@@ -133,7 +150,7 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
         let opened = tokio::task::spawn_blocking(move || open_engine(&cfg, &access)).await;
         let failure = match opened {
             Ok(Ok(engine)) => {
-                *shared.engine.lock().unwrap() = Some(engine.clone());
+                *lock(&shared.engine) = Some(engine.clone());
                 let mode = if shared.cfg.pull_only { "pull-only" } else { "two-way" };
                 info!("engine started ({mode}) for {}", shared.cfg.vault_path);
                 shared.set_state(RunState::Running, Some(mode.into()));
@@ -153,7 +170,7 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
                     .in_current_span(),
                 );
                 let result = run.await;
-                *shared.engine.lock().unwrap() = None;
+                *lock(&shared.engine) = None;
                 if *stop.borrow() {
                     break;
                 }
@@ -184,7 +201,7 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
 
 impl LiveSync {
     fn slot_shared(&self, id: &str) -> Option<Arc<Shared>> {
-        self.slots.lock().unwrap().get(id).map(|s| s.shared.clone())
+        lock(&self.slots).get(id).map(|s| s.shared.clone())
     }
 
     fn running_engine(&self, id: &str) -> Result<Engine, LiveSyncError> {
@@ -207,7 +224,7 @@ impl LiveSync {
                 slot.shared.cfg.id
             );
             task.abort();
-            *slot.shared.engine.lock().unwrap() = None;
+            *lock(&slot.shared.engine) = None;
             slot.shared
                 .set_state(RunState::Stopped, Some("abandoned while stopping".into()));
         }
@@ -243,12 +260,12 @@ impl LiveSync {
     /// Install the vault access check every engine asks before a pass that
     /// could delete remote documents (see [`VaultAccess`]).
     pub fn set_vault_access(&self, access: Box<dyn VaultAccess>) {
-        *self.access.lock().unwrap() = Some(Arc::from(access));
+        *lock(&self.access) = Some(Arc::from(access));
     }
 
     /// Receive run-state changes of every profile.
     pub fn set_listener(&self, listener: Box<dyn StatusListener>) {
-        *self.listener.lock().unwrap() = Some(listener);
+        *lock(&self.listener) = Some(Arc::from(listener));
     }
 
     /// Start (or restart with new settings) the engine for a profile. Refused
@@ -257,7 +274,7 @@ impl LiveSync {
     pub fn start(&self, cfg: ProfileConfig) -> Result<(), LiveSyncError> {
         cfg.validate().map_err(|msg| LiveSyncError::Invalid { msg })?;
         let previous = {
-            let mut slots = self.slots.lock().unwrap();
+            let mut slots = lock(&self.slots);
             for (id, other) in slots.iter() {
                 if *id == cfg.id {
                     continue;
@@ -303,14 +320,14 @@ impl LiveSync {
 
     /// Stop a profile's engine (waits up to 15 s for it to wind down).
     pub fn stop(&self, profile_id: String) {
-        let slot = self.slots.lock().unwrap().remove(&profile_id);
+        let slot = lock(&self.slots).remove(&profile_id);
         if let Some(slot) = slot {
             self.stop_slot(slot);
         }
     }
 
     pub fn stop_all(&self) {
-        let slots: Vec<Slot> = self.slots.lock().unwrap().drain().map(|(_, s)| s).collect();
+        let slots: Vec<Slot> = lock(&self.slots).drain().map(|(_, s)| s).collect();
         for s in &slots {
             let _ = s.stop.send(true);
         }
@@ -322,7 +339,7 @@ impl LiveSync {
     /// IDs of the profiles that have an engine slot (running, starting or
     /// waiting to retry).
     pub fn active_profiles(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.slots.lock().unwrap().keys().cloned().collect();
+        let mut v: Vec<String> = lock(&self.slots).keys().cloned().collect();
         v.sort();
         v
     }
@@ -351,7 +368,7 @@ impl LiveSync {
         if !up {
             return;
         }
-        let all: Vec<Arc<Shared>> = self.slots.lock().unwrap().values().map(|s| s.shared.clone()).collect();
+        let all: Vec<Arc<Shared>> = lock(&self.slots).values().map(|s| s.shared.clone()).collect();
         for s in all {
             match s.engine() {
                 Some(e) => e.network_changed(true),
@@ -366,7 +383,7 @@ impl LiveSync {
         let shared = self.slot_shared(&profile_id);
         let (state, message, pull_only) = match &shared {
             Some(s) => {
-                let (st, msg) = s.state.lock().unwrap().clone();
+                let (st, msg) = lock(&s.state).clone();
                 (st, msg, s.cfg.pull_only)
             }
             None => (RunState::Stopped, None, false),
@@ -444,7 +461,7 @@ impl LiveSync {
     /// device resolved. This is how a milestone lock without a rebuild is
     /// cleared. The engine is restarted.
     pub fn fetch_from_remote(&self, profile_id: String) -> Result<(), LiveSyncError> {
-        let slot = self.slots.lock().unwrap().remove(&profile_id);
+        let slot = lock(&self.slots).remove(&profile_id);
         let Some(slot) = slot else {
             return Err(LiveSyncError::NotRunning {
                 msg: format!("profile {profile_id} is not started"),
@@ -484,7 +501,7 @@ impl LiveSync {
 
 impl Drop for LiveSync {
     fn drop(&mut self) {
-        let slots: Vec<Slot> = self.slots.lock().unwrap().drain().map(|(_, s)| s).collect();
+        let slots: Vec<Slot> = lock(&self.slots).drain().map(|(_, s)| s).collect();
         for s in slots {
             let _ = s.stop.send(true);
         }

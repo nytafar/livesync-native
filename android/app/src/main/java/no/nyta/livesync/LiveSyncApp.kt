@@ -28,8 +28,11 @@ class LiveSyncApp : Application() {
             // Without all-files access the vault looks empty; never let that
             // read as "everything was deleted".
             host.setVaultAccess(object : VaultAccess {
-                override fun problem(vaultPath: String): String? =
+                override fun problem(vaultPath: String): String? = try {
                     if (Environment.isExternalStorageManager()) null else "all-files access is not granted"
+                } catch (e: Exception) {
+                    "cannot check all-files access: ${e.message}"
+                }
             })
             Core(host, profiles, secrets, File(cacheDir, "connect-test"))
         }
