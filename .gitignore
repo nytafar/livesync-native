@@ -1,0 +1,4 @@
+target/
+tools/golden/node_modules/
+*.sqlite
+*.sqlite-*

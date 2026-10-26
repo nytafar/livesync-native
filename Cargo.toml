@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/livesync-model", "crates/livesync-remote", "crates/livesync-engine", "crates/lsync"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

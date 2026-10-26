@@ -1,0 +1,16 @@
+[package]
+name = "livesync-remote"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+livesync-model = { version = "0.1.0", path = "../livesync-model" }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "http2"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["time"] }
+tracing = "0.1.44"
+url = "2.5.8"

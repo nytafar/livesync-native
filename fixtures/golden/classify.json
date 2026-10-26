@@ -1,0 +1,114 @@
+{
+ "meta": {
+  "generator": "tools/golden/generate.mjs",
+  "package": "@vrtmrz/livesync-commonlib",
+  "version": "0.2.1"
+ },
+ "cases": [
+  {
+   "path": "redflag.md",
+   "ignored": true,
+   "plainText": true
+  },
+  {
+   "path": "redflag2.md",
+   "ignored": true,
+   "plainText": true
+  },
+  {
+   "path": "redflag3.md",
+   "ignored": true,
+   "plainText": true
+  },
+  {
+   "path": "flag_rebuild.md",
+   "ignored": true,
+   "plainText": true
+  },
+  {
+   "path": "flag_fetch.md",
+   "ignored": true,
+   "plainText": true
+  },
+  {
+   "path": "livesync_log_2026.md",
+   "ignored": true,
+   "plainText": true
+  },
+  {
+   "path": "LIVESYNC_LOG_x.md",
+   "ignored": true,
+   "plainText": true
+  },
+  {
+   "path": "sub/redflag.md",
+   "ignored": false,
+   "plainText": true
+  },
+  {
+   "path": "note.md",
+   "ignored": false,
+   "plainText": true
+  },
+  {
+   "path": "a.txt",
+   "ignored": false,
+   "plainText": true
+  },
+  {
+   "path": "a.svg",
+   "ignored": false,
+   "plainText": true
+  },
+  {
+   "path": "a.html",
+   "ignored": false,
+   "plainText": true
+  },
+  {
+   "path": "a.csv",
+   "ignored": false,
+   "plainText": true
+  },
+  {
+   "path": "a.css",
+   "ignored": false,
+   "plainText": true
+  },
+  {
+   "path": "a.js",
+   "ignored": false,
+   "plainText": true
+  },
+  {
+   "path": "a.xml",
+   "ignored": false,
+   "plainText": true
+  },
+  {
+   "path": "a.canvas",
+   "ignored": false,
+   "plainText": true
+  },
+  {
+   "path": "a.json",
+   "ignored": false,
+   "plainText": false
+  },
+  {
+   "path": "a.png",
+   "ignored": false,
+   "plainText": false
+  },
+  {
+   "path": "a.MD",
+   "ignored": false,
+   "plainText": false
+  },
+  {
+   "path": "a.pdf",
+   "ignored": false,
+   "plainText": false
+  }
+ ]
+}

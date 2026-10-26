@@ -1,0 +1,259 @@
+{
+ "meta": {
+  "generator": "tools/golden/generate.mjs",
+  "package": "@vrtmrz/livesync-commonlib",
+  "version": "0.2.1"
+ },
+ "cases": [
+  {
+   "path": "note.md",
+   "caseInsensitive": true,
+   "id": "note.md"
+  },
+  {
+   "path": "note.md",
+   "caseInsensitive": false,
+   "id": "note.md"
+  },
+  {
+   "path": "Folder/Sub Folder/Note With Spaces.md",
+   "caseInsensitive": true,
+   "id": "folder/sub folder/note with spaces.md"
+  },
+  {
+   "path": "Folder/Sub Folder/Note With Spaces.md",
+   "caseInsensitive": false,
+   "id": "Folder/Sub Folder/Note With Spaces.md"
+  },
+  {
+   "path": "README.MD",
+   "caseInsensitive": true,
+   "id": "readme.md"
+  },
+  {
+   "path": "README.MD",
+   "caseInsensitive": false,
+   "id": "README.MD"
+  },
+  {
+   "path": "_underscore.md",
+   "caseInsensitive": true,
+   "id": "/_underscore.md"
+  },
+  {
+   "path": "_underscore.md",
+   "caseInsensitive": false,
+   "id": "/_underscore.md"
+  },
+  {
+   "path": "_Folder/_inner.md",
+   "caseInsensitive": true,
+   "id": "/_folder/_inner.md"
+  },
+  {
+   "path": "_Folder/_inner.md",
+   "caseInsensitive": false,
+   "id": "/_Folder/_inner.md"
+  },
+  {
+   "path": "folder/_inner.md",
+   "caseInsensitive": true,
+   "id": "folder/_inner.md"
+  },
+  {
+   "path": "folder/_inner.md",
+   "caseInsensitive": false,
+   "id": "folder/_inner.md"
+  },
+  {
+   "path": "Ærlig talt – ÆØÅ æøå.md",
+   "caseInsensitive": true,
+   "id": "ærlig talt – æøå æøå.md"
+  },
+  {
+   "path": "Ærlig talt – ÆØÅ æøå.md",
+   "caseInsensitive": false,
+   "id": "Ærlig talt – ÆØÅ æøå.md"
+  },
+  {
+   "path": "Straße/Größe.md",
+   "caseInsensitive": true,
+   "id": "straße/größe.md"
+  },
+  {
+   "path": "Straße/Größe.md",
+   "caseInsensitive": false,
+   "id": "Straße/Größe.md"
+  },
+  {
+   "path": "İstanbul.md",
+   "caseInsensitive": true,
+   "id": "i̇stanbul.md"
+  },
+  {
+   "path": "İstanbul.md",
+   "caseInsensitive": false,
+   "id": "İstanbul.md"
+  },
+  {
+   "path": "ΣΊΣΥΦΟΣ.md",
+   "caseInsensitive": true,
+   "id": "σίσυφοσ.md"
+  },
+  {
+   "path": "ΣΊΣΥΦΟΣ.md",
+   "caseInsensitive": false,
+   "id": "ΣΊΣΥΦΟΣ.md"
+  },
+  {
+   "path": "Café.md",
+   "caseInsensitive": true,
+   "id": "café.md"
+  },
+  {
+   "path": "Café.md",
+   "caseInsensitive": false,
+   "id": "Café.md"
+  },
+  {
+   "path": "Café.md",
+   "caseInsensitive": true,
+   "id": "café.md"
+  },
+  {
+   "path": "Café.md",
+   "caseInsensitive": false,
+   "id": "Café.md"
+  },
+  {
+   "path": "emoji 🎉/😀 face.md",
+   "caseInsensitive": true,
+   "id": "emoji 🎉/😀 face.md"
+  },
+  {
+   "path": "emoji 🎉/😀 face.md",
+   "caseInsensitive": false,
+   "id": "emoji 🎉/😀 face.md"
+  },
+  {
+   "path": "日本語/ノート.md",
+   "caseInsensitive": true,
+   "id": "日本語/ノート.md"
+  },
+  {
+   "path": "日本語/ノート.md",
+   "caseInsensitive": false,
+   "id": "日本語/ノート.md"
+  },
+  {
+   "path": "attachments/Image 1.PNG",
+   "caseInsensitive": true,
+   "id": "attachments/image 1.png"
+  },
+  {
+   "path": "attachments/Image 1.PNG",
+   "caseInsensitive": false,
+   "id": "attachments/Image 1.PNG"
+  },
+  {
+   "path": ".obsidian/app.json",
+   "caseInsensitive": true,
+   "id": ".obsidian/app.json"
+  },
+  {
+   "path": ".obsidian/app.json",
+   "caseInsensitive": false,
+   "id": ".obsidian/app.json"
+  },
+  {
+   "path": "i:.obsidian/app.json",
+   "caseInsensitive": true,
+   "id": "i:.obsidian/app.json"
+  },
+  {
+   "path": "i:.obsidian/app.json",
+   "caseInsensitive": false,
+   "id": "i:.obsidian/app.json"
+  },
+  {
+   "path": "ix:Term/category/Name.md",
+   "caseInsensitive": true,
+   "id": "ix:term/category/name.md"
+  },
+  {
+   "path": "ix:Term/category/Name.md",
+   "caseInsensitive": false,
+   "id": "ix:Term/category/Name.md"
+  },
+  {
+   "path": "ps:obsolete.md",
+   "caseInsensitive": true,
+   "id": "ps:obsolete.md"
+  },
+  {
+   "path": "ps:obsolete.md",
+   "caseInsensitive": false,
+   "id": "ps:obsolete.md"
+  },
+  {
+   "path": "a/b/c/d/e.canvas",
+   "caseInsensitive": true,
+   "id": "a/b/c/d/e.canvas"
+  },
+  {
+   "path": "a/b/c/d/e.canvas",
+   "caseInsensitive": false,
+   "id": "a/b/c/d/e.canvas"
+  },
+  {
+   "path": " leading space.md",
+   "caseInsensitive": true,
+   "id": " leading space.md"
+  },
+  {
+   "path": " leading space.md",
+   "caseInsensitive": false,
+   "id": " leading space.md"
+  },
+  {
+   "path": "trailing space .md",
+   "caseInsensitive": true,
+   "id": "trailing space .md"
+  },
+  {
+   "path": "trailing space .md",
+   "caseInsensitive": false,
+   "id": "trailing space .md"
+  },
+  {
+   "path": "ǅ titlecase.md",
+   "caseInsensitive": true,
+   "id": "ǆ titlecase.md"
+  },
+  {
+   "path": "ǅ titlecase.md",
+   "caseInsensitive": false,
+   "id": "ǅ titlecase.md"
+  },
+  {
+   "path": "K kelvin sign.md",
+   "caseInsensitive": true,
+   "id": "k kelvin sign.md"
+  },
+  {
+   "path": "K kelvin sign.md",
+   "caseInsensitive": false,
+   "id": "K kelvin sign.md"
+  },
+  {
+   "path": "ﬃ ligature.md",
+   "caseInsensitive": true,
+   "id": "ﬃ ligature.md"
+  },
+  {
+   "path": "ﬃ ligature.md",
+   "caseInsensitive": false,
+   "id": "ﬃ ligature.md"
+  }
+ ]
+}

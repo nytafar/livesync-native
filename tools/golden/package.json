@@ -1,0 +1,8 @@
+{
+  "name": "livesync-golden",
+  "private": true,
+  "type": "module",
+  "description": "Emits golden test vectors from @vrtmrz/livesync-commonlib for the Rust crates",
+  "scripts": { "generate": "node generate.mjs ../../fixtures/golden" },
+  "dependencies": { "@vrtmrz/livesync-commonlib": "0.2.1" }
+}
