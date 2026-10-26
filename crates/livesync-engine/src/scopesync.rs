@@ -17,6 +17,7 @@ use livesync_model::path::{is_internal_id, path_to_id};
 use livesync_model::scope::{Scope, Widening};
 use livesync_remote::ChangeRow;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use tracing::{info, warn};
 
 type Result<T> = std::result::Result<T, EngineError>;
@@ -29,6 +30,42 @@ pub(crate) fn id_to_scope_path(id: &str) -> &str {
 }
 
 const PAGE: usize = 5000;
+
+/// `_all_docs` key ranges (raw collation, inclusive) holding every document
+/// ID whose path may lie under `prefix` when IDs are case-insensitive. IDs
+/// are lower-cased paths, but older clients wrote mixed-case ones, which sort
+/// elsewhere; so the ranges cover every ID that starts with the prefix's
+/// first character in either case, and the caller filters by scope. Chunk
+/// IDs (`h:`) are left out.
+pub(crate) fn id_ranges(prefix: &str) -> Vec<(String, String)> {
+    const TOP: char = '\u{10FFFF}';
+    let id = path_to_id(prefix, true);
+    if id.starts_with("/_") {
+        // The leading-underscore rule: `_` has no case.
+        return vec![("/_".into(), format!("/_{TOP}"))];
+    }
+    let Some(c) = id.chars().next() else {
+        return vec![(String::new(), TOP.to_string())];
+    };
+    let variants: BTreeSet<String> = [
+        c.to_lowercase().collect::<String>(),
+        c.to_uppercase().collect(),
+        c.to_string(),
+    ]
+    .into_iter()
+    .collect();
+    let mut out = Vec::new();
+    for v in variants {
+        if v == "h" {
+            // Around the chunks (`h:...`).
+            out.push(("h".into(), "h:".into()));
+            out.push(("h;".into(), format!("h{TOP}")));
+        } else {
+            out.push((v.clone(), format!("{v}{TOP}")));
+        }
+    }
+    out
+}
 
 impl Engine {
     /// Drop what fell out of the scope. Returns the scope the index was last
@@ -86,13 +123,12 @@ impl Engine {
             let ids = match new.widening_from(old) {
                 Widening::None => vec![],
                 Widening::Prefixes(ps) if !case_sensitive => {
-                    let mut ids = Vec::new();
-                    for p in ps {
-                        let start = path_to_id(&p, true);
-                        let end = format!("{start}/\u{10FFFF}");
+                    let ranges: BTreeSet<(String, String)> = ps.iter().flat_map(|p| id_ranges(p)).collect();
+                    let mut ids = BTreeSet::new();
+                    for (start, end) in ranges {
                         ids.extend(self.scan_ids(Some(&start), Some(&end)).await?);
                     }
-                    ids
+                    ids.into_iter().collect()
                 }
                 Widening::Prefixes(_) | Widening::Everything => self.scan_ids(None, None).await?,
             };
@@ -166,5 +202,33 @@ impl Engine {
                 None => return Ok(out),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_ranges_cover_both_cases_and_skip_chunks() {
+        let r = id_ranges("notes");
+        assert_eq!(
+            r,
+            vec![
+                ("N".to_string(), "N\u{10FFFF}".to_string()),
+                ("n".to_string(), "n\u{10FFFF}".to_string())
+            ]
+        );
+        let inside = |id: &str| r.iter().any(|(a, b)| id >= a.as_str() && id <= b.as_str());
+        assert!(inside("notes/a.md") && inside("Notes/Mixed.md") && inside("nOtes/x.md"));
+        assert!(!inside("other/a.md"));
+        let h = id_ranges("hobbies");
+        let inside = |id: &str| h.iter().any(|(a, b)| id >= a.as_str() && id <= b.as_str());
+        assert!(inside("hobbies/a.md") && inside("Hobbies/b.md"));
+        assert!(!inside("h:abc123"), "chunks are not scanned");
+        assert_eq!(
+            id_ranges("_templates"),
+            vec![("/_".to_string(), "/_\u{10FFFF}".to_string())]
+        );
     }
 }

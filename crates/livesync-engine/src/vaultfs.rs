@@ -22,8 +22,9 @@ pub struct DiskState {
     pub hash: String,
     pub size: u64,
     pub mtime_ms: i64,
-    #[cfg(unix)]
-    pub ino: (u64, u64),
+    /// The file's identity (device and inode) where the platform has one
+    /// (`platform::file_id`); `None` when unknown.
+    pub file_id: Option<(u64, u64)>,
 }
 
 fn mtime_ms(md: &fs::Metadata) -> i64 {
@@ -42,18 +43,13 @@ pub fn read_state(path: &Path) -> io::Result<Option<DiskState>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    #[cfg(unix)]
-    let ino = {
-        use std::os::unix::fs::MetadataExt;
-        (md.dev(), md.ino())
-    };
+    let file_id = crate::platform::file_id(&md);
     if !md.is_file() {
         return Ok(Some(DiskState {
             hash: format!("not-a-file:{:?}", md.file_type()),
             size: 0,
             mtime_ms: mtime_ms(&md),
-            #[cfg(unix)]
-            ino,
+            file_id,
         }));
     }
     let mut f = File::open(path)?;
@@ -72,8 +68,7 @@ pub fn read_state(path: &Path) -> io::Result<Option<DiskState>> {
         hash: format!("{:016x}", h.digest()),
         size,
         mtime_ms: mtime_ms(&md),
-        #[cfg(unix)]
-        ino,
+        file_id,
     }))
 }
 
@@ -389,52 +384,8 @@ pub fn ensure_nomedia(root: &Path) -> io::Result<bool> {
     }
 }
 
-/// An exclusive advisory lock (`flock`) on a lock file, held until dropped.
-#[derive(Debug)]
-pub struct LockFile {
-    _file: File,
-    pub path: PathBuf,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum LockError {
-    #[error("{0} is locked by another lsync process")]
-    Busy(PathBuf),
-    #[error("cannot lock {path}: {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-}
-
-impl LockFile {
-    /// Take the lock without waiting.
-    pub fn try_acquire(path: &Path) -> Result<LockFile, LockError> {
-        let io_err = |source| LockError::Io {
-            path: path.to_path_buf(),
-            source,
-        };
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).map_err(io_err)?;
-        }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(io_err)?;
-        match file.try_lock() {
-            Ok(()) => Ok(LockFile {
-                _file: file,
-                path: path.to_path_buf(),
-            }),
-            Err(fs::TryLockError::WouldBlock) => Err(LockError::Busy(path.to_path_buf())),
-            Err(fs::TryLockError::Error(e)) => Err(io_err(e)),
-        }
-    }
-}
+// The profile lock (a seam) lives in `platform`; re-exported for callers.
+pub use crate::platform::{LockError, LockFile};
 
 pub fn now_ms() -> i64 {
     SystemTime::now()

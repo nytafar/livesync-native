@@ -329,6 +329,24 @@ async fn run_sync(engine: &Engine, json: bool, fetch: bool) -> Result<u8> {
             p.conflicted, u.conflicts
         );
         println!("  kept remote      {} (local deletes not applied)", u.kept_remote);
+        if u.deleted_locally > 0 {
+            println!(
+                "  removed locally  {} (stale copies of notes deleted elsewhere)",
+                u.deleted_locally
+            );
+        }
+        if u.orphans_pushed > 0 {
+            println!(
+                "  pushed back      {} the remote lacked after a rebuild or fetch (see `lsync status`)",
+                u.orphans_pushed
+            );
+        }
+        if u.failed > 0 {
+            println!("  failed           {} (see local issues in `lsync status`)", u.failed);
+        }
+        if u.unreadable > 0 {
+            println!("  unreadable       {} (not treated as deleted)", u.unreadable);
+        }
         println!("  out of scope     {} (moved out locally; remote kept)", u.out_of_scope);
         println!("  dirty (kept)     {}", p.dirty);
         println!("  pending (retry)  {}", p.pending);
@@ -337,7 +355,12 @@ async fn run_sync(engine: &Engine, json: bool, fetch: bool) -> Result<u8> {
             println!("  SAFETY STOP      too many files missing; nothing deleted (see `lsync status`)");
         }
     }
-    let attention = rep.pull.dirty > 0 || rep.pull.pending > 0 || rep.push.issues > 0 || rep.push.safety_stops > 0;
+    let attention = rep.pull.dirty > 0
+        || rep.pull.pending > 0
+        || rep.push.issues > 0
+        || rep.push.safety_stops > 0
+        || rep.push.failed > 0
+        || rep.push.orphans_pushed > 0;
     Ok(if attention { 3 } else { 0 })
 }
 
@@ -451,10 +474,16 @@ fn print_status(s: &livesync_engine::Status) {
     println!("registered      {}", fmt_ms(s.registered_ms));
     println!("folders         {}", s.scope.as_deref().unwrap_or("-"));
     if s.needs_full_fetch {
-        println!("full fetch      owed (runs at the next sync)");
+        println!("full fetch      owed; pushes are held until a two-way sync completes it");
+    }
+    if let Some(w) = &s.rebuild_wait {
+        println!("rebuild wait    {w}");
+    }
+    if let Some(o) = &s.rebuild_orphans {
+        println!("pushed back     {o}");
     }
     if let Some(stop) = &s.safety_stop {
-        println!("SAFETY STOP     {stop}");
+        println!("SAFETY STOP     {stop} (lsync sync --allow-mass-delete)");
     }
     println!("last error      {}", s.last_error.as_deref().unwrap_or("-"));
     println!("files           {:?}", s.counts);

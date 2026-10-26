@@ -365,10 +365,13 @@ impl Index {
     /// A rebuild elsewhere invalidates every revision and the changes sequence.
     /// Keep the rows' disk hashes so files that are still clean may be
     /// overwritten by the refetch, while dirty files stay protected.
+    /// `out_of_scope` rows stay too (without a revision): the file was moved
+    /// away on purpose, and the refetch must not write the remote copy back
+    /// beside it.
     pub fn reset_for_rebuild(&self) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("UPDATE files SET base_rev = NULL, base_children = '[]'", [])?;
-        tx.execute("DELETE FROM files WHERE state IN ('skipped', 'out_of_scope')", [])?;
+        tx.execute("DELETE FROM files WHERE state = 'skipped'", [])?;
         tx.execute("DELETE FROM pending", [])?;
         tx.execute("DELETE FROM meta WHERE key = 'since'", [])?;
         tx.commit()
@@ -452,6 +455,9 @@ mod tests {
         let mut s = row(".obsidian/x", ".obsidian/x");
         s.state = State::Skipped;
         ix.upsert(&s).unwrap();
+        let mut o = row("moved.md", "moved.md");
+        o.state = State::OutOfScope;
+        ix.upsert(&o).unwrap();
         ix.set_meta("since", "\"5-x\"").unwrap();
         ix.add_pending("b.md", Some("1-b"), "missing chunks", 0).unwrap();
         ix.reset_for_rebuild().unwrap();
@@ -459,6 +465,8 @@ mod tests {
         assert_eq!(r.base_rev, None);
         assert_eq!(r.disk_hash.as_deref(), Some("00"));
         assert!(ix.by_doc(".obsidian/x").unwrap().is_none());
+        let o = ix.by_doc("moved.md").unwrap().unwrap();
+        assert_eq!((o.state, o.base_rev), (State::OutOfScope, None));
         assert!(ix.get_meta("since").unwrap().is_none());
         assert!(ix.pending(None).unwrap().is_empty());
     }
