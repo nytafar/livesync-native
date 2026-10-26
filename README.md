@@ -2,7 +2,7 @@
 
 A native client for [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync): a Rust sync engine that talks to the LiveSync CouchDB database directly and keeps a plain folder (an Obsidian vault) in step with it. The engine becomes the core of an always-on Android app. For now it ships as the `lsync` command-line tool for Linux and for Termux on Android.
 
-**Status: milestone M2a, two-way sync on Linux.** `lsync sync` and `lsync daemon` pull and push; `lsync pull` and `lsync daemon --pull-only` stay read-only. The Android app (M2b) and end-to-end encryption (M3) are not here yet.
+**Status: milestone M2b, the Android app.** `lsync sync` and `lsync daemon` pull and push; `lsync pull` and `lsync daemon --pull-only` stay read-only. The Android app (`android/`, built by `scripts/build-apk.sh`) runs the same engine always-on in a foreground service, pull-only or two-way per vault. End-to-end encryption (M3) is not here yet.
 
 ## What it does
 
@@ -77,7 +77,10 @@ Exit codes:
 | `crates/livesync-remote` | CouchDB over HTTP (reqwest + rustls with bundled webpki roots): `_changes`, `_all_docs`, `_local` docs, backoff |
 | `crates/livesync-engine` | Pull and push loops, daemons, SQLite index, vault file operations; platform seams (`Watcher`, `FsRules`) |
 | `crates/lsync` | The CLI, including `probe` |
+| `crates/livesync-ffi` | UniFFI surface for the app: one host, one engine per profile, connect test, status, logs |
+| `crates/uniffi-bindgen` | UniFFI's Kotlin binding generator, pinned to the same version |
+| `android/` | The Android app (Kotlin, Compose): foreground service, onboarding, status screen |
 | `tools/golden` | Node program pinned to `@vrtmrz/livesync-commonlib` 0.2.1; it emits the fixtures in `fixtures/golden` |
-| `scripts/` | Android build, dev-database environment, a vault comparison script, and `interop.sh` (the M2 scenarios against the official CLI) |
+| `scripts/` | APK and Termux builds, dev-database environment, a vault comparison script, and `interop.sh` (the M2 scenarios against the official CLI) |
 
 Build and test instructions are in [AGENTS.md](AGENTS.md).

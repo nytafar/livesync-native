@@ -26,6 +26,18 @@ node generate.mjs ../../fixtures/golden
 
 Bump the pinned version in `tools/golden/package.json`, and the version assertion in `crates/livesync-model/tests/golden.rs`, together.
 
+## Android app (APK)
+
+```sh
+scripts/build-apk.sh             # -> dist/livesync-android-<version>.apk + .sha256
+```
+
+It builds `livesync-ffi` for `arm64-v8a` (cargo-ndk, API 30) and for the host, generates the Kotlin bindings with the workspace's `uniffi-bindgen` into `android/app/build/generated/` (never committed), then runs Gradle: `testReleaseUnitTest` (including `CoreBindingTest`, which loads the host build of the core through the generated bindings and cannot be skipped here), `lintRelease` (no errors allowed) and `assembleRelease`. That is the Android gate; run it after any change under `android/` or `crates/livesync-ffi`. `--skip-checks` builds only.
+
+- Toolchain: Android SDK at `$ANDROID_HOME` (default `~/Android/Sdk`) with platform 35, build-tools 35.0.0 and NDK r29; JDK 21 from mise (`LIVESYNC_JAVA_HOME` overrides; Gradle 8.14 does not run on JDK 27). Gradle comes from the wrapper (checksum-pinned).
+- Signing: the sideload keystore lives in `~/.config/livesync-android/` (`sideload.jks` and `sideload.properties`, both 0600), created by the script on first use. Never commit them; `LIVESYNC_SIGNING` points at another properties file.
+- `cargo test -p livesync-ffi` runs the FFI host against the engine's mock CouchDB. The opt-in `devdb` test runs it against the dev container (read-only, asserts `update_seq` did not move): `source scripts/dev-env.sh && cargo test --release -p livesync-ffi --test devdb -- --ignored`.
+
 ## Android (Termux) build
 
 ```sh
