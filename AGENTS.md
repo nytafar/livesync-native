@@ -45,6 +45,17 @@ The binary links only `libc`, `libm` and `libdl`. TLS is rustls with bundled web
 - Credentials never go into the repo, test fixtures or commit messages.
 - `lsync pull` and `lsync daemon --pull-only` (`Engine::pull_once`, `Engine::daemon_pull_only`) never write to the remote: no document writes and no milestone registration. The mock-server tests assert it. Writes happen only in `sync`, `fetch` and the two-way `daemon`.
 
+## Interop check against the official CLI
+
+Not part of the gate (it needs the dev container and node), but run it after any change to the engine:
+
+```sh
+scripts/interop.sh                 # every scenario; drops its throwaway database
+KEEP=1 ONLY="S4 S6" scripts/interop.sh
+```
+
+It creates `lsync-it-<run>` on the dev container, drives the official CLI (`~/code/ref/obsidian-livesync/src/apps/cli/dist/index.cjs`, run with `node` directly) and `lsync` through the M2 scenarios, and prints PASS/FAIL lines. It refuses any URL other than `127.0.0.1:8411`.
+
 ## End-to-end check against the dev database
 
 ```sh
