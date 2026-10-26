@@ -18,6 +18,7 @@ use livesync_remote::Couch;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
@@ -86,6 +87,11 @@ struct Shared {
     /// The running engine task, so a stop that times out can cancel it too
     /// (the supervisor alone is not enough: the task would run on, detached).
     run_abort: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Open the first engine of this slot with mass deletes allowed, for one
+    /// successful push pass (the user confirmed a safety stop).
+    allow_mass_delete_once: bool,
+    /// Whether the running engine currently allows mass deletes.
+    mass_delete_allowed: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
@@ -124,8 +130,9 @@ pub struct LiveSync {
     access: Access,
 }
 
-fn open_engine(cfg: &ProfileConfig, access: &Access) -> Result<Engine, LiveSyncError> {
+fn open_engine(cfg: &ProfileConfig, access: &Access, allow_mass_delete: bool) -> Result<Engine, LiveSyncError> {
     let mut ec = cfg.engine_config().map_err(|msg| LiveSyncError::Invalid { msg })?;
+    ec.allow_mass_delete = allow_mass_delete;
     // Read at every check, so a check installed after the start still applies.
     let access = access.clone();
     let vault = cfg.vault_path.clone();
@@ -149,6 +156,7 @@ fn open_engine(cfg: &ProfileConfig, access: &Access) -> Result<Engine, LiveSyncE
 
 async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
     let mut delay = RETRY_FIRST;
+    let mut allow_once = shared.allow_mass_delete_once;
     loop {
         if *stop.borrow() {
             break;
@@ -156,34 +164,72 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
         shared.set_state(RunState::Starting, None);
         let cfg = shared.cfg.clone();
         let access = shared.access.clone();
-        let opened = tokio::task::spawn_blocking(move || open_engine(&cfg, &access)).await;
+        let allow = allow_once;
+        let opened = tokio::task::spawn_blocking(move || open_engine(&cfg, &access, allow)).await;
         let failure = match opened {
             Ok(Ok(engine)) => {
                 *lock(&shared.engine) = Some(engine.clone());
+                shared.mass_delete_allowed.store(allow, Ordering::SeqCst);
                 let mode = if shared.cfg.pull_only { "pull-only" } else { "two-way" };
-                info!("engine started ({mode}) for {}", shared.cfg.vault_path);
+                info!(
+                    "engine started ({mode}{}) for {}",
+                    if allow {
+                        ", mass deletes allowed for one pass"
+                    } else {
+                        ""
+                    },
+                    shared.cfg.vault_path
+                );
                 shared.set_state(RunState::Running, Some(mode.into()));
                 let started = Instant::now();
-                let rx = stop.clone();
+                // The engine gets its own stop channel, so the supervisor can
+                // end a run (after the allowed pass) without stopping the slot.
+                let (run_tx, run_rx) = watch::channel(false);
                 let pull_only = shared.cfg.pull_only;
+                let runner = engine.clone();
                 // A separate task, so a panic in the engine is reported here
                 // instead of taking the supervisor down with it.
-                let run = tokio::spawn(
+                let mut run = tokio::spawn(
                     async move {
                         if pull_only {
-                            engine.daemon_pull_only(rx).await
+                            runner.daemon_pull_only(run_rx).await
                         } else {
-                            engine.run(rx).await
+                            runner.run(run_rx).await
                         }
                     }
                     .in_current_span(),
                 );
                 *lock(&shared.run_abort) = Some(run.abort_handle());
-                let result = run.await;
+                let mut stopping = false;
+                let mut once_done = false;
+                let result = loop {
+                    tokio::select! {
+                        r = &mut run => break r,
+                        _ = stop.changed(), if !stopping => {
+                            stopping = true;
+                            let _ = run_tx.send(true);
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(2)), if allow && !once_done && !stopping => {
+                            if engine.push_report().passes > 0 {
+                                info!("the push pass with mass deletes allowed is done; restarting without");
+                                once_done = true;
+                                let _ = run_tx.send(true);
+                            }
+                        }
+                    }
+                };
                 *lock(&shared.run_abort) = None;
                 *lock(&shared.engine) = None;
+                shared.mass_delete_allowed.store(false, Ordering::SeqCst);
+                drop(engine);
                 if *stop.borrow() {
                     break;
+                }
+                if once_done && matches!(result, Ok(Ok(()))) {
+                    allow_once = false;
+                    let dir = shared.cfg.state_dir.clone();
+                    let _ = tokio::task::spawn_blocking(move || wait_released(&dir, Duration::from_secs(10))).await;
+                    continue;
                 }
                 if started.elapsed() >= HEALTHY_RUN {
                     delay = RETRY_FIRST;
@@ -208,6 +254,10 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
     }
     info!("engine stopped");
     shared.set_state(RunState::Stopped, None);
+}
+
+fn in_quiet_wait(e: &Engine) -> bool {
+    e.status().map(|st| st.rebuild_wait.is_some()).unwrap_or(false)
 }
 
 /// Wait until no engine holds the state folder's lock (the engine's own
@@ -276,17 +326,24 @@ impl LiveSync {
         if !finished {
             slot.shared.set_state(
                 RunState::Stopped,
-                Some(if released { "cancelled while stopping" } else { "still winding down" }.into()),
+                Some(
+                    if released {
+                        "cancelled while stopping"
+                    } else {
+                        "still winding down"
+                    }
+                    .into(),
+                ),
             );
         }
         released
     }
 
-    fn start_locked(&self, cfg: ProfileConfig) -> Result<(), LiveSyncError> {
+    fn start_locked(&self, cfg: ProfileConfig, allow_mass_delete_once: bool) -> Result<(), LiveSyncError> {
         cfg.validate().map_err(|msg| LiveSyncError::Invalid { msg })?;
         let previous = {
             let mut slots = lock(&self.slots);
-            if slots.get(&cfg.id).is_some_and(|s| s.shared.cfg == cfg) {
+            if !allow_mass_delete_once && slots.get(&cfg.id).is_some_and(|s| s.shared.cfg == cfg) {
                 // Already running with exactly these settings.
                 return Ok(());
             }
@@ -324,6 +381,8 @@ impl LiveSync {
             listener: self.listener.clone(),
             access: self.access.clone(),
             run_abort: Mutex::new(None),
+            allow_mass_delete_once,
+            mass_delete_allowed: std::sync::atomic::AtomicBool::new(false),
         });
         let span = tracing::info_span!("profile", id = %cfg.id);
         let task = self.rt.spawn(supervise(shared.clone(), rx).instrument(span));
@@ -383,7 +442,32 @@ impl LiveSync {
     /// above this one, or shares its state folder.
     pub fn start(&self, cfg: ProfileConfig) -> Result<(), LiveSyncError> {
         let _serial = lock(&self.lifecycle);
-        self.start_locked(cfg)
+        self.start_locked(cfg, false)
+    }
+
+    /// The user confirmed a mass-delete safety stop: restart the profile with
+    /// mass deletes allowed until one push pass has completed, then run on
+    /// without (the engine's `allow_mass_delete`, for one run).
+    pub fn allow_mass_delete_once(&self, profile_id: String) -> Result<(), LiveSyncError> {
+        let _serial = lock(&self.lifecycle);
+        let cfg = match lock(&self.slots).get(&profile_id) {
+            Some(s) => s.shared.cfg.clone(),
+            None => {
+                return Err(LiveSyncError::NotRunning {
+                    msg: format!("profile {profile_id} is not started"),
+                })
+            }
+        };
+        if cfg.pull_only {
+            return Err(LiveSyncError::Invalid {
+                msg: "a pull-only profile never deletes anything remotely".into(),
+            });
+        }
+        warn!("profile {profile_id}: mass deletes allowed for one push pass (confirmed by the user)");
+        if let Some(slot) = lock(&self.slots).remove(&profile_id) {
+            self.stop_slot(slot);
+        }
+        self.start_locked(cfg, true)
     }
 
     /// Stop a profile's engine: wait up to 15 s for it to wind down, cancel
@@ -440,6 +524,9 @@ impl LiveSync {
         let all: Vec<Arc<Shared>> = lock(&self.slots).values().map(|s| s.shared.clone()).collect();
         for s in all {
             match s.engine() {
+                // A nudge restarts a rebuild's quiet wait; a flapping network
+                // must not hold pushes back indefinitely.
+                Some(e) if in_quiet_wait(&e) => info!("profile {}: in a rebuild wait; not nudged", s.cfg.id),
                 Some(e) => e.network_changed(true),
                 None => s.wake.notify_one(),
             }
@@ -450,14 +537,15 @@ impl LiveSync {
     /// the index is read from `state_dir` (no network).
     pub fn status(&self, profile_id: String, vault_path: String, state_dir: String) -> ProfileStatus {
         let shared = self.slot_shared(&profile_id);
-        let (state, message, pull_only) = match &shared {
+        let (state, message, pull_only, allowed) = match &shared {
             Some(s) => {
                 let (st, msg) = lock(&s.state).clone();
-                (st, msg, s.cfg.pull_only)
+                (st, msg, s.cfg.pull_only, s.mass_delete_allowed.load(Ordering::SeqCst))
             }
-            None => (RunState::Stopped, None, false),
+            None => (RunState::Stopped, None, false, false),
         };
         let engine = shared.as_ref().and_then(|s| s.engine());
+        let push = engine.as_ref().map(|e| e.push_report());
         let (snap, session) = match &engine {
             Some(e) => (e.status().ok(), Some(e.report())),
             None => {
@@ -472,7 +560,10 @@ impl LiveSync {
                 (snap, None)
             }
         };
-        status::from_engine(&profile_id, state, message, pull_only, snap.as_ref(), session.as_ref())
+        let mut out = status::from_engine(&profile_id, state, message, pull_only, snap.as_ref(), session.as_ref());
+        status::add_push(&mut out, push.as_ref());
+        out.mass_delete_allowed = allowed;
+        out
     }
 
     /// Run the connect gate for settings that are not saved yet, against a
@@ -490,7 +581,7 @@ impl LiveSync {
         let result = self.rt.block_on(async {
             let t = test.clone();
             let access = self.access.clone();
-            let engine = match tokio::task::spawn_blocking(move || open_engine(&t, &access)).await {
+            let engine = match tokio::task::spawn_blocking(move || open_engine(&t, &access, false)).await {
                 Ok(Ok(e)) => e,
                 Ok(Err(e)) => return GateResult::with(crate::GateOutcome::Failed, e.to_string()),
                 Err(e) => return GateResult::with(crate::GateOutcome::Failed, e.to_string()),
@@ -541,18 +632,18 @@ impl LiveSync {
         };
         let cfg = slot.shared.cfg.clone();
         if !self.stop_slot(slot) {
-            self.start_locked(cfg)?;
+            self.start_locked(cfg, false)?;
             return Err(LiveSyncError::Busy {
                 msg: "the engine did not stop; the full fetch was not scheduled".into(),
             });
         }
-        let r = open_engine(&cfg, &self.access).and_then(|e| Ok(e.request_full_fetch()?));
+        let r = open_engine(&cfg, &self.access, false).and_then(|e| Ok(e.request_full_fetch()?));
         if let Err(e) = &r {
             warn!("profile {profile_id}: full fetch not scheduled: {e}");
         } else {
             info!("profile {profile_id}: full fetch scheduled");
         }
-        self.start_locked(cfg)?;
+        self.start_locked(cfg, false)?;
         r
     }
 

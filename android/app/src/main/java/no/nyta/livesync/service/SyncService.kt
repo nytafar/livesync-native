@@ -15,6 +15,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.edit
 import no.nyta.livesync.Core
 import no.nyta.livesync.LiveSyncApp
 import no.nyta.livesync.R
@@ -196,25 +197,61 @@ class SyncService : Service() {
                 } catch (e: Exception) {
                     null
                 }
-                ProfileLine(
-                    name = p.name,
-                    paused = p.paused,
-                    startProblem = problems[p.id],
-                    runState = st?.runState?.name?.lowercase()?.replaceFirstChar { it.uppercase() } ?: "Stopped",
-                    runMessage = st?.runMessage,
-                    pullOnly = p.pullOnly,
-                    lastGate = st?.lastGate,
-                    lastActivityMs = listOfNotNull(st?.lastPullMs, st?.lastPushMs).maxOrNull(),
-                    conflicted = st?.conflicted ?: 0,
-                    safetyStop = st?.safetyStop,
-                    needsAttention = st?.attention?.size?.toLong() ?: 0,
-                )
+                st?.let { alertIfNew(p, it) }
+                StatusSummary.line(p, st, problems[p.id])
             }
         } catch (e: Exception) {
             return
         }
         lastText = StatusSummary.summarize(lines)
         notifyNow()
+    }
+
+    /**
+     * A separate, alerting notification for what needs the user: files pushed
+     * back after a rebuild, and a mass-delete safety stop. Each distinct
+     * value alerts once (they are stamped by the engine), so a status that
+     * stays the same never alerts again.
+     */
+    private fun alertIfNew(p: no.nyta.livesync.profile.Profile, st: no.nyta.livesync.core.ProfileStatus) {
+        val prefs = getSharedPreferences("alerts", MODE_PRIVATE)
+        fun once(key: String, stamped: String?, id: Int, title: String, text: () -> String) {
+            // Without the engine's timestamp: a stop re-recorded at every pass
+            // with the same text is the same stop.
+            val value = stamped?.substringAfter(' ') ?: return
+            if (prefs.getString(key, null) == value) return
+            prefs.edit { putString(key, value) }
+            postAlert(id, title, text())
+        }
+        val base = 1000 + (p.id.hashCode() and 0xffff) * 4
+        once("orphans-${p.id}", st.rebuildOrphans, base, "${p.name}: files pushed back after a rebuild") {
+            st.rebuildOrphans!!.substringAfter(' ') + " Check them in Obsidian."
+        }
+        once("safety-${p.id}", st.safetyStop, base + 1, "${p.name}: deletions held back") {
+            st.safetyStop!!.substringAfter(' ') + " Open LiveSync to decide."
+        }
+    }
+
+    private fun postAlert(id: Int, title: String, text: String) {
+        if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return
+        val open = PendingIntent.getActivity(
+            this, 2, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val n = NotificationCompat.Builder(this, LiveSyncApp.CHANNEL_ALERTS)
+            .setSmallIcon(R.drawable.ic_stat_sync)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setAutoCancel(true)
+            .setContentIntent(open)
+            .build()
+        try {
+            NotificationManagerCompat.from(this).notify(id, n)
+        } catch (e: SecurityException) {
+            // Permission revoked meanwhile.
+        }
+        app.core.getOrNull()?.log("alert: $title")
     }
 
     private fun notifyNow() {

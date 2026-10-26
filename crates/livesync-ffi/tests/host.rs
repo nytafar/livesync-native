@@ -146,6 +146,7 @@ fn two_way_profile_pushes_local_files() {
     });
     let st = env.status(&p);
     assert!(st.last_push_ms.is_some());
+    assert!(st.pushed >= 1, "session push counters: {}", st.push_json);
     assert!(
         st.registered_ms.is_some(),
         "registered in the milestone after the first fetch"
@@ -329,7 +330,14 @@ fn stop_returns_once_the_state_folder_is_free_and_identical_starts_are_no_ops() 
     let p = env.profile("st", "vault-st");
     env.host.start(p.clone()).unwrap();
     wait_until("s.md", Duration::from_secs(20), || read(&p, "s.md").is_some());
-    let starts = || rec.0.lock().unwrap().iter().filter(|(_, s)| *s == RunState::Starting).count();
+    let starts = || {
+        rec.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| *s == RunState::Starting)
+            .count()
+    };
     assert_eq!(starts(), 1);
     // The service re-applies the same settings on every reconcile: no restart.
     env.host.start(p.clone()).unwrap();
@@ -357,10 +365,18 @@ fn fetch_from_remote_restarts_with_the_same_settings() {
     wait_until("f.md", Duration::from_secs(20), || read(&p, "f.md").is_some());
     env.host.fetch_from_remote("fx".into()).unwrap();
     assert_eq!(env.host.active_profiles(), vec!["fx".to_string()]);
-    wait_until("running again", Duration::from_secs(20), || env.status(&p).run_state == RunState::Running);
+    wait_until("running again", Duration::from_secs(20), || {
+        env.status(&p).run_state == RunState::Running
+    });
     assert!(env.status(&p).pull_only, "still pull-only");
-    wait_until("caught up again", Duration::from_secs(20), || !env.status(&p).needs_full_fetch);
-    assert!(env.mock.writes().is_empty(), "pull-only fetch wrote: {:?}", env.mock.writes());
+    wait_until("caught up again", Duration::from_secs(20), || {
+        !env.status(&p).needs_full_fetch
+    });
+    assert!(
+        env.mock.writes().is_empty(),
+        "pull-only fetch wrote: {:?}",
+        env.mock.writes()
+    );
     env.host.stop_all();
 }
 
@@ -380,7 +396,9 @@ fn stop_cancels_an_engine_stuck_on_the_network_and_frees_its_state() {
     let mut p = env.profile("hole", "vault-hole");
     p.url = format!("http://{addr}");
     env.host.start(p.clone()).unwrap();
-    wait_until("the gate request", Duration::from_secs(10), || !held.lock().unwrap().is_empty());
+    wait_until("the gate request", Duration::from_secs(10), || {
+        !held.lock().unwrap().is_empty()
+    });
     let t0 = Instant::now();
     assert!(env.host.stop("hole".into()), "released");
     let took = t0.elapsed();
@@ -391,6 +409,68 @@ fn stop_cancels_an_engine_stuck_on_the_network_and_frees_its_state() {
     assert_eq!(env.status(&p).run_state, RunState::Stopped);
     // And it starts again on the same state folder.
     env.host.start(p.clone()).unwrap();
-    wait_until("running again", Duration::from_secs(10), || env.status(&p).run_state == RunState::Running);
+    wait_until("running again", Duration::from_secs(10), || {
+        env.status(&p).run_state == RunState::Running
+    });
+    env.host.stop_all();
+}
+
+#[test]
+fn a_confirmed_mass_delete_goes_through_once() {
+    let env = Env::new();
+    let names: Vec<String> = (0..25).map(|i| format!("m/n{i:02}.md")).collect();
+    for n in &names {
+        env.mock.put_text(n, &["content of ", n]);
+    }
+    let mut p = env.profile("mass", "vault-mass");
+    p.pull_only = false;
+    env.host.start(p.clone()).unwrap();
+    wait_until("all files", Duration::from_secs(30), || {
+        names.iter().all(|n| read(&p, n).is_some())
+    });
+    wait_until("registration", Duration::from_secs(20), || {
+        env.status(&p).registered_ms.is_some()
+    });
+    for n in &names[..22] {
+        std::fs::remove_file(Path::new(&p.vault_path).join(n)).unwrap();
+    }
+    env.host.sync_now("mass".into()).unwrap();
+    wait_until("the safety stop", Duration::from_secs(30), || {
+        env.status(&p).safety_stop.is_some()
+    });
+    assert!(
+        names[..22].iter().all(|n| !soft_deleted(&env, n)),
+        "deleted despite the stop"
+    );
+    assert!(matches!(
+        env.host.allow_mass_delete_once("nope".into()),
+        Err(LiveSyncError::NotRunning { .. })
+    ));
+
+    env.host.allow_mass_delete_once("mass".into()).unwrap();
+    wait_until("the deletions", Duration::from_secs(40), || {
+        names[..22].iter().all(|n| soft_deleted(&env, n))
+    });
+    assert!(
+        names[22..].iter().all(|n| !soft_deleted(&env, n)),
+        "the kept files stay"
+    );
+    // After that one pass the engine runs on without the permission.
+    wait_until("the permission to end", Duration::from_secs(30), || {
+        let st = env.status(&p);
+        !st.mass_delete_allowed && st.run_state == RunState::Running && st.safety_stop.is_none()
+    });
+    env.host.stop_all();
+}
+
+#[test]
+fn pull_only_profiles_cannot_allow_mass_deletes() {
+    let env = Env::new();
+    let p = env.profile("po", "vault-po");
+    env.host.start(p).unwrap();
+    assert!(matches!(
+        env.host.allow_mass_delete_once("po".into()),
+        Err(LiveSyncError::Invalid { .. })
+    ));
     env.host.stop_all();
 }

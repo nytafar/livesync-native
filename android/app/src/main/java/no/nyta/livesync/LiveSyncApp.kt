@@ -48,10 +48,15 @@ class LiveSyncApp : Application() {
                     setShowBadge(false)
                 }
         )
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_ALERTS, getString(R.string.channel_alerts), NotificationManager.IMPORTANCE_DEFAULT)
+                .apply { description = getString(R.string.channel_alerts_description) }
+        )
     }
 
     companion object {
         const val CHANNEL_STATUS = "status"
+        const val CHANNEL_ALERTS = "alerts"
 
         fun deviceNameDefault(): String = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
     }

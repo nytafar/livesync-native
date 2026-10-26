@@ -404,6 +404,8 @@ pub(crate) struct Inner {
     pub(crate) runtime: Mutex<Runtime>,
     mem: Semaphore,
     report: Mutex<PullReport>,
+    /// The two-way daemon's push totals for this session (`push_report`).
+    pub(crate) push_report: Mutex<crate::push::PushReport>,
     pub(crate) nudge: Notify,
     /// Wakes the push loop for a full rescan.
     pub(crate) rescan: Notify,
@@ -574,6 +576,7 @@ impl Engine {
                 index: Mutex::new(index),
                 mem: Semaphore::new(budget),
                 report: Mutex::new(PullReport::default()),
+                push_report: Mutex::new(crate::push::PushReport::default()),
                 nudge: Notify::new(),
                 rescan: Notify::new(),
                 ops: tokio::sync::Mutex::new(()),

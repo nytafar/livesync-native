@@ -320,6 +320,12 @@ enum Fate {
 }
 
 impl Engine {
+    /// The push totals of the running two-way daemon (`run`) since this
+    /// engine was opened: what a front-end shows next to `report()`.
+    pub fn push_report(&self) -> PushReport {
+        self.inner.push_report.lock().unwrap().clone()
+    }
+
     fn ids_case_insensitive(&self) -> bool {
         !self.inner.runtime.lock().unwrap().case_sensitive_ids
     }
@@ -1703,6 +1709,7 @@ impl Engine {
                     backoff.reset();
                     retry_at = None;
                     total.add(&rep);
+                    self.inner.push_report.lock().unwrap().add(&rep);
                 }
                 Err(e) => {
                     let wait = backoff.next_delay();

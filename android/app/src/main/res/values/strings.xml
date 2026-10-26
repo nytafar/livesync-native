@@ -3,4 +3,6 @@
     <string name="app_name">LiveSync</string>
     <string name="channel_status">Sync status</string>
     <string name="channel_status_description">The always-on status of your synced vaults</string>
+    <string name="channel_alerts">Needs attention</string>
+    <string name="channel_alerts_description">Files pushed back after a rebuild, and deletions held back for your decision</string>
 </resources>

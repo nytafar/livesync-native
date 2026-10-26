@@ -104,6 +104,14 @@ class CoreBindingTest {
         } catch (e: LiveSyncException.NotRunning) {
             // expected
         }
+        try {
+            host.allowMassDeleteOnce("p1")
+            fail("a pull-only profile allowed mass deletes")
+        } catch (e: LiveSyncException.Invalid) {
+            // expected
+        }
+        assertFalse(st.massDeleteAllowed)
+        assertEquals(0L, st.pushed)
 
         host.stop("p1")
         assertTrue(host.activeProfiles().isEmpty())

@@ -2,7 +2,7 @@
 //! snapshot (index counts, `since`, the last gate, files needing attention).
 
 use crate::host::RunState;
-use livesync_engine::{EngineError, GateReport, PullReport, Status};
+use livesync_engine::{EngineError, GateReport, PullReport, PushReport, Status};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum GateOutcome {
@@ -138,12 +138,50 @@ pub struct ProfileStatus {
     pub local_issues: i64,
     pub attention: Vec<AttentionItem>,
     pub scope: Option<String>,
+    /// A full fetch or a resolution is owed; pushes are held until a two-way
+    /// run completes it.
     pub needs_full_fetch: bool,
+    /// `"<ms> <text>"`: a mass deletion was refused and waits for the user.
     pub safety_stop: Option<String>,
+    /// The running engine allows mass deletes (for one pass, confirmed by the user).
+    pub mass_delete_allowed: bool,
+    /// `"<ms> <text>"`: waiting for a rebuilding device to finish uploading.
+    pub rebuild_wait: Option<String>,
+    /// `"<ms> <count> file(s) ...: paths"`: files the remote lacked after a
+    /// rebuild or full fetch, pushed back from this device; worth checking.
+    pub rebuild_orphans: Option<String>,
+    /// Rows kept because another device deleted the document while this
+    /// device's copy was in conflict (or had changed).
+    pub deleted_elsewhere: i64,
+    /// This engine session's push totals (two-way only; zero otherwise).
+    pub pushed: i64,
+    pub push_conflicts: i64,
+    pub deleted_remote: i64,
+    pub deleted_locally: i64,
+    pub orphans_pushed: i64,
+    pub push_failed: i64,
+    pub unreadable: i64,
+    pub push_json: String,
     /// The engine's full status as JSON (the debug screen's raw view).
     pub status_json: String,
     /// This engine session's pull counters as JSON (empty when not running).
     pub session_json: String,
+}
+
+/// The engine's note prefix for rows kept after a deletion elsewhere.
+pub const DELETED_ELSEWHERE: &str = "deleted on another device";
+
+/// Add the running two-way daemon's push totals.
+pub(crate) fn add_push(out: &mut ProfileStatus, push: Option<&PushReport>) {
+    let Some(p) = push else { return };
+    out.pushed = p.pushed as i64;
+    out.push_conflicts = p.conflicts as i64;
+    out.deleted_remote = p.deleted as i64;
+    out.deleted_locally = p.deleted_locally as i64;
+    out.orphans_pushed = p.orphans_pushed as i64;
+    out.push_failed = p.failed as i64;
+    out.unreadable = p.unreadable as i64;
+    out.push_json = serde_json::to_string_pretty(p).unwrap_or_default();
 }
 
 /// `"306714-g1AAAA..."` (JSON-quoted in the index) → `306714-g1AAAA…`.
@@ -193,6 +231,18 @@ pub(crate) fn from_engine(
         scope: None,
         needs_full_fetch: false,
         safety_stop: None,
+        mass_delete_allowed: false,
+        rebuild_wait: None,
+        rebuild_orphans: None,
+        deleted_elsewhere: 0,
+        pushed: 0,
+        push_conflicts: 0,
+        deleted_remote: 0,
+        deleted_locally: 0,
+        orphans_pushed: 0,
+        push_failed: 0,
+        unreadable: 0,
+        push_json: String::new(),
         status_json: String::new(),
         session_json: session
             .map(|s| serde_json::to_string_pretty(s).unwrap_or_default())
@@ -229,6 +279,8 @@ pub(crate) fn from_engine(
     out.scope = st.scope.clone();
     out.needs_full_fetch = st.needs_full_fetch;
     out.safety_stop = st.safety_stop.clone();
+    out.rebuild_wait = st.rebuild_wait.clone();
+    out.rebuild_orphans = st.rebuild_orphans.clone();
     let rows = [
         ("conflicted", &st.conflicted),
         ("dirty", &st.dirty),
@@ -236,20 +288,37 @@ pub(crate) fn from_engine(
         ("unwritable", &st.unwritable),
         ("collision", &st.collisions),
     ];
+    // Deleted on another device while this copy was kept: first, so they
+    // are seen (they need a decision: keep the file, or delete it here).
+    let mut kept = Vec::new();
+    let mut rest = Vec::new();
     for (kind, list) in rows {
         for r in list.iter() {
-            out.attention.push(AttentionItem {
-                kind: kind.into(),
-                path: r.path.clone(),
-                note: r.note.clone().unwrap_or_default(),
-            });
+            let note = r.note.clone().unwrap_or_default();
+            if note.contains(DELETED_ELSEWHERE) {
+                kept.push(AttentionItem {
+                    kind: "deleted_elsewhere".into(),
+                    path: r.path.clone(),
+                    note,
+                });
+            } else {
+                rest.push(AttentionItem {
+                    kind: kind.into(),
+                    path: r.path.clone(),
+                    note,
+                });
+            }
         }
     }
+    out.deleted_elsewhere = kept.len() as i64;
+    out.attention.extend(kept);
+    out.attention.extend(rest);
     for i in &st.local_issues {
         out.attention.push(AttentionItem {
-            kind: "local_issue".into(),
+            // unreadable, push-failed, stale-copy, case collisions, ...
+            kind: i.kind.clone(),
             path: i.path.clone(),
-            note: format!("{} ({})", i.note, i.kind),
+            note: i.note.clone(),
         });
     }
     for p in &st.pending {

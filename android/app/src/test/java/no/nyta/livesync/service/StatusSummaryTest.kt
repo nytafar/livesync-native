@@ -30,6 +30,21 @@ class StatusSummaryTest {
     }
 
     @Test
+    fun rebuildWaitsOrphansAndDeletionsElsewhereAreNamed() {
+        val wait = StatusSummary.phrase(line().copy(rebuildWait = "1700000000000 waiting 30 s"))
+        assertEquals("waiting for a rebuild elsewhere to finish", wait.first)
+        assertFalse(wait.second)
+        val orphans = StatusSummary.phrase(line().copy(rebuildOrphans = "1700000000000 2 file(s): a.md, b.md"))
+        assertTrue(orphans.first.contains("pushed back"))
+        assertTrue(orphans.second)
+        val kept = StatusSummary.phrase(line().copy(deletedElsewhere = 3))
+        assertTrue(kept.first.contains("3 kept after a delete elsewhere"))
+        assertTrue(kept.second)
+        val stop = StatusSummary.phrase(line().copy(safetyStop = "1700000000000 25 of 30 tracked files are missing"))
+        assertEquals("safety stop: 25 of 30 tracked files are missing", stop.first)
+    }
+
+    @Test
     fun severalProfilesShareOneNotification() {
         val t = StatusSummary.summarize(listOf(line("a"), line("b").copy(paused = true)))
         assertEquals("LiveSync · 2 vaults", t.title)

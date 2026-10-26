@@ -102,20 +102,39 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
 
         val st = status
         SectionCard("Status") {
-            val (phrase, alert) = StatusSummary.phrase(
-                no.nyta.livesync.service.ProfileLine(
-                    name = p.name, paused = p.paused, startProblem = null,
-                    runState = st?.runState?.name?.lowercase()?.replaceFirstChar { it.uppercase() } ?: "Stopped",
-                    runMessage = st?.runMessage, pullOnly = p.pullOnly, lastGate = st?.lastGate,
-                    lastActivityMs = listOfNotNull(st?.lastPullMs, st?.lastPushMs).maxOrNull(),
-                    conflicted = st?.conflicted ?: 0, safetyStop = st?.safetyStop,
-                    needsAttention = st?.attention?.size?.toLong() ?: 0,
-                )
-            )
+            val (phrase, alert) = StatusSummary.phrase(StatusSummary.line(p, st, null))
             Banner(phrase, if (alert) Tone.ERROR else if (st?.runState == RunState.RUNNING) Tone.OK else Tone.INFO)
-            st?.safetyStop?.let { Banner("Safety stop: ${it.substringAfter(' ')}", Tone.ERROR) }
+            st?.safetyStop?.let {
+                Banner("Safety stop: ${it.substringAfter(' ')}", Tone.ERROR)
+                Text(
+                    "Nothing was deleted on the server. If the folder or the storage permission went missing, fix that " +
+                        "and press Sync now. If you really deleted these files, allow the deletions once.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedButton(enabled = !p.pullOnly && st.runState == RunState.RUNNING, onClick = { confirm = Confirm.MassDelete }) {
+                    Text("Allow these deletions…")
+                }
+            }
+            if (st?.massDeleteAllowed == true) Banner("Mass deletes are allowed for the current push pass.", Tone.WARN)
+            st?.rebuildWait?.let { Banner("Waiting for a rebuild elsewhere to finish: ${fmtStamped(it)}", Tone.INFO) }
+            st?.rebuildOrphans?.let {
+                Banner("Pushed back after a rebuild (check them): ${it.substringAfter(' ')}", Tone.WARN)
+            }
+            if ((st?.deletedElsewhere ?: 0) > 0) {
+                Banner(
+                    "${st!!.deletedElsewhere} file(s) were deleted on another device while this phone's copy was kept " +
+                        "(see Needs attention). Delete them here to accept the deletion, or keep them.",
+                    Tone.WARN,
+                )
+            }
             st?.lastError?.let { Banner("Last error: ${fmtStamped(it)}", Tone.WARN) }
-            if (st?.needsFullFetch == true) Banner("A full fetch is owed; it runs at the next sync.", Tone.INFO)
+            if (st?.needsFullFetch == true) {
+                Banner(
+                    if (p.pullOnly) "A full fetch or a resolution is owed; pull-only runs cannot complete it, so pushes stay held until two-way sync runs."
+                    else "A full fetch or a resolution is owed; pushes are held until it completes.",
+                    Tone.INFO,
+                )
+            }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(if (p.pullOnly) "Pull only (read-only)" else "Two-way")
@@ -161,6 +180,14 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
             KeyValue("since", st?.since)
             KeyValue("Last pull", fmtTime(st?.lastPullMs))
             KeyValue("Last push", fmtTime(st?.lastPushMs))
+            if (!p.pullOnly && st != null) {
+                KeyValue(
+                    "This session",
+                    "${st.pushed} pushed, ${st.deletedRemote} deleted remotely, ${st.pushConflicts} as conflicts, " +
+                        "${st.deletedLocally} stale copies removed, ${st.orphansPushed} pushed back, " +
+                        "${st.pushFailed} failed, ${st.unreadable} unreadable",
+                )
+            }
             KeyValue("Registered", fmtTime(st?.registeredMs))
             KeyValue("Alive", fmtTime(st?.daemonHeartbeatMs))
             st?.rebuildDetectedMs?.let { KeyValue("Rebuild seen", fmtTime(it)) }
@@ -184,7 +211,8 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
             SectionCard("Needs attention (${st!!.attention.size})") {
                 Text(
                     "Conflicts are resolved by an official LiveSync client (desktop); dirty files are local edits " +
-                        "not pushed (pull-only) or waiting to be pushed.",
+                        "not pushed (pull-only) or waiting to be pushed; deleted_elsewhere files were deleted on " +
+                        "another device while this copy was kept.",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 LazyColumn(Modifier.heightIn(max = 300.dp)) {
@@ -225,6 +253,7 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
             if (showRaw) {
                 Text(st?.statusJson ?: "", fontFamily = FontFamily.Monospace, fontSize = 10.sp)
                 if (!st?.sessionJson.isNullOrEmpty()) Text(st?.sessionJson ?: "", fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+                if (!st?.pushJson.isNullOrEmpty()) Text(st?.pushJson ?: "", fontFamily = FontFamily.Monospace, fontSize = 10.sp)
             }
             OutlinedButton(onClick = { confirm = Confirm.Remove }) { Text("Remove this vault profile") }
         }
@@ -250,6 +279,10 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
                     confirm = null
                     when (c) {
                         Confirm.TwoWay -> update("switched to two-way") { it.copy(pullOnly = false) }
+                        Confirm.MassDelete -> scope.launch {
+                            val r = withContext(Dispatchers.IO) { runCatching { core.engine.allowMassDeleteOnce(p.id) } }
+                            busy = r.exceptionOrNull()?.let { "Allow deletions: ${it.message}" }
+                        }
                         Confirm.Adopt -> scope.launch {
                             gateResult = withContext(Dispatchers.IO) {
                                 runCatching { core.engine.adoptTweaks(p.id) }.getOrNull()
@@ -287,6 +320,12 @@ private enum class Confirm(val title: String, val text: String, val action: Stri
             "other devices. Files edited here while in pull-only mode are pushed now. Deletions are soft deletes, " +
             "and a pass that would delete more than half of the files stops instead.",
         "Switch to two-way",
+    ),
+    MassDelete(
+        "Delete these files on the server?",
+        "The files listed as missing will be soft-deleted on the server and disappear from your other devices " +
+            "(they stay recoverable there as deleted documents). This permission lasts for one sync pass.",
+        "Delete them",
     ),
     Adopt(
         "Adopt the server's settings?",
