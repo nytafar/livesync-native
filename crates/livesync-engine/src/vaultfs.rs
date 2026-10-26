@@ -222,6 +222,136 @@ pub fn sweep_temp_files(root: &Path) -> usize {
     removed
 }
 
+// ----------------------------------------------------------------------
+// Names the filesystem cannot hold
+// ----------------------------------------------------------------------
+
+/// Characters Android's shared storage (FAT rules, enforced by the FUSE layer
+/// over `/storage/emulated`) refuses in a name, as in Android's
+/// `FileUtils.isValidFatFilenameChar`. `/` separates components and is not
+/// listed.
+pub fn is_fat_invalid_char(c: char) -> bool {
+    matches!(c, '"' | '*' | ':' | '<' | '>' | '?' | '\\' | '|' | '\u{7f}') || (c as u32) < 0x20
+}
+
+/// The distinct characters in `rel` that FAT-style storage refuses.
+pub fn fat_invalid_chars(rel: &str) -> Vec<char> {
+    let mut out: Vec<char> = Vec::new();
+    for c in rel.chars().filter(|c| is_fat_invalid_char(*c)) {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether a vault folder lives on Android shared storage, where FAT naming
+/// rules apply. `path` should be canonical.
+pub fn is_android_shared_storage(path: &Path) -> bool {
+    ["/storage/", "/sdcard", "/mnt/user/", "/mnt/media_rw/"]
+        .iter()
+        .any(|p| path.to_string_lossy().starts_with(p))
+}
+
+/// errno values (identical on Linux and Android/bionic).
+mod errno {
+    pub const EPERM: i32 = 1;
+    pub const EINVAL: i32 = 22;
+    pub const ENAMETOOLONG: i32 = 36;
+    pub const EILSEQ: i32 = 84;
+}
+
+/// Whether an I/O error on the vault path `rel` means the name itself cannot
+/// exist on this filesystem, so retrying is pointless.
+///
+/// `ENAMETOOLONG` and `EILSEQ` always are. `EPERM` and `EINVAL` are what the
+/// Android FUSE layer answers for forbidden characters, but `EPERM` also means
+/// an ordinary permission problem, so those two count only when the path
+/// contains a character FAT-style storage refuses.
+pub fn is_unwritable_name_error(e: &io::Error, rel: &str) -> bool {
+    match e.raw_os_error() {
+        Some(errno::ENAMETOOLONG | errno::EILSEQ) => true,
+        Some(errno::EPERM | errno::EINVAL) => !fat_invalid_chars(rel).is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether `rel` exists under `root` with exactly this spelling in every
+/// component, judged from directory listings. On a case-insensitive
+/// filesystem `stat("A.md")` finds `a.md`, but only one spelling is listed.
+pub fn exists_with_exact_case(root: &Path, rel: &str) -> bool {
+    let mut dir = root.to_path_buf();
+    for comp in rel.split('/').filter(|c| !c.is_empty()) {
+        let Ok(rd) = fs::read_dir(&dir) else { return false };
+        if !rd.flatten().any(|e| e.file_name() == std::ffi::OsStr::new(comp)) {
+            return false;
+        }
+        dir.push(comp);
+    }
+    true
+}
+
+/// Create an empty `.nomedia` at the vault root, so MediaStore and Google
+/// Photos skip the vault's images. Returns true when it was created.
+pub fn ensure_nomedia(root: &Path) -> io::Result<bool> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join(".nomedia"))
+    {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// An exclusive advisory lock (`flock`) on a lock file, held until dropped.
+#[derive(Debug)]
+pub struct LockFile {
+    _file: File,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LockError {
+    #[error("{0} is locked by another lsync process")]
+    Busy(PathBuf),
+    #[error("cannot lock {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl LockFile {
+    /// Take the lock without waiting.
+    pub fn try_acquire(path: &Path) -> Result<LockFile, LockError> {
+        let io_err = |source| LockError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(io_err)?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(io_err)?;
+        match file.try_lock() {
+            Ok(()) => Ok(LockFile {
+                _file: file,
+                path: path.to_path_buf(),
+            }),
+            Err(fs::TryLockError::WouldBlock) => Err(LockError::Busy(path.to_path_buf())),
+            Err(fs::TryLockError::Error(e)) => Err(io_err(e)),
+        }
+    }
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -289,6 +419,48 @@ mod tests {
             remove_if_matches(d.path(), &t, &s.hash).unwrap(),
             RemoveOutcome::AlreadyGone
         );
+    }
+
+    #[test]
+    fn unwritable_name_errors() {
+        let e = |n| io::Error::from_raw_os_error(n);
+        assert!(is_unwritable_name_error(&e(errno::EPERM), "He said \"hi\".md"));
+        assert!(is_unwritable_name_error(&e(errno::EINVAL), "a/b:c.md"));
+        assert!(is_unwritable_name_error(&e(errno::ENAMETOOLONG), "plain.md"));
+        assert!(is_unwritable_name_error(&e(errno::EILSEQ), "plain.md"));
+        // A permission problem on an ordinary name is retried, not skipped.
+        assert!(!is_unwritable_name_error(&e(errno::EPERM), "plain.md"));
+        assert!(!is_unwritable_name_error(&e(13), "a:b.md"), "EACCES");
+        assert!(!is_unwritable_name_error(&e(20), "a:b.md"), "ENOTDIR");
+        assert_eq!(fat_invalid_chars("a\"b\"*<>?|:\\c\u{1}.md").len(), 9);
+        assert!(fat_invalid_chars("Notes/æøå [x] (y) #z.md").is_empty());
+        assert!(is_android_shared_storage(Path::new("/storage/emulated/0/hvelv")));
+        assert!(!is_android_shared_storage(Path::new(
+            "/data/data/com.termux/files/home/v"
+        )));
+    }
+
+    #[test]
+    fn exact_case_lookup() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("Dir")).unwrap();
+        fs::write(d.path().join("Dir/note.md"), b"x").unwrap();
+        assert!(exists_with_exact_case(d.path(), "Dir/note.md"));
+        assert!(!exists_with_exact_case(d.path(), "Dir/Note.md"));
+        assert!(!exists_with_exact_case(d.path(), "dir/note.md"));
+        assert!(!exists_with_exact_case(d.path(), "Dir/missing.md"));
+    }
+
+    #[test]
+    fn nomedia_and_lock() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(ensure_nomedia(d.path()).unwrap());
+        assert!(!ensure_nomedia(d.path()).unwrap());
+        let p = d.path().join("s/lsync.lock");
+        let held = LockFile::try_acquire(&p).unwrap();
+        assert!(matches!(LockFile::try_acquire(&p), Err(LockError::Busy(_))));
+        drop(held);
+        LockFile::try_acquire(&p).unwrap();
     }
 
     #[test]

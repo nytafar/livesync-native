@@ -358,10 +358,45 @@ fn getprop(key: &str) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// Why probing this vault would leak into a LiveSync database, if it would.
+///
+/// The probe writes, edits, renames and deletes `lsync-probe*.md`. In a vault
+/// where the Self-hosted LiveSync plugin is enabled, the plugin pushes those
+/// notes and their deletions to the real database. Enabled means the plugin
+/// folder exists and `.obsidian/community-plugins.json` lists it; when that
+/// file exists but cannot be read, assume enabled.
+pub fn livesync_enabled(vault: &Path) -> Option<String> {
+    const ID: &str = "obsidian-livesync";
+    let obsidian = vault.join(".obsidian");
+    if !obsidian.join("plugins").join(ID).is_dir() {
+        return None;
+    }
+    let list = obsidian.join("community-plugins.json");
+    let text = match std::fs::read_to_string(&list) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("{} exists but cannot be read ({e})", list.display())),
+    };
+    match serde_json::from_str::<Vec<String>>(&text) {
+        Ok(ids) if ids.iter().any(|i| i == ID) => Some(format!("{} lists {ID}", list.display())),
+        Ok(_) => None,
+        Err(e) => Some(format!("{} cannot be parsed ({e})", list.display())),
+    }
+}
+
 pub fn run(args: ProbeArgs) -> Result<u8> {
     let vault = std::fs::canonicalize(&args.vault).with_context(|| format!("vault {}", args.vault.display()))?;
     if !vault.is_dir() {
         bail!("{} is not a directory", vault.display());
+    }
+    if let Some(why) = livesync_enabled(&vault) {
+        bail!(
+            "refusing to probe {}: the Self-hosted LiveSync plugin is enabled in this vault ({why}). \
+             The probe writes, renames and deletes lsync-probe*.md notes, and the plugin would push \
+             them and their deletions to the real database. Probe a vault without LiveSync, \
+             or disable the plugin in Obsidian first.",
+            vault.display()
+        );
     }
     let mut p = Prompter {
         stdin: Box::leak(Box::new(std::io::stdin())).lock(),
@@ -620,4 +655,43 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
         println!("probe notes removed");
     }
     Ok(if pass1 && pass2 { 0 } else { 4 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_vaults_with_livesync_enabled() {
+        let d = tempfile::tempdir().unwrap();
+        let v = d.path();
+        assert!(livesync_enabled(v).is_none(), "no .obsidian at all");
+        std::fs::create_dir_all(v.join(".obsidian/plugins/obsidian-livesync")).unwrap();
+        assert!(livesync_enabled(v).is_none(), "installed, but no plugin list");
+        let list = v.join(".obsidian/community-plugins.json");
+        std::fs::write(&list, r#"["dataview"]"#).unwrap();
+        assert!(livesync_enabled(v).is_none(), "installed but disabled");
+        std::fs::write(&list, r#"["dataview", "obsidian-livesync"]"#).unwrap();
+        assert!(livesync_enabled(v).unwrap().contains("obsidian-livesync"));
+        std::fs::write(&list, "not json").unwrap();
+        assert!(livesync_enabled(v).is_some(), "unreadable list fails closed");
+
+        // `run` stops before writing anything.
+        std::fs::write(&list, r#"["obsidian-livesync"]"#).unwrap();
+        let err = run(ProbeArgs {
+            vault: v.to_path_buf(),
+            report: Some(v.join("report.md")),
+            delay: 0,
+            watch_secs: Some(0),
+            keep: false,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("LiveSync plugin is enabled"), "{err}");
+        assert!(!v.join(NOTE).exists());
+        assert!(!v.join(".lsync-probe-fs").exists());
+
+        // Listed but not installed: fine.
+        std::fs::remove_dir_all(v.join(".obsidian/plugins")).unwrap();
+        assert!(livesync_enabled(v).is_none());
+    }
 }

@@ -50,6 +50,16 @@ impl RemoteError {
 
 pub type Result<T> = std::result::Result<T, RemoteError>;
 
+/// Result of a single-document GET.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocFetch {
+    Found(Value),
+    /// 404 with `reason: "deleted"`: the document exists as a tombstone.
+    Deleted,
+    /// Any other 404, with CouchDB's reason (or the start of the body).
+    Missing(String),
+}
+
 /// Connection settings for one remote database.
 #[derive(Clone)]
 pub struct RemoteConfig {
@@ -274,6 +284,16 @@ impl Couch {
 
     /// `GET /{db}/{id}`, `None` on 404. Supports `_local/<name>` IDs.
     pub async fn get_doc(&self, id: &str, conflicts: bool) -> Result<Option<Value>> {
+        Ok(match self.fetch_doc(id, conflicts).await? {
+            DocFetch::Found(v) => Some(v),
+            DocFetch::Deleted | DocFetch::Missing(_) => None,
+        })
+    }
+
+    /// `GET /{db}/{id}`, telling a deleted document (404 with
+    /// `reason: "deleted"`) apart from any other 404: a document that never
+    /// existed, a database that is gone, or a proxy answering for something else.
+    pub async fn fetch_doc(&self, id: &str, conflicts: bool) -> Result<DocFetch> {
         let mut url = match id.strip_prefix("_local/") {
             Some(name) => self.doc_url(&["_local", name]),
             None => self.doc_url(&[id]),
@@ -284,9 +304,20 @@ impl Couch {
         let what = format!("GET {id}");
         let r = self.send(&what, self.http.get(url)).await?;
         if r.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
+            let bytes = r.bytes().await.map_err(|e| RemoteError::Transport {
+                what: what.clone(),
+                source: e,
+            })?;
+            let reason = serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|v| v.get("reason").and_then(Value::as_str).map(str::to_string));
+            return Ok(match reason.as_deref() {
+                Some("deleted") => DocFetch::Deleted,
+                Some(other) => DocFetch::Missing(other.to_string()),
+                None => DocFetch::Missing(String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).into_owned()),
+            });
         }
-        Self::json(&what, r).await.map(Some)
+        Self::json(&what, r).await.map(DocFetch::Found)
     }
 
     /// Filtered `_changes` with `include_docs` and `conflicts`.

@@ -59,6 +59,8 @@ pub enum Refusal {
     EncryptedContent(String),
     #[error("the local index belongs to a different remote ({0}); use another state directory or reset the index")]
     ForeignIndex(String),
+    #[error("the local index belongs to the vault folder {index_vault}, not {vault}; use the profile or state directory that belongs to {vault}, or a new one")]
+    ForeignVault { index_vault: String, vault: String },
 }
 
 /// Version document: `obsydian_livesync_version`.

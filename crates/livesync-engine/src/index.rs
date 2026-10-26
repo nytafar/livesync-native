@@ -220,6 +220,15 @@ impl Index {
         rows.collect()
     }
 
+    /// Rows of `state` whose note starts with `prefix`.
+    pub fn list_state_with_note(&self, state: State, prefix: &str, limit: usize) -> rusqlite::Result<Vec<FileRow>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM files WHERE state = ?1 AND substr(note, 1, length(?2)) = ?2 ORDER BY path LIMIT ?3"
+        ))?;
+        let rows = st.query_map(params![state.as_str(), prefix, limit as i64], row_from)?;
+        rows.collect()
+    }
+
     pub fn all_rows(&self) -> rusqlite::Result<Vec<FileRow>> {
         let mut st = self.conn.prepare(&format!("SELECT {COLS} FROM files ORDER BY path"))?;
         let rows = st.query_map([], row_from)?;
@@ -253,6 +262,12 @@ impl Index {
     pub fn remove_pending(&self, doc_id: &str) -> rusqlite::Result<()> {
         self.conn.execute("DELETE FROM pending WHERE doc_id = ?1", [doc_id])?;
         Ok(())
+    }
+
+    /// When the earliest pending row is due, if there is one.
+    pub fn next_pending_due(&self) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .query_row("SELECT MIN(next_attempt_ms) FROM pending", [], |r| r.get(0))
     }
 
     pub fn pending(&self, due_before_ms: Option<i64>) -> rusqlite::Result<Vec<PendingRow>> {
@@ -331,5 +346,8 @@ mod tests {
         let p = &ix.pending(None).unwrap()[0];
         assert_eq!(p.attempts, 2);
         assert_eq!(p.next_attempt_ms, 31_000 + 60_000);
+        assert_eq!(ix.next_pending_due().unwrap(), Some(91_000));
+        ix.remove_pending("b.md").unwrap();
+        assert_eq!(ix.next_pending_due().unwrap(), None);
     }
 }

@@ -188,6 +188,22 @@ impl Mock {
         st.log.retain(|(_, i)| i != id);
     }
 
+    /// Replace a document's body without a change-feed entry (only GETs see it).
+    pub fn replace_silently(&self, id: &str, doc: Value) {
+        self.state.lock().unwrap().docs.insert(id.into(), doc);
+    }
+
+    /// Number of `_changes` requests so far.
+    pub fn changes_requests(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|(_, p)| p.ends_with("/_changes"))
+            .count()
+    }
+
     /// Requests that were not reads.
     pub fn writes(&self) -> Vec<(String, String)> {
         self.state
@@ -222,7 +238,18 @@ async fn get_doc(State((st, _)): S, Path(id): Path<String>) -> Response {
     record(&st, "GET", &format!("/db/{id}"));
     match st.lock().unwrap().docs.get(&id) {
         Some(d) if d.get("_deleted") != Some(&json!(true)) => Json(d.clone()).into_response(),
-        _ => (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response(),
+        // CouchDB tells a deleted document apart from one that never existed
+        // (or a database that is gone) by the `reason`.
+        Some(_) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "not_found", "reason": "deleted"})),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "not_found", "reason": "missing"})),
+        )
+            .into_response(),
     }
 }
 

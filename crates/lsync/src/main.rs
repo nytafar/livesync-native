@@ -342,6 +342,12 @@ fn print_status(s: &livesync_engine::Status) {
             println!("  {}  — {}", r.path, r.note.as_deref().unwrap_or(""));
         }
     }
+    if !s.unwritable.is_empty() {
+        println!("skipped, the vault's filesystem cannot hold the name (not retried):");
+        for r in &s.unwritable {
+            println!("  {}  — {}", r.path, r.note.as_deref().unwrap_or(""));
+        }
+    }
     if !s.pending.is_empty() {
         println!("pending (will retry):");
         for p in &s.pending {

@@ -13,8 +13,12 @@ A native client for [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-li
 - Skips the following:
   - hidden-file and customisation documents (`i:`, `ix:`, `ps:`) and every dot-path (`.obsidian/`, `.trash/`, dotfiles);
   - `redflag*.md`, `flag_*.md` and `livesync_log_*` at the vault root;
-  - anything matching the local `syncIgnoreRegEx`;
-  - files over `syncMaxSizeInMB`.
+  - anything matching the local `syncIgnoreRegEx` (upstream syntax: entries joined by `|[]|`, `!!` negates, spaces and newlines are dropped);
+  - files over `syncMaxSizeInMB`;
+  - names the vault's filesystem cannot hold. On Android shared storage (`/storage/...`) that means any of `" * : < > ? \ |` or a control character, checked up front; elsewhere, names the filesystem rejects. They are marked `skipped` ("unwritable name"), shown by `status` and never retried.
+- **Handles errors one file at a time.** A local I/O error on one file (unreadable, a file where a folder should be) defers that file to the retry queue; the rest of the batch and the changes sequence move on.
+- Creates an empty `.nomedia` at the vault root, so MediaStore and Google Photos leave the vault's images alone.
+- Allows one process per state directory and per vault (lock files `lsync.lock` in the state directory and `.lsync.lock` at the vault root).
 - **Fails closed.** It refuses to sync when it meets any of these:
   - a server that is not CouchDB;
   - a version document that is missing, above 13 or invalid, or that has unknown `used_features`;
@@ -22,7 +26,8 @@ A native client for [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-li
   - incompatible chunk-version ranges;
   - encryption, path obfuscation, a `hashAlg` other than xxhash64, or `pathNormalizationVersion=1`;
   - PREFERRED tweaks that changed since setup;
-  - encrypted content.
+  - encrypted content;
+  - an index that belongs to another remote or another vault folder.
 - If the milestone's `created` changes (the database was rebuilt elsewhere), it resets the index and refetches. Files that are still clean are refreshed; edited ones are kept.
 
 ## Usage
@@ -37,6 +42,7 @@ lsync pull                  # one-shot pull into the vault folder
 lsync daemon --pull-only    # follow changes (longpoll + heartbeat, jittered reconnect)
 lsync status                # index summary, last gate result, dirty/conflicted/pending files
 lsync probe <vault>         # on-phone check: Obsidian vs outside writes, inotify vs Obsidian saves
+                            # (refuses vaults where the LiveSync plugin is enabled)
 ```
 
 Every setting can also come from flags or `LSYNC_*` environment variables, for example `LSYNC_URL`, `LSYNC_DB`, `LSYNC_USER`, `LSYNC_PASSWORD`, `LSYNC_VAULT`, `LSYNC_STATE_DIR` and `LSYNC_IGNORE_REGEX`. Flags win over the environment, and the environment wins over the config file. The index lives in `$XDG_STATE_HOME/lsync/<profile>/index.sqlite` unless `--state-dir` says otherwise.

@@ -26,6 +26,9 @@ impl Env {
         self.dir.path().join("vault")
     }
     fn engine_with(&self, f: impl FnOnce(&mut EngineConfig)) -> Engine {
+        self.engine_try(f).unwrap()
+    }
+    fn engine_try(&self, f: impl FnOnce(&mut EngineConfig)) -> Result<Engine, EngineError> {
         let couch = Couch::new(&RemoteConfig {
             url: self.mock.url.clone(),
             database: DB.into(),
@@ -37,7 +40,7 @@ impl Env {
         cfg.batch_limit = 3; // force several pages
         cfg.concurrency = 2;
         f(&mut cfg);
-        Engine::open(couch, cfg).unwrap()
+        Engine::open(couch, cfg)
     }
     fn engine(&self) -> Engine {
         self.engine_with(|_| {})
@@ -150,6 +153,7 @@ async fn pull_materialises_files_and_skips_the_rest() {
     assert_eq!(count_temp(&env.vault()), 0);
     // Read-only: nothing but GETs, _changes and _all_docs.
     assert!(m.writes().is_empty(), "unexpected requests: {:?}", m.writes());
+    drop(engine);
 
     // A second pull is a no-op.
     let rep2 = env.engine().pull_once().await.unwrap();
@@ -472,4 +476,303 @@ async fn wait_for(path: &Path, content: &[u8]) {
             .ok()
             .map(|b| String::from_utf8_lossy(&b).into_owned())
     );
+}
+
+fn since_of(engine: &Engine) -> Option<String> {
+    engine.status().unwrap().since
+}
+
+/// True when the current user can still read a file after `chmod 000`
+/// (root), which makes the permission-based checks meaningless.
+fn chmod_000_is_ignored(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::File::open(path).is_ok()
+}
+
+// Item 1: a per-file I/O error defers that file only; the rest of the batch
+// and `since` move on.
+#[tokio::test]
+async fn per_file_io_error_defers_only_that_file() {
+    let env = Env::new().await;
+    let m = &env.mock;
+    m.put_text("x", &["a file named x"]);
+    env.engine().pull_once().await.unwrap();
+    let since_before = since_of(&env.engine());
+
+    // `x/y.md` cannot be stat'ed (ENOTDIR): `x` is a file.
+    m.put_text("x/y.md", &["under x"]);
+    m.put_text("unrelated.md", &["fine"]);
+    let engine = env.engine_with(|c| c.batch_limit = 10);
+    let rep = engine.pull_once().await.expect("one bad path must not fail the pull");
+    assert_eq!(env.read("unrelated.md").unwrap(), b"fine");
+    assert_eq!(env.read("x").unwrap(), b"a file named x");
+    assert_eq!(rep.pending, 1);
+    let st = engine.status().unwrap();
+    assert_eq!(st.pending.len(), 1);
+    assert_eq!(st.pending[0].doc_id, "x/y.md");
+    assert_ne!(st.since, since_before, "since advanced past the bad document");
+}
+
+#[tokio::test]
+async fn unreadable_local_files_do_not_stop_the_batch() {
+    let env = Env::new().await;
+    let m = &env.mock;
+    m.put_text("locked.md", &["v1"]);
+    m.put_text("gone.md", &["bye"]);
+    env.engine().pull_once().await.unwrap();
+
+    let unreadable = ["locked.md", "gone.md"];
+    if unreadable.iter().any(|p| chmod_000_is_ignored(&env.vault().join(p))) {
+        eprintln!("running as root; skipping the permission part");
+        return;
+    }
+    m.put_text("locked.md", &["v2"]);
+    m.soft_delete("gone.md");
+    m.put_text("after.md", &["after"]);
+    let engine = env.engine_with(|c| c.batch_limit = 20);
+    let rep = engine
+        .pull_once()
+        .await
+        .expect("unreadable files must not fail the pull");
+    assert_eq!(env.read("after.md").unwrap(), b"after");
+    assert!(
+        env.vault().join("gone.md").exists(),
+        "an unreadable file is never deleted"
+    );
+    assert_eq!(rep.pending, 2, "the update and the delete wait for a retry");
+    let ids: Vec<String> = engine.status().unwrap().pending.into_iter().map(|p| p.doc_id).collect();
+    assert_eq!(ids, vec!["gone.md".to_string(), "locked.md".to_string()]);
+    // Retries back off instead of resetting to the first delay.
+    drop(engine);
+    env.engine().pull_once().await.unwrap();
+    let attempts: Vec<u32> = env
+        .engine()
+        .status()
+        .unwrap()
+        .pending
+        .iter()
+        .map(|p| p.attempts)
+        .collect();
+    assert!(attempts.iter().all(|a| *a >= 2), "attempts {attempts:?}");
+}
+
+#[tokio::test]
+async fn daemon_keeps_running_past_per_file_errors() {
+    let env = Env::new().await;
+    let m = env.mock.clone();
+    m.put_text("x", &["file"]);
+    let engine = env.engine_with(|c| c.regate_interval = Duration::from_secs(600));
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let e2 = engine.clone();
+    let h = tokio::spawn(async move { e2.daemon_pull_only(rx).await });
+    wait_for(&env.vault().join("x"), b"file").await;
+    m.put_text("x/y.md", &["under x"]);
+    m.put_text("unrelated.md", &["arrives"]);
+    wait_for(&env.vault().join("unrelated.md"), b"arrives").await;
+    assert!(!h.is_finished(), "the daemon must not exit on a per-file error");
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), h)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+// Item 2: names the filesystem cannot hold are skipped with a reason and
+// never retried.
+#[tokio::test]
+async fn unwritable_names_are_skipped_and_not_retried() {
+    let env = Env::new().await;
+    let m = &env.mock;
+    m.put_text("Notes/He said \"hi\".md", &["quoted"]);
+    m.put_text("a:b.md", &["colon"]);
+    m.put_text("ok.md", &["fine"]);
+    let engine = env.engine_with(|c| c.restrict_names = Some(true));
+    let rep = engine.pull_once().await.unwrap();
+    assert_eq!(env.read("ok.md").unwrap(), b"fine");
+    assert!(env.read("a:b.md").is_none());
+    assert_eq!(rep.pending, 0);
+    assert_eq!(rep.skipped.get("unwritable-name"), Some(&2));
+    let row = env.row("notes/he said \"hi\".md").unwrap();
+    assert_eq!(row.state, State::Skipped);
+    assert!(row.note.unwrap().starts_with("unwritable name"));
+    let st = engine.status().unwrap();
+    assert!(st.pending.is_empty());
+    assert_eq!(st.unwritable.len(), 2);
+
+    // Not retried: a later pull fetches nothing, and a new revision of the
+    // same document is skipped again without downloading its chunks.
+    let rep = engine.pull_once().await.unwrap();
+    assert_eq!(rep.chunks_fetched, 0);
+    m.put_text("a:b.md", &["colon v2"]);
+    let rep = engine.pull_once().await.unwrap();
+    assert_eq!(rep.chunks_fetched, 0);
+    assert_eq!(rep.pending, 0);
+    assert_eq!(rep.skipped.get("unwritable-name"), Some(&1));
+}
+
+#[tokio::test]
+async fn names_rejected_by_the_filesystem_are_skipped_as_unwritable() {
+    // ENAMETOOLONG is the failure Linux can produce; the phone's FUSE layer
+    // answers EPERM/EINVAL for forbidden characters, which takes the same path.
+    let env = Env::new().await;
+    let m = &env.mock;
+    let long = format!("{}.md", "n".repeat(300));
+    m.put_text(&long, &["long"]);
+    m.put_text("ok.md", &["fine"]);
+    let rep = env
+        .engine()
+        .pull_once()
+        .await
+        .expect("a rejected name must not fail the pull");
+    assert_eq!(env.read("ok.md").unwrap(), b"fine");
+    assert_eq!(rep.pending, 0);
+    assert_eq!(rep.skipped.get("unwritable-name"), Some(&1));
+    let row = env.row(&long).unwrap();
+    assert_eq!(row.state, State::Skipped);
+    assert!(row.note.unwrap().starts_with("unwritable name"));
+}
+
+// Item 3: an index belongs to one vault folder.
+#[tokio::test]
+async fn index_is_bound_to_its_vault_folder() {
+    let env = Env::new().await;
+    env.mock.put_text("a.md", &["A"]);
+    env.engine().pull_once().await.unwrap();
+    let other = env.dir.path().join("other-vault");
+    let engine = env.engine_with(|c| c.vault = other.clone());
+    assert!(matches!(
+        refused(engine.pull_once().await),
+        Refusal::ForeignVault { .. }
+    ));
+    assert!(!other.join("a.md").exists());
+    drop(engine);
+    // The original vault still works.
+    env.engine().pull_once().await.unwrap();
+}
+
+// Item 4: `.nomedia` at the vault root.
+#[tokio::test]
+async fn pull_creates_nomedia_but_keeps_an_existing_one() {
+    let env = Env::new().await;
+    env.mock.put_text("a.md", &["A"]);
+    env.engine().pull_once().await.unwrap();
+    assert_eq!(env.read(".nomedia").unwrap(), b"");
+    std::fs::write(env.vault().join(".nomedia"), b"mine").unwrap();
+    env.engine().pull_once().await.unwrap();
+    assert_eq!(env.read(".nomedia").unwrap(), b"mine");
+}
+
+// Item 6: the daemon wakes for pending rows when they are due, not on a
+// fixed timer.
+#[tokio::test]
+async fn daemon_retries_pending_rows_when_due() {
+    let env = Env::new().await;
+    let m = env.mock.clone();
+    let ids = m.put_chunks(&["part1", "part2"]);
+    m.remove_doc(&ids[1]);
+    m.put(json!({"_id": "late.md", "path": "late.md", "type": "plain", "children": ids, "mtime": 1, "ctime": 1, "size": 10, "eden": {}}));
+    let engine = env.engine_with(|c| c.regate_interval = Duration::from_secs(600));
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let e2 = engine.clone();
+    let h = tokio::spawn(async move { e2.daemon_pull_only(rx).await });
+    for _ in 0..100 {
+        if !engine.status().unwrap().pending.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(engine.status().unwrap().pending.len(), 1);
+
+    // Idle with a row not yet due: the longpoll stays open.
+    let before = m.changes_requests();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(m.changes_requests() <= before + 1, "longpoll reopened while idle");
+
+    // The chunk arrives (no feed entry for the file) and the row becomes due
+    // in a moment: the daemon retries it then.
+    m.put_chunks(&["part2"]);
+    let soon = livesync_engine::vaultfs::now_ms() + 300;
+    Index::open(&env.dir.path().join("state/index.sqlite"))
+        .unwrap()
+        .add_pending("late.md", None, "test: due soon", soon - 60_000)
+        .unwrap();
+    engine.nudge(); // re-evaluate now (the Android shell nudges on network changes)
+    wait_for(&env.vault().join("late.md"), b"part1part2").await;
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), h)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+// Item 7: only `reason: "deleted"` counts as a deletion in the retry.
+#[tokio::test]
+async fn pending_retry_deletes_only_on_a_deleted_404() {
+    let env = Env::new().await;
+    let m = &env.mock;
+    m.put_text("keep.md", &["v1"]);
+    m.put_text("del.md", &["v1"]);
+    env.engine().pull_once().await.unwrap();
+    // New revisions whose chunks are not there yet: both go pending.
+    for path in ["keep.md", "del.md"] {
+        let ids = m.put_chunks(&["v2"]);
+        m.remove_doc(&ids[0]);
+        m.put(json!({"_id": path, "path": path, "type": "plain", "children": ids, "mtime": 1, "ctime": 1, "size": 2, "eden": {}}));
+    }
+    let rep = env.engine().pull_once().await.unwrap();
+    assert_eq!(rep.pending, 2);
+
+    // `keep.md` disappears without a tombstone (database recreated, proxy
+    // misroute: 404 "missing"); `del.md` is deleted (404 "deleted").
+    m.state.lock().unwrap().docs.remove("keep.md");
+    m.replace_silently("del.md", json!({"_id": "del.md", "_rev": "9-x", "_deleted": true}));
+    let rep = env.engine().pull_once().await.unwrap();
+    assert_eq!(env.read("keep.md").unwrap(), b"v1", "a plain 404 never deletes");
+    assert!(env.read("del.md").is_none(), "a deleted 404 does");
+    assert_eq!(rep.pending, 1);
+    let st = env.engine().status().unwrap();
+    assert_eq!(st.pending[0].doc_id, "keep.md");
+    assert!(st.pending[0].reason.contains("missing"), "{}", st.pending[0].reason);
+}
+
+// Item 9: a case-only rename on a case-sensitive filesystem still replaces
+// the old name (the case-insensitive guard must not leave it behind).
+#[tokio::test]
+async fn case_only_rename_on_a_case_sensitive_fs_removes_the_old_name() {
+    let env = Env::new().await;
+    let m = &env.mock;
+    m.put_text("Dir/Note.md", &["same"]);
+    env.engine().pull_once().await.unwrap();
+    assert!(env.vault().join("Dir/Note.md").exists());
+    m.put_text("Dir/note.md", &["same"]);
+    env.engine().pull_once().await.unwrap();
+    assert!(env.vault().join("Dir/note.md").exists());
+    assert!(!env.vault().join("Dir/Note.md").exists());
+    assert_eq!(env.row("dir/note.md").unwrap().path, "Dir/note.md");
+}
+
+// Item 10: one process per state directory and per vault.
+#[tokio::test]
+async fn a_second_engine_on_the_same_state_or_vault_is_refused() {
+    let env = Env::new().await;
+    let first = env.engine();
+    let same_state = env.engine_try(|_| {});
+    assert!(
+        matches!(same_state, Err(EngineError::Busy(_))),
+        "{:?}",
+        same_state.err()
+    );
+    let other_state = env.dir.path().join("state2/index.sqlite");
+    let same_vault = env.engine_try(|c| c.index_path = other_state.clone());
+    assert!(
+        matches!(same_vault, Err(EngineError::Busy(_))),
+        "{:?}",
+        same_vault.err()
+    );
+    drop(first);
+    env.engine_try(|_| {})
+        .expect("free again once the first engine is gone");
 }

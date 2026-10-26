@@ -1,7 +1,7 @@
 //! Gate evaluation, the pull loop and the pull-only daemon.
 
 use crate::index::{FileRow, Index, PendingRow, State};
-use crate::vaultfs::{self, DiskState, Expect, RemoveOutcome, WriteError};
+use crate::vaultfs::{self, DiskState, Expect, LockError, LockFile, RemoveOutcome, WriteError};
 use futures::stream::{self, StreamExt};
 use livesync_model::chunk::chunk_id_xxhash64;
 use livesync_model::codec::{self, CodecError};
@@ -9,7 +9,7 @@ use livesync_model::doc::{classify_doc, Classified, MILESTONE_LOCAL_ID, SYNC_PAR
 use livesync_model::gate::{self, Milestone, Refusal};
 use livesync_model::path::{classify_path, is_internal_id, PathSkip};
 use livesync_model::{FileDoc, FileKind};
-use livesync_remote::{Backoff, ChangeRow, ChangesQuery, Couch, RemoteError};
+use livesync_remote::{Backoff, ChangeRow, ChangesQuery, Couch, DocFetch, RemoteError};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -35,7 +35,21 @@ mod meta {
     pub const LAST_PULL: &str = "last_pull_ms";
     pub const REBUILD_AT: &str = "rebuild_detected_ms";
     pub const DAEMON_SEEN: &str = "daemon_heartbeat_ms";
+    pub const VAULT: &str = "vault_path";
 }
+
+/// Note prefix (and status filter) for documents whose names the vault's
+/// filesystem cannot hold.
+pub const UNWRITABLE_NOTE: &str = "unwritable name";
+
+/// Lock file in the state directory (next to the index).
+pub const STATE_LOCK: &str = "lsync.lock";
+/// Lock file at the vault root, so two profiles cannot share a vault either.
+pub const VAULT_LOCK: &str = ".lsync.lock";
+
+/// Minimum spacing between pending retries in the daemon, so a retry that
+/// fails before it can reschedule its rows does not spin.
+const PENDING_RETRY_MIN_GAP: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -44,7 +58,8 @@ pub struct EngineConfig {
     /// SQLite index file. Keep it outside the vault (or under a dot-directory).
     pub index_path: PathBuf,
     /// Local `syncIgnoreRegEx` (upstream format: patterns joined by `|[]|`,
-    /// `!` prefix negates). Not part of the remote tweaks.
+    /// `!!` prefix negates, spaces and newlines are removed). Not part of the
+    /// remote tweaks.
     pub ignore_regex: Option<String>,
     /// Override for `syncMaxSizeInMB` (otherwise taken from PREFERRED).
     pub max_size_mb: Option<u64>,
@@ -56,6 +71,11 @@ pub struct EngineConfig {
     pub regate_interval: Duration,
     /// Memory budget for in-flight chunk data, in MiB.
     pub memory_budget_mb: usize,
+    /// Skip names with characters FAT-style storage refuses (`" * : < > ? \ |`
+    /// and control characters) without trying them. `None`: on when the vault
+    /// is on Android shared storage. Names the filesystem rejects at write
+    /// time are skipped either way.
+    pub restrict_names: Option<bool>,
 }
 
 impl EngineConfig {
@@ -69,6 +89,7 @@ impl EngineConfig {
             batch_limit: 250,
             regate_interval: Duration::from_secs(300),
             memory_budget_mb: 160,
+            restrict_names: None,
         }
     }
 }
@@ -81,6 +102,9 @@ pub enum EngineError {
     Remote(#[from] RemoteError),
     #[error("index: {0}")]
     Index(#[from] rusqlite::Error),
+    /// Another process holds the state directory or the vault.
+    #[error("{0}")]
+    Busy(String),
     #[error("{0}")]
     Other(String),
 }
@@ -151,6 +175,8 @@ pub struct Status {
     pub dirty: Vec<FileRow>,
     pub conflicted: Vec<FileRow>,
     pub pending: Vec<PendingRow>,
+    /// Skipped because the vault's filesystem cannot hold the name.
+    pub unwritable: Vec<FileRow>,
 }
 
 /// One upstream `syncIgnoreRegEx` entry.
@@ -160,12 +186,16 @@ struct IgnoreRule {
     negate: bool,
 }
 
+/// Parse a `syncIgnoreRegEx` list as upstream does (`parseCustomRegExpList`
+/// in commonlib `utils.ts`): drop every space and newline from the whole
+/// list, split on `|[]|`, drop empty entries; a `!!` prefix negates.
 fn parse_ignore(src: &str, case_sensitive: bool) -> std::result::Result<Vec<IgnoreRule>, regex::Error> {
-    src.split("|[]|")
-        .map(str::trim)
+    let cleaned: String = src.chars().filter(|c| *c != ' ' && *c != '\n').collect();
+    cleaned
+        .split("|[]|")
         .filter(|s| !s.is_empty())
         .map(|s| {
-            let (negate, pat) = match s.strip_prefix('!') {
+            let (negate, pat) = match s.strip_prefix("!!") {
                 Some(p) => (true, p),
                 None => (false, s),
             };
@@ -186,6 +216,10 @@ struct Runtime {
 struct Inner {
     couch: Couch,
     cfg: EngineConfig,
+    /// Canonical vault path, recorded in (and checked against) the index.
+    vault_canon: String,
+    restrict_names: bool,
+    _locks: Vec<LockFile>,
     index: Mutex<Index>,
     runtime: Mutex<Runtime>,
     mem: Semaphore,
@@ -205,6 +239,8 @@ enum Skip {
     Ignored,
     TooLarge(u64),
     Legacy,
+    /// The vault's filesystem cannot hold this name.
+    Unwritable(String),
 }
 
 impl Skip {
@@ -214,6 +250,7 @@ impl Skip {
             Skip::Ignored => "ignore-regex",
             Skip::TooLarge(_) => "too-large",
             Skip::Legacy => "legacy-notes-doc",
+            Skip::Unwritable(_) => "unwritable-name",
         }
     }
 }
@@ -237,8 +274,32 @@ fn seq_to_string(v: &Value) -> String {
 }
 
 impl Engine {
+    /// Open the index and take the locks on the state directory and the
+    /// vault (`EngineError::Busy` when another process holds either).
     pub fn open(couch: Couch, cfg: EngineConfig) -> Result<Self> {
         std::fs::create_dir_all(&cfg.vault).map_err(EngineError::other)?;
+        let canon = std::fs::canonicalize(&cfg.vault).map_err(EngineError::other)?;
+        let state_dir = cfg.index_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let mut locks = Vec::new();
+        for (path, required) in [(state_dir.join(STATE_LOCK), true), (canon.join(VAULT_LOCK), false)] {
+            match LockFile::try_acquire(&path) {
+                Ok(l) => locks.push(l),
+                Err(LockError::Busy(p)) => {
+                    return Err(EngineError::Busy(format!(
+                        "another lsync process is using this {} ({} is locked); stop it first",
+                        if required { "state directory" } else { "vault" },
+                        p.display()
+                    )))
+                }
+                // The state-dir lock is the one that must work; a vault on a
+                // filesystem without locking only loses the cross-profile check.
+                Err(e) if required => return Err(EngineError::other(e)),
+                Err(e) => warn!("{e}; continuing without the vault lock"),
+            }
+        }
+        let restrict_names = cfg
+            .restrict_names
+            .unwrap_or_else(|| vaultfs::is_android_shared_storage(&canon));
         let index = Index::open(&cfg.index_path)?;
         if index.get_meta(meta::NODE_ID)?.is_none() {
             index.set_meta(meta::NODE_ID, &random_node_id())?;
@@ -251,6 +312,9 @@ impl Engine {
         Ok(Engine {
             inner: Arc::new(Inner {
                 couch,
+                vault_canon: canon.to_string_lossy().into_owned(),
+                restrict_names,
+                _locks: locks,
                 runtime: Mutex::new(Runtime {
                     max_size_bytes: cfg.max_size_mb.map(|m| m * 1024 * 1024),
                     ignore,
@@ -324,7 +388,20 @@ impl Engine {
         r
     }
 
+    /// Refuse when the index was made for another vault folder.
+    fn check_vault(&self, ix: &Index) -> Result<()> {
+        match ix.get_meta(meta::VAULT)? {
+            Some(v) if v != self.inner.vault_canon => Err(Refusal::ForeignVault {
+                index_vault: v,
+                vault: self.inner.vault_canon.clone(),
+            }
+            .into()),
+            _ => Ok(()),
+        }
+    }
+
     async fn connect_gate_inner(&self, adopt_tweaks: bool) -> Result<GateReport> {
+        self.check_vault(&self.inner.index.lock().unwrap())?;
         let couch = &self.inner.couch;
         let root = match couch.server_root().await {
             Ok(v) => v,
@@ -360,6 +437,10 @@ impl Engine {
         let mut rebuild = false;
         {
             let ix = self.inner.index.lock().unwrap();
+            self.check_vault(&ix)?;
+            if ix.get_meta(meta::VAULT)?.is_none() {
+                ix.set_meta(meta::VAULT, &self.inner.vault_canon)?;
+            }
             match ix.get_meta(meta::REMOTE)? {
                 Some(r) if r != label => return Err(Refusal::ForeignIndex(r).into()),
                 Some(_) => {}
@@ -458,10 +539,7 @@ impl Engine {
             "gate ok: {} (version {}, {} docs)",
             gate.remote, gate.version, gate.doc_count
         );
-        let swept = vaultfs::sweep_temp_files(&self.inner.cfg.vault);
-        if swept > 0 {
-            info!("removed {swept} stale temp files");
-        }
+        self.prepare_vault();
         loop {
             let since = self.since()?;
             let resp = self
@@ -488,6 +566,21 @@ impl Engine {
         rep.elapsed_ms = start.elapsed().as_millis() as u64;
         rep.pending = self.with_index(|ix| ix.pending(None))?.len() as u64;
         Ok(rep)
+    }
+
+    /// After a passed gate: remove temp files left by an interrupted run (safe,
+    /// since this process holds the vault) and make sure `.nomedia` exists.
+    fn prepare_vault(&self) {
+        let vault = &self.inner.cfg.vault;
+        let swept = vaultfs::sweep_temp_files(vault);
+        if swept > 0 {
+            info!("removed {swept} stale temp files");
+        }
+        match vaultfs::ensure_nomedia(vault) {
+            Ok(true) => info!("created .nomedia at the vault root"),
+            Ok(false) => {}
+            Err(e) => warn!("cannot create .nomedia at the vault root: {e}"),
+        }
     }
 
     fn log_progress(&self, start: Instant, pending: Option<u64>) {
@@ -533,7 +626,7 @@ impl Engine {
         }
 
         let mut writes: Vec<FileDoc> = Vec::new();
-        let mut deletes: Vec<String> = Vec::new();
+        let mut deletes: Vec<(String, Option<String>)> = Vec::new();
         let mut skips: Vec<(FileDoc, Skip)> = Vec::new();
         let mut ignored = 0u64;
         // Pre-scan: refusals stop the batch before anything is applied.
@@ -549,7 +642,8 @@ impl Engine {
                     if id.starts_with("h:") {
                         ignored += 1;
                     } else {
-                        deletes.push(id);
+                        let rev = doc.get("_rev").and_then(Value::as_str).map(str::to_string);
+                        deletes.push((id, rev));
                     }
                 }
                 Classified::LegacyNote { id, path } => {
@@ -581,7 +675,7 @@ impl Engine {
                     if is_internal_id(&f.id) {
                         ignored += 1;
                     } else if f.deleted {
-                        deletes.push(f.id);
+                        deletes.push((f.id, Some(f.rev)));
                     } else if let Some(s) = self.skip_reason(&f) {
                         skips.push((f, s));
                     } else {
@@ -595,8 +689,8 @@ impl Engine {
         // Deletions and skips are quick, local-only work.
         let this = self.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            for id in deletes {
-                this.apply_delete(&id)?;
+            for (id, rev) in deletes {
+                this.apply_delete(&id, rev.as_deref())?;
             }
             for (f, s) in skips {
                 this.apply_skip(&f, &s)?;
@@ -627,6 +721,25 @@ impl Engine {
         if let Some(p) = classify_path(&f.path) {
             return Some(Skip::Path(p));
         }
+        if self.inner.restrict_names {
+            let bad = vaultfs::fat_invalid_chars(&f.path);
+            if !bad.is_empty() {
+                let list: Vec<String> = bad.iter().map(|c| format!("{c:?}")).collect();
+                return Some(Skip::Unwritable(format!(
+                    "contains {} (not allowed on Android shared storage)",
+                    list.join(" ")
+                )));
+            }
+        }
+        // Rejected by the filesystem before: do not fetch it again.
+        if let Ok(Some(b)) = self.with_index(|ix| ix.by_doc(&f.id)) {
+            if b.state == State::Skipped && b.path == f.path {
+                if let Some(n) = b.note.as_deref().filter(|n| n.starts_with(UNWRITABLE_NOTE)) {
+                    let detail = n.strip_prefix(UNWRITABLE_NOTE).unwrap_or_default();
+                    return Some(Skip::Unwritable(detail.trim_start_matches([':', ' ']).to_string()));
+                }
+            }
+        }
         let rt = self.inner.runtime.lock().unwrap();
         if rt.ignore.iter().any(|r| r.re.is_match(&f.path) != r.negate) {
             return Some(Skip::Ignored);
@@ -650,6 +763,13 @@ impl Engine {
             .or_default() += 1;
         let note = match s {
             Skip::TooLarge(n) => format!("too large ({n} bytes)"),
+            Skip::Unwritable(why) => {
+                warn!(
+                    "{}: skipped, the vault's filesystem cannot hold this name ({why})",
+                    f.path
+                );
+                format!("{UNWRITABLE_NOTE}: {why}")
+            }
             other => other.label().to_string(),
         };
         self.with_index(|ix| {
@@ -677,26 +797,38 @@ impl Engine {
         })
     }
 
-    fn apply_delete(&self, id: &str) -> Result<()> {
+    fn apply_delete(&self, id: &str, rev: Option<&str>) -> Result<()> {
         let base = self.with_index(|ix| ix.by_doc(id))?;
-        self.with_index(|ix| ix.remove_pending(id))?;
-        let Some(mut b) = base else { return Ok(()) };
+        let Some(mut b) = base else {
+            return self.with_index(|ix| ix.remove_pending(id));
+        };
         if b.state == State::Skipped {
-            return self.with_index(|ix| ix.delete_doc(id));
+            return self.with_index(|ix| {
+                ix.delete_doc(id)?;
+                ix.remove_pending(id)
+            });
         }
         let target = self.inner.cfg.vault.join(&b.path);
         let outcome = match &b.disk_hash {
-            Some(h) => vaultfs::remove_if_matches(&self.inner.cfg.vault, &target, h).map_err(EngineError::other)?,
-            None => match vaultfs::read_state(&target).map_err(EngineError::other)? {
+            Some(h) => vaultfs::remove_if_matches(&self.inner.cfg.vault, &target, h),
+            None => vaultfs::read_state(&target).map(|st| match st {
                 None => RemoveOutcome::AlreadyGone,
                 Some(s) => RemoveOutcome::Diverged { found: s.hash },
-            },
+            }),
+        };
+        let outcome = match outcome {
+            Ok(o) => o,
+            // This file only: keep it and its row, retry the deletion later.
+            Err(e) => return self.defer(id, rev, &b.path, &format!("deletion not applied: {e}")),
         };
         match outcome {
             RemoveOutcome::Removed | RemoveOutcome::AlreadyGone => {
                 self.inner.report.lock().unwrap().deleted += 1;
                 debug!("deleted {}", b.path);
-                self.with_index(|ix| ix.delete_doc(id))
+                self.with_index(|ix| {
+                    ix.delete_doc(id)?;
+                    ix.remove_pending(id)
+                })
             }
             RemoveOutcome::Diverged { .. } => {
                 warn!(
@@ -706,7 +838,10 @@ impl Engine {
                 self.inner.report.lock().unwrap().dirty += 1;
                 b.state = State::Dirty;
                 b.note = Some("deleted remotely; local changes kept".into());
-                self.with_index(|ix| ix.upsert(&b))
+                self.with_index(|ix| {
+                    ix.upsert(&b)?;
+                    ix.remove_pending(id)
+                })
             }
         }
     }
@@ -777,7 +912,7 @@ impl Engine {
             for (p, content) in ready {
                 match content {
                     Ok(bytes) => this.materialise(p, bytes)?,
-                    Err(reason) => this.defer(&p.doc, &reason)?,
+                    Err(reason) => this.defer_doc(&p.doc, &reason)?,
                 }
             }
             Ok(())
@@ -802,8 +937,20 @@ impl Engine {
                         changed = true;
                     }
                     if b.state == State::Dirty {
-                        let local =
-                            vaultfs::read_state(&self.inner.cfg.vault.join(&b.path)).map_err(EngineError::other)?;
+                        let local = match vaultfs::read_state(&self.inner.cfg.vault.join(&b.path)) {
+                            Ok(l) => l,
+                            Err(e) => {
+                                // Cannot tell whether the edit was reverted: stays dirty.
+                                warn!("{}: cannot read the local file ({e}); it stays dirty", b.path);
+                                Some(DiskState {
+                                    hash: format!("unreadable: {e}"),
+                                    size: 0,
+                                    mtime_ms: 0,
+                                    #[cfg(unix)]
+                                    ino: (0, 0),
+                                })
+                            }
+                        };
                         if local.as_ref().map(|l| &l.hash) == b.disk_hash.as_ref() {
                             b.state = if doc.conflicts.is_empty() {
                                 State::Clean
@@ -822,7 +969,14 @@ impl Engine {
                     continue;
                 }
             }
-            let local = vaultfs::read_state(&self.inner.cfg.vault.join(&doc.path)).map_err(EngineError::other)?;
+            let local = match vaultfs::read_state(&self.inner.cfg.vault.join(&doc.path)) {
+                Ok(l) => l,
+                Err(e) => {
+                    // This document only; the rest of the batch goes on.
+                    self.io_failure(&doc, &e)?;
+                    continue;
+                }
+            };
             plans.push(Plan { doc, base, local });
         }
         Ok(plans)
@@ -942,10 +1096,24 @@ impl Engine {
         Ok(out)
     }
 
-    fn defer(&self, doc: &FileDoc, reason: &str) -> Result<()> {
-        warn!("{}: deferred ({reason})", doc.path);
+    fn defer(&self, id: &str, rev: Option<&str>, path: &str, reason: &str) -> Result<()> {
+        warn!("{path}: deferred ({reason})");
         self.inner.report.lock().unwrap().pending += 1;
-        self.with_index(|ix| ix.add_pending(&doc.id, Some(&doc.rev), reason, vaultfs::now_ms()))
+        self.with_index(|ix| ix.add_pending(id, rev, reason, vaultfs::now_ms()))
+    }
+
+    fn defer_doc(&self, doc: &FileDoc, reason: &str) -> Result<()> {
+        self.defer(&doc.id, Some(&doc.rev), &doc.path, reason)
+    }
+
+    /// A local I/O error on one document: skip it for good when the name
+    /// cannot exist on this filesystem, otherwise retry it later.
+    fn io_failure(&self, doc: &FileDoc, e: &std::io::Error) -> Result<()> {
+        if vaultfs::is_unwritable_name_error(e, &doc.path) {
+            self.apply_skip(doc, &Skip::Unwritable(e.to_string()))
+        } else {
+            self.defer_doc(doc, &format!("local I/O error: {e}"))
+        }
     }
 
     /// Put fetched content on disk, if the local file is clean.
@@ -1028,7 +1196,7 @@ impl Engine {
                 base,
                 "local file changed during the write; remote change not applied",
             ),
-            Err(e @ WriteError::Io { .. }) => self.defer(&doc, &e.to_string()),
+            Err(WriteError::Io { source, .. }) => self.io_failure(&doc, &source),
         }
     }
 
@@ -1039,7 +1207,17 @@ impl Engine {
         if b.path == new_path {
             return;
         }
-        let old = self.inner.cfg.vault.join(&b.path);
+        let vault = &self.inner.cfg.vault;
+        // A case-only rename on a case-insensitive filesystem: the old name
+        // may be the very file just written or adopted, even when the inode
+        // numbers differ (FUSE need not keep them stable). Remove it only when
+        // the directory listings show both spellings as separate entries.
+        if b.path.to_lowercase() == new_path.to_lowercase()
+            && !(vaultfs::exists_with_exact_case(vault, &b.path) && vaultfs::exists_with_exact_case(vault, new_path))
+        {
+            return;
+        }
+        let old = vault.join(&b.path);
         let Ok(Some(old_state)) = vaultfs::read_state(&old) else {
             return;
         };
@@ -1091,8 +1269,18 @@ impl Engine {
         info!("retrying {} pending document(s)", due.len());
         let mut rows = Vec::new();
         for p in &due {
-            let doc = self.inner.couch.get_doc(&p.doc_id, true).await?;
-            let doc = doc.unwrap_or_else(|| serde_json::json!({"_id": p.doc_id, "_deleted": true}));
+            let doc = match self.inner.couch.fetch_doc(&p.doc_id, true).await? {
+                DocFetch::Found(d) => d,
+                DocFetch::Deleted => serde_json::json!({"_id": p.doc_id, "_deleted": true}),
+                // Not a deletion: the database may have been recreated, or a
+                // proxy answered for something else. Touch nothing; retry later.
+                DocFetch::Missing(reason) => {
+                    let why = format!("document missing on the remote (404 {reason}); local file left alone");
+                    warn!("{}: {why}", p.doc_id);
+                    self.with_index(|ix| ix.add_pending(&p.doc_id, p.rev.as_deref(), &why, vaultfs::now_ms()))?;
+                    continue;
+                }
+            };
             rows.push(ChangeRow {
                 seq: Value::Null,
                 id: p.doc_id.clone(),
@@ -1114,10 +1302,7 @@ impl Engine {
     /// lock resumes without a restart.
     pub async fn daemon_pull_only(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut backoff = Backoff::default();
-        let sweep_vault = self.inner.cfg.vault.clone();
-        tokio::task::spawn_blocking(move || vaultfs::sweep_temp_files(&sweep_vault))
-            .await
-            .ok();
+        let mut prepared = false;
         'outer: loop {
             if *shutdown.borrow() {
                 return Ok(());
@@ -1128,6 +1313,11 @@ impl Engine {
                     info!("gate ok: {} (version {}, created {})", g.remote, g.version, g.created);
                     if g.rebuild_detected {
                         warn!("remote was rebuilt; refetching everything");
+                    }
+                    if !prepared {
+                        let this = self.clone();
+                        tokio::task::spawn_blocking(move || this.prepare_vault()).await.ok();
+                        prepared = true;
                     }
                 }
                 Err(e) => {
@@ -1144,17 +1334,25 @@ impl Engine {
                 }
             }
             let regate_at = Instant::now() + self.inner.cfg.regate_interval;
-            let mut next_pending = Instant::now();
+            let mut last_retry: Option<Instant> = None;
             let session = Instant::now();
             loop {
-                if Instant::now() >= next_pending {
+                let retry_allowed_at = last_retry.map(|t| t + PENDING_RETRY_MIN_GAP);
+                let due = self.pending_due_at(retry_allowed_at)?;
+                if due.is_some_and(|d| d <= Instant::now()) {
                     if let Err(e) = self.retry_pending(false).await {
                         warn!("pending retry failed: {e}");
                     }
-                    next_pending = Instant::now() + Duration::from_secs(60);
+                    last_retry = Some(Instant::now());
                 }
                 let _ = self.with_index(|ix| ix.set_meta(meta::DAEMON_SEEN, &vaultfs::now_ms().to_string()));
-                let wake_at = regate_at.min(next_pending);
+                // Leave the longpoll open unless a pending row falls due or
+                // it is time to re-run the gate.
+                let retry_allowed_at = last_retry.map(|t| t + PENDING_RETRY_MIN_GAP);
+                let wake_at = match self.pending_due_at(retry_allowed_at)? {
+                    Some(d) => d.min(regate_at),
+                    None => regate_at,
+                };
                 let since = self.since()?;
                 let q = ChangesQuery {
                     since,
@@ -1165,6 +1363,8 @@ impl Engine {
                 let res = tokio::select! {
                     r = self.inner.couch.changes(&q) => Some(r),
                     _ = tokio::time::sleep_until(wake_at.into()) => None,
+                    // Network change or similar: reconnect and re-check now.
+                    _ = self.inner.nudge.notified() => None,
                     _ = shutdown.changed() => return Ok(()),
                 };
                 match res {
@@ -1217,6 +1417,17 @@ impl Engine {
         }
     }
 
+    /// When the earliest pending row is due, as an `Instant`, but not before
+    /// `not_before`. `None` when nothing is pending.
+    fn pending_due_at(&self, not_before: Option<Instant>) -> Result<Option<Instant>> {
+        let Some(due_ms) = self.with_index(|ix| ix.next_pending_due())? else {
+            return Ok(None);
+        };
+        let wait = Duration::from_millis((due_ms - vaultfs::now_ms()).max(0) as u64);
+        let at = Instant::now() + wait;
+        Ok(Some(not_before.map_or(at, |nb| at.max(nb))))
+    }
+
     /// Sleep, waking early on a nudge. Returns true on shutdown.
     async fn sleep_or_shutdown(&self, d: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
         tokio::select! {
@@ -1260,6 +1471,7 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
         dirty: ix.list_state(State::Dirty, 50)?,
         conflicted: ix.list_state(State::Conflicted, 50)?,
         pending: ix.pending(None)?,
+        unwritable: ix.list_state_with_note(State::Skipped, UNWRITABLE_NOTE, 200)?,
     })
 }
 
@@ -1269,11 +1481,35 @@ mod tests {
 
     #[test]
     fn ignore_rules() {
-        let r = parse_ignore("\\/\\.git\\/|[]|^Private/|[]|!\\.md$", false).unwrap();
+        let r = parse_ignore("\\/\\.git\\/|[]|^Private/|[]|!!\\.md$", false).unwrap();
         assert_eq!(r.len(), 3);
         assert!(r[0].re.is_match("a/.git/x"));
         assert!(r[1].re.is_match("private/x.md"), "case-insensitive by default");
         assert!(r[2].negate);
         assert!(parse_ignore("", false).unwrap().is_empty());
+    }
+
+    fn ignored(rules: &[IgnoreRule], path: &str) -> bool {
+        rules.iter().any(|r| r.re.is_match(path) != r.negate)
+    }
+
+    #[test]
+    fn ignore_rules_match_upstream_syntax() {
+        // A single `!` is part of the pattern, not a negation.
+        let r = parse_ignore("!draft", false).unwrap();
+        assert!(!r[0].negate);
+        assert!(ignored(&r, "notes/!draft.md"));
+        assert!(!ignored(&r, "notes/draft.md"));
+        // `!!` negates: everything that does not match is ignored.
+        let r = parse_ignore("!!^keep/", false).unwrap();
+        assert!(r[0].negate);
+        assert!(ignored(&r, "other/x.md"));
+        assert!(!ignored(&r, "keep/x.md"));
+        // Spaces and newlines are removed from the whole list before splitting.
+        let r = parse_ignore("^a b/ |[]|\n^c/\n|[]|  ", false).unwrap();
+        assert_eq!(r.len(), 2);
+        assert!(ignored(&r, "ab/x.md"));
+        assert!(!ignored(&r, "a b/x.md"));
+        assert!(ignored(&r, "c/x.md"));
     }
 }
