@@ -326,7 +326,13 @@ impl Engine {
 
     async fn connect_gate_inner(&self, adopt_tweaks: bool) -> Result<GateReport> {
         let couch = &self.inner.couch;
-        let root = couch.server_root().await?;
+        let root = match couch.server_root().await {
+            Ok(v) => v,
+            // A web page or a proxy's 404 instead of CouchDB's welcome JSON.
+            Err(RemoteError::Decode { .. }) => return Err(Refusal::NotCouchDb.into()),
+            Err(RemoteError::Http { status: 404 | 405, .. }) => return Err(Refusal::NotCouchDb.into()),
+            Err(e) => return Err(e.into()),
+        };
         if root.get("couchdb").and_then(Value::as_str) != Some("Welcome") {
             return Err(Refusal::NotCouchDb.into());
         }
@@ -1184,7 +1190,7 @@ impl Engine {
                             Err(e) => {
                                 self.record_error(&e);
                                 let wait = match &e {
-                                    EngineError::Refused(_) => Duration::from_secs(5),
+                                    EngineError::Refused(_) => Duration::from_secs(300),
                                     EngineError::Remote(_) => backoff.next_delay(),
                                     _ => return Err(e),
                                 };

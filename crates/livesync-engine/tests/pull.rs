@@ -344,6 +344,18 @@ async fn gates_fail_closed() {
     env.mock.state.lock().unwrap().root = json!({"minio": true});
     assert_eq!(refused(env.engine().connect_gate(false).await), Refusal::NotCouchDb);
 
+    // A web page at the server root.
+    let env = Env::new().await;
+    let couch = Couch::new(&RemoteConfig {
+        url: format!("{}/nowhere", env.mock.url),
+        database: DB.into(),
+        username: None,
+        password: None,
+    })
+    .unwrap();
+    let engine = Engine::open(couch, EngineConfig::new(env.vault(), env.dir.path().join("i.sqlite"))).unwrap();
+    assert_eq!(refused(engine.connect_gate(false).await), Refusal::NotCouchDb);
+
     // Missing milestone.
     let env = Env::new().await;
     env.mock
