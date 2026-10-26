@@ -18,7 +18,6 @@ import androidx.core.content.ContextCompat
 import no.nyta.livesync.Core
 import no.nyta.livesync.LiveSyncApp
 import no.nyta.livesync.R
-import no.nyta.livesync.core.ProfileConfig
 import no.nyta.livesync.core.RunState
 import no.nyta.livesync.core.StatusListener
 import no.nyta.livesync.ui.MainActivity
@@ -34,8 +33,6 @@ class SyncService : Service() {
     private lateinit var handler: Handler
     private var network: NetworkMonitor? = null
 
-    /** What each running engine was started with (worker thread only). */
-    private val started = mutableMapOf<String, ProfileConfig>()
     /** Profiles that could not be started, with the reason (worker thread only). */
     private val problems = mutableMapOf<String, String>()
     private var lastText: StatusSummary.Text = StatusSummary.Text("LiveSync", "Starting…", false)
@@ -55,6 +52,7 @@ class SyncService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        current = this
         worker = HandlerThread("livesync-service").apply { start() }
         handler = Handler(worker.looper)
         goForeground()
@@ -96,7 +94,7 @@ class SyncService : Service() {
         when (action) {
             ACTION_SYNC_NOW -> {
                 // A service started by this very intent has no engines yet.
-                if (started.isEmpty()) reconcile(core)
+                if (core.engine.activeProfiles().isEmpty()) reconcile(core)
                 val ids = profileId?.let { listOf(it) } ?: core.engine.activeProfiles()
                 for (id in ids) {
                     try {
@@ -115,7 +113,12 @@ class SyncService : Service() {
         updateNotification()
     }
 
-    /** Make the running engines match the profile store. */
+    /**
+     * Make the host's engines match the profile store. The host is the source
+     * of truth for what runs (it is shared with the UI and with any earlier
+     * instance of this service); starting a profile with unchanged settings
+     * is a no-op there.
+     */
     private fun reconcile(core: Core) {
         val profiles = try {
             app.profiles.all()
@@ -124,14 +127,18 @@ class SyncService : Service() {
             emptyList()
         }
         val wanted = profiles.filter { !it.paused }.associateBy { it.id }
-        for (id in started.keys.toList()) {
+        val active = try {
+            core.engine.activeProfiles().toSet()
+        } catch (e: Exception) {
+            emptySet()
+        }
+        for (id in active) {
             if (id !in wanted) {
                 try {
                     core.engine.stop(id)
                 } catch (e: Exception) {
                     core.log("stopping $id: ${e.message}", "error")
                 }
-                started.remove(id)
                 core.log("profile $id stopped")
             }
         }
@@ -144,13 +151,13 @@ class SyncService : Service() {
                 problems[p.id] = e.message ?: "no password"
                 continue
             }
-            if (started[p.id] == cfg) continue
-            if (!java.io.File(app.profiles.stateDir(p.id), "index.sqlite").exists()) holdFirstSyncWakeLock()
+            if (p.id !in active && !java.io.File(app.profiles.stateDir(p.id), "index.sqlite").exists()) {
+                holdFirstSyncWakeLock()
+            }
             try {
                 core.engine.start(cfg)
-                started[p.id] = cfg
                 problems.remove(p.id)
-                core.log("profile ${p.id} started (${if (p.pullOnly) "pull-only" else "two-way"})")
+                if (p.id !in active) core.log("profile ${p.id} started (${if (p.pullOnly) "pull-only" else "two-way"})")
             } catch (e: Exception) {
                 // LiveSyncException (refused, invalid) or InternalException (a bug).
                 problems[p.id] = e.message ?: e.javaClass.simpleName
@@ -269,19 +276,26 @@ class SyncService : Service() {
         handler.removeCallbacks(refresh)
         val core = app.core.getOrNull()
         handler.post {
+            // A newer instance (a quick pause then resume) owns the engines now;
+            // stopping them here would stop its work.
+            if (current !== this) return@post
             core?.log("service destroyed; stopping engines")
             try {
                 core?.engine?.stopAll()
             } catch (e: Exception) {
                 core?.log("stopping engines: ${e.message}", "error")
             }
-            started.clear()
+            if (current === this) current = null
         }
         worker.quitSafely()
         super.onDestroy()
     }
 
     companion object {
+        /** The newest instance; an older one's teardown leaves the engines alone. */
+        @Volatile
+        private var current: SyncService? = null
+
         const val NOTIFICATION_ID = 1
         const val REFRESH_MS = 60_000L
         const val FIRST_SYNC_WAKELOCK_MS = 20 * 60_000L

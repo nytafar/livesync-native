@@ -11,7 +11,8 @@ use crate::profile::{paths_overlap, ProfileConfig};
 use crate::status::{self, GateResult, ProfileStatus};
 use crate::{logging, LiveSyncError};
 use livesync_engine::engine::status_from_index;
-use livesync_engine::engine::AccessCheck;
+use livesync_engine::engine::{AccessCheck, STATE_LOCK};
+use livesync_engine::platform::{LockError, LockFile};
 use livesync_engine::{Engine, Index};
 use livesync_remote::Couch;
 use std::collections::HashMap;
@@ -49,6 +50,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// First and longest delay before reopening an engine that failed.
 const RETRY_FIRST: Duration = Duration::from_secs(15);
 const RETRY_MAX: Duration = Duration::from_secs(15 * 60);
+/// How long a stopped engine may take to let go of its state folder.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A run this long counts as healthy: the next failure starts the delays over.
 const HEALTHY_RUN: Duration = Duration::from_secs(10 * 60);
 
@@ -80,6 +83,9 @@ struct Shared {
     wake: Notify,
     listener: Listener,
     access: Access,
+    /// The running engine task, so a stop that times out can cancel it too
+    /// (the supervisor alone is not enough: the task would run on, detached).
+    run_abort: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl Shared {
@@ -111,6 +117,9 @@ struct Slot {
 pub struct LiveSync {
     rt: tokio::runtime::Runtime,
     slots: Mutex<HashMap<String, Slot>>,
+    /// Serialises start, stop and the full-fetch restart: callers come from
+    /// several threads (the service's worker, the UI).
+    lifecycle: Mutex<()>,
     listener: Listener,
     access: Access,
 }
@@ -169,7 +178,9 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
                     }
                     .in_current_span(),
                 );
+                *lock(&shared.run_abort) = Some(run.abort_handle());
                 let result = run.await;
+                *lock(&shared.run_abort) = None;
                 *lock(&shared.engine) = None;
                 if *stop.borrow() {
                     break;
@@ -199,6 +210,25 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
     shared.set_state(RunState::Stopped, None);
 }
 
+/// Wait until no engine holds the state folder's lock (the engine's own
+/// `flock` on `lsync.lock`, which conflicts within one process too).
+fn wait_released(state_dir: &str, timeout: Duration) -> bool {
+    let path = Path::new(state_dir).join(STATE_LOCK);
+    if !Path::new(state_dir).exists() {
+        return true;
+    }
+    let end = Instant::now() + timeout;
+    loop {
+        match LockFile::try_acquire(&path) {
+            Ok(_held) => return true,
+            Err(LockError::Busy(_)) if Instant::now() < end => std::thread::sleep(Duration::from_millis(100)),
+            Err(LockError::Busy(_)) => return false,
+            // Cannot lock at all (should not happen in app storage): nothing to wait for.
+            Err(_) => return true,
+        }
+    }
+}
+
 impl LiveSync {
     fn slot_shared(&self, id: &str) -> Option<Arc<Shared>> {
         lock(&self.slots).get(id).map(|s| s.shared.clone())
@@ -212,7 +242,10 @@ impl LiveSync {
             })
     }
 
-    fn stop_slot(&self, slot: Slot) {
+    /// Stop a slot's supervisor and engine, and wait until the engine has
+    /// let go of its state folder. Returns false if it still holds it after
+    /// the grace period (the caller must not delete the state then).
+    fn stop_slot(&self, slot: Slot) -> bool {
         let _ = slot.stop.send(true);
         let mut task = slot.task;
         let finished = self
@@ -220,61 +253,43 @@ impl LiveSync {
             .block_on(async { tokio::time::timeout(STOP_TIMEOUT, &mut task).await.is_ok() });
         if !finished {
             warn!(
-                "profile {}: the engine did not stop in time; abandoning it",
-                slot.shared.cfg.id
+                "profile {}: the engine did not stop within {}s; cancelling it",
+                slot.shared.cfg.id,
+                STOP_TIMEOUT.as_secs()
             );
+            // Cancelling is like a crash without the exit: every batch and
+            // pass is crash-safe (`since` only moves after a whole batch).
+            if let Some(run) = lock(&slot.shared.run_abort).take() {
+                run.abort();
+            }
             task.abort();
             *lock(&slot.shared.engine) = None;
-            slot.shared
-                .set_state(RunState::Stopped, Some("abandoned while stopping".into()));
         }
-    }
-}
-
-#[uniffi::export]
-impl LiveSync {
-    /// Create the host. `log_dir` receives `livesync.log` (rotated at 4 MB).
-    #[uniffi::constructor]
-    pub fn new(log_dir: String) -> Result<Arc<Self>, LiveSyncError> {
-        logging::init();
-        if !log_dir.is_empty() {
-            logging::set_log_dir(Path::new(&log_dir)).map_err(|e| LiveSyncError::Other {
-                msg: format!("cannot open the log folder: {e}"),
-            })?;
+        let released = wait_released(&slot.shared.cfg.state_dir, RELEASE_TIMEOUT);
+        if !released {
+            error!(
+                "profile {}: the engine still holds its state folder {}s after stopping",
+                slot.shared.cfg.id,
+                RELEASE_TIMEOUT.as_secs()
+            );
         }
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("livesync")
-            .enable_all()
-            .build()
-            .map_err(|e| LiveSyncError::Other { msg: e.to_string() })?;
-        info!("livesync core {} ready", env!("CARGO_PKG_VERSION"));
-        Ok(Arc::new(LiveSync {
-            rt,
-            slots: Mutex::new(HashMap::new()),
-            listener: Arc::new(Mutex::new(None)),
-            access: Arc::new(Mutex::new(None)),
-        }))
+        if !finished {
+            slot.shared.set_state(
+                RunState::Stopped,
+                Some(if released { "cancelled while stopping" } else { "still winding down" }.into()),
+            );
+        }
+        released
     }
 
-    /// Install the vault access check every engine asks before a pass that
-    /// could delete remote documents (see [`VaultAccess`]).
-    pub fn set_vault_access(&self, access: Box<dyn VaultAccess>) {
-        *lock(&self.access) = Some(Arc::from(access));
-    }
-
-    /// Receive run-state changes of every profile.
-    pub fn set_listener(&self, listener: Box<dyn StatusListener>) {
-        *lock(&self.listener) = Some(Arc::from(listener));
-    }
-
-    /// Start (or restart with new settings) the engine for a profile. Refused
-    /// when another running profile's vault folder is the same as, inside or
-    /// above this one, or shares its state folder.
-    pub fn start(&self, cfg: ProfileConfig) -> Result<(), LiveSyncError> {
+    fn start_locked(&self, cfg: ProfileConfig) -> Result<(), LiveSyncError> {
         cfg.validate().map_err(|msg| LiveSyncError::Invalid { msg })?;
         let previous = {
             let mut slots = lock(&self.slots);
+            if slots.get(&cfg.id).is_some_and(|s| s.shared.cfg == cfg) {
+                // Already running with exactly these settings.
+                return Ok(());
+            }
             for (id, other) in slots.iter() {
                 if *id == cfg.id {
                     continue;
@@ -308,25 +323,79 @@ impl LiveSync {
             wake: Notify::new(),
             listener: self.listener.clone(),
             access: self.access.clone(),
+            run_abort: Mutex::new(None),
         });
         let span = tracing::info_span!("profile", id = %cfg.id);
         let task = self.rt.spawn(supervise(shared.clone(), rx).instrument(span));
-        self.slots
-            .lock()
-            .unwrap()
-            .insert(cfg.id.clone(), Slot { shared, stop: tx, task });
+        lock(&self.slots).insert(cfg.id.clone(), Slot { shared, stop: tx, task });
         Ok(())
     }
 
-    /// Stop a profile's engine (waits up to 15 s for it to wind down).
-    pub fn stop(&self, profile_id: String) {
-        let slot = lock(&self.slots).remove(&profile_id);
-        if let Some(slot) = slot {
-            self.stop_slot(slot);
+    fn stop_locked(&self, profile_id: &str) -> bool {
+        let slot = lock(&self.slots).remove(profile_id);
+        match slot {
+            Some(slot) => self.stop_slot(slot),
+            None => true,
         }
+    }
+}
+
+#[uniffi::export]
+impl LiveSync {
+    /// Create the host. `log_dir` receives `livesync.log` (rotated at 4 MB).
+    #[uniffi::constructor]
+    pub fn new(log_dir: String) -> Result<Arc<Self>, LiveSyncError> {
+        logging::init();
+        if !log_dir.is_empty() {
+            logging::set_log_dir(Path::new(&log_dir)).map_err(|e| LiveSyncError::Other {
+                msg: format!("cannot open the log folder: {e}"),
+            })?;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("livesync")
+            .enable_all()
+            .build()
+            .map_err(|e| LiveSyncError::Other { msg: e.to_string() })?;
+        info!("livesync core {} ready", env!("CARGO_PKG_VERSION"));
+        Ok(Arc::new(LiveSync {
+            rt,
+            slots: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
+            listener: Arc::new(Mutex::new(None)),
+            access: Arc::new(Mutex::new(None)),
+        }))
+    }
+
+    /// Install the vault access check every engine asks before a pass that
+    /// could delete remote documents (see [`VaultAccess`]).
+    pub fn set_vault_access(&self, access: Box<dyn VaultAccess>) {
+        *lock(&self.access) = Some(Arc::from(access));
+    }
+
+    /// Receive run-state changes of every profile.
+    pub fn set_listener(&self, listener: Box<dyn StatusListener>) {
+        *lock(&self.listener) = Some(Arc::from(listener));
+    }
+
+    /// Start (or restart with new settings) the engine for a profile. Refused
+    /// when another running profile's vault folder is the same as, inside or
+    /// above this one, or shares its state folder.
+    pub fn start(&self, cfg: ProfileConfig) -> Result<(), LiveSyncError> {
+        let _serial = lock(&self.lifecycle);
+        self.start_locked(cfg)
+    }
+
+    /// Stop a profile's engine: wait up to 15 s for it to wind down, cancel
+    /// it after that, and wait until it let go of its state folder. Returns
+    /// false if it still holds the folder (do not delete the state then).
+    pub fn stop(&self, profile_id: String) -> bool {
+        let _serial = lock(&self.lifecycle);
+        self.stop_locked(&profile_id)
     }
 
     pub fn stop_all(&self) {
+        let _serial = lock(&self.lifecycle);
         let slots: Vec<Slot> = lock(&self.slots).drain().map(|(_, s)| s).collect();
         for s in &slots {
             let _ = s.stop.send(true);
@@ -461,6 +530,9 @@ impl LiveSync {
     /// device resolved. This is how a milestone lock without a rebuild is
     /// cleared. The engine is restarted.
     pub fn fetch_from_remote(&self, profile_id: String) -> Result<(), LiveSyncError> {
+        // Held throughout, so no start or stop (a pause, a switch to
+        // pull-only) can land between taking the slot down and restarting it.
+        let _serial = lock(&self.lifecycle);
         let slot = lock(&self.slots).remove(&profile_id);
         let Some(slot) = slot else {
             return Err(LiveSyncError::NotRunning {
@@ -468,14 +540,19 @@ impl LiveSync {
             });
         };
         let cfg = slot.shared.cfg.clone();
-        self.stop_slot(slot);
+        if !self.stop_slot(slot) {
+            self.start_locked(cfg)?;
+            return Err(LiveSyncError::Busy {
+                msg: "the engine did not stop; the full fetch was not scheduled".into(),
+            });
+        }
         let r = open_engine(&cfg, &self.access).and_then(|e| Ok(e.request_full_fetch()?));
         if let Err(e) = &r {
             warn!("profile {profile_id}: full fetch not scheduled: {e}");
         } else {
             info!("profile {profile_id}: full fetch scheduled");
         }
-        self.start(cfg)?;
+        self.start_locked(cfg)?;
         r
     }
 

@@ -16,7 +16,7 @@ pub enum ScopeKind {
 
 /// Everything one engine needs. The app resolves the password from its
 /// SecretStore just before handing this over; it is never stored here.
-#[derive(Clone, uniffi::Record)]
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ProfileConfig {
     /// Stable profile ID (also keys the app's secret and state folder).
     pub id: String,

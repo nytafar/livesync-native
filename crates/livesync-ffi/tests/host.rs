@@ -319,3 +319,78 @@ fn a_failing_listener_does_not_stop_syncing() {
     env.host.stop("thr".into());
     assert_eq!(env.status(&p).run_state, RunState::Stopped);
 }
+
+#[test]
+fn stop_returns_once_the_state_folder_is_free_and_identical_starts_are_no_ops() {
+    let env = Env::new();
+    let rec = Recorder::default();
+    env.host.set_listener(Box::new(rec.clone()));
+    env.mock.put_text("s.md", &["s"]);
+    let p = env.profile("st", "vault-st");
+    env.host.start(p.clone()).unwrap();
+    wait_until("s.md", Duration::from_secs(20), || read(&p, "s.md").is_some());
+    let starts = || rec.0.lock().unwrap().iter().filter(|(_, s)| *s == RunState::Starting).count();
+    assert_eq!(starts(), 1);
+    // The service re-applies the same settings on every reconcile: no restart.
+    env.host.start(p.clone()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(starts(), 1, "an identical start restarted the engine");
+    // Changed settings do restart.
+    let mut q = p.clone();
+    q.device_name = "renamed".into();
+    env.host.start(q).unwrap();
+    wait_until("the restart", Duration::from_secs(20), || starts() == 2);
+
+    assert!(env.host.stop("st".into()), "stop reports the state folder as released");
+    // Nothing holds the state lock any more: an engine opens on it at once.
+    let lock = Path::new(&p.state_dir).join("lsync.lock");
+    assert!(livesync_engine::platform::LockFile::try_acquire(&lock).is_ok());
+    assert!(env.host.stop("never-started".into()));
+}
+
+#[test]
+fn fetch_from_remote_restarts_with_the_same_settings() {
+    let env = Env::new();
+    env.mock.put_text("f.md", &["f"]);
+    let p = env.profile("fx", "vault-fx");
+    env.host.start(p.clone()).unwrap();
+    wait_until("f.md", Duration::from_secs(20), || read(&p, "f.md").is_some());
+    env.host.fetch_from_remote("fx".into()).unwrap();
+    assert_eq!(env.host.active_profiles(), vec!["fx".to_string()]);
+    wait_until("running again", Duration::from_secs(20), || env.status(&p).run_state == RunState::Running);
+    assert!(env.status(&p).pull_only, "still pull-only");
+    wait_until("caught up again", Duration::from_secs(20), || !env.status(&p).needs_full_fetch);
+    assert!(env.mock.writes().is_empty(), "pull-only fetch wrote: {:?}", env.mock.writes());
+    env.host.stop_all();
+}
+
+#[test]
+fn stop_cancels_an_engine_stuck_on_the_network_and_frees_its_state() {
+    let env = Env::new();
+    // Accepts connections and never answers: the gate request hangs.
+    let hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = hole.local_addr().unwrap();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let keep = held.clone();
+    std::thread::spawn(move || {
+        for c in hole.incoming().flatten() {
+            keep.lock().unwrap().push(c);
+        }
+    });
+    let mut p = env.profile("hole", "vault-hole");
+    p.url = format!("http://{addr}");
+    env.host.start(p.clone()).unwrap();
+    wait_until("the gate request", Duration::from_secs(10), || !held.lock().unwrap().is_empty());
+    let t0 = Instant::now();
+    assert!(env.host.stop("hole".into()), "released");
+    let took = t0.elapsed();
+    assert!(took >= Duration::from_secs(14), "the stop did wait first ({took:?})");
+    assert!(took < Duration::from_secs(40), "and then cancelled ({took:?})");
+    let lock = Path::new(&p.state_dir).join("lsync.lock");
+    assert!(livesync_engine::platform::LockFile::try_acquire(&lock).is_ok());
+    assert_eq!(env.status(&p).run_state, RunState::Stopped);
+    // And it starts again on the same state folder.
+    env.host.start(p.clone()).unwrap();
+    wait_until("running again", Duration::from_secs(10), || env.status(&p).run_state == RunState::Running);
+    env.host.stop_all();
+}
