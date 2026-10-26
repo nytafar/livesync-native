@@ -96,7 +96,14 @@ async fn pull_materialises_files_and_skips_the_rest() {
     m.soft_delete("gone.md");
     // Conflicted document: the winner is written and marked.
     let children = m.put_chunks(&["winner"]);
-    m.put(json!({"_id": "conflict.md", "path": "conflict.md", "type": "plain", "children": children, "mtime": 1, "ctime": 1, "size": 6, "eden": {}, "_conflicts": ["2-abc"]}));
+    let loser = m.put_chunks(&["loser!"]);
+    let doc = json!({"_id": "conflict.md", "path": "conflict.md", "type": "plain", "children": children, "mtime": 1, "ctime": 1, "size": 6, "eden": {}});
+    let first = m.put(doc.clone());
+    m.put(doc.clone());
+    m.put(doc.clone()); // the winner is two revisions deep, the branch one
+    let mut other = doc;
+    other["children"] = json!(loser);
+    m.put_branch(other, &first);
 
     let engine = env.engine_with(|c| {
         c.ignore_regex = Some("^private/".into());
@@ -319,10 +326,17 @@ async fn gates_fail_closed() {
         Refusal::UnknownFeatures(_)
     ));
 
-    // Locked milestone that does not list us.
+    // Locked milestone that does not list us: an index that already synced
+    // with this remote is refused (a lock without a rebuild is a human's call)...
     let env = Env::new().await;
+    env.engine().pull_once().await.unwrap();
     env.mock.update_milestone(|m| m["locked"] = json!(true));
     assert_eq!(refused(env.engine().connect_gate(false).await), Refusal::Locked);
+    // ... while a fresh index may fetch, and is marked resolved afterwards.
+    let env = Env::new().await;
+    env.mock.update_milestone(|m| m["locked"] = json!(true));
+    let g = env.engine().connect_gate(false).await.unwrap();
+    assert!(g.fetch_to_resolve && g.needs_full_fetch);
 
     // Unsupported remote settings.
     for (k, v) in [

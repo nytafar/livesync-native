@@ -11,6 +11,9 @@ pub enum State {
     Dirty,
     Conflicted,
     Skipped,
+    /// The local file was moved out of the folder scope (or into a dot-folder);
+    /// the remote document is left alone.
+    OutOfScope,
 }
 
 impl State {
@@ -20,6 +23,7 @@ impl State {
             State::Dirty => "dirty",
             State::Conflicted => "conflicted",
             State::Skipped => "skipped",
+            State::OutOfScope => "out_of_scope",
         }
     }
 
@@ -28,6 +32,7 @@ impl State {
             "clean" => State::Clean,
             "dirty" => State::Dirty,
             "conflicted" => State::Conflicted,
+            "out_of_scope" => State::OutOfScope,
             _ => State::Skipped,
         }
     }
@@ -48,6 +53,16 @@ pub struct FileRow {
     pub state: State,
     /// Human-readable reason for dirty/conflicted/skipped.
     pub note: Option<String>,
+}
+
+/// A local file the push side cannot sync (no document involved), such as a
+/// case collision between two local names or a file over the size limit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LocalIssue {
+    pub path: String,
+    pub kind: String,
+    pub note: String,
+    pub seen_ms: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -73,7 +88,8 @@ CREATE TABLE IF NOT EXISTS files (
     disk_size     INTEGER,
     disk_hash     TEXT,
     state         TEXT NOT NULL,
-    note          TEXT
+    note          TEXT,
+    fold          TEXT
 );
 CREATE INDEX IF NOT EXISTS files_state ON files(state);
 CREATE TABLE IF NOT EXISTS meta (
@@ -87,9 +103,22 @@ CREATE TABLE IF NOT EXISTS pending (
     attempts        INTEGER NOT NULL DEFAULT 0,
     next_attempt_ms INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS local_issues (
+    path    TEXT PRIMARY KEY,
+    kind    TEXT NOT NULL,
+    note    TEXT NOT NULL,
+    seen_ms INTEGER NOT NULL
+);
 "#;
 
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "2";
+
+/// The key two paths collide on when the vault's filesystem folds case and
+/// Unicode normalisation: JavaScript lower-casing, then NFC.
+pub fn fold_key(path: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    livesync_model::path::js_to_lower_case(path).nfc().collect()
+}
 
 fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<FileRow> {
     let children: String = r.get(3)?;
@@ -127,10 +156,34 @@ impl Index {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(SCHEMA)?;
         let idx = Index { conn };
-        if idx.get_meta("schema_version")?.is_none() {
+        let version = idx.get_meta("schema_version")?;
+        if version.as_deref() == Some("1") {
+            idx.migrate_v1()?;
+        }
+        idx.conn
+            .execute_batch("CREATE INDEX IF NOT EXISTS files_fold ON files(fold);")?;
+        if version.as_deref() != Some(SCHEMA_VERSION) {
             idx.set_meta("schema_version", SCHEMA_VERSION)?;
         }
         Ok(idx)
+    }
+
+    /// v1 -> v2: the `fold` column (and the `local_issues` table, created above).
+    fn migrate_v1(&self) -> rusqlite::Result<()> {
+        let has_fold = self.conn.prepare("SELECT fold FROM files LIMIT 0").is_ok();
+        if !has_fold {
+            self.conn.execute_batch("ALTER TABLE files ADD COLUMN fold TEXT;")?;
+        }
+        let paths: Vec<String> = {
+            let mut st = self.conn.prepare("SELECT path FROM files")?;
+            let rows = st.query_map([], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        for p in paths {
+            tx.execute("UPDATE files SET fold = ?1 WHERE path = ?2", params![fold_key(&p), p])?;
+        }
+        tx.commit()
     }
 
     pub fn get_meta(&self, key: &str) -> rusqlite::Result<Option<String>> {
@@ -178,11 +231,11 @@ impl Index {
         )?;
         tx.execute(
             &format!(
-                "INSERT INTO files({COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO files({COLS}, fold) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(path) DO UPDATE SET doc_id = excluded.doc_id, base_rev = excluded.base_rev,
                    base_children = excluded.base_children, disk_mtime = excluded.disk_mtime,
                    disk_size = excluded.disk_size, disk_hash = excluded.disk_hash,
-                   state = excluded.state, note = excluded.note"
+                   state = excluded.state, note = excluded.note, fold = excluded.fold"
             ),
             params![
                 row.path,
@@ -194,9 +247,83 @@ impl Index {
                 row.disk_hash,
                 row.state.as_str(),
                 row.note,
+                fold_key(&row.path),
             ],
         )?;
         tx.commit()
+    }
+
+    /// Rows whose path folds to the same key as `path`, other than `doc_id`'s.
+    pub fn fold_collisions(&self, path: &str, doc_id: &str) -> rusqlite::Result<Vec<FileRow>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM files WHERE fold = ?1 AND doc_id <> ?2 ORDER BY path"
+        ))?;
+        let rows = st.query_map(params![fold_key(path), doc_id], row_from)?;
+        rows.collect()
+    }
+
+    /// Rows at `prefix` itself or below `prefix/`.
+    pub fn rows_under(&self, prefix: &str) -> rusqlite::Result<Vec<FileRow>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM files WHERE path = ?1 OR substr(path, 1, length(?1) + 1) = ?1 || '/' ORDER BY path"
+        ))?;
+        let rows = st.query_map([prefix], row_from)?;
+        rows.collect()
+    }
+
+    pub fn delete_path(&self, path: &str) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM files WHERE path = ?1", [path])?;
+        Ok(())
+    }
+
+    pub fn set_issue(&self, path: &str, kind: &str, note: &str, now_ms: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO local_issues(path, kind, note, seen_ms) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET kind = excluded.kind, note = excluded.note, seen_ms = excluded.seen_ms",
+            params![path, kind, note, now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_issue(&self, path: &str) -> rusqlite::Result<()> {
+        self.conn.execute("DELETE FROM local_issues WHERE path = ?1", [path])?;
+        Ok(())
+    }
+
+    /// Drop issues for paths a full scan no longer reports.
+    pub fn retain_issues(&self, keep: &std::collections::HashSet<String>) -> rusqlite::Result<()> {
+        for i in self.issues()? {
+            if !keep.contains(&i.path) {
+                self.clear_issue(&i.path)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn issues(&self) -> rusqlite::Result<Vec<LocalIssue>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT path, kind, note, seen_ms FROM local_issues ORDER BY path")?;
+        let rows = st.query_map([], |r| {
+            Ok(LocalIssue {
+                path: r.get(0)?,
+                kind: r.get(1)?,
+                note: r.get(2)?,
+                seen_ms: r.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Queue a document to be fetched again at once (for example after a
+    /// local deletion was not propagated because the remote moved on).
+    pub fn add_pending_now(&self, doc_id: &str, reason: &str, now_ms: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending(doc_id, rev, reason, attempts, next_attempt_ms) VALUES (?1, NULL, ?2, 0, ?3)
+             ON CONFLICT(doc_id) DO UPDATE SET reason = excluded.reason, next_attempt_ms = excluded.next_attempt_ms",
+            params![doc_id, reason, now_ms],
+        )?;
+        Ok(())
     }
 
     pub fn delete_doc(&self, doc_id: &str) -> rusqlite::Result<()> {
@@ -241,7 +368,7 @@ impl Index {
     pub fn reset_for_rebuild(&self) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("UPDATE files SET base_rev = NULL, base_children = '[]'", [])?;
-        tx.execute("DELETE FROM files WHERE state = 'skipped'", [])?;
+        tx.execute("DELETE FROM files WHERE state IN ('skipped', 'out_of_scope')", [])?;
         tx.execute("DELETE FROM pending", [])?;
         tx.execute("DELETE FROM meta WHERE key = 'since'", [])?;
         tx.commit()
@@ -334,6 +461,39 @@ mod tests {
         assert!(ix.by_doc(".obsidian/x").unwrap().is_none());
         assert!(ix.get_meta("since").unwrap().is_none());
         assert!(ix.pending(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fold_and_issues() {
+        let ix = Index::open_in_memory().unwrap();
+        ix.upsert(&row("Notes/Café.md", "notes/café.md")).unwrap();
+        // NFD spelling and other case fold to the same key.
+        let other = "notes/cafe\u{301}.md";
+        assert_eq!(ix.fold_collisions(other, "x").unwrap().len(), 1);
+        assert!(ix.fold_collisions("Notes/Café.md", "notes/café.md").unwrap().is_empty());
+        assert_eq!(ix.rows_under("Notes").unwrap().len(), 1);
+        assert!(ix.rows_under("Note").unwrap().is_empty());
+        ix.set_issue("a.md", "case-collision", "x", 1).unwrap();
+        ix.set_issue("b.md", "too-large", "y", 1).unwrap();
+        ix.retain_issues(&["b.md".to_string()].into_iter().collect()).unwrap();
+        assert_eq!(ix.issues().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migrates_v1_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE files (path TEXT PRIMARY KEY, doc_id TEXT NOT NULL UNIQUE, base_rev TEXT,
+               base_children TEXT NOT NULL DEFAULT '[]', disk_mtime INTEGER, disk_size INTEGER,
+               disk_hash TEXT, state TEXT NOT NULL, note TEXT);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('schema_version', '1');
+             INSERT INTO files(path, doc_id, state) VALUES ('A.md', 'a.md', 'clean');",
+        )
+        .unwrap();
+        let ix = Index::init(conn).unwrap();
+        assert_eq!(ix.get_meta("schema_version").unwrap().as_deref(), Some(SCHEMA_VERSION));
+        assert_eq!(ix.fold_collisions("a.MD", "other").unwrap().len(), 1);
     }
 
     #[test]

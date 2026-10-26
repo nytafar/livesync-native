@@ -1,27 +1,35 @@
-//! Gate evaluation, the pull loop and the pull-only daemon.
+//! Gate evaluation, the pull loop, the daemons (pull-only and two-way) and
+//! milestone registration. The push side lives in `push.rs`.
 
-use crate::index::{FileRow, Index, PendingRow, State};
+use crate::fsrules::{FsRules, PROBED_CHARS};
+use crate::index::{FileRow, Index, LocalIssue, PendingRow, State};
 use crate::vaultfs::{self, DiskState, Expect, LockError, LockFile, RemoveOutcome, WriteError};
 use futures::stream::{self, StreamExt};
 use livesync_model::chunk::chunk_id_xxhash64;
 use livesync_model::codec::{self, CodecError};
 use livesync_model::doc::{classify_doc, Classified, MILESTONE_LOCAL_ID, SYNC_PARAMS_LOCAL_ID, VERSION_DOC_ID};
 use livesync_model::gate::{self, Milestone, Refusal};
+use livesync_model::milestone::{register_node, DeviceInfo};
 use livesync_model::path::{classify_path, is_internal_id, PathSkip};
+use livesync_model::scope::Scope;
+use livesync_model::splitter::SplitParams;
 use livesync_model::{FileDoc, FileKind};
-use livesync_remote::{Backoff, ChangeRow, ChangesQuery, Couch, DocFetch, RemoteError};
+use livesync_remote::{Backoff, ChangeRow, ChangesQuery, Couch, DocFetch, PutOutcome, RemoteError};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
+use meta_keys as meta;
+
 /// Keys used in the index `meta` table.
-mod meta {
+pub(crate) mod meta_keys {
     pub const SINCE: &str = "since";
     pub const REMOTE: &str = "remote";
     pub const NODE_ID: &str = "node_id";
@@ -36,11 +44,30 @@ mod meta {
     pub const REBUILD_AT: &str = "rebuild_detected_ms";
     pub const DAEMON_SEEN: &str = "daemon_heartbeat_ms";
     pub const VAULT: &str = "vault_path";
+    /// The folder scope the index was last synced with (JSON).
+    pub const SCOPE: &str = "scope";
+    /// The probed filesystem rules (JSON).
+    pub const FS_RULES: &str = "fs_rules";
+    /// Set when a full fetch is owed: a fresh index, a rebuild seen on the
+    /// remote, or an explicit `request_full_fetch`. Cleared once a pull has
+    /// caught up with the remote (after the quiet wait in two-way mode).
+    pub const NEEDS_FETCH: &str = "needs_full_fetch";
+    /// Set when a lock was let through for a full fetch; cleared once this
+    /// node is marked resolved (`accepted_nodes`), which only the two-way
+    /// side does.
+    pub const RESOLVE_OWED: &str = "resolve_owed";
+    /// When the node was last registered in the milestone.
+    pub const REGISTERED: &str = "registered_ms";
+    pub const LAST_PUSH: &str = "last_push_ms";
+    /// A safety stop that needs a human (for example a mass deletion).
+    pub const SAFETY_STOP: &str = "safety_stop";
 }
 
 /// Note prefix (and status filter) for documents whose names the vault's
 /// filesystem cannot hold.
 pub const UNWRITABLE_NOTE: &str = "unwritable name";
+/// Note prefix for documents skipped by the case-collision guard.
+pub const COLLISION_NOTE: &str = "case collision with";
 
 /// Lock file in the state directory (next to the index).
 pub const STATE_LOCK: &str = "lsync.lock";
@@ -72,10 +99,36 @@ pub struct EngineConfig {
     /// Memory budget for in-flight chunk data, in MiB.
     pub memory_budget_mb: usize,
     /// Skip names with characters FAT-style storage refuses (`" * : < > ? \ |`
-    /// and control characters) without trying them. `None`: on when the vault
-    /// is on Android shared storage. Names the filesystem rejects at write
-    /// time are skipped either way.
+    /// and control characters) without trying them. `None`: as probed on the
+    /// vault's filesystem at open. Names the filesystem rejects at write time
+    /// are skipped either way.
     pub restrict_names: Option<bool>,
+    /// Treat the vault's filesystem as folding case and Unicode
+    /// normalisation (`Some(true)`) or not. `None`: as probed.
+    pub case_insensitive: Option<bool>,
+    /// Folder scope (spec "Folder scope"). Changing it means opening a new
+    /// engine; the change is reconciled at the next sync.
+    pub scope: Scope,
+    /// When the scope narrows, also remove the local copies of files that
+    /// fell out of it (clean ones only; the remote is never touched).
+    pub remove_out_of_scope_copies: bool,
+    /// A changed file counts as settled once its size and mtime were stable
+    /// this long.
+    pub settle: Duration,
+    /// Full rescan interval of the two-way daemon.
+    pub rescan_interval: Duration,
+    /// Use the platform's file watcher in the two-way daemon (otherwise
+    /// periodic rescans only).
+    pub watch: bool,
+    /// Device name advertised in the milestone (default: `lsync-<host>`).
+    pub device_name: Option<String>,
+    /// After a rebuild elsewhere, the remote's update sequence must stay
+    /// unchanged this long before the refetch counts as complete (the
+    /// rebuilding device uploads for a while after the lock).
+    pub rebuild_quiet: Duration,
+    /// Allow a single sync pass to delete more than half of the tracked files
+    /// (otherwise it stops and asks, in case the vault folder vanished).
+    pub allow_mass_delete: bool,
 }
 
 impl EngineConfig {
@@ -90,6 +143,15 @@ impl EngineConfig {
             regate_interval: Duration::from_secs(300),
             memory_budget_mb: 160,
             restrict_names: None,
+            case_insensitive: None,
+            scope: Scope::all(),
+            remove_out_of_scope_copies: false,
+            settle: Duration::from_secs(2),
+            rescan_interval: Duration::from_secs(15 * 60),
+            watch: true,
+            device_name: None,
+            rebuild_quiet: Duration::from_secs(30),
+            allow_mass_delete: false,
         }
     }
 }
@@ -110,7 +172,7 @@ pub enum EngineError {
 }
 
 impl EngineError {
-    fn other(e: impl std::fmt::Display) -> Self {
+    pub(crate) fn other(e: impl std::fmt::Display) -> Self {
         EngineError::Other(e.to_string())
     }
 }
@@ -132,6 +194,18 @@ pub struct GateReport {
     pub salt_present: bool,
     pub max_size_mb: u64,
     pub case_sensitive: bool,
+    /// Locked against this node, but a full fetch may proceed (fresh index or
+    /// rebuild seen); the node is marked resolved after it.
+    pub fetch_to_resolve: bool,
+    /// A full fetch is still owed before pushing (see `fetch_to_resolve`).
+    pub needs_full_fetch: bool,
+}
+
+/// Result of [`Engine::sync_once`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SyncReport {
+    pub pull: PullReport,
+    pub push: crate::push::PushReport,
 }
 
 /// Counters for one pull (or one daemon session).
@@ -153,7 +227,42 @@ pub struct PullReport {
     pub bytes_written: u64,
     pub size_mismatches: u64,
     pub chunk_id_mismatches: u64,
+    /// Local edits that landed while a remote change was being written, put back.
+    pub restored_edits: u64,
     pub elapsed_ms: u64,
+}
+
+impl PullReport {
+    /// `self - before`, for per-batch log lines.
+    fn delta(&self, before: &PullReport) -> PullReport {
+        let mut skipped = self.skipped.clone();
+        for (k, v) in &before.skipped {
+            if let Some(x) = skipped.get_mut(k) {
+                *x = x.saturating_sub(*v);
+            }
+        }
+        skipped.retain(|_, v| *v > 0);
+        PullReport {
+            batches: self.batches - before.batches,
+            changes: self.changes - before.changes,
+            written: self.written - before.written,
+            adopted: self.adopted - before.adopted,
+            unchanged: self.unchanged - before.unchanged,
+            deleted: self.deleted - before.deleted,
+            dirty: self.dirty - before.dirty,
+            conflicted: self.conflicted - before.conflicted,
+            pending: self.pending - before.pending,
+            skipped,
+            ignored_docs: self.ignored_docs - before.ignored_docs,
+            chunks_fetched: self.chunks_fetched - before.chunks_fetched,
+            chunk_bytes: self.chunk_bytes - before.chunk_bytes,
+            bytes_written: self.bytes_written - before.bytes_written,
+            size_mismatches: self.size_mismatches - before.size_mismatches,
+            chunk_id_mismatches: self.chunk_id_mismatches - before.chunk_id_mismatches,
+            restored_edits: self.restored_edits - before.restored_edits,
+            elapsed_ms: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,6 +286,18 @@ pub struct Status {
     pub pending: Vec<PendingRow>,
     /// Skipped because the vault's filesystem cannot hold the name.
     pub unwritable: Vec<FileRow>,
+    /// Skipped because another file's name folds to the same one here.
+    pub collisions: Vec<FileRow>,
+    /// Moved out of the folder scope locally; the remote document is kept.
+    pub out_of_scope: Vec<FileRow>,
+    /// Local files the push side cannot sync.
+    pub local_issues: Vec<LocalIssue>,
+    pub scope: Option<String>,
+    pub fs_rules: Option<String>,
+    pub registered_ms: Option<i64>,
+    pub last_push_ms: Option<i64>,
+    pub needs_full_fetch: bool,
+    pub safety_stop: Option<String>,
 }
 
 /// One upstream `syncIgnoreRegEx` entry.
@@ -208,28 +329,52 @@ fn parse_ignore(src: &str, case_sensitive: bool) -> std::result::Result<Vec<Igno
 }
 
 #[derive(Debug, Clone)]
-struct Runtime {
-    max_size_bytes: Option<u64>,
+pub(crate) struct Runtime {
+    pub(crate) max_size_bytes: Option<u64>,
     ignore: Vec<IgnoreRule>,
+    /// Document IDs keep their case (`handleFilenameCaseSensitive`).
+    pub(crate) case_sensitive_ids: bool,
+    pub(crate) split: SplitParams,
+    /// The PREFERRED tweaks, advertised as ours when registering.
+    pub(crate) preferred: Map<String, Value>,
 }
 
-struct Inner {
-    couch: Couch,
-    cfg: EngineConfig,
+impl Runtime {
+    pub(crate) fn ignored(&self, path: &str) -> bool {
+        self.ignore.iter().any(|r| r.re.is_match(path) != r.negate)
+    }
+}
+
+pub(crate) struct Inner {
+    pub(crate) couch: Couch,
+    pub(crate) cfg: EngineConfig,
     /// Canonical vault path, recorded in (and checked against) the index.
-    vault_canon: String,
-    restrict_names: bool,
+    pub(crate) vault_canon: String,
+    pub(crate) state_dir: PathBuf,
+    /// What the vault's filesystem can hold (probed at open).
+    pub(crate) fs: FsRules,
     _locks: Vec<LockFile>,
-    index: Mutex<Index>,
-    runtime: Mutex<Runtime>,
+    pub(crate) index: Mutex<Index>,
+    pub(crate) runtime: Mutex<Runtime>,
     mem: Semaphore,
     report: Mutex<PullReport>,
-    nudge: Notify,
+    pub(crate) nudge: Notify,
+    /// Wakes the push loop for a full rescan.
+    pub(crate) rescan: Notify,
+    /// Serialises the pull and push sides: a batch of remote changes and a
+    /// pass of local changes never run at the same time.
+    pub(crate) ops: tokio::sync::Mutex<()>,
+    /// The two-way daemon allows pushes only after the gate passed and the
+    /// owed full fetch and registration are done.
+    pub(crate) push_enabled: AtomicBool,
+    /// Held while materialising on a filesystem that folds names, so the
+    /// collision check and the write cannot interleave across units.
+    fold_lock: Mutex<()>,
 }
 
 #[derive(Clone)]
 pub struct Engine {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
 
 /// Why a file document is not materialised.
@@ -241,6 +386,9 @@ enum Skip {
     Legacy,
     /// The vault's filesystem cannot hold this name.
     Unwritable(String),
+    /// Another document's file already has this name here (case or
+    /// normalisation folding).
+    Collision(String),
 }
 
 impl Skip {
@@ -251,6 +399,7 @@ impl Skip {
             Skip::TooLarge(_) => "too-large",
             Skip::Legacy => "legacy-notes-doc",
             Skip::Unwritable(_) => "unwritable-name",
+            Skip::Collision(_) => "case-collision",
         }
     }
 }
@@ -269,7 +418,14 @@ fn random_node_id() -> String {
     (0..10).map(|_| A[r.gen_range(0..A.len())] as char).collect()
 }
 
-fn seq_to_string(v: &Value) -> String {
+fn conflict_note(doc: &FileDoc) -> String {
+    format!(
+        "{} conflicting revision(s); resolve with an official client",
+        doc.conflicts.len()
+    )
+}
+
+pub(crate) fn seq_to_string(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_default()
 }
 
@@ -297,13 +453,33 @@ impl Engine {
                 Err(e) => warn!("{e}; continuing without the vault lock"),
             }
         }
-        let restrict_names = cfg
-            .restrict_names
-            .unwrap_or_else(|| vaultfs::is_android_shared_storage(&canon));
+        let mut fs = match FsRules::probe(&canon) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("cannot probe the vault's filesystem ({e}); assuming permissive rules");
+                FsRules::permissive()
+            }
+        };
+        match cfg.restrict_names {
+            Some(true) => {
+                fs.forbidden = PROBED_CHARS.to_vec();
+                fs.control_chars_forbidden = true;
+            }
+            Some(false) => {
+                fs.forbidden.clear();
+                fs.control_chars_forbidden = false;
+            }
+            None => {}
+        }
+        if let Some(ci) = cfg.case_insensitive {
+            fs.case_insensitive = ci;
+            fs.normalization_insensitive = ci;
+        }
         let index = Index::open(&cfg.index_path)?;
         if index.get_meta(meta::NODE_ID)?.is_none() {
             index.set_meta(meta::NODE_ID, &random_node_id())?;
         }
+        index.set_meta(meta::FS_RULES, &serde_json::to_string(&fs).unwrap_or_default())?;
         let ignore = match &cfg.ignore_regex {
             Some(s) => parse_ignore(s, false).map_err(|e| EngineError::Other(format!("invalid ignore regex: {e}")))?,
             None => Vec::new(),
@@ -313,19 +489,51 @@ impl Engine {
             inner: Arc::new(Inner {
                 couch,
                 vault_canon: canon.to_string_lossy().into_owned(),
-                restrict_names,
+                state_dir,
+                fs,
                 _locks: locks,
                 runtime: Mutex::new(Runtime {
                     max_size_bytes: cfg.max_size_mb.map(|m| m * 1024 * 1024),
                     ignore,
+                    case_sensitive_ids: false,
+                    split: SplitParams::default(),
+                    preferred: Map::new(),
                 }),
                 cfg,
                 index: Mutex::new(index),
                 mem: Semaphore::new(budget),
                 report: Mutex::new(PullReport::default()),
                 nudge: Notify::new(),
+                rescan: Notify::new(),
+                ops: tokio::sync::Mutex::new(()),
+                push_enabled: AtomicBool::new(false),
+                fold_lock: Mutex::new(()),
             }),
         })
+    }
+
+    /// The probed (or configured) filesystem rules.
+    pub fn fs_rules(&self) -> &FsRules {
+        &self.inner.fs
+    }
+
+    pub fn config(&self) -> &EngineConfig {
+        &self.inner.cfg
+    }
+
+    /// Ask the two-way daemon for a full rescan of the vault (for example
+    /// after the network came back, or from a "sync now" button).
+    pub fn rescan_now(&self) {
+        self.inner.rescan.notify_one();
+    }
+
+    /// The network came up or went down. When up: reconnect at once and
+    /// rescan (spec: rescan when the network comes back).
+    pub fn network_changed(&self, up: bool) {
+        if up {
+            self.nudge();
+            self.rescan_now();
+        }
     }
 
     pub fn node_id(&self) -> String {
@@ -352,12 +560,12 @@ impl Engine {
         *self.inner.report.lock().unwrap() = PullReport::default();
     }
 
-    fn with_index<T>(&self, f: impl FnOnce(&Index) -> rusqlite::Result<T>) -> Result<T> {
+    pub(crate) fn with_index<T>(&self, f: impl FnOnce(&Index) -> rusqlite::Result<T>) -> Result<T> {
         let ix = self.inner.index.lock().unwrap();
         Ok(f(&ix)?)
     }
 
-    fn record_error(&self, e: &EngineError) {
+    pub(crate) fn record_error(&self, e: &EngineError) {
         let _ = self.with_index(|ix| ix.set_meta(meta::LAST_ERROR, &format!("{} {e}", vaultfs::now_ms())));
     }
 
@@ -379,6 +587,8 @@ impl Engine {
             ix.set_meta(meta::LAST_GATE, &format!("{now} {summary}"))?;
             if r.is_ok() {
                 ix.set_meta(meta::LAST_GATE_OK, &now.to_string())?;
+                // A passed gate supersedes any earlier failure.
+                ix.delete_meta(meta::LAST_ERROR)?;
             }
             Ok(())
         });
@@ -422,7 +632,24 @@ impl Engine {
             .ok_or(Refusal::MissingMilestone)?;
         let milestone = Milestone::parse(&milestone)?;
         let node_id = self.node_id();
-        gate::assess_milestone(&milestone, &node_id)?;
+        let (fresh, rebuilt, owed) = {
+            let ix = self.inner.index.lock().unwrap();
+            let stored = ix.get_meta(meta::CREATED)?.and_then(|s| s.parse::<i64>().ok());
+            (
+                stored.is_none(),
+                stored.is_some_and(|c| c != milestone.created),
+                ix.get_meta(meta::NEEDS_FETCH)?.is_some() || ix.get_meta(meta::RESOLVE_OWED)?.is_some(),
+            )
+        };
+        // A lock (after a rebuild elsewhere) is upstream's "fetch again":
+        // a client that is about to do a full fetch anyway may proceed, and
+        // is marked resolved once the fetch is complete.
+        let mut fetch_to_resolve = false;
+        match gate::assess_milestone(&milestone, &node_id) {
+            Ok(()) => {}
+            Err(Refusal::Locked | Refusal::Cleaned) if fresh || rebuilt || owed => fetch_to_resolve = true,
+            Err(e) => return Err(e.into()),
+        }
         let preferred = milestone.preferred().ok_or(Refusal::MissingPreferredTweaks)?.clone();
         gate::assess_supported_tweaks(&preferred)?;
         let params = couch.get_doc(&format!("_local/{SYNC_PARAMS_LOCAL_ID}"), false).await?;
@@ -478,6 +705,12 @@ impl Engine {
                 }
                 _ => {}
             }
+            if fresh || rebuild {
+                ix.set_meta(meta::NEEDS_FETCH, &vaultfs::now_ms().to_string())?;
+            }
+            if fetch_to_resolve {
+                ix.set_meta(meta::RESOLVE_OWED, &vaultfs::now_ms().to_string())?;
+            }
             ix.set_meta(meta::CREATED, &milestone.created.to_string())?;
             ix.set_meta(meta::VERSION, &version.to_string())?;
             match &salt {
@@ -495,8 +728,12 @@ impl Engine {
             .cfg
             .max_size_mb
             .unwrap_or_else(|| gate::max_size_mb(&preferred));
+        let needs_full_fetch = self.with_index(|ix| ix.get_meta(meta::NEEDS_FETCH))?.is_some();
         {
             let mut rt = self.inner.runtime.lock().unwrap();
+            rt.case_sensitive_ids = case_sensitive;
+            rt.split = SplitParams::from_tweaks(&preferred);
+            rt.preferred = preferred.clone();
             rt.max_size_bytes = if max_mb == 0 { None } else { Some(max_mb * 1024 * 1024) };
             if let Some(src) = &self.inner.cfg.ignore_regex {
                 rt.ignore = parse_ignore(src, case_sensitive)
@@ -516,7 +753,65 @@ impl Engine {
             salt_present: salt.is_some(),
             max_size_mb: max_mb,
             case_sensitive,
+            fetch_to_resolve,
+            needs_full_fetch,
         })
+    }
+
+    /// Register this node in the milestone (`node_info`, `tweak_values`,
+    /// `node_chunk_info`), and with `mark_resolved` add it to
+    /// `accepted_nodes`. Writes only when something changed. Returns whether
+    /// it wrote.
+    pub(crate) async fn register_node(&self, mark_resolved: bool) -> Result<bool> {
+        let id = format!("_local/{MILESTONE_LOCAL_ID}");
+        let device = self.device_info();
+        let node = self.node_id();
+        let tweaks = self.inner.runtime.lock().unwrap().preferred.clone();
+        for _ in 0..3 {
+            let current = self
+                .inner
+                .couch
+                .get_doc(&id, false)
+                .await?
+                .ok_or(Refusal::MissingMilestone)?;
+            let Some(updated) = register_node(&current, &node, &device, &tweaks, vaultfs::now_ms(), mark_resolved)
+            else {
+                return Ok(false);
+            };
+            match self.inner.couch.put_doc(&updated).await? {
+                PutOutcome::Saved { .. } => {
+                    self.with_index(|ix| ix.set_meta(meta::REGISTERED, &vaultfs::now_ms().to_string()))?;
+                    info!(
+                        "registered node {node} in the milestone{}",
+                        if mark_resolved { " (marked resolved)" } else { "" }
+                    );
+                    return Ok(true);
+                }
+                PutOutcome::Conflict => continue, // someone else wrote it; re-read
+            }
+        }
+        Err(EngineError::Other(
+            "milestone kept changing while registering this node".into(),
+        ))
+    }
+
+    fn device_info(&self) -> DeviceInfo {
+        let vault_name = Path::new(&self.inner.vault_canon)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        DeviceInfo {
+            device_name: self
+                .inner
+                .cfg
+                .device_name
+                .clone()
+                .unwrap_or_else(|| format!("lsync-{}", crate::platform::hostname())),
+            vault_name,
+            app_version: "lsync".into(),
+            plugin_version: env!("CARGO_PKG_VERSION").into(),
+            platform: Some(crate::platform::platform_name().into()),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -539,8 +834,24 @@ impl Engine {
             "gate ok: {} (version {}, {} docs)",
             gate.remote, gate.version, gate.doc_count
         );
+        let old_scope = self.apply_scope_narrowing()?;
         self.prepare_vault();
+        self.catch_up(start).await?;
+        self.with_index(|ix| ix.delete_meta(meta::NEEDS_FETCH))?;
+        self.scope_catch_up(&old_scope).await?;
+        self.retry_pending(true).await?;
+        self.with_index(|ix| ix.set_meta(meta::LAST_PULL, &vaultfs::now_ms().to_string()))?;
+        let mut rep = self.report();
+        rep.elapsed_ms = start.elapsed().as_millis() as u64;
+        rep.pending = self.with_index(|ix| ix.pending(None))?.len() as u64;
+        Ok(rep)
+    }
+
+    /// Page through `_changes` (no longpoll) until caught up, persisting
+    /// `since` after each fully applied page.
+    pub(crate) async fn catch_up(&self, start: Instant) -> Result<()> {
         loop {
+            let before = self.report();
             let since = self.since()?;
             let resp = self
                 .inner
@@ -555,22 +866,18 @@ impl Engine {
             let n = resp.results.len();
             self.apply_batch(resp.results).await?;
             self.with_index(|ix| ix.set_meta(meta::SINCE, &seq_to_string(&resp.last_seq)))?;
-            self.log_progress(start, resp.pending);
+            if n > 0 {
+                self.log_progress(start, &before, resp.pending);
+            }
             if n == 0 || resp.pending == Some(0) {
-                break;
+                return Ok(());
             }
         }
-        self.retry_pending(true).await?;
-        self.with_index(|ix| ix.set_meta(meta::LAST_PULL, &vaultfs::now_ms().to_string()))?;
-        let mut rep = self.report();
-        rep.elapsed_ms = start.elapsed().as_millis() as u64;
-        rep.pending = self.with_index(|ix| ix.pending(None))?.len() as u64;
-        Ok(rep)
     }
 
     /// After a passed gate: remove temp files left by an interrupted run (safe,
     /// since this process holds the vault) and make sure `.nomedia` exists.
-    fn prepare_vault(&self) {
+    pub(crate) fn prepare_vault(&self) {
         let vault = &self.inner.cfg.vault;
         let swept = vaultfs::sweep_temp_files(vault);
         if swept > 0 {
@@ -583,26 +890,31 @@ impl Engine {
         }
     }
 
-    fn log_progress(&self, start: Instant, pending: Option<u64>) {
-        let r = self.report();
+    /// One line per applied batch: what this batch did, then running totals.
+    fn log_progress(&self, start: Instant, before: &PullReport, pending: Option<u64>) {
+        let total = self.report();
+        let d = total.delta(before);
         info!(
-            "batch {}: {} changes, {} written, {} adopted, {} unchanged, {} deleted, {} dirty, {} chunks ({:.1} MB), remaining {}, {:.1}s",
-            r.batches,
-            r.changes,
-            r.written,
-            r.adopted,
-            r.unchanged,
-            r.deleted,
-            r.dirty,
-            r.chunks_fetched,
-            r.chunk_bytes as f64 / 1e6,
+            "batch: {} changes, {} written, {} adopted, {} unchanged, {} deleted, {} dirty, {} chunks ({:.1} MB); remaining {}; totals since {:.0}s ago: {} batches, {} changes, {} written",
+            d.changes,
+            d.written,
+            d.adopted,
+            d.unchanged,
+            d.deleted,
+            d.dirty,
+            d.chunks_fetched,
+            d.chunk_bytes as f64 / 1e6,
             pending.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
-            start.elapsed().as_secs_f64()
+            start.elapsed().as_secs_f64(),
+            total.batches,
+            total.changes,
+            total.written
         );
     }
 
     /// Apply one page of changes. The caller persists `since` afterwards.
-    async fn apply_batch(&self, rows: Vec<ChangeRow>) -> Result<()> {
+    pub(crate) async fn apply_batch(&self, rows: Vec<ChangeRow>) -> Result<()> {
+        let _ops = self.inner.ops.lock().await;
         {
             let mut r = self.inner.report.lock().unwrap();
             r.batches += 1;
@@ -648,7 +960,7 @@ impl Engine {
                 }
                 Classified::LegacyNote { id, path } => {
                     let path = path.unwrap_or_else(|| id.clone());
-                    if is_internal_id(&id) || classify_path(&path).is_some() {
+                    if is_internal_id(&id) || classify_path(&path).is_some() || !self.inner.cfg.scope.contains(&path) {
                         ignored += 1;
                     } else {
                         let f = FileDoc {
@@ -674,6 +986,17 @@ impl Engine {
                     }
                     if is_internal_id(&f.id) {
                         ignored += 1;
+                    } else if classify_path(&f.path).is_none() && !self.inner.cfg.scope.contains(&f.path) {
+                        // Outside the folder scope: invisible. No row, and a
+                        // remote deletion never touches the local file.
+                        *self
+                            .inner
+                            .report
+                            .lock()
+                            .unwrap()
+                            .skipped
+                            .entry("out-of-scope".into())
+                            .or_default() += 1;
                     } else if f.deleted {
                         deletes.push((f.id, Some(f.rev)));
                     } else if let Some(s) = self.skip_reason(&f) {
@@ -721,15 +1044,8 @@ impl Engine {
         if let Some(p) = classify_path(&f.path) {
             return Some(Skip::Path(p));
         }
-        if self.inner.restrict_names {
-            let bad = vaultfs::fat_invalid_chars(&f.path);
-            if !bad.is_empty() {
-                let list: Vec<String> = bad.iter().map(|c| format!("{c:?}")).collect();
-                return Some(Skip::Unwritable(format!(
-                    "contains {} (not allowed on Android shared storage)",
-                    list.join(" ")
-                )));
-            }
+        if let Some(why) = self.inner.fs.unwritable_reason(&f.path) {
+            return Some(Skip::Unwritable(why));
         }
         // Rejected by the filesystem before: do not fetch it again.
         if let Ok(Some(b)) = self.with_index(|ix| ix.by_doc(&f.id)) {
@@ -741,7 +1057,7 @@ impl Engine {
             }
         }
         let rt = self.inner.runtime.lock().unwrap();
-        if rt.ignore.iter().any(|r| r.re.is_match(&f.path) != r.negate) {
+        if rt.ignored(&f.path) {
             return Some(Skip::Ignored);
         }
         if let Some(max) = rt.max_size_bytes {
@@ -769,6 +1085,13 @@ impl Engine {
                     f.path
                 );
                 format!("{UNWRITABLE_NOTE}: {why}")
+            }
+            Skip::Collision(other) => {
+                warn!(
+                    "{}: skipped, it would land on the same file as {other} on this filesystem",
+                    f.path
+                );
+                format!("{COLLISION_NOTE} {other}")
             }
             other => other.label().to_string(),
         };
@@ -802,7 +1125,8 @@ impl Engine {
         let Some(mut b) = base else {
             return self.with_index(|ix| ix.remove_pending(id));
         };
-        if b.state == State::Skipped {
+        if matches!(b.state, State::Skipped | State::OutOfScope) {
+            // No file of ours at this path (or the user moved it away).
             return self.with_index(|ix| {
                 ix.delete_doc(id)?;
                 ix.remove_pending(id)
@@ -827,6 +1151,19 @@ impl Engine {
                 debug!("deleted {}", b.path);
                 self.with_index(|ix| {
                     ix.delete_doc(id)?;
+                    ix.remove_pending(id)
+                })?;
+                self.requeue_collisions(&b.path)
+            }
+            RemoveOutcome::Raced { displaced } => {
+                // An edit landed while we removed the file: put it back.
+                warn!("{}: edited while being deleted; the edit is kept", b.path);
+                self.inner.report.lock().unwrap().restored_edits += 1;
+                self.put_back(&b.path, displaced, None);
+                b.state = State::Dirty;
+                b.note = Some("deleted remotely; a local edit made meanwhile was kept".into());
+                self.with_index(|ix| {
+                    ix.upsert(&b)?;
                     ix.remove_pending(id)
                 })
             }
@@ -926,6 +1263,12 @@ impl Engine {
         let mut plans = Vec::new();
         for doc in docs {
             let base = self.with_index(|ix| ix.by_doc(&doc.id))?;
+            if base.as_ref().is_some_and(|b| b.state == State::OutOfScope) {
+                // Moved out of scope locally: the remote copy is not brought back.
+                self.inner.report.lock().unwrap().unchanged += 1;
+                self.with_index(|ix| ix.remove_pending(&doc.id))?;
+                continue;
+            }
             if let Some(b) = &base {
                 if b.path == doc.path && b.base_rev.as_deref() == Some(doc.rev.as_str()) {
                     // Same revision as on disk.
@@ -977,6 +1320,28 @@ impl Engine {
                     continue;
                 }
             };
+            // D4: the document has conflicts and our revision is one of its
+            // live leaves (we pushed a branch). Keep our content on disk.
+            if let Some(b) = &base {
+                let ours_is_leaf = b
+                    .base_rev
+                    .as_ref()
+                    .is_some_and(|r| *r == doc.rev || doc.conflicts.contains(r));
+                let clean = local.as_ref().map(|l| &l.hash) == b.disk_hash.as_ref();
+                if !doc.conflicts.is_empty() && ours_is_leaf && b.path == doc.path && clean {
+                    let mut b = b.clone();
+                    b.state = State::Conflicted;
+                    b.note = Some(conflict_note(&doc));
+                    self.with_index(|ix| {
+                        ix.upsert(&b)?;
+                        ix.remove_pending(&doc.id)
+                    })?;
+                    let mut r = self.inner.report.lock().unwrap();
+                    r.conflicted += 1;
+                    r.unchanged += 1;
+                    continue;
+                }
+            }
             plans.push(Plan { doc, base, local });
         }
         Ok(plans)
@@ -1127,12 +1492,7 @@ impl Engine {
         } else {
             State::Conflicted
         };
-        let note = (!doc.conflicts.is_empty()).then(|| {
-            format!(
-                "{} conflicting revision(s); resolve with an official client",
-                doc.conflicts.len()
-            )
-        });
+        let note = (!doc.conflicts.is_empty()).then(|| conflict_note(&doc));
         let row_for = |disk: &DiskState| FileRow {
             path: doc.path.clone(),
             doc_id: doc.id.clone(),
@@ -1145,6 +1505,18 @@ impl Engine {
             note: note.clone(),
         };
         let count = |f: fn(&mut PullReport)| f(&mut self.inner.report.lock().unwrap());
+        // Case-collision guard: on a filesystem that folds names, never let
+        // a second document land on the file of another.
+        let _fold = self.inner.fs.folds().then(|| self.inner.fold_lock.lock().unwrap());
+        if self.inner.fs.folds() {
+            let others = self.with_index(|ix| ix.fold_collisions(&doc.path, &doc.id))?;
+            if let Some(o) = others
+                .iter()
+                .find(|o| matches!(o.state, State::Clean | State::Dirty | State::Conflicted))
+            {
+                return self.apply_skip(&doc, &Skip::Collision(o.path.clone()));
+            }
+        }
         if state == State::Conflicted {
             count(|r| r.conflicted += 1);
         }
@@ -1179,7 +1551,41 @@ impl Engine {
             Some(l) => Expect::Hash(l.hash.clone()),
         };
         match vaultfs::atomic_write(&target, &bytes, doc.mtime, &expect) {
-            Ok(disk) => {
+            Ok(w) if w.displaced.is_some() => {
+                // An edit landed between our check and the swap. Put it back
+                // and keep the old base, so the push side sends it as a
+                // child of what the editor saw (a conflict, not a loss).
+                warn!(
+                    "{}: edited while a remote change was written; the edit is kept",
+                    doc.path
+                );
+                count(|r| r.restored_edits += 1);
+                self.put_back(&doc.path, w.displaced.unwrap(), Some(&w.state.hash));
+                let row = match base {
+                    Some(mut b) if b.path == doc.path => {
+                        b.state = State::Dirty;
+                        b.note = Some(format!("local edit during a remote update (remote {})", doc.rev));
+                        b
+                    }
+                    _ => FileRow {
+                        path: doc.path.clone(),
+                        doc_id: doc.id.clone(),
+                        base_rev: None,
+                        base_children: vec![],
+                        disk_mtime: None,
+                        disk_size: None,
+                        disk_hash: None,
+                        state: State::Dirty,
+                        note: Some("local edit during a remote update".into()),
+                    },
+                };
+                self.with_index(|ix| {
+                    ix.upsert(&row)?;
+                    ix.remove_pending(&doc.id)
+                })
+            }
+            Ok(w) => {
+                let disk = w.state;
                 self.with_index(|ix| {
                     ix.upsert(&row_for(&disk))?;
                     ix.remove_pending(&doc.id)
@@ -1227,9 +1633,58 @@ impl Engine {
         }
         if let Some(h) = &b.disk_hash {
             if *h == old_state.hash {
-                let _ = vaultfs::remove_if_matches(&self.inner.cfg.vault, &old, h);
+                if let Ok(RemoveOutcome::Raced { displaced }) =
+                    vaultfs::remove_if_matches(&self.inner.cfg.vault, &old, h)
+                {
+                    self.put_back(&b.path, displaced, None);
+                }
             }
         }
+    }
+
+    /// Put content displaced by a race back at `rel`: over the file we just
+    /// wrote (`over` is its hash) or where nothing is now. If that fails
+    /// too, keep it in the state directory's `recovered/` folder.
+    pub(crate) fn put_back(&self, rel: &str, content: Vec<u8>, over: Option<&str>) {
+        let target = self.inner.cfg.vault.join(rel);
+        let expect = match over {
+            Some(h) => Expect::Hash(h.to_string()),
+            None => Expect::Absent,
+        };
+        match vaultfs::atomic_write(&target, &content, vaultfs::now_ms(), &expect) {
+            Ok(w) if w.displaced.is_none() => {}
+            Ok(w) => {
+                self.save_recovered(rel, &content);
+                if let Some(d) = w.displaced {
+                    self.save_recovered(rel, &d);
+                }
+            }
+            Err(_) => self.save_recovered(rel, &content),
+        }
+    }
+
+    fn save_recovered(&self, rel: &str, content: &[u8]) {
+        let dir = self.inner.state_dir.join("recovered");
+        let name = format!("{}-{}", vaultfs::now_ms(), rel.replace('/', "%2F"));
+        let p = dir.join(name);
+        match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&p, content)) {
+            Ok(()) => warn!("{rel}: a displaced local edit was saved to {}", p.display()),
+            Err(e) => warn!("{rel}: could not save a displaced local edit: {e}"),
+        }
+    }
+
+    /// Documents skipped because they collided with `path` get another try.
+    fn requeue_collisions(&self, path: &str) -> Result<()> {
+        let note = format!("{COLLISION_NOTE} {path}");
+        self.with_index(|ix| {
+            for r in ix.list_state_with_note(State::Skipped, &note, 100)? {
+                if r.note.as_deref() == Some(note.as_str()) {
+                    ix.delete_doc(&r.doc_id)?;
+                    ix.add_pending_now(&r.doc_id, "the colliding file is gone", vaultfs::now_ms())?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn mark_dirty(&self, doc: &FileDoc, base: Option<FileRow>, why: &str) -> Result<()> {
@@ -1297,31 +1752,149 @@ impl Engine {
     // Daemon
     // ------------------------------------------------------------------
 
-    /// Follow `_changes` with longpoll until `shutdown` turns true. Gate
-    /// refusals stop syncing; the gate is re-checked periodically so a lifted
-    /// lock resumes without a restart.
-    pub async fn daemon_pull_only(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    /// Follow `_changes` with longpoll until `shutdown` turns true, without
+    /// ever writing to the remote. Gate refusals stop syncing; the gate is
+    /// re-checked periodically so a lifted lock resumes without a restart.
+    pub async fn daemon_pull_only(&self, shutdown: watch::Receiver<bool>) -> Result<()> {
+        self.daemon(shutdown, false).await
+    }
+
+    /// The two-way daemon: the pull loop here, the push loop (watcher,
+    /// settle queue, periodic rescans) beside it. Pushes start once the gate
+    /// passed, the remote was caught up (with a full fetch when one is owed)
+    /// and this node is registered in the milestone.
+    pub async fn run(&self, shutdown: watch::Receiver<bool>) -> Result<()> {
+        let push = tokio::spawn(self.clone().push_loop(shutdown.clone()));
+        let pulled = self.daemon(shutdown, true).await;
+        self.inner.push_enabled.store(false, Ordering::SeqCst);
+        let pushed = push.await.map_err(EngineError::other)?;
+        pulled?;
+        pushed.map(|_| ())
+    }
+
+    /// One two-way pass: gate, pull until caught up (a full fetch when one is
+    /// owed), register, then push everything that changed locally.
+    pub async fn sync_once(&self) -> Result<SyncReport> {
+        let start = Instant::now();
+        self.reset_report();
+        let gate = self.connect_gate(false).await?;
+        info!(
+            "gate ok: {} (version {}, {} docs)",
+            gate.remote, gate.version, gate.doc_count
+        );
+        let old_scope = self.apply_scope_narrowing()?;
+        self.prepare_vault();
+        self.catch_up(start).await?;
+        self.after_catch_up(&gate, &old_scope, None).await?;
+        let push = self.push_all(false).await?;
+        // Our own writes come back through the changes feed; take them in so
+        // `since` is current.
+        self.catch_up(start).await?;
+        self.retry_pending(true).await?;
+        self.with_index(|ix| ix.set_meta(meta::LAST_PULL, &vaultfs::now_ms().to_string()))?;
+        let mut pull = self.report();
+        pull.elapsed_ms = start.elapsed().as_millis() as u64;
+        pull.pending = self.with_index(|ix| ix.pending(None))?.len() as u64;
+        Ok(SyncReport { pull, push })
+    }
+
+    /// Start over from the remote, as upstream's "Fetch": forget every
+    /// revision and `since` (disk hashes are kept, so clean files are
+    /// refreshed and edited ones protected), then do a full fetch at the
+    /// next sync and mark this node resolved after it. This is how a lock
+    /// that does not come with a rebuild (or `cleaned`) is cleared.
+    pub fn request_full_fetch(&self) -> Result<()> {
+        self.with_index(|ix| {
+            ix.reset_for_rebuild()?;
+            ix.set_meta(meta::NEEDS_FETCH, &vaultfs::now_ms().to_string())
+        })
+    }
+
+    /// After the pull caught up: finish an owed full fetch (waiting for a
+    /// rebuilding device to finish uploading), catch up a widened scope,
+    /// register this node, and allow pushes.
+    async fn after_catch_up(
+        &self,
+        gate: &GateReport,
+        old_scope: &Scope,
+        shutdown: Option<&mut watch::Receiver<bool>>,
+    ) -> Result<()> {
+        if gate.needs_full_fetch && (gate.rebuild_detected || gate.fetch_to_resolve || gate.locked) {
+            self.wait_until_quiet(shutdown).await?;
+        }
+        self.scope_catch_up(old_scope).await?;
+        self.retry_pending(true).await?;
+        let resolve_owed = self.with_index(|ix| ix.get_meta(meta::RESOLVE_OWED))?.is_some();
+        let mark_resolved = gate.needs_full_fetch || resolve_owed;
+        self.register_node(mark_resolved).await?;
+        if mark_resolved {
+            self.with_index(|ix| {
+                ix.delete_meta(meta::NEEDS_FETCH)?;
+                ix.delete_meta(meta::RESOLVE_OWED)
+            })?;
+            info!("full fetch complete; this node is registered and marked resolved");
+        }
+        self.inner.push_enabled.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// After a rebuild elsewhere the rebuilding device keeps uploading for a
+    /// while. Pull until the remote's update sequence stays the same for
+    /// `rebuild_quiet`, so the fetch is complete before we push anything.
+    async fn wait_until_quiet(&self, mut shutdown: Option<&mut watch::Receiver<bool>>) -> Result<()> {
+        let quiet = self.inner.cfg.rebuild_quiet;
+        if quiet.is_zero() {
+            return Ok(());
+        }
+        loop {
+            let before = self.inner.couch.db_info().await?.update_seq;
+            info!("waiting {quiet:.0?} for the remote to settle after a rebuild");
+            match shutdown.as_deref_mut() {
+                Some(rx) => {
+                    if self.sleep_or_shutdown(quiet, rx).await {
+                        return Ok(());
+                    }
+                }
+                None => tokio::time::sleep(quiet).await,
+            }
+            let after = self.inner.couch.db_info().await?.update_seq;
+            if seq_to_string(&before) == seq_to_string(&after) {
+                return Ok(());
+            }
+            self.catch_up(Instant::now()).await?;
+        }
+    }
+
+    async fn daemon(&self, mut shutdown: watch::Receiver<bool>, two_way: bool) -> Result<()> {
         let mut backoff = Backoff::default();
         let mut prepared = false;
+        let mut old_scope: Option<Scope> = None;
         'outer: loop {
             if *shutdown.borrow() {
                 return Ok(());
             }
             self.reset_report();
-            match self.connect_gate(false).await {
+            let gate = match self.connect_gate(false).await {
                 Ok(g) => {
                     info!("gate ok: {} (version {}, created {})", g.remote, g.version, g.created);
                     if g.rebuild_detected {
                         warn!("remote was rebuilt; refetching everything");
                     }
                     if !prepared {
+                        old_scope = Some(self.apply_scope_narrowing()?);
                         let this = self.clone();
                         tokio::task::spawn_blocking(move || this.prepare_vault()).await.ok();
                         prepared = true;
                     }
+                    g
                 }
                 Err(e) => {
+                    self.inner.push_enabled.store(false, Ordering::SeqCst);
                     let wait = match &e {
+                        // Mid-rebuild states clear within seconds to minutes.
+                        EngineError::Refused(
+                            Refusal::MissingMilestone | Refusal::Locked | Refusal::MissingVersionDoc,
+                        ) => Duration::from_secs(30),
                         EngineError::Refused(_) => Duration::from_secs(300),
                         EngineError::Remote(_) => backoff.next_delay(),
                         _ => return Err(e),
@@ -1332,10 +1905,46 @@ impl Engine {
                     }
                     continue;
                 }
+            };
+            let session = Instant::now();
+            // Catch up without longpoll first, so we know when we are current.
+            let caught = match self.catch_up(session).await {
+                Ok(()) => {
+                    let scope = old_scope.clone().unwrap_or_else(|| self.inner.cfg.scope.clone());
+                    let r = if two_way {
+                        self.after_catch_up(&gate, &scope, Some(&mut shutdown)).await
+                    } else {
+                        match self.with_index(|ix| ix.delete_meta(meta::NEEDS_FETCH)) {
+                            Ok(()) => self.scope_catch_up(&scope).await,
+                            Err(e) => Err(e),
+                        }
+                    };
+                    if r.is_ok() {
+                        old_scope = Some(self.inner.cfg.scope.clone());
+                    }
+                    r
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = caught {
+                self.record_error(&e);
+                self.inner.push_enabled.store(false, Ordering::SeqCst);
+                let wait = match &e {
+                    EngineError::Refused(_) => Duration::from_secs(300),
+                    EngineError::Remote(_) | EngineError::Other(_) => backoff.next_delay(),
+                    _ => return Err(e),
+                };
+                warn!("catching up failed: {e}; retrying in {wait:.0?}");
+                if self.sleep_or_shutdown(wait, &mut shutdown).await {
+                    return Ok(());
+                }
+                continue 'outer;
+            }
+            if *shutdown.borrow() {
+                return Ok(());
             }
             let regate_at = Instant::now() + self.inner.cfg.regate_interval;
             let mut last_retry: Option<Instant> = None;
-            let session = Instant::now();
             loop {
                 let retry_allowed_at = last_retry.map(|t| t + PENDING_RETRY_MIN_GAP);
                 let due = self.pending_due_at(retry_allowed_at)?;
@@ -1379,13 +1988,14 @@ impl Engine {
                             self.with_index(|ix| ix.set_meta(meta::SINCE, &seq_to_string(&resp.last_seq)))?;
                             continue;
                         }
+                        let before = self.report();
                         match self.apply_batch(resp.results).await {
                             Ok(()) => {
                                 self.with_index(|ix| {
                                     ix.set_meta(meta::SINCE, &seq_to_string(&resp.last_seq))?;
                                     ix.set_meta(meta::LAST_PULL, &vaultfs::now_ms().to_string())
                                 })?;
-                                self.log_progress(session, resp.pending);
+                                self.log_progress(session, &before, resp.pending);
                             }
                             Err(e) => {
                                 self.record_error(&e);
@@ -1472,6 +2082,18 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
         conflicted: ix.list_state(State::Conflicted, 50)?,
         pending: ix.pending(None)?,
         unwritable: ix.list_state_with_note(State::Skipped, UNWRITABLE_NOTE, 200)?,
+        collisions: ix.list_state_with_note(State::Skipped, COLLISION_NOTE, 200)?,
+        out_of_scope: ix.list_state(State::OutOfScope, 200)?,
+        local_issues: ix.issues()?,
+        scope: ix
+            .get_meta(meta::SCOPE)?
+            .and_then(|s| serde_json::from_str::<Scope>(&s).ok())
+            .map(|s| s.describe()),
+        fs_rules: ix.get_meta(meta::FS_RULES)?,
+        registered_ms: num(meta::REGISTERED)?,
+        last_push_ms: num(meta::LAST_PUSH)?,
+        needs_full_fetch: ix.get_meta(meta::NEEDS_FETCH)?.is_some() || ix.get_meta(meta::RESOLVE_OWED)?.is_some(),
+        safety_stop: ix.get_meta(meta::SAFETY_STOP)?,
     })
 }
 

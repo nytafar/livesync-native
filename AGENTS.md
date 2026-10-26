@@ -12,7 +12,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-`cargo test` needs no network or database. The engine tests run against an in-process mock CouchDB (`crates/livesync-engine/tests/common`). The golden tests read `fixtures/golden/*.json`.
+`cargo test` needs no network or database. The engine tests run against an in-process mock CouchDB with revision trees (`crates/livesync-engine/tests/common`). The golden tests read `fixtures/golden/*.json`, including the splitter vectors.
 
 ## Golden vectors
 
@@ -39,10 +39,11 @@ The binary links only `libc`, `libm` and `libdl`. TLS is rustls with bundled web
 
 ## Dev database: rules
 
-- **Never connect to the real CouchDB (port 8410).** Development uses only the dev container `lsync-dev-couchdb` at `127.0.0.1:8411`, database `vault-copy`. Its credentials are in `~/.config/livesync-android/dev.env`.
+- **Never connect to the real CouchDB (port 8410).** Development uses only the dev container `lsync-dev-couchdb` at `127.0.0.1:8411`. Its credentials are in `~/.config/livesync-android/dev.env`.
+- **Writes go to throwaway databases only.** `vault-copy` on the dev container is a copy of the real vault: read it, or copy it for rebuild realism, but never sync two-way against it. The interop script (`scripts/interop.sh`) creates and drops its own `lsync-it-*` databases.
 - `source scripts/dev-env.sh` maps the dev credentials to `LSYNC_*` variables and refuses anything on port 8410.
 - Credentials never go into the repo, test fixtures or commit messages.
-- M1 is read-only. Nothing in `livesync-remote` may issue `PUT`, `DELETE`, `_bulk_docs` or milestone writes. The mock-server tests assert that no write requests are made.
+- `lsync pull` and `lsync daemon --pull-only` (`Engine::pull_once`, `Engine::daemon_pull_only`) never write to the remote: no document writes and no milestone registration. The mock-server tests assert it. Writes happen only in `sync`, `fetch` and the two-way `daemon`.
 
 ## End-to-end check against the dev database
 

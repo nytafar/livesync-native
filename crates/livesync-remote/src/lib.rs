@@ -1,8 +1,8 @@
 //! CouchDB over HTTP for the LiveSync engine: server/database info, single
 //! documents and `_local` documents, the filtered `_changes` feed (normal and
-//! longpoll with heartbeat) and chunk fetches through `POST _all_docs`.
-//!
-//! M1 is read-only: this crate exposes no write methods at all.
+//! longpoll with heartbeat), chunk fetches through `POST _all_docs`, and the
+//! writes two-way sync needs: `PUT` with an explicit `_rev`, `_bulk_docs`
+//! (normal and `new_edits:false`) and `_local` document updates.
 
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -143,6 +143,32 @@ struct AllDocsResponse {
     rows: Vec<AllDocsRow>,
 }
 
+/// Result of a `PUT` with an explicit revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutOutcome {
+    Saved {
+        rev: String,
+    },
+    /// 409: the given `_rev` is not the current leaf (or a document exists
+    /// and no `_rev` was given).
+    Conflict,
+}
+
+/// One row of a `_bulk_docs` response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BulkResult {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub rev: Option<String>,
+    #[serde(default)]
+    pub ok: Option<bool>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// The `_selector` used for the changes feed: every document except chunks,
 /// plus deletion tombstones (whose bodies have no `type`).
 pub fn changes_selector() -> Value {
@@ -165,8 +191,32 @@ impl std::fmt::Debug for Couch {
     }
 }
 
+/// An HTTP client with the timeouts the engine expects. Profiles that talk to
+/// the same host may share one (its connection pool) through
+/// [`Couch::with_client`]; nothing here is process-wide.
+pub fn http_client() -> Result<Client> {
+    Client::builder()
+        .user_agent(concat!("lsync/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(20))
+        // Longpoll sends a heartbeat newline every 30 s, so 90 s of silence
+        // means the connection is dead. Large chunk responses keep flowing.
+        .read_timeout(Duration::from_secs(90))
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| RemoteError::Transport {
+            what: "client setup".into(),
+            source: e,
+        })
+}
+
 impl Couch {
     pub fn new(cfg: &RemoteConfig) -> Result<Self> {
+        Self::with_client(cfg, http_client()?)
+    }
+
+    /// Like [`Couch::new`], reusing an existing client and its connection pool.
+    pub fn with_client(cfg: &RemoteConfig, http: Client) -> Result<Self> {
         let mut server = Url::parse(cfg.url.trim()).map_err(|e| RemoteError::Url(format!("{}: {e}", cfg.url)))?;
         match server.scheme() {
             "http" | "https" => {}
@@ -196,19 +246,6 @@ impl Couch {
             .map_err(|_| RemoteError::Url("URL cannot be a base".into()))?
             .pop_if_empty()
             .push(&cfg.database);
-        let http = Client::builder()
-            .user_agent(concat!("lsync/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(20))
-            // Longpoll sends a heartbeat newline every 30 s, so 90 s of silence
-            // means the connection is dead. Large chunk responses keep flowing.
-            .read_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| RemoteError::Transport {
-                what: "client setup".into(),
-                source: e,
-            })?;
         let label = format!("{}{}", server, cfg.database);
         Ok(Couch {
             http,
@@ -290,17 +327,108 @@ impl Couch {
         })
     }
 
+    fn id_url(&self, id: &str) -> Url {
+        match id.strip_prefix("_local/") {
+            Some(name) => self.doc_url(&["_local", name]),
+            None => self.doc_url(&[id]),
+        }
+    }
+
+    /// `GET /{db}/{id}?rev=…` for one specific revision.
+    pub async fn fetch_rev(&self, id: &str, rev: &str) -> Result<DocFetch> {
+        let mut url = self.id_url(id);
+        url.query_pairs_mut().append_pair("rev", rev);
+        self.fetch_url(id, url).await
+    }
+
+    /// `PUT /{db}/{id}` with the body's `_rev` (absent for a new document).
+    /// Works for `_local/` IDs too.
+    pub async fn put_doc(&self, doc: &Value) -> Result<PutOutcome> {
+        let id = doc
+            .get("_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RemoteError::Url("document without _id".into()))?;
+        let what = format!("PUT {id}");
+        let r = self.send(&what, self.http.put(self.id_url(id)).json(doc)).await?;
+        if r.status() == StatusCode::CONFLICT {
+            return Ok(PutOutcome::Conflict);
+        }
+        let v: Value = Self::json(&what, r).await?;
+        let rev = v
+            .get("rev")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RemoteError::Decode {
+                what,
+                msg: "no rev in response".into(),
+            })?;
+        Ok(PutOutcome::Saved { rev: rev.to_string() })
+    }
+
+    /// `POST /{db}/_bulk_docs`. With `new_edits: false` the documents carry
+    /// their own `_rev` and `_revisions` and are merged into the revision
+    /// tree as given (CouchDB then answers with an empty list on success).
+    pub async fn bulk_docs(&self, docs: &[Value], new_edits: bool) -> Result<Vec<BulkResult>> {
+        let url = self.doc_url(&["_bulk_docs"]);
+        let body = if new_edits {
+            json!({ "docs": docs })
+        } else {
+            json!({ "docs": docs, "new_edits": false })
+        };
+        let r = self.send("_bulk_docs", self.http.post(url).json(&body)).await?;
+        Self::json("_bulk_docs", r).await
+    }
+
+    /// `POST /{db}/_all_docs` with `keys` and without bodies: which documents
+    /// exist (`value.rev`, `value.deleted`) and which do not (`error`).
+    pub async fn all_docs_revs(&self, keys: &[String]) -> Result<Vec<AllDocsRow>> {
+        let url = self.doc_url(&["_all_docs"]);
+        let r = self
+            .send("_all_docs", self.http.post(url).json(&json!({ "keys": keys })))
+            .await?;
+        let resp: AllDocsResponse = Self::json("_all_docs", r).await?;
+        Ok(resp.rows)
+    }
+
+    /// One page of `GET /{db}/_all_docs` in key order, starting at
+    /// `start_key` (inclusive) and stopping at `end_key` (inclusive).
+    pub async fn all_docs_page(
+        &self,
+        start_key: Option<&str>,
+        end_key: Option<&str>,
+        limit: usize,
+        include_docs: bool,
+    ) -> Result<Vec<AllDocsRow>> {
+        let mut url = self.doc_url(&["_all_docs"]);
+        {
+            let mut qp = url.query_pairs_mut();
+            qp.append_pair("limit", &limit.to_string());
+            if include_docs {
+                qp.append_pair("include_docs", "true").append_pair("conflicts", "true");
+            }
+            if let Some(k) = start_key {
+                qp.append_pair("start_key", &serde_json::to_string(k).unwrap());
+            }
+            if let Some(k) = end_key {
+                qp.append_pair("end_key", &serde_json::to_string(k).unwrap());
+            }
+        }
+        let r = self.send("_all_docs", self.http.get(url)).await?;
+        let resp: AllDocsResponse = Self::json("_all_docs", r).await?;
+        Ok(resp.rows)
+    }
+
     /// `GET /{db}/{id}`, telling a deleted document (404 with
     /// `reason: "deleted"`) apart from any other 404: a document that never
     /// existed, a database that is gone, or a proxy answering for something else.
     pub async fn fetch_doc(&self, id: &str, conflicts: bool) -> Result<DocFetch> {
-        let mut url = match id.strip_prefix("_local/") {
-            Some(name) => self.doc_url(&["_local", name]),
-            None => self.doc_url(&[id]),
-        };
+        let mut url = self.id_url(id);
         if conflicts {
             url.query_pairs_mut().append_pair("conflicts", "true");
         }
+        self.fetch_url(id, url).await
+    }
+
+    async fn fetch_url(&self, id: &str, url: Url) -> Result<DocFetch> {
         let what = format!("GET {id}");
         let r = self.send(&what, self.http.get(url)).await?;
         if r.status() == StatusCode::NOT_FOUND {
@@ -350,7 +478,9 @@ impl Couch {
     /// `POST /{db}/_all_docs?include_docs=true` with `keys`.
     pub async fn all_docs_by_keys(&self, keys: &[String]) -> Result<Vec<AllDocsRow>> {
         let mut url = self.doc_url(&["_all_docs"]);
-        url.query_pairs_mut().append_pair("include_docs", "true");
+        url.query_pairs_mut()
+            .append_pair("include_docs", "true")
+            .append_pair("conflicts", "true");
         let r = self
             .send("_all_docs", self.http.post(url).json(&json!({ "keys": keys })))
             .await?;

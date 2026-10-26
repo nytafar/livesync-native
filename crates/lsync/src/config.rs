@@ -18,6 +18,12 @@ pub struct FileConfig {
     pub ignore_regex: Option<String>,
     pub max_size_mb: Option<u64>,
     pub concurrency: Option<usize>,
+    /// Folder scope: `all` (default), `include` or `exclude`.
+    pub scope_mode: Option<String>,
+    /// Vault-relative folders for `include`/`exclude` (case-insensitive).
+    pub scope_folders: Option<Vec<String>>,
+    /// Device name advertised in the milestone.
+    pub device_name: Option<String>,
 }
 
 /// Values given on the command line or through `LSYNC_*` variables.
@@ -50,6 +56,24 @@ pub struct Overrides {
     /// Chunk-fetch requests in flight
     #[arg(long, env = "LSYNC_CONCURRENCY", global = true)]
     pub concurrency: Option<usize>,
+    /// Sync only these vault folders (repeatable or comma-separated; case-insensitive)
+    #[arg(
+        long,
+        env = "LSYNC_INCLUDE",
+        global = true,
+        value_delimiter = ',',
+        conflicts_with = "exclude"
+    )]
+    pub include: Vec<String>,
+    /// Sync everything except these vault folders (repeatable or comma-separated)
+    #[arg(long, env = "LSYNC_EXCLUDE", global = true, value_delimiter = ',')]
+    pub exclude: Vec<String>,
+    /// Sync all folders (clears a configured include or exclude list)
+    #[arg(long, global = true, conflicts_with_all = ["include", "exclude"])]
+    pub all_folders: bool,
+    /// Device name shown to other LiveSync clients
+    #[arg(long, env = "LSYNC_DEVICE_NAME", global = true)]
+    pub device_name: Option<String>,
 }
 
 impl FileConfig {
@@ -70,7 +94,30 @@ impl FileConfig {
         take!(ignore_regex);
         take!(max_size_mb);
         take!(concurrency);
+        take!(device_name);
+        if !o.include.is_empty() {
+            self.scope_mode = Some("include".into());
+            self.scope_folders = Some(o.include.clone());
+        } else if !o.exclude.is_empty() {
+            self.scope_mode = Some("exclude".into());
+            self.scope_folders = Some(o.exclude.clone());
+        } else if o.all_folders {
+            self.scope_mode = Some("all".into());
+            self.scope_folders = None;
+        }
         self
+    }
+
+    /// The folder scope this configuration describes.
+    pub fn scope(&self) -> Result<livesync_model::scope::Scope> {
+        use livesync_model::scope::{Scope, ScopeMode};
+        let mode = match self.scope_mode.as_deref().unwrap_or("all") {
+            "all" | "" => ScopeMode::All,
+            "include" => ScopeMode::Include,
+            "exclude" => ScopeMode::Exclude,
+            other => bail!("unknown scope_mode {other:?} (use all, include or exclude)"),
+        };
+        Scope::new(mode, self.scope_folders.as_deref().unwrap_or_default()).map_err(|e| anyhow::anyhow!(e))
     }
 }
 
@@ -136,6 +183,8 @@ pub struct Resolved {
     pub ignore_regex: Option<String>,
     pub max_size_mb: Option<u64>,
     pub concurrency: Option<usize>,
+    pub scope: livesync_model::scope::Scope,
+    pub device_name: Option<String>,
 }
 
 pub fn resolve(cfg: &FileConfig, profile: &str, need_remote: bool) -> Result<Resolved> {
@@ -159,5 +208,7 @@ pub fn resolve(cfg: &FileConfig, profile: &str, need_remote: bool) -> Result<Res
         ignore_regex: cfg.ignore_regex.clone().filter(|s| !s.is_empty()),
         max_size_mb: cfg.max_size_mb,
         concurrency: cfg.concurrency,
+        scope: cfg.scope()?,
+        device_name: cfg.device_name.clone(),
     })
 }

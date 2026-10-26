@@ -1,4 +1,4 @@
-//! `lsync`: Linux/Termux CLI over the LiveSync engine (M1: read-only).
+//! `lsync`: Linux/Termux CLI over the LiveSync engine.
 
 mod config;
 mod probe;
@@ -6,7 +6,7 @@ mod probe;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use config::{FileConfig, Overrides};
-use livesync_engine::{engine::status_from_index, Engine, EngineConfig, EngineError, Index};
+use livesync_engine::{engine::status_from_index, Engine, EngineConfig, EngineError, Index, SyncReport};
 use livesync_remote::Couch;
 use std::io::Read;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ use std::time::Instant;
 use tracing::{error, info};
 
 #[derive(Parser)]
-#[command(name = "lsync", version, about = "Self-hosted LiveSync client (read-only in M1)")]
+#[command(name = "lsync", version, about = "Self-hosted LiveSync client")]
 struct Cli {
     /// Profile name (selects the config file and state directory)
     #[arg(long, short = 'p', env = "LSYNC_PROFILE", default_value = "default", global = true)]
@@ -45,17 +45,35 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// One-shot pull of the remote into the vault folder
+    /// One-shot pull of the remote into the vault folder (never writes to the remote)
     Pull {
         /// Print the report as JSON
         #[arg(long)]
         json: bool,
     },
-    /// Follow the remote continuously
+    /// One-shot two-way sync: pull, register this device, push local changes
+    Sync {
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        push: PushOpts,
+    },
+    /// Start over from the remote (upstream's "Fetch"), then sync; clears a
+    /// lock that came without a rebuild
+    Fetch {
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        push: PushOpts,
+    },
+    /// Follow the remote continuously and push local changes as they happen
     Daemon {
-        /// Only pull (required in M1; two-way sync arrives in M2)
+        /// Only pull; never write to the remote
         #[arg(long)]
         pull_only: bool,
+        #[command(flatten)]
+        push: PushOpts,
     },
     /// Show index state, last gate result and files needing attention
     Status {
@@ -65,6 +83,16 @@ enum Cmd {
     /// Interactive on-device check: does Obsidian see outside writes, and does
     /// inotify see Obsidian's saves?
     Probe(probe::ProbeArgs),
+}
+
+#[derive(clap::Args, Debug, Clone, Default)]
+struct PushOpts {
+    /// Allow one pass to delete more than half of the tracked files remotely
+    #[arg(long)]
+    allow_mass_delete: bool,
+    /// When the folder scope narrows, remove the clean local copies that fell out of it
+    #[arg(long)]
+    remove_out_of_scope_copies: bool,
 }
 
 fn init_logging() {
@@ -138,7 +166,7 @@ fn run(cli: Cli) -> Result<u8> {
         }
         Cmd::Probe(args) => probe::run(args),
         Cmd::Connect { adopt_tweaks, json } => rt()?.block_on(async {
-            let engine = engine_for(&cfg, &cli.profile)?;
+            let engine = engine_for(&cfg, &cli.profile, &PushOpts::default())?;
             match engine.connect_gate(adopt_tweaks).await {
                 Ok(g) => {
                     if json {
@@ -151,7 +179,10 @@ fn run(cli: Cli) -> Result<u8> {
                         println!("  created         {}", g.created);
                         println!("  locked          {}", g.locked);
                         println!("  accepted nodes  {}", g.accepted_nodes);
-                        println!("  our node id     {} (not registered: read-only)", g.node_id);
+                        println!("  our node id     {}", g.node_id);
+                        if g.fetch_to_resolve {
+                            println!("  lock            locked against us; a full fetch will mark us resolved");
+                        }
                         println!(
                             "  tweaks adopted  {}",
                             if g.adopted_tweaks_now { "now" } else { "unchanged" }
@@ -170,7 +201,7 @@ fn run(cli: Cli) -> Result<u8> {
             }
         }),
         Cmd::Pull { json } => rt()?.block_on(async {
-            let engine = engine_for(&cfg, &cli.profile)?;
+            let engine = engine_for(&cfg, &cli.profile, &PushOpts::default())?;
             let t0 = Instant::now();
             let rep = match engine.pull_once().await {
                 Ok(r) => r,
@@ -216,27 +247,98 @@ fn run(cli: Cli) -> Result<u8> {
             }
             Ok(if rep.dirty > 0 || rep.pending > 0 { 3 } else { 0 })
         }),
-        Cmd::Daemon { pull_only } => {
-            if !pull_only {
-                bail!("two-way sync arrives in M2; run `lsync daemon --pull-only`");
-            }
-            rt()?.block_on(async {
-                let engine = engine_for(&cfg, &cli.profile)?;
-                let (tx, rx) = tokio::sync::watch::channel(false);
-                tokio::spawn(async move {
-                    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        Cmd::Sync { json, push } => rt()?.block_on(async {
+            let engine = engine_for(&cfg, &cli.profile, &push)?;
+            run_sync(&engine, json, false).await
+        }),
+        Cmd::Fetch { json, push } => rt()?.block_on(async {
+            let engine = engine_for(&cfg, &cli.profile, &push)?;
+            run_sync(&engine, json, true).await
+        }),
+        Cmd::Daemon { pull_only, push } => rt()?.block_on(async {
+            let engine = engine_for(&cfg, &cli.profile, &push)?;
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            let nudger = engine.clone();
+            tokio::spawn(async move {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut term = signal(SignalKind::terminate()).ok();
+                let mut usr1 = signal(SignalKind::user_defined1()).ok();
+                loop {
                     tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {},
-                        _ = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending::<()>().await } } => {},
+                        _ = tokio::signal::ctrl_c() => break,
+                        _ = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending::<()>().await } } => break,
+                        // `kill -USR1`: reconnect now and rescan the vault ("sync now").
+                        _ = async { match usr1.as_mut() { Some(u) => { u.recv().await; } None => std::future::pending::<()>().await } } => {
+                            info!("SIGUSR1: reconnecting and rescanning");
+                            nudger.network_changed(true);
+                            continue;
+                        }
                     }
-                    info!("shutting down");
-                    let _ = tx.send(true);
-                });
+                }
+                info!("shutting down");
+                let _ = tx.send(true);
+            });
+            if pull_only {
                 engine.daemon_pull_only(rx).await.context("daemon")?;
-                Ok(0)
-            })
+            } else {
+                engine.run(rx).await.context("daemon")?;
+            }
+            Ok(0)
+        }),
+    }
+}
+
+async fn run_sync(engine: &Engine, json: bool, fetch: bool) -> Result<u8> {
+    if fetch {
+        engine.request_full_fetch()?;
+    }
+    let t0 = Instant::now();
+    let rep: SyncReport = match engine.sync_once().await {
+        Ok(r) => r,
+        Err(EngineError::Refused(r)) => {
+            eprintln!("sync refused: {r}");
+            return Ok(2);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let wall = t0.elapsed();
+    if json {
+        let mut v = serde_json::to_value(&rep)?;
+        v["wall_ms"] = (wall.as_millis() as u64).into();
+        v["peak_rss_kib"] = peak_rss_kib().into();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        let (p, u) = (&rep.pull, &rep.push);
+        println!("sync complete in {:.1}s", wall.as_secs_f64());
+        println!(
+            "  pulled           {} changes, {} written, {} deleted, {} adopted",
+            p.changes, p.written, p.deleted, p.adopted
+        );
+        println!(
+            "  pushed           {} ({} new), {} adopted",
+            u.pushed, u.created, u.adopted
+        );
+        println!(
+            "  chunks uploaded  {} ({:.1} MB)",
+            u.chunks_uploaded,
+            u.chunk_bytes as f64 / 1e6
+        );
+        println!("  deleted remotely {}", u.deleted);
+        println!(
+            "  conflicts        {} pulled, {} pushed as branches",
+            p.conflicted, u.conflicts
+        );
+        println!("  kept remote      {} (local deletes not applied)", u.kept_remote);
+        println!("  out of scope     {} (moved out locally; remote kept)", u.out_of_scope);
+        println!("  dirty (kept)     {}", p.dirty);
+        println!("  pending (retry)  {}", p.pending);
+        println!("  local issues     {}", u.issues);
+        if u.safety_stops > 0 {
+            println!("  SAFETY STOP      too many files missing; nothing deleted (see `lsync status`)");
         }
     }
+    let attention = rep.pull.dirty > 0 || rep.pull.pending > 0 || rep.push.issues > 0 || rep.push.safety_stops > 0;
+    Ok(if attention { 3 } else { 0 })
 }
 
 fn rt() -> Result<tokio::runtime::Runtime> {
@@ -254,12 +356,16 @@ fn absolute(p: &std::path::Path) -> Result<PathBuf> {
     })
 }
 
-fn engine_for(cfg: &FileConfig, profile: &str) -> Result<Engine> {
+fn engine_for(cfg: &FileConfig, profile: &str, push: &PushOpts) -> Result<Engine> {
     let r = config::resolve(cfg, profile, true)?;
     let couch = Couch::new(&r.remote)?;
     let mut ec = EngineConfig::new(absolute(&r.vault)?, r.state_dir.join("index.sqlite"));
     ec.ignore_regex = r.ignore_regex;
     ec.max_size_mb = r.max_size_mb;
+    ec.scope = r.scope;
+    ec.device_name = r.device_name;
+    ec.allow_mass_delete = push.allow_mass_delete;
+    ec.remove_out_of_scope_copies = push.remove_out_of_scope_copies;
     if let Some(c) = r.concurrency {
         ec.concurrency = c.max(1);
     }
@@ -293,6 +399,11 @@ fn print_config(c: &FileConfig) {
             .unwrap_or("(default)".into())
     );
     println!("  ignore re  {}", show(&c.ignore_regex));
+    match c.scope() {
+        Ok(s) => println!("  folders    {}", s.describe()),
+        Err(e) => println!("  folders    INVALID: {e}"),
+    }
+    println!("  device     {}", show(&c.device_name));
 }
 
 fn fmt_ms(ms: Option<i64>) -> String {
@@ -328,6 +439,15 @@ fn print_status(s: &livesync_engine::Status) {
     if let Some(r) = s.rebuild_detected_ms {
         println!("rebuild seen    {}", fmt_ms(Some(r)));
     }
+    println!("last push       {}", fmt_ms(s.last_push_ms));
+    println!("registered      {}", fmt_ms(s.registered_ms));
+    println!("folders         {}", s.scope.as_deref().unwrap_or("-"));
+    if s.needs_full_fetch {
+        println!("full fetch      owed (runs at the next sync)");
+    }
+    if let Some(stop) = &s.safety_stop {
+        println!("SAFETY STOP     {stop}");
+    }
     println!("last error      {}", s.last_error.as_deref().unwrap_or("-"));
     println!("files           {:?}", s.counts);
     if !s.dirty.is_empty() {
@@ -346,6 +466,24 @@ fn print_status(s: &livesync_engine::Status) {
         println!("skipped, the vault's filesystem cannot hold the name (not retried):");
         for r in &s.unwritable {
             println!("  {}  — {}", r.path, r.note.as_deref().unwrap_or(""));
+        }
+    }
+    if !s.collisions.is_empty() {
+        println!("skipped, another file has the same name on this filesystem:");
+        for r in &s.collisions {
+            println!("  {}  — {}", r.path, r.note.as_deref().unwrap_or(""));
+        }
+    }
+    if !s.out_of_scope.is_empty() {
+        println!("moved out of the synced folders (remote copy kept):");
+        for r in &s.out_of_scope {
+            println!("  {}  — {}", r.path, r.note.as_deref().unwrap_or(""));
+        }
+    }
+    if !s.local_issues.is_empty() {
+        println!("local files not synced:");
+        for i in &s.local_issues {
+            println!("  {}  — {} ({})", i.path, i.note, i.kind);
         }
     }
     if !s.pending.is_empty() {

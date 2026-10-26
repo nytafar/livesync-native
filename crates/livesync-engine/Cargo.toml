@@ -9,6 +9,7 @@ anyhow = "1.0.104"
 futures = "0.3.34"
 livesync-model = { version = "0.1.0", path = "../livesync-model" }
 livesync-remote = { version = "0.1.0", path = "../livesync-remote" }
+notify = "8.2"
 rand = "0.8"
 regex = "1.13.1"
 rusqlite = { version = "0.41.0", features = ["bundled"] }
@@ -17,6 +18,7 @@ serde_json = "1.0.154"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
 tracing = "0.1.44"
+unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8.19", features = ["xxh64"] }
 
 [dev-dependencies]

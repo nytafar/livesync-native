@@ -268,11 +268,10 @@ fn fs_checks(vault: &Path) -> Vec<(String, String)> {
     }
     // Atomic replace by rename, and setting mtime.
     let a = dir.join("a.md");
-    let r1 = vaultfs::atomic_write(&a, b"first", 1_600_000_000_000, &Expect::Absent);
-    let r2 = r1
-        .as_ref()
-        .ok()
-        .map(|s| vaultfs::atomic_write(&a, b"second", 1_600_000_123_000, &Expect::Hash(s.hash.clone())));
+    let r1 = vaultfs::atomic_write(&a, b"first", 1_600_000_000_000, &Expect::Absent).map(|w| w.state);
+    let r2 = r1.as_ref().ok().map(|s| {
+        vaultfs::atomic_write(&a, b"second", 1_600_000_123_000, &Expect::Hash(s.hash.clone())).map(|w| w.state)
+    });
     match (&r1, &r2) {
         (Ok(_), Some(Ok(s2))) => {
             let content = std::fs::read(&a).unwrap_or_default();
@@ -298,37 +297,53 @@ fn fs_checks(vault: &Path) -> Vec<(String, String)> {
         (Err(e), _) | (_, Some(Err(e))) => out.push(("temp file + rename".into(), format!("FAILED: {e}"))),
         _ => {}
     }
-    // Case sensitivity.
-    let lower = dir.join("case-probe.txt");
-    let _ = std::fs::write(&lower, b"x");
-    let upper_exists = dir.join("CASE-PROBE.txt").exists();
-    out.push((
-        "file names".into(),
-        if upper_exists {
-            "case-INsensitive".into()
-        } else {
-            "case-sensitive".into()
-        },
-    ));
-    // Characters Windows/Android-FAT forbid.
-    let mut bad = Vec::new();
-    for c in [':', '?', '"', '*', '<', '>', '|', '\\'] {
-        let p = dir.join(format!("x{c}y.md"));
-        if std::fs::write(&p, b"x").is_err() {
-            bad.push(c);
+    // The rules the engine probes at vault open (FsRules).
+    match livesync_engine::fsrules::FsRules::probe(&dir) {
+        Ok(r) => {
+            out.push((
+                "file names".into(),
+                if r.case_insensitive {
+                    "case-INsensitive".into()
+                } else {
+                    "case-sensitive".into()
+                },
+            ));
+            out.push((
+                "Unicode normalisation".into(),
+                if r.normalization_insensitive {
+                    "NFC and NFD name the same file".into()
+                } else {
+                    "NFC and NFD are different names".into()
+                },
+            ));
+            out.push((
+                "forbidden characters in names".into(),
+                if r.forbidden.is_empty() {
+                    "none of : ? \" * < > | \\".into()
+                } else {
+                    format!(
+                        "rejected: {}",
+                        r.forbidden
+                            .iter()
+                            .map(|c| format!("{c:?}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                },
+            ));
+            out.push((
+                "control characters in names".into(),
+                if r.control_chars_forbidden {
+                    "rejected"
+                } else {
+                    "allowed"
+                }
+                .into(),
+            ));
+            out.push(("longest name".into(), format!("{} bytes", r.max_name_bytes)));
         }
+        Err(e) => out.push(("filesystem rules".into(), format!("FAILED: {e}"))),
     }
-    out.push((
-        "forbidden characters in names".into(),
-        if bad.is_empty() {
-            "none of : ? \" * < > | \\".into()
-        } else {
-            format!(
-                "rejected: {}",
-                bad.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(" ")
-            )
-        },
-    ));
     let _ = std::fs::remove_dir_all(&dir);
     out
 }
