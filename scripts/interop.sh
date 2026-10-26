@@ -284,13 +284,14 @@ check "a move out of scope is not a delete (Notes/a.md still live)" remote_live 
 check "a file outside the scope is not pushed" test "$(couch -o /dev/null -w '%{http_code}' "$LSYNC_URL/$DB/elsewhere%2Fnew.md")" == 404
 check "status lists the move out of scope" bash -c \
   "LSYNC_DB=$DB LSYNC_VAULT=$W/vault-b LSYNC_STATE_DIR=$W/state-b LSYNC_CONFIG=$W/b.toml '$BIN' --include notes status --json 2>/dev/null | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s[\"out_of_scope\"] and s[\"out_of_scope\"][0][\"path\"]==\"Notes/a.md\" else 1)'"
-since_before=$(LSYNC_DB=$DB LSYNC_VAULT=$W/vault-b LSYNC_STATE_DIR=$W/state-b LSYNC_CONFIG=$W/b.toml "$BIN" status --json 2>/dev/null | jfield '["since"]')
+lsb --include notes,other sync >/dev/null
+check "widening include notes -> notes,other (an _all_docs key range): Other/o.md arrives" file_is "$W/vault-b/Other/o.md" "outside"
+check "  ... and setup/ stays outside" gone "$W/vault-b/setup"
 lsb --all-folders sync >/dev/null
 check "widening: Other/o.md arrives" file_is "$W/vault-b/Other/o.md" "outside"
 check "widening: setup/init.md arrives" file_is "$W/vault-b/setup/init.md" "init"
 check "widening: the local files there are pushed" remote_live Elsewhere/new.md
 grep -q "folder scope widened" "$W/lsync-b.log" && ok "widening used the catch-up (log: $(grep -o 'folder scope widened[^"]*' "$W/lsync-b.log" | tail -1))" || bad "widening catch-up not logged"
-log "    since before widening: ${since_before:0:40}…"
 lsb --exclude other sync >/dev/null
 check "narrowing (exclude Other): the local copy stays" file_is "$W/vault-b/Other/o.md" "outside"
 rm "$W/vault-b/Other/o.md"
@@ -300,6 +301,8 @@ mkdir -p "$W/vault-b/.trash"
 mv "$W/vault-b/Notes/b.md" "$W/vault-b/.trash/b.md"
 lsb --exclude other sync >/dev/null
 check "a move into .trash/ is a delete" remote_deleted Notes/b.md
+lsb --all-folders sync >/dev/null
+check "widening exclude other -> all (key range): the excluded file comes back" file_is "$W/vault-b/Other/o.md" "outside"
 lsa sync >/dev/null
 check "profile A sees the trash delete" gone "$W/vault/Notes/b.md"
 fi
