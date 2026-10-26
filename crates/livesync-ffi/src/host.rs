@@ -120,6 +120,11 @@ pub struct LiveSync {
     /// Serialises start, stop and the full-fetch restart: callers come from
     /// several threads (the service's worker, the UI).
     lifecycle: Mutex<()>,
+    /// Profiles whose engine had not let go of its state folder when it was
+    /// stopped: id -> state folder.
+    draining: Mutex<HashMap<String, String>>,
+    /// The stop and release grace periods.
+    stop_timeouts: Mutex<(Duration, Duration)>,
     listener: Listener,
     access: Access,
 }
@@ -255,12 +260,12 @@ impl LiveSync {
         let mut task = slot.task;
         let finished = self
             .rt
-            .block_on(async { tokio::time::timeout(STOP_TIMEOUT, &mut task).await.is_ok() });
+            .block_on(async { tokio::time::timeout(self.timeouts().0, &mut task).await.is_ok() });
         if !finished {
             warn!(
                 "profile {}: the engine did not stop within {}s; cancelling it",
                 slot.shared.cfg.id,
-                STOP_TIMEOUT.as_secs()
+                self.timeouts().0.as_secs()
             );
             // Cancelling is like a crash without the exit: every batch and
             // pass is crash-safe (`since` only moves after a whole batch).
@@ -270,12 +275,12 @@ impl LiveSync {
             task.abort();
             *lock(&slot.shared.engine) = None;
         }
-        let released = wait_released(&slot.shared.cfg.state_dir, RELEASE_TIMEOUT);
+        let released = wait_released(&slot.shared.cfg.state_dir, self.timeouts().1);
         if !released {
             error!(
                 "profile {}: the engine still holds its state folder {}s after stopping",
                 slot.shared.cfg.id,
-                RELEASE_TIMEOUT.as_secs()
+                self.timeouts().1.as_secs()
             );
         }
         if !finished {
@@ -339,6 +344,8 @@ impl LiveSync {
         });
         let span = tracing::info_span!("profile", id = %cfg.id);
         let task = self.rt.spawn(supervise(shared.clone(), rx).instrument(span));
+        // A new slot's own stop checks the same state lock again.
+        lock(&self.draining).remove(&cfg.id);
         lock(&self.slots).insert(cfg.id.clone(), Slot { shared, stop: tx, task });
         Ok(())
     }
@@ -346,9 +353,41 @@ impl LiveSync {
     fn stop_locked(&self, profile_id: &str) -> bool {
         let slot = lock(&self.slots).remove(profile_id);
         match slot {
-            Some(slot) => self.stop_slot(slot),
-            None => true,
+            Some(slot) => {
+                let dir = slot.shared.cfg.state_dir.clone();
+                let released = self.stop_slot(slot);
+                if !released {
+                    // Remembered, so a later stop checks again instead of
+                    // reporting a profile without a slot as released.
+                    lock(&self.draining).insert(profile_id.to_string(), dir);
+                }
+                released
+            }
+            None => self.drained(profile_id),
         }
+    }
+
+    /// For a profile without a slot: whether an engine that did not let go
+    /// at its stop has done so by now.
+    fn drained(&self, profile_id: &str) -> bool {
+        let Some(dir) = lock(&self.draining).get(profile_id).cloned() else {
+            return true;
+        };
+        let released = wait_released(&dir, Duration::from_secs(2));
+        if released {
+            lock(&self.draining).remove(profile_id);
+        }
+        released
+    }
+
+    fn timeouts(&self) -> (Duration, Duration) {
+        *lock(&self.stop_timeouts)
+    }
+
+    /// Shorter stop and release grace periods, for tests.
+    #[doc(hidden)]
+    pub fn set_stop_timeouts_for_tests(&self, stop: Duration, release: Duration) {
+        *lock(&self.stop_timeouts) = (stop, release);
     }
 }
 
@@ -374,6 +413,8 @@ impl LiveSync {
             rt,
             slots: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(()),
+            draining: Mutex::new(HashMap::new()),
+            stop_timeouts: Mutex::new((STOP_TIMEOUT, RELEASE_TIMEOUT)),
             listener: Arc::new(Mutex::new(None)),
             access: Arc::new(Mutex::new(None)),
         }))
@@ -433,7 +474,10 @@ impl LiveSync {
             let _ = s.stop.send(true);
         }
         for s in slots {
-            self.stop_slot(s);
+            let (id, dir) = (s.shared.cfg.id.clone(), s.shared.cfg.state_dir.clone());
+            if !self.stop_slot(s) {
+                lock(&self.draining).insert(id, dir);
+            }
         }
     }
 

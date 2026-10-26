@@ -474,3 +474,41 @@ fn pull_only_profiles_cannot_allow_mass_deletes() {
     ));
     env.host.stop_all();
 }
+
+#[test]
+fn a_profile_whose_engine_has_not_let_go_stays_unreleased_on_every_stop() {
+    let env = Env::new();
+    env.host
+        .set_stop_timeouts_for_tests(Duration::from_millis(500), Duration::from_millis(500));
+    let hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = hole.local_addr().unwrap();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let keep = held.clone();
+    std::thread::spawn(move || {
+        for c in hole.incoming().flatten() {
+            keep.lock().unwrap().push(c);
+        }
+    });
+    let mut p = env.profile("drain", "vault-drain");
+    p.url = format!("http://{addr}");
+    env.host.start(p.clone()).unwrap();
+    wait_until("running", Duration::from_secs(10), || {
+        env.status(&p).run_state == RunState::Running
+    });
+    // Something else holds the engine: a gate re-run that hangs on the link.
+    let h = env.host.clone();
+    std::thread::spawn(move || {
+        let _ = h.adopt_tweaks("drain".into());
+    });
+    wait_until("both requests", Duration::from_secs(10), || {
+        held.lock().unwrap().len() >= 2
+    });
+    assert!(!env.host.stop("drain".into()), "the engine still holds its state");
+    assert!(env.host.active_profiles().is_empty());
+    assert!(
+        !env.host.stop("drain".into()),
+        "a second stop must not report it released"
+    );
+    let lock = Path::new(&p.state_dir).join("lsync.lock");
+    assert!(livesync_engine::platform::LockFile::try_acquire(&lock).is_err());
+}

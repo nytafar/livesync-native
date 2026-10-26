@@ -17,6 +17,7 @@ import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import no.nyta.livesync.Core
+import no.nyta.livesync.EngineLifecycle
 import no.nyta.livesync.LiveSyncApp
 import no.nyta.livesync.R
 import no.nyta.livesync.core.RunState
@@ -120,7 +121,9 @@ class SyncService : Service() {
      * instance of this service); starting a profile with unchanged settings
      * is a no-op there.
      */
-    private fun reconcile(core: Core) {
+    private fun reconcile(core: Core) = synchronized(EngineLifecycle.lock) { reconcileLocked(core) }
+
+    private fun reconcileLocked(core: Core) {
         val profiles = try {
             app.profiles.all()
         } catch (e: Exception) {
@@ -323,16 +326,20 @@ class SyncService : Service() {
         handler.removeCallbacks(refresh)
         val core = app.core.getOrNull()
         handler.post {
-            // A newer instance (a quick pause then resume) owns the engines now;
-            // stopping them here would stop its work.
-            if (current !== this) return@post
-            core?.log("service destroyed; stopping engines")
-            try {
-                core?.engine?.stopAll()
-            } catch (e: Exception) {
-                core?.log("stopping engines: ${e.message}", "error")
+            synchronized(EngineLifecycle.lock) {
+                // A newer instance (a quick pause then resume) owns the engines
+                // now; stopping them here would stop its work. Its reconcile
+                // waits for this lock, so it runs after this teardown or not
+                // at all before the check.
+                if (current !== this) return@synchronized
+                core?.log("service destroyed; stopping engines")
+                try {
+                    core?.engine?.stopAll()
+                } catch (e: Exception) {
+                    core?.log("stopping engines: ${e.message}", "error")
+                }
+                current = null
             }
-            if (current === this) current = null
         }
         worker.quitSafely()
         super.onDestroy()

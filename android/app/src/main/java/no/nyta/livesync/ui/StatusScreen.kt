@@ -39,6 +39,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import no.nyta.livesync.EngineLifecycle
 import no.nyta.livesync.LiveSyncApp
 import no.nyta.livesync.core.GateResult
 import no.nyta.livesync.core.ProfileStatus
@@ -297,14 +298,7 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
                             busy = "Stopping the engine…"
                             val r = withContext(Dispatchers.IO) {
                                 runCatching {
-                                    app.profiles.update(p.id) { it.copy(paused = true) }
-                                    // Its index must not be deleted while an engine still uses it.
-                                    check(core.engine.stop(p.id)) {
-                                        "the engine is still stopping; the profile is paused, try again in a minute"
-                                    }
-                                    app.secrets.removeProfile(p.id)
-                                    app.profiles.remove(p.id)
-                                    core.log("profile ${p.id} removed")
+                                    synchronized(EngineLifecycle.lock) { removeProfile(app, p.id) }
                                 }
                             }
                             SyncService.start(ctx, "profile removed or paused")
@@ -321,6 +315,17 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
             },
         )
     }
+}
+
+/** Pause, stop (confirmed), then forget. Caller holds [EngineLifecycle.lock]. */
+private fun removeProfile(app: LiveSyncApp, id: String) {
+    val core = app.core.getOrThrow()
+    app.profiles.update(id) { it.copy(paused = true) }
+    // Its index must not be deleted while an engine still uses it.
+    check(core.engine.stop(id)) { "the engine is still stopping; the profile is paused, try again in a minute" }
+    app.secrets.removeProfile(id)
+    app.profiles.remove(id)
+    core.log("profile $id removed")
 }
 
 private enum class Confirm(val title: String, val text: String, val action: String) {

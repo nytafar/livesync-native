@@ -12,6 +12,16 @@ import no.nyta.livesync.secret.SecretStore
 import java.io.File
 
 /**
+ * Serialises everything that decides which engines run: the service's
+ * reconcile and teardown, and removing a profile. Each takes it for its whole
+ * read-decide-act sequence, so none acts on settings another has made stale.
+ * Never taken on the main thread (a stop can wait for tens of seconds).
+ */
+object EngineLifecycle {
+    val lock = Any()
+}
+
+/**
  * The Rust engine host plus the glue from a [Profile] (and its secret) to the
  * engine's [ProfileConfig]. One per process. Every call may block (opening or
  * stopping an engine waits for disk and network): call it off the main thread.
