@@ -5,7 +5,10 @@
 //! `notify` crate (inotify on Linux and Android, FSEvents on macOS,
 //! ReadDirectoryChangesW on Windows).
 
+mod lock;
 mod notify_watcher;
+
+pub use lock::{LockError, LockFile};
 
 use crate::watcher::{WatchSender, Watcher};
 use std::io;
@@ -32,4 +35,19 @@ pub fn hostname() -> String {
         })
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "device".into())
+}
+
+/// A file's identity (device, inode) where the platform has one, so two
+/// names can be recognised as the same file. `None` elsewhere.
+pub fn file_id(md: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((md.dev(), md.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        None
+    }
 }

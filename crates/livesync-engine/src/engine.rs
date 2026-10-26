@@ -49,13 +49,28 @@ pub(crate) mod meta_keys {
     /// The probed filesystem rules (JSON).
     pub const FS_RULES: &str = "fs_rules";
     /// Set when a full fetch is owed: a fresh index, a rebuild seen on the
-    /// remote, or an explicit `request_full_fetch`. Cleared once a pull has
-    /// caught up with the remote (after the quiet wait in two-way mode).
+    /// remote, or an explicit `request_full_fetch`. Cleared by the two-way
+    /// side once it caught up (after the quiet wait when one is owed) and
+    /// registered; a read-only pull clears it only when neither a quiet wait
+    /// nor a lock resolution is owed with it. While set, pushes refuse to run.
     pub const NEEDS_FETCH: &str = "needs_full_fetch";
-    /// Set when a lock was let through for a full fetch; cleared once this
-    /// node is marked resolved (`accepted_nodes`), which only the two-way
-    /// side does.
+    /// The milestone `created` value a lock was let through for (a full
+    /// fetch was owed). Cleared once this node is marked resolved
+    /// (`accepted_nodes`), which only the two-way side does, or once the
+    /// milestone no longer locks us out. While set, pushes refuse to run.
     pub const RESOLVE_OWED: &str = "resolve_owed";
+    /// A rebuild was seen: the refetch must wait until the remote stops
+    /// changing before it counts as complete. `<ms> <description>`; shown
+    /// by `status` while owed or running, cleared when the remote settled.
+    pub const REBUILD_WAIT: &str = "rebuild_wait";
+    /// Files a rebuilt (or refetched) database lacked and this device pushed
+    /// back, since the last full fetch (JSON `OrphanRecord`). For `status`.
+    pub const ORPHANS: &str = "rebuild_orphans";
+    /// The first full push pass after a full fetch reconciles files that
+    /// have no known revision (a fresh index next to an existing vault):
+    /// there, a local copy older than a remote deletion of the same content
+    /// is stale. Set with `needs_full_fetch`, cleared after that pass.
+    pub const RECONCILE: &str = "reconcile_pending";
     /// When the node was last registered in the milestone.
     pub const REGISTERED: &str = "registered_ms";
     pub const LAST_PUSH: &str = "last_push_ms";
@@ -129,6 +144,28 @@ pub struct EngineConfig {
     /// Allow a single sync pass to delete more than half of the tracked files
     /// (otherwise it stops and asks, in case the vault folder vanished).
     pub allow_mass_delete: bool,
+    /// Asked before any pass that could delete remote documents (a seam for
+    /// the front-end, e.g. Android's "all files access" check). `None`: no
+    /// check beyond the engine's own.
+    pub access_check: Option<AccessCheck>,
+}
+
+/// A front-end check that the vault is fully visible to this process (for
+/// example that Android's all-files access is still granted). `Err` carries
+/// the reason; while it fails, missing files are never treated as deleted.
+#[derive(Clone)]
+pub struct AccessCheck(pub Arc<dyn Fn() -> std::result::Result<(), String> + Send + Sync>);
+
+impl AccessCheck {
+    pub fn new(f: impl Fn() -> std::result::Result<(), String> + Send + Sync + 'static) -> Self {
+        AccessCheck(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for AccessCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AccessCheck(..)")
+    }
 }
 
 impl EngineConfig {
@@ -152,6 +189,7 @@ impl EngineConfig {
             device_name: None,
             rebuild_quiet: Duration::from_secs(30),
             allow_mass_delete: false,
+            access_check: None,
         }
     }
 }
@@ -296,8 +334,16 @@ pub struct Status {
     pub fs_rules: Option<String>,
     pub registered_ms: Option<i64>,
     pub last_push_ms: Option<i64>,
+    /// A full fetch is owed, or this node still has to be marked resolved;
+    /// pushes are held until the two-way side completes it.
     pub needs_full_fetch: bool,
     pub safety_stop: Option<String>,
+    /// After a rebuild: the refetch is waiting (or owes a wait) for the
+    /// remote to stop changing. `<ms> <description>`.
+    pub rebuild_wait: Option<String>,
+    /// The last push-back of files a rebuilt or refetched database lacked:
+    /// `<ms> <count> <description and paths>`.
+    pub rebuild_orphans: Option<String>,
 }
 
 /// One upstream `syncIgnoreRegEx` entry.
@@ -370,6 +416,8 @@ pub(crate) struct Inner {
     /// Held while materialising on a filesystem that folds names, so the
     /// collision check and the write cannot interleave across units.
     fold_lock: Mutex<()>,
+    /// The milestone the gate read last (for log lines).
+    last_milestone: Mutex<Option<Value>>,
 }
 
 #[derive(Clone)]
@@ -402,6 +450,12 @@ impl Skip {
             Skip::Collision(_) => "case-collision",
         }
     }
+}
+
+/// How a quiet wait ended.
+enum Quiet {
+    Settled,
+    Interrupted,
 }
 
 /// Planned work for one file document whose content must be fetched.
@@ -453,11 +507,27 @@ impl Engine {
                 Err(e) => warn!("{e}; continuing without the vault lock"),
             }
         }
-        let mut fs = match FsRules::probe(&canon) {
+        let index = Index::open(&cfg.index_path)?;
+        let probed = FsRules::probe(&canon);
+        let probe_ok = probed.is_ok();
+        let mut fs = match probed {
             Ok(r) => r,
             Err(e) => {
-                warn!("cannot probe the vault's filesystem ({e}); assuming permissive rules");
-                FsRules::permissive()
+                // Never fall back to permissive rules: on Android's shared
+                // storage that would switch off the case-collision guard.
+                let recorded: Option<FsRules> = index
+                    .get_meta(meta::FS_RULES)?
+                    .and_then(|s| serde_json::from_str(&s).ok());
+                match recorded {
+                    Some(r) => {
+                        warn!("cannot probe the vault's filesystem ({e}); using the rules recorded at an earlier open");
+                        r
+                    }
+                    None => {
+                        warn!("cannot probe the vault's filesystem ({e}); assuming FAT-style rules (case-insensitive, restricted names)");
+                        FsRules::fat()
+                    }
+                }
             }
         };
         match cfg.restrict_names {
@@ -475,11 +545,12 @@ impl Engine {
             fs.case_insensitive = ci;
             fs.normalization_insensitive = ci;
         }
-        let index = Index::open(&cfg.index_path)?;
         if index.get_meta(meta::NODE_ID)?.is_none() {
             index.set_meta(meta::NODE_ID, &random_node_id())?;
         }
-        index.set_meta(meta::FS_RULES, &serde_json::to_string(&fs).unwrap_or_default())?;
+        if probe_ok {
+            index.set_meta(meta::FS_RULES, &serde_json::to_string(&fs).unwrap_or_default())?;
+        }
         let ignore = match &cfg.ignore_regex {
             Some(s) => parse_ignore(s, false).map_err(|e| EngineError::Other(format!("invalid ignore regex: {e}")))?,
             None => Vec::new(),
@@ -508,6 +579,7 @@ impl Engine {
                 ops: tokio::sync::Mutex::new(()),
                 push_enabled: AtomicBool::new(false),
                 fold_lock: Mutex::new(()),
+                last_milestone: Mutex::new(None),
             }),
         })
     }
@@ -630,23 +702,28 @@ impl Engine {
             .get_doc(&format!("_local/{MILESTONE_LOCAL_ID}"), false)
             .await?
             .ok_or(Refusal::MissingMilestone)?;
+        *self.inner.last_milestone.lock().unwrap() = Some(milestone.clone());
         let milestone = Milestone::parse(&milestone)?;
         let node_id = self.node_id();
         let (fresh, rebuilt, owed) = {
             let ix = self.inner.index.lock().unwrap();
             let stored = ix.get_meta(meta::CREATED)?.and_then(|s| s.parse::<i64>().ok());
+            // A lingering `resolve_owed` only counts for the database
+            // (`created`) whose lock it was set for.
+            let resolve_owed = ix.get_meta(meta::RESOLVE_OWED)?.as_deref() == Some(&milestone.created.to_string());
             (
                 stored.is_none(),
                 stored.is_some_and(|c| c != milestone.created),
-                ix.get_meta(meta::NEEDS_FETCH)?.is_some() || ix.get_meta(meta::RESOLVE_OWED)?.is_some(),
+                ix.get_meta(meta::NEEDS_FETCH)?.is_some() || resolve_owed,
             )
         };
         // A lock (after a rebuild elsewhere) is upstream's "fetch again":
         // a client that is about to do a full fetch anyway may proceed, and
         // is marked resolved once the fetch is complete.
         let mut fetch_to_resolve = false;
+        let mut lets_us_in = false;
         match gate::assess_milestone(&milestone, &node_id) {
-            Ok(()) => {}
+            Ok(()) => lets_us_in = true,
             Err(Refusal::Locked | Refusal::Cleaned) if fresh || rebuilt || owed => fetch_to_resolve = true,
             Err(e) => return Err(e.into()),
         }
@@ -663,6 +740,8 @@ impl Engine {
         let mut adopted_now = false;
         let mut rebuild = false;
         {
+            // No push pass or batch runs while the index may be reset.
+            let _ops = self.inner.ops.lock().await;
             let ix = self.inner.index.lock().unwrap();
             self.check_vault(&ix)?;
             if ix.get_meta(meta::VAULT)?.is_none() {
@@ -700,16 +779,25 @@ impl Engine {
                         milestone.created
                     );
                     ix.reset_for_rebuild()?;
-                    ix.set_meta(meta::REBUILD_AT, &vaultfs::now_ms().to_string())?;
+                    let now = vaultfs::now_ms();
+                    ix.set_meta(meta::REBUILD_AT, &now.to_string())?;
+                    ix.set_meta(
+                        meta::REBUILD_WAIT,
+                        &format!("{now} owed: the refetch waits for the rebuilt remote to stop changing before anything is pushed"),
+                    )?;
                     rebuild = true;
                 }
                 _ => {}
             }
             if fresh || rebuild {
                 ix.set_meta(meta::NEEDS_FETCH, &vaultfs::now_ms().to_string())?;
+                ix.set_meta(meta::RECONCILE, &vaultfs::now_ms().to_string())?;
             }
             if fetch_to_resolve {
-                ix.set_meta(meta::RESOLVE_OWED, &vaultfs::now_ms().to_string())?;
+                ix.set_meta(meta::RESOLVE_OWED, &milestone.created.to_string())?;
+            } else if lets_us_in {
+                // Nothing left to resolve (unlocked, or we are accepted).
+                ix.delete_meta(meta::RESOLVE_OWED)?;
             }
             ix.set_meta(meta::CREATED, &milestone.created.to_string())?;
             ix.set_meta(meta::VERSION, &version.to_string())?;
@@ -774,6 +862,18 @@ impl Engine {
                 .get_doc(&id, false)
                 .await?
                 .ok_or(Refusal::MissingMilestone)?;
+            // Never register (let alone mark resolved) against a database
+            // other than the one this index was fetched from: it may have
+            // been rebuilt again since the gate ran.
+            let stored = self.with_index(|ix| ix.get_meta(meta::CREATED))?;
+            let created = current.get("created").and_then(Value::as_i64).map(|c| c.to_string());
+            if stored.is_some() && created != stored {
+                return Err(EngineError::Other(format!(
+                    "the remote milestone changed (created {} -> {}); checking the remote again before registering",
+                    stored.unwrap_or_default(),
+                    created.unwrap_or_default()
+                )));
+            }
             let Some(updated) = register_node(&current, &node, &device, &tweaks, vaultfs::now_ms(), mark_resolved)
             else {
                 return Ok(false);
@@ -837,7 +937,7 @@ impl Engine {
         let old_scope = self.apply_scope_narrowing()?;
         self.prepare_vault();
         self.catch_up(start).await?;
-        self.with_index(|ix| ix.delete_meta(meta::NEEDS_FETCH))?;
+        self.finish_read_only_fetch()?;
         self.scope_catch_up(&old_scope).await?;
         self.retry_pending(true).await?;
         self.with_index(|ix| ix.set_meta(meta::LAST_PULL, &vaultfs::now_ms().to_string()))?;
@@ -845,6 +945,22 @@ impl Engine {
         rep.elapsed_ms = start.elapsed().as_millis() as u64;
         rep.pending = self.with_index(|ix| ix.pending(None))?.len() as u64;
         Ok(rep)
+    }
+
+    /// A read-only pull caught up. It completes an owed full fetch only when
+    /// nothing else is owed with it: after a rebuild the quiet wait, and
+    /// after a lock was let through the resolution, belong to the two-way
+    /// side, so the flag stays set for it (and pushes stay held).
+    fn finish_read_only_fetch(&self) -> Result<()> {
+        self.with_index(|ix| {
+            if ix.get_meta(meta::NEEDS_FETCH)?.is_some()
+                && ix.get_meta(meta::REBUILD_WAIT)?.is_none()
+                && ix.get_meta(meta::RESOLVE_OWED)?.is_none()
+            {
+                ix.delete_meta(meta::NEEDS_FETCH)?;
+            }
+            Ok(())
+        })
     }
 
     /// Page through `_changes` (no longpoll) until caught up, persisting
@@ -939,6 +1055,8 @@ impl Engine {
 
         let mut writes: Vec<FileDoc> = Vec::new();
         let mut deletes: Vec<(String, Option<String>)> = Vec::new();
+        // Deleted winners that still have live conflicting revisions.
+        let mut conflicted_deletes: Vec<FileDoc> = Vec::new();
         let mut skips: Vec<(FileDoc, Skip)> = Vec::new();
         let mut ignored = 0u64;
         // Pre-scan: refusals stop the batch before anything is applied.
@@ -997,6 +1115,8 @@ impl Engine {
                             .skipped
                             .entry("out-of-scope".into())
                             .or_default() += 1;
+                    } else if f.deleted && !f.conflicts.is_empty() {
+                        conflicted_deletes.push(f);
                     } else if f.deleted {
                         deletes.push((f.id, Some(f.rev)));
                     } else if let Some(s) = self.skip_reason(&f) {
@@ -1014,6 +1134,9 @@ impl Engine {
         tokio::task::spawn_blocking(move || -> Result<()> {
             for (id, rev) in deletes {
                 this.apply_delete(&id, rev.as_deref())?;
+            }
+            for f in conflicted_deletes {
+                this.apply_conflicted_delete(&f)?;
             }
             for (f, s) in skips {
                 this.apply_skip(&f, &s)?;
@@ -1132,6 +1255,26 @@ impl Engine {
                 ix.remove_pending(id)
             });
         }
+        if b.state == State::Conflicted {
+            // Our revision was a conflicting branch, and the document now
+            // ends in a deletion. That may be an automatic resolution
+            // (upstream keeps the newer mtime, and a deletion's mtime is
+            // "now"), so the local copy is the only place our edit is
+            // easy to find: keep it and say so.
+            warn!(
+                "{}: deleted on another device while this device's version was in conflict; the local copy is kept (delete it here to accept the deletion)",
+                b.path
+            );
+            self.inner.report.lock().unwrap().dirty += 1;
+            b.state = State::Dirty;
+            b.note = Some(
+                "deleted on another device while this device's version was in conflict; local copy kept (delete it here to accept the deletion)".into(),
+            );
+            return self.with_index(|ix| {
+                ix.upsert(&b)?;
+                ix.remove_pending(id)
+            });
+        }
         let target = self.inner.cfg.vault.join(&b.path);
         let outcome = match &b.disk_hash {
             Some(h) => vaultfs::remove_if_matches(&self.inner.cfg.vault, &target, h),
@@ -1181,6 +1324,50 @@ impl Engine {
                 })
             }
         }
+    }
+
+    /// A deleted winner that still has live conflicting revisions (D4:
+    /// a document with `_conflicts` leaves the disk alone). Typically our
+    /// own edit, pushed as a branch, against a deletion on another device:
+    /// the file is kept and reported as conflicted, never removed.
+    fn apply_conflicted_delete(&self, f: &FileDoc) -> Result<()> {
+        let Some(mut b) = self.with_index(|ix| ix.by_doc(&f.id))? else {
+            // Nothing of ours on disk; the conflict is resolved elsewhere.
+            return self.with_index(|ix| ix.remove_pending(&f.id));
+        };
+        match b.state {
+            State::Skipped | State::OutOfScope => {
+                return self.with_index(|ix| {
+                    ix.delete_doc(&f.id)?;
+                    ix.remove_pending(&f.id)
+                })
+            }
+            // An unpushed local edit: the push side writes it as a branch.
+            State::Dirty => return self.with_index(|ix| ix.remove_pending(&f.id)),
+            State::Clean | State::Conflicted => {}
+        }
+        let ours_is_leaf = b.base_rev.as_ref().is_some_and(|r| f.conflicts.contains(r));
+        let note = if ours_is_leaf {
+            format!(
+                "deleted on another device; this device's version is kept as a conflicting revision ({} in conflict); resolve with an official client",
+                f.conflicts.len()
+            )
+        } else {
+            format!(
+                "deleted on another device, with {}; the local file is kept",
+                conflict_note(f)
+            )
+        };
+        if b.state != State::Conflicted || b.note.as_deref() != Some(note.as_str()) {
+            warn!("{}: {note}", b.path);
+        }
+        self.inner.report.lock().unwrap().conflicted += 1;
+        b.state = State::Conflicted;
+        b.note = Some(note);
+        self.with_index(|ix| {
+            ix.upsert(&b)?;
+            ix.remove_pending(&f.id)
+        })
     }
 
     fn group_units(&self, docs: Vec<FileDoc>) -> Vec<Vec<FileDoc>> {
@@ -1297,8 +1484,7 @@ impl Engine {
                                     hash: format!("unreadable: {e}"),
                                     size: 0,
                                     mtime_ms: 0,
-                                    #[cfg(unix)]
-                                    ino: (0, 0),
+                                    file_id: None,
                                 })
                             }
                         };
@@ -1635,8 +1821,7 @@ impl Engine {
         let Ok(Some(old_state)) = vaultfs::read_state(&old) else {
             return;
         };
-        #[cfg(unix)]
-        if old_state.ino == new_disk.ino {
+        if old_state.file_id.is_some() && old_state.file_id == new_disk.file_id {
             return; // same file on a case-insensitive filesystem
         }
         if let Some(h) = &b.disk_hash {
@@ -1671,7 +1856,7 @@ impl Engine {
         }
     }
 
-    fn save_recovered(&self, rel: &str, content: &[u8]) {
+    pub(crate) fn save_recovered(&self, rel: &str, content: &[u8]) {
         let dir = self.inner.state_dir.join("recovered");
         let name = format!("{}-{}", vaultfs::now_ms(), rel.replace('/', "%2F"));
         let p = dir.join(name);
@@ -1820,7 +2005,8 @@ impl Engine {
         let old_scope = self.apply_scope_narrowing()?;
         self.prepare_vault();
         self.catch_up(start).await?;
-        self.after_catch_up(&gate, &old_scope, None).await?;
+        let done = self.after_catch_up(&gate, &old_scope, None).await?;
+        debug_assert!(done, "only a shutdown interrupts, and sync_once has none");
         let push = self.push_all(false).await?;
         // Our own writes come back through the changes feed; take them in so
         // `since` is current.
@@ -1841,63 +2027,188 @@ impl Engine {
     pub fn request_full_fetch(&self) -> Result<()> {
         self.with_index(|ix| {
             ix.reset_for_rebuild()?;
-            ix.set_meta(meta::NEEDS_FETCH, &vaultfs::now_ms().to_string())
+            ix.set_meta(meta::NEEDS_FETCH, &vaultfs::now_ms().to_string())?;
+            ix.set_meta(meta::RECONCILE, &vaultfs::now_ms().to_string())
+        })
+    }
+
+    /// Why pushes must wait, if they must: a full fetch is owed, or this
+    /// node still has to be marked resolved after a lock was let through.
+    /// The push passes check this themselves, so no caller can push into a
+    /// database that is being rebuilt or that we have not fully fetched.
+    pub(crate) fn pushes_held(&self) -> Result<Option<&'static str>> {
+        self.with_index(|ix| {
+            Ok(if ix.get_meta(meta::NEEDS_FETCH)?.is_some() {
+                Some("a full fetch of the remote is still owed")
+            } else if ix.get_meta(meta::RESOLVE_OWED)?.is_some() {
+                Some("this device is not yet marked resolved after a remote lock")
+            } else {
+                None
+            })
         })
     }
 
     /// After the pull caught up: finish an owed full fetch (waiting for a
     /// rebuilding device to finish uploading), catch up a widened scope,
-    /// register this node, and allow pushes.
+    /// register this node, and allow pushes. Returns false when a shutdown
+    /// interrupted the quiet wait: then nothing is registered, no flag is
+    /// cleared and pushes stay off, so the next start does it all again.
     async fn after_catch_up(
         &self,
         gate: &GateReport,
         old_scope: &Scope,
         shutdown: Option<&mut watch::Receiver<bool>>,
-    ) -> Result<()> {
-        if gate.needs_full_fetch && (gate.rebuild_detected || gate.fetch_to_resolve || gate.locked) {
-            self.wait_until_quiet(shutdown).await?;
+    ) -> Result<bool> {
+        let (needs_fetch, wait_owed) = self.with_index(|ix| {
+            Ok((
+                ix.get_meta(meta::NEEDS_FETCH)?.is_some(),
+                ix.get_meta(meta::REBUILD_WAIT)?.is_some(),
+            ))
+        })?;
+        if wait_owed && !needs_fetch {
+            self.with_index(|ix| ix.delete_meta(meta::REBUILD_WAIT))?; // stale
+        }
+        if needs_fetch && (wait_owed || gate.rebuild_detected || gate.fetch_to_resolve || gate.locked) {
+            match self.wait_until_quiet(shutdown).await? {
+                Quiet::Settled => {}
+                Quiet::Interrupted => {
+                    info!("stopped during the quiet wait; the full fetch is completed at the next start");
+                    return Ok(false);
+                }
+            }
         }
         self.scope_catch_up(old_scope).await?;
         self.retry_pending(true).await?;
         let resolve_owed = self.with_index(|ix| ix.get_meta(meta::RESOLVE_OWED))?.is_some();
-        let mark_resolved = gate.needs_full_fetch || resolve_owed;
+        let mark_resolved = needs_fetch || resolve_owed;
         self.register_node(mark_resolved).await?;
         if mark_resolved {
             self.with_index(|ix| {
+                if needs_fetch {
+                    // A new full fetch: its push-backs are reported afresh.
+                    ix.delete_meta(meta::ORPHANS)?;
+                }
                 ix.delete_meta(meta::NEEDS_FETCH)?;
                 ix.delete_meta(meta::RESOLVE_OWED)
             })?;
             info!("full fetch complete; this node is registered and marked resolved");
         }
         self.inner.push_enabled.store(true, Ordering::SeqCst);
-        Ok(())
+        Ok(true)
     }
 
     /// After a rebuild elsewhere the rebuilding device keeps uploading for a
     /// while. Pull until the remote's update sequence stays the same for
     /// `rebuild_quiet`, so the fetch is complete before we push anything.
-    async fn wait_until_quiet(&self, mut shutdown: Option<&mut watch::Receiver<bool>>) -> Result<()> {
+    ///
+    /// - A nudge (network change, "sync now") restarts the window; it never
+    ///   ends it early.
+    /// - A database holding nothing but the version document is not quiet
+    ///   yet (the rebuilder has not started uploading), up to 20 windows.
+    /// - A shutdown returns `Interrupted`.
+    async fn wait_until_quiet(&self, mut shutdown: Option<&mut watch::Receiver<bool>>) -> Result<Quiet> {
         let quiet = self.inner.cfg.rebuild_quiet;
-        if quiet.is_zero() {
-            return Ok(());
-        }
+        let started = Instant::now();
+        let started_ms = vaultfs::now_ms();
+        let max_empty = quiet * 20;
+        let mut rounds = 0u32;
         loop {
-            let before = self.inner.couch.db_info().await?.update_seq;
-            info!("waiting {quiet:.0?} for the remote to settle after a rebuild");
-            match shutdown.as_deref_mut() {
-                Some(rx) => {
-                    if self.sleep_or_shutdown(quiet, rx).await {
-                        return Ok(());
-                    }
+            if quiet.is_zero() {
+                break;
+            }
+            let info = self.inner.couch.db_info().await?;
+            let before = seq_to_string(&info.update_seq);
+            let msg = format!(
+                "waiting since {started_ms} for the rebuilt remote to stay unchanged for {quiet:.0?} ({} documents so far){}",
+                info.doc_count,
+                self.rebuilder_note()
+            );
+            self.with_index(|ix| ix.set_meta(meta::REBUILD_WAIT, &format!("{} {msg}", vaultfs::now_ms())))?;
+            if rounds == 0 {
+                info!("{msg}");
+            } else {
+                debug!("{msg}");
+            }
+            rounds += 1;
+            enum Woke {
+                Timer,
+                Nudged,
+                Shutdown,
+            }
+            let woke = match shutdown.as_deref_mut() {
+                Some(rx) => tokio::select! {
+                    _ = tokio::time::sleep(quiet) => Woke::Timer,
+                    _ = self.inner.nudge.notified() => Woke::Nudged,
+                    _ = rx.changed() => Woke::Shutdown,
+                },
+                None => tokio::select! {
+                    _ = tokio::time::sleep(quiet) => Woke::Timer,
+                    _ = self.inner.nudge.notified() => Woke::Nudged,
+                },
+            };
+            match woke {
+                Woke::Shutdown => return Ok(Quiet::Interrupted),
+                Woke::Nudged => {
+                    info!("nudged during the quiet wait; catching up and restarting the {quiet:.0?} window");
+                    self.catch_up(Instant::now()).await?;
+                    continue;
                 }
-                None => tokio::time::sleep(quiet).await,
+                Woke::Timer => {}
             }
-            let after = self.inner.couch.db_info().await?.update_seq;
-            if seq_to_string(&before) == seq_to_string(&after) {
-                return Ok(());
+            let after = self.inner.couch.db_info().await?;
+            if before != seq_to_string(&after.update_seq) {
+                self.catch_up(Instant::now()).await?;
+                continue;
             }
-            self.catch_up(Instant::now()).await?;
+            if after.doc_count <= 1 && started.elapsed() < max_empty {
+                info!("the rebuilt remote is quiet but still empty; waiting for the rebuilding device to upload");
+                continue;
+            }
+            if after.doc_count <= 1 {
+                warn!(
+                    "the rebuilt remote stayed empty for {:.0?}; treating it as settled",
+                    started.elapsed()
+                );
+            }
+            break;
         }
+        self.with_index(|ix| ix.delete_meta(meta::REBUILD_WAIT))?;
+        if !quiet.is_zero() {
+            info!("the rebuilt remote settled after {:.0?}", started.elapsed());
+        }
+        Ok(Quiet::Settled)
+    }
+
+    /// For the quiet-wait log: which node(s) the milestone accepts (the
+    /// rebuilder) and when they last connected.
+    fn rebuilder_note(&self) -> String {
+        // Best effort, from the milestone the gate read last.
+        let Some(v) = self.inner.last_milestone.lock().unwrap().clone() else {
+            return String::new();
+        };
+        let accepted: Vec<String> = v
+            .get("accepted_nodes")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        if accepted.is_empty() {
+            return String::new();
+        }
+        let parts: Vec<String> = accepted
+            .iter()
+            .map(|n| {
+                let info = v.get("node_info").and_then(|i| i.get(n));
+                let name = info
+                    .and_then(|i| i.get("device_name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(n);
+                match info.and_then(|i| i.get("last_connected")).and_then(Value::as_i64) {
+                    Some(t) => format!("{name} (last connected {t})"),
+                    None => name.to_string(),
+                }
+            })
+            .collect();
+        format!("; accepted node(s): {}", parts.join(", "))
     }
 
     async fn daemon(&self, mut shutdown: watch::Receiver<bool>, two_way: bool) -> Result<()> {
@@ -1915,6 +2226,11 @@ impl Engine {
                     info!("gate ok: {} (version {}, created {})", g.remote, g.version, g.created);
                     if g.rebuild_detected {
                         warn!("remote was rebuilt; refetching everything");
+                    }
+                    if self.pushes_held()?.is_some() {
+                        // Stop pushing at once; `after_catch_up` turns it
+                        // back on when the owed fetch is complete.
+                        self.inner.push_enabled.store(false, Ordering::SeqCst);
                     }
                     if !prepared {
                         old_scope = Some(self.apply_scope_narrowing()?);
@@ -1947,7 +2263,11 @@ impl Engine {
             let caught = match self.catch_up(session).await {
                 Ok(()) => {
                     let scope = old_scope.clone().unwrap_or_else(|| self.inner.cfg.scope.clone());
-                    let r = if two_way && caught_up_once && !gate.needs_full_fetch {
+                    let owed = match self.pushes_held() {
+                        Ok(h) => h.is_some(),
+                        Err(e) => return Err(e),
+                    };
+                    let r = if two_way && caught_up_once && !owed {
                         // A routine re-gate: refresh the registration (at
                         // most once a minute) and carry on pushing.
                         match self.register_node(false).await {
@@ -1958,9 +2278,13 @@ impl Engine {
                             Err(e) => Err(e),
                         }
                     } else if two_way {
-                        self.after_catch_up(&gate, &scope, Some(&mut shutdown)).await
+                        match self.after_catch_up(&gate, &scope, Some(&mut shutdown)).await {
+                            Ok(true) => Ok(()),
+                            Ok(false) => return Ok(()), // shut down during the quiet wait
+                            Err(e) => Err(e),
+                        }
                     } else {
-                        match self.with_index(|ix| ix.delete_meta(meta::NEEDS_FETCH)) {
+                        match self.finish_read_only_fetch() {
                             Ok(()) => self.scope_catch_up(&scope).await,
                             Err(e) => Err(e),
                         }
@@ -2141,6 +2465,11 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
         last_push_ms: num(meta::LAST_PUSH)?,
         needs_full_fetch: ix.get_meta(meta::NEEDS_FETCH)?.is_some() || ix.get_meta(meta::RESOLVE_OWED)?.is_some(),
         safety_stop: ix.get_meta(meta::SAFETY_STOP)?,
+        rebuild_wait: ix.get_meta(meta::REBUILD_WAIT)?,
+        rebuild_orphans: ix
+            .get_meta(meta::ORPHANS)?
+            .and_then(|s| serde_json::from_str::<crate::push::OrphanRecord>(&s).ok())
+            .map(|r| r.describe()),
     })
 }
 

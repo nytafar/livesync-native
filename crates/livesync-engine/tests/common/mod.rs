@@ -91,6 +91,11 @@ pub struct MockState {
     pub fail_changes: u32,
     /// Fail this many document writes (PUT and `_bulk_docs`) with a 503.
     pub fail_writes: u32,
+    /// Refuse `PUT`s of these document IDs with a 400 (a document the
+    /// server or a proxy will never take).
+    pub reject_puts: HashSet<String>,
+    /// Store the next `PUT`, then answer 500 as if the response was lost.
+    pub lose_next_put_response: bool,
     pub db_missing: bool,
 }
 
@@ -554,10 +559,22 @@ async fn put_doc(State((st, notify)): S, Path(id): Path<String>, Json(mut body):
         s.fail_writes -= 1;
         return (StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
     }
+    if s.reject_puts.contains(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "bad_request", "reason": "rejected by the mock"})),
+        )
+            .into_response();
+    }
     body["_id"] = json!(id);
     let r = s.write(body);
+    let lose = std::mem::take(&mut s.lose_next_put_response);
     drop(s);
     match r {
+        WriteResult::Ok(_) if lose => {
+            notify.notify_waiters();
+            (StatusCode::INTERNAL_SERVER_ERROR, "response lost").into_response()
+        }
         WriteResult::Ok(rev) => {
             notify.notify_waiters();
             (StatusCode::CREATED, Json(json!({"ok": true, "id": id, "rev": rev}))).into_response()
