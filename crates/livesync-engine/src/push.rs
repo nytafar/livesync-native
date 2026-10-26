@@ -229,6 +229,8 @@ struct PassCtx {
     incomplete: bool,
     /// The file `push_local` is working on: (document path, content hash).
     attempt: Option<(String, String)>,
+    /// This pass may delete en masse (consumed `allow_mass_delete_once`).
+    mass_delete_once: bool,
     /// Paths and content hashes whose push failed in this pass: a vanished
     /// file renamed to one of them is not deleted yet.
     failed_paths: HashSet<String>,
@@ -324,6 +326,20 @@ impl Engine {
     /// engine was opened: what a front-end shows next to `report()`.
     pub fn push_report(&self) -> PushReport {
         self.inner.push_report.lock().unwrap().clone()
+    }
+
+    /// Let the next full push pass, and only that one, delete more than the
+    /// mass-delete stop allows: a front-end's answer to a safety stop the
+    /// user confirmed (the per-run `EngineConfig::allow_mass_delete` stays
+    /// for the CLI). Asks for that pass now.
+    pub fn allow_mass_delete_once(&self) {
+        self.inner.mass_delete_once.store(true, Ordering::SeqCst);
+        self.rescan_now();
+    }
+
+    /// Whether an `allow_mass_delete_once` is still waiting for its pass.
+    pub fn mass_delete_allowed(&self) -> bool {
+        self.inner.mass_delete_once.load(Ordering::SeqCst)
     }
 
     fn ids_case_insensitive(&self) -> bool {
@@ -587,6 +603,8 @@ impl Engine {
         let mut ctx = PassCtx {
             reconcile: self.with_index(|ix| ix.get_meta(meta::RECONCILE))?.is_some(),
             incomplete: !walk.unreadable.is_empty(),
+            // Taken by this full pass, so a later pass never inherits it.
+            mass_delete_once: self.inner.mass_delete_once.swap(false, Ordering::SeqCst),
             ..Default::default()
         };
         for (f, row) in work {
@@ -1387,7 +1405,7 @@ impl Engine {
             } else {
                 format!("{undestined} of {tracked} tracked files are missing from the vault")
             };
-            if self.inner.cfg.allow_mass_delete {
+            if self.inner.cfg.allow_mass_delete || ctx.mass_delete_once {
                 warn!("{msg}; deleting them remotely (mass deletes allowed)");
             } else {
                 let msg = format!("{msg}; not deleting them remotely (allow mass deletes if this is intended)");

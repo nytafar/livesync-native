@@ -148,8 +148,18 @@ class SyncService : Service() {
             val cfg = try {
                 core.configFor(p)
             } catch (e: Exception) {
-                // No stored password, or the Keystore key is gone.
+                // No stored password, or the Keystore key is gone. An engine
+                // still running on older settings (perhaps two-way, where the
+                // profile now says pull-only) must not run on.
                 problems[p.id] = e.message ?: "no password"
+                if (p.id in active) {
+                    try {
+                        core.engine.stop(p.id)
+                    } catch (x: Exception) {
+                        core.log("stopping ${p.id}: ${x.message}", "error")
+                    }
+                    core.log("profile ${p.id} stopped: its settings cannot be loaded (${e.message})", "error")
+                }
                 continue
             }
             if (p.id !in active && !java.io.File(app.profiles.stateDir(p.id), "index.sqlite").exists()) {

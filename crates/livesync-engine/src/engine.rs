@@ -78,6 +78,15 @@ pub(crate) mod meta_keys {
     pub const SAFETY_STOP: &str = "safety_stop";
 }
 
+/// Aborts a spawned task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Note prefix (and status filter) for documents whose names the vault's
 /// filesystem cannot hold.
 pub const UNWRITABLE_NOTE: &str = "unwritable name";
@@ -406,6 +415,8 @@ pub(crate) struct Inner {
     report: Mutex<PullReport>,
     /// The two-way daemon's push totals for this session (`push_report`).
     pub(crate) push_report: Mutex<crate::push::PushReport>,
+    /// The next full push pass may delete en masse (`allow_mass_delete_once`).
+    pub(crate) mass_delete_once: AtomicBool,
     pub(crate) nudge: Notify,
     /// Wakes the push loop for a full rescan.
     pub(crate) rescan: Notify,
@@ -577,6 +588,7 @@ impl Engine {
                 mem: Semaphore::new(budget),
                 report: Mutex::new(PullReport::default()),
                 push_report: Mutex::new(crate::push::PushReport::default()),
+                mass_delete_once: AtomicBool::new(false),
                 nudge: Notify::new(),
                 rescan: Notify::new(),
                 ops: tokio::sync::Mutex::new(()),
@@ -1984,6 +1996,9 @@ impl Engine {
         // ended (a fatal error on one side stops both).
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut push = tokio::spawn(self.clone().push_loop(stop_rx.clone()));
+        // If the caller drops this future (cancels the run), the push side
+        // goes with it instead of finishing a pass detached.
+        let _push_guard = AbortOnDrop(push.abort_handle());
         let pull = self.daemon(stop_rx, true);
         tokio::pin!(pull);
         let result = tokio::select! {

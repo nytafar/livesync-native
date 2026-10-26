@@ -115,7 +115,7 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
                     Text("Allow these deletions…")
                 }
             }
-            if (st?.massDeleteAllowed == true) Banner("Mass deletes are allowed for the current push pass.", Tone.WARN)
+            if (st?.massDeleteAllowed == true) Banner("Deleting the missing files at the next full sync pass…", Tone.WARN)
             st?.rebuildWait?.let { Banner("Waiting for a rebuild elsewhere to finish: ${fmtStamped(it)}", Tone.INFO) }
             st?.rebuildOrphans?.let {
                 Banner("Pushed back after a rebuild (check them): ${it.substringAfter(' ')}", Tone.WARN)
@@ -294,17 +294,27 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
                             busy = r.exceptionOrNull()?.let { "Full fetch: ${it.message}" }
                         }
                         Confirm.Remove -> scope.launch {
-                            withContext(Dispatchers.IO) {
+                            busy = "Stopping the engine…"
+                            val r = withContext(Dispatchers.IO) {
                                 runCatching {
                                     app.profiles.update(p.id) { it.copy(paused = true) }
-                                    core.engine.stop(p.id)
+                                    // Its index must not be deleted while an engine still uses it.
+                                    check(core.engine.stop(p.id)) {
+                                        "the engine is still stopping; the profile is paused, try again in a minute"
+                                    }
+                                    app.secrets.removeProfile(p.id)
+                                    app.profiles.remove(p.id)
+                                    core.log("profile ${p.id} removed")
                                 }
-                                runCatching { app.secrets.removeProfile(p.id) }
-                                app.profiles.remove(p.id)
-                                core.log("profile ${p.id} removed")
                             }
-                            SyncService.start(ctx, "profile removed")
-                            onRemoved()
+                            SyncService.start(ctx, "profile removed or paused")
+                            r.onSuccess {
+                                busy = null
+                                onRemoved()
+                            }.onFailure {
+                                busy = "Not removed: ${it.message}"
+                                onChanged()
+                            }
                         }
                     }
                 }) { Text(c.action) }
@@ -324,7 +334,7 @@ private enum class Confirm(val title: String, val text: String, val action: Stri
     MassDelete(
         "Delete these files on the server?",
         "The files listed as missing will be soft-deleted on the server and disappear from your other devices " +
-            "(they stay recoverable there as deleted documents). This permission lasts for one sync pass.",
+            "(they stay recoverable there as deleted documents). This permission covers the next full sync pass only.",
         "Delete them",
     ),
     Adopt(

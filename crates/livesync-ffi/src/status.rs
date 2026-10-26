@@ -143,7 +143,7 @@ pub struct ProfileStatus {
     pub needs_full_fetch: bool,
     /// `"<ms> <text>"`: a mass deletion was refused and waits for the user.
     pub safety_stop: Option<String>,
-    /// The running engine allows mass deletes (for one pass, confirmed by the user).
+    /// A confirmed mass delete is waiting for its (one) full push pass.
     pub mass_delete_allowed: bool,
     /// `"<ms> <text>"`: waiting for a rebuilding device to finish uploading.
     pub rebuild_wait: Option<String>,
