@@ -1738,6 +1738,13 @@ impl Engine {
                 // Not a deletion: the database may have been recreated, or a
                 // proxy answered for something else. Touch nothing; retry later.
                 DocFetch::Missing(reason) => {
+                    if self.with_index(|ix| ix.by_doc(&p.doc_id))?.is_none() {
+                        // Nothing local depends on it (for example a refetch
+                        // queued for a document a rebuild dropped).
+                        debug!("{}: gone from the remote and not tracked locally; dropped", p.doc_id);
+                        self.with_index(|ix| ix.remove_pending(&p.doc_id))?;
+                        continue;
+                    }
                     let why = format!("document missing on the remote (404 {reason}); local file left alone");
                     warn!("{}: {why}", p.doc_id);
                     self.with_index(|ix| ix.add_pending(&p.doc_id, p.rev.as_deref(), &why, vaultfs::now_ms()))?;
@@ -1771,13 +1778,33 @@ impl Engine {
     /// settle queue, periodic rescans) beside it. Pushes start once the gate
     /// passed, the remote was caught up (with a full fetch when one is owed)
     /// and this node is registered in the milestone.
-    pub async fn run(&self, shutdown: watch::Receiver<bool>) -> Result<()> {
-        let push = tokio::spawn(self.clone().push_loop(shutdown.clone()));
-        let pulled = self.daemon(shutdown, true).await;
+    pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        // Each side stops when the caller says so, or when the other side
+        // ended (a fatal error on one side stops both).
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let mut push = tokio::spawn(self.clone().push_loop(stop_rx.clone()));
+        let pull = self.daemon(stop_rx, true);
+        tokio::pin!(pull);
+        let result = tokio::select! {
+            r = &mut pull => {
+                let _ = stop_tx.send(true);
+                let pushed = push.await.map_err(EngineError::other)?;
+                r.and(pushed.map(|_| ()))
+            }
+            r = &mut push => {
+                let _ = stop_tx.send(true);
+                let pulled = pull.await;
+                r.map_err(EngineError::other)?.map(|_| ()).and(pulled)
+            }
+            _ = shutdown.changed() => {
+                let _ = stop_tx.send(true);
+                let pulled = pull.await;
+                let pushed = push.await.map_err(EngineError::other)?;
+                pulled.and(pushed.map(|_| ()))
+            }
+        };
         self.inner.push_enabled.store(false, Ordering::SeqCst);
-        let pushed = push.await.map_err(EngineError::other)?;
-        pulled?;
-        pushed.map(|_| ())
+        result
     }
 
     /// One two-way pass: gate, pull until caught up (a full fetch when one is
@@ -1876,6 +1903,7 @@ impl Engine {
     async fn daemon(&self, mut shutdown: watch::Receiver<bool>, two_way: bool) -> Result<()> {
         let mut backoff = Backoff::default();
         let mut prepared = false;
+        let mut caught_up_once = false;
         let mut old_scope: Option<Scope> = None;
         'outer: loop {
             if *shutdown.borrow() {
@@ -1919,7 +1947,17 @@ impl Engine {
             let caught = match self.catch_up(session).await {
                 Ok(()) => {
                     let scope = old_scope.clone().unwrap_or_else(|| self.inner.cfg.scope.clone());
-                    let r = if two_way {
+                    let r = if two_way && caught_up_once && !gate.needs_full_fetch {
+                        // A routine re-gate: refresh the registration (at
+                        // most once a minute) and carry on pushing.
+                        match self.register_node(false).await {
+                            Ok(_) => {
+                                self.inner.push_enabled.store(true, Ordering::SeqCst);
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else if two_way {
                         self.after_catch_up(&gate, &scope, Some(&mut shutdown)).await
                     } else {
                         match self.with_index(|ix| ix.delete_meta(meta::NEEDS_FETCH)) {
@@ -1929,6 +1967,7 @@ impl Engine {
                     };
                     if r.is_ok() {
                         old_scope = Some(self.inner.cfg.scope.clone());
+                        caught_up_once = true;
                     }
                     r
                 }

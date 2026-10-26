@@ -1147,6 +1147,14 @@ impl Engine {
     ) {
         let mut note_path = |abs: &Path, watcher: &mut dyn Watcher, watched: &mut HashSet<PathBuf>| {
             let Some(rel) = rel_of(root, abs) else { return };
+            // Obsidian creates `.trash/` on its first delete; watch it then,
+            // so later deletes are matched by their rename cookie.
+            if rel == ".trash" && abs.is_dir() && !watched.contains(abs) && !watched.is_empty() {
+                if watcher.watch_dir(abs).is_ok() {
+                    watched.insert(abs.to_path_buf());
+                }
+                return;
+            }
             if classify_path(&rel).is_some() {
                 return; // dot-paths (including our temp files) and flag files
             }

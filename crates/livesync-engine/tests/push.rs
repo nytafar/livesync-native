@@ -723,3 +723,27 @@ async fn a_branch_that_loses_to_our_revision_is_still_reported() {
     assert_eq!(row.state, State::Conflicted, "{row:?}");
     assert_eq!(env.engine().status().unwrap().conflicted.len(), 1);
 }
+
+#[tokio::test]
+async fn a_refetch_of_a_document_that_is_gone_does_not_linger() {
+    // After a rebuild, a file the rebuilder lacked and that was also deleted
+    // locally: nothing to delete, nothing to fetch, nothing left pending.
+    let env = Env::new().await;
+    env.mock.put_text("keep.md", &["keep"]);
+    env.mock.put_text("lost.md", &["lost"]);
+    env.engine().sync_once().await.unwrap();
+    std::fs::remove_file(env.vault().join("lost.md")).unwrap();
+    {
+        let mut st = env.mock.state.lock().unwrap();
+        st.docs.retain(|k, _| k == "obsydian_livesync_version");
+        st.trees.retain(|k, _| k == "obsydian_livesync_version");
+        st.log.clear();
+    }
+    env.mock.update_milestone(|m| m["created"] = json!(3000));
+    env.mock.put_text("keep.md", &["keep"]);
+    env.engine().sync_once().await.unwrap();
+    let st = env.engine().status().unwrap();
+    assert!(st.pending.is_empty(), "{:?}", st.pending);
+    assert!(env.row("lost.md").is_none());
+    assert!(env.mock.doc("lost.md").is_none(), "nothing written for it");
+}
