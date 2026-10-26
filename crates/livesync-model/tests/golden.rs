@@ -4,7 +4,9 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> Vec<Value> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/golden").join(name);
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/golden")
+        .join(name);
     let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["meta"]["version"], "0.2.1", "fixtures must come from commonlib 0.2.1");
@@ -28,7 +30,12 @@ fn chunk_ids_match_upstream() {
     assert!(cases.len() >= 10);
     for c in cases {
         let piece = c["piece"].as_str().unwrap();
-        assert_eq!(chunk::chunk_id_xxhash64(piece), c["id"].as_str().unwrap(), "piece len {}", piece.len());
+        assert_eq!(
+            chunk::chunk_id_xxhash64(piece),
+            c["id"].as_str().unwrap(),
+            "piece len {}",
+            piece.len()
+        );
     }
 }
 
@@ -51,7 +58,11 @@ fn decompression_matches_upstream() {
 fn classification_matches_upstream() {
     for c in fixture("classify.json") {
         let p = c["path"].as_str().unwrap();
-        assert_eq!(path::upstream_should_be_ignored(p), c["ignored"].as_bool().unwrap(), "{p}");
+        assert_eq!(
+            path::upstream_should_be_ignored(p),
+            c["ignored"].as_bool().unwrap(),
+            "{p}"
+        );
         assert_eq!(path::is_plain_text(p), c["plainText"].as_bool().unwrap(), "{p}");
         // Our skip rule is a superset of upstream's.
         if c["ignored"].as_bool().unwrap() {

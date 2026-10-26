@@ -154,7 +154,11 @@ impl Index {
 
     pub fn by_doc(&self, doc_id: &str) -> rusqlite::Result<Option<FileRow>> {
         self.conn
-            .query_row(&format!("SELECT {COLS} FROM files WHERE doc_id = ?1"), [doc_id], row_from)
+            .query_row(
+                &format!("SELECT {COLS} FROM files WHERE doc_id = ?1"),
+                [doc_id],
+                row_from,
+            )
             .optional()
     }
 
@@ -168,7 +172,10 @@ impl Index {
     /// the same document under another path (a case-only rename).
     pub fn upsert(&self, row: &FileRow) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM files WHERE doc_id = ?1 AND path <> ?2", params![row.doc_id, row.path])?;
+        tx.execute(
+            "DELETE FROM files WHERE doc_id = ?1 AND path <> ?2",
+            params![row.doc_id, row.path],
+        )?;
         tx.execute(
             &format!(
                 "INSERT INTO files({COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -198,15 +205,17 @@ impl Index {
     }
 
     pub fn counts_by_state(&self) -> rusqlite::Result<Vec<(String, u64)>> {
-        let mut st = self.conn.prepare("SELECT state, COUNT(*) FROM files GROUP BY state ORDER BY state")?;
+        let mut st = self
+            .conn
+            .prepare("SELECT state, COUNT(*) FROM files GROUP BY state ORDER BY state")?;
         let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?;
         rows.collect()
     }
 
     pub fn list_state(&self, state: State, limit: usize) -> rusqlite::Result<Vec<FileRow>> {
-        let mut st = self
-            .conn
-            .prepare(&format!("SELECT {COLS} FROM files WHERE state = ?1 ORDER BY path LIMIT ?2"))?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM files WHERE state = ?1 ORDER BY path LIMIT ?2"
+        ))?;
         let rows = st.query_map(params![state.as_str(), limit as i64], row_from)?;
         rows.collect()
     }

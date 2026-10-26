@@ -127,9 +127,7 @@ pub fn upstream_should_be_ignored(path: &str) -> bool {
 
 /// Extensions LiveSync stores as text (`type: "plain"`).
 pub fn is_plain_text(path: &str) -> bool {
-    const EXT: [&str; 9] = [
-        ".md", ".txt", ".svg", ".html", ".csv", ".css", ".js", ".xml", ".canvas",
-    ];
+    const EXT: [&str; 9] = [".md", ".txt", ".svg", ".html", ".csv", ".css", ".js", ".xml", ".canvas"];
     EXT.iter().any(|e| path.ends_with(e))
 }
 

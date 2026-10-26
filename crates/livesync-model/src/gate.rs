@@ -65,7 +65,11 @@ pub enum Refusal {
 /// `doc` is `None` when the document does not exist.
 pub fn assess_version_doc(doc: Option<&Value>, db_has_docs: bool) -> Result<i64, Refusal> {
     let Some(doc) = doc else {
-        return if db_has_docs { Err(Refusal::MissingVersionDoc) } else { Ok(0) };
+        return if db_has_docs {
+            Err(Refusal::MissingVersionDoc)
+        } else {
+            Ok(0)
+        };
     };
     let invalid = |m: &str| Err(Refusal::InvalidVersionDoc(m.to_string()));
     if doc.get("type").and_then(Value::as_str) != Some("versioninfo") {
@@ -92,7 +96,11 @@ pub fn assess_version_doc(doc: Option<&Value>, db_has_docs: bool) -> Result<i64,
         return Err(Refusal::UnsupportedGeneration(version));
     }
     if version == 12 {
-        return if has_features { invalid("used_features at generation 12") } else { Ok(12) };
+        return if has_features {
+            invalid("used_features at generation 12")
+        } else {
+            Ok(12)
+        };
     }
     let Some(features) = doc.get("used_features").and_then(Value::as_array) else {
         return invalid("used_features missing at generation 13");
@@ -106,7 +114,11 @@ pub fn assess_version_doc(doc: Option<&Value>, db_has_docs: bool) -> Result<i64,
     }
     names.sort();
     names.dedup();
-    let unknown: Vec<_> = names.iter().filter(|n| !KNOWN_FEATURES.contains(&n.as_str())).cloned().collect();
+    let unknown: Vec<_> = names
+        .iter()
+        .filter(|n| !KNOWN_FEATURES.contains(&n.as_str()))
+        .cloned()
+        .collect();
     if !unknown.is_empty() {
         return Err(Refusal::UnknownFeatures(unknown.join(", ")));
     }
@@ -132,7 +144,10 @@ impl Milestone {
     pub fn parse(doc: &Value) -> Result<Self, Refusal> {
         let bad = |m: &str| Refusal::InvalidMilestone(m.to_string());
         let created = match doc.get("created") {
-            Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).ok_or_else(|| bad("created"))?,
+            Some(Value::Number(n)) => n
+                .as_i64()
+                .or_else(|| n.as_f64().map(|f| f as i64))
+                .ok_or_else(|| bad("created"))?,
             _ => return Err(bad("created missing")),
         };
         let accepted_nodes = doc
@@ -145,8 +160,14 @@ impl Milestone {
         let mut node_chunk_info = BTreeMap::new();
         if let Some(m) = doc.get("node_chunk_info").and_then(Value::as_object) {
             for (k, v) in m {
-                let min = v.get("min").and_then(Value::as_i64).ok_or_else(|| bad("node_chunk_info.min"))?;
-                let max = v.get("max").and_then(Value::as_i64).ok_or_else(|| bad("node_chunk_info.max"))?;
+                let min = v
+                    .get("min")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| bad("node_chunk_info.min"))?;
+                let max = v
+                    .get("max")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| bad("node_chunk_info.max"))?;
                 node_chunk_info.insert(k.clone(), (min, max));
             }
         }
@@ -330,8 +351,14 @@ mod tests {
     #[test]
     fn version_doc() {
         assert_eq!(vd(json!({"type":"versioninfo","version":12})), Ok(12));
-        assert_eq!(vd(json!({"type":"versioninfo","version":13,"used_features":[]})), Ok(13));
-        assert!(matches!(vd(json!({"type":"versioninfo","version":14})), Err(Refusal::UnsupportedGeneration(14))));
+        assert_eq!(
+            vd(json!({"type":"versioninfo","version":13,"used_features":[]})),
+            Ok(13)
+        );
+        assert!(matches!(
+            vd(json!({"type":"versioninfo","version":14})),
+            Err(Refusal::UnsupportedGeneration(14))
+        ));
         assert!(matches!(
             vd(json!({"type":"versioninfo","version":13,"used_features":["warp-drive"]})),
             Err(Refusal::UnknownFeatures(_))
@@ -340,10 +367,22 @@ mod tests {
             vd(json!({"type":"versioninfo","version":13,"used_features":["nfc-path-identity-v1"]})),
             Err(Refusal::UnsupportedFeatures(_))
         ));
-        assert!(matches!(vd(json!({"type":"versioninfo","version":13})), Err(Refusal::InvalidVersionDoc(_))));
-        assert!(matches!(vd(json!({"type":"versioninfo","version":12,"used_features":[]})), Err(Refusal::InvalidVersionDoc(_))));
-        assert!(matches!(vd(json!({"type":"versioninfo","version":11})), Err(Refusal::OlderGeneration(11))));
-        assert!(matches!(vd(json!({"type":"x","version":12})), Err(Refusal::InvalidVersionDoc(_))));
+        assert!(matches!(
+            vd(json!({"type":"versioninfo","version":13})),
+            Err(Refusal::InvalidVersionDoc(_))
+        ));
+        assert!(matches!(
+            vd(json!({"type":"versioninfo","version":12,"used_features":[]})),
+            Err(Refusal::InvalidVersionDoc(_))
+        ));
+        assert!(matches!(
+            vd(json!({"type":"versioninfo","version":11})),
+            Err(Refusal::OlderGeneration(11))
+        ));
+        assert!(matches!(
+            vd(json!({"type":"x","version":12})),
+            Err(Refusal::InvalidVersionDoc(_))
+        ));
         assert_eq!(assess_version_doc(None, true), Err(Refusal::MissingVersionDoc));
         assert_eq!(assess_version_doc(None, false), Ok(0));
     }
@@ -371,7 +410,10 @@ mod tests {
     fn chunk_ranges() {
         let mut m = milestone(false, &["a", "b"]);
         m.node_chunk_info.insert("b".into(), (2500, 3000));
-        assert!(matches!(assess_milestone(&m, "me"), Err(Refusal::IncompatibleChunkVersion(..))));
+        assert!(matches!(
+            assess_milestone(&m, "me"),
+            Err(Refusal::IncompatibleChunkVersion(..))
+        ));
         // A node without chunk info collapses the range to 0..0, which still overlaps.
         let m = milestone(false, &["a", "z"]);
         assert_eq!(assess_milestone(&m, "me"), Ok(()));

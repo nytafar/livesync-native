@@ -160,7 +160,11 @@ impl Couch {
         let mut server = Url::parse(cfg.url.trim()).map_err(|e| RemoteError::Url(format!("{}: {e}", cfg.url)))?;
         match server.scheme() {
             "http" | "https" => {}
-            s => return Err(RemoteError::Url(format!("unsupported scheme {s:?}; use http:// or https://"))),
+            s => {
+                return Err(RemoteError::Url(format!(
+                    "unsupported scheme {s:?}; use http:// or https://"
+                )))
+            }
         }
         // Credentials embedded in the URL are moved into basic auth.
         let mut user = cfg.username.clone().filter(|s| !s.is_empty());
@@ -191,9 +195,19 @@ impl Couch {
             .tcp_keepalive(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(60))
             .build()
-            .map_err(|e| RemoteError::Transport { what: "client setup".into(), source: e })?;
+            .map_err(|e| RemoteError::Transport {
+                what: "client setup".into(),
+                source: e,
+            })?;
         let label = format!("{}{}", server, cfg.database);
-        Ok(Couch { http, server, db, user, password, label })
+        Ok(Couch {
+            http,
+            server,
+            db,
+            user,
+            password,
+            label,
+        })
     }
 
     pub fn label(&self) -> &str {
@@ -219,25 +233,31 @@ impl Couch {
     }
 
     async fn send(&self, what: &str, rb: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-        let resp = self
-            .auth(rb)
-            .send()
-            .await
-            .map_err(|e| RemoteError::Transport { what: what.into(), source: e })?;
+        let resp = self.auth(rb).send().await.map_err(|e| RemoteError::Transport {
+            what: what.into(),
+            source: e,
+        })?;
         Ok(resp)
     }
 
     async fn json<T: serde::de::DeserializeOwned>(what: &str, resp: reqwest::Response) -> Result<T> {
         let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| RemoteError::Transport { what: what.into(), source: e })?;
+        let bytes = resp.bytes().await.map_err(|e| RemoteError::Transport {
+            what: what.into(),
+            source: e,
+        })?;
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes[..bytes.len().min(500)]).into_owned();
-            return Err(RemoteError::Http { status: status.as_u16(), what: what.into(), body });
+            return Err(RemoteError::Http {
+                status: status.as_u16(),
+                what: what.into(),
+                body,
+            });
         }
-        serde_json::from_slice(&bytes).map_err(|e| RemoteError::Decode { what: what.into(), msg: e.to_string() })
+        serde_json::from_slice(&bytes).map_err(|e| RemoteError::Decode {
+            what: what.into(),
+            msg: e.to_string(),
+        })
     }
 
     /// `GET /` on the server.
@@ -290,7 +310,9 @@ impl Couch {
                     .append_pair("heartbeat", &q.heartbeat_ms.to_string());
             }
         }
-        let r = self.send("_changes", self.http.post(url).json(&changes_selector())).await?;
+        let r = self
+            .send("_changes", self.http.post(url).json(&changes_selector()))
+            .await?;
         Self::json("_changes", r).await
     }
 
@@ -345,6 +367,12 @@ mod tests {
         })
         .unwrap();
         assert_eq!(c.db.as_str(), "https://host/prefix/db");
-        assert!(Couch::new(&RemoteConfig { url: "ftp://x".into(), database: "d".into(), username: None, password: None }).is_err());
+        assert!(Couch::new(&RemoteConfig {
+            url: "ftp://x".into(),
+            database: "d".into(),
+            username: None,
+            password: None
+        })
+        .is_err());
     }
 }

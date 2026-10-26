@@ -63,10 +63,7 @@ fn str_field<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
 
 fn i64_field(v: &Value, k: &str) -> i64 {
     match v.get(k) {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .or_else(|| n.as_f64().map(|f| f as i64))
-            .unwrap_or(0),
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).unwrap_or(0),
         _ => 0,
     }
 }
@@ -86,7 +83,10 @@ pub fn classify_doc(doc: &Value) -> Classified {
         Some("plain") | Some("newnote") => {}
         Some("notes") | None => {
             if id.starts_with("_design/") {
-                return Classified::Other { id, kind: "design".into() };
+                return Classified::Other {
+                    id,
+                    kind: "design".into(),
+                };
             }
             return Classified::LegacyNote {
                 id,
@@ -94,7 +94,10 @@ pub fn classify_doc(doc: &Value) -> Classified {
             };
         }
         Some(other) => {
-            return Classified::Other { id, kind: other.to_string() };
+            return Classified::Other {
+                id,
+                kind: other.to_string(),
+            };
         }
     }
     let path = str_field(doc, "path").unwrap_or_default().to_string();
@@ -107,7 +110,11 @@ pub fn classify_doc(doc: &Value) -> Classified {
     if body_id.starts_with("f:") || path.starts_with("/\\:") {
         return Classified::Encrypted { id };
     }
-    let kind = if ty == Some("plain") { FileKind::Plain } else { FileKind::Binary };
+    let kind = if ty == Some("plain") {
+        FileKind::Plain
+    } else {
+        FileKind::Binary
+    };
     let children = doc
         .get("children")
         .and_then(Value::as_array)
@@ -124,7 +131,9 @@ pub fn classify_doc(doc: &Value) -> Classified {
         .map(|m| {
             m.iter()
                 .filter_map(|(k, v)| {
-                    v.get("data").and_then(Value::as_str).map(|d| (k.clone(), d.to_string()))
+                    v.get("data")
+                        .and_then(Value::as_str)
+                        .map(|d| (k.clone(), d.to_string()))
                 })
                 .collect()
         })

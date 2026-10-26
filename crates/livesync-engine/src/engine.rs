@@ -169,7 +169,9 @@ fn parse_ignore(src: &str, case_sensitive: bool) -> std::result::Result<Vec<Igno
                 Some(p) => (true, p),
                 None => (false, s),
             };
-            let re = regex::RegexBuilder::new(pat).case_insensitive(!case_sensitive).build()?;
+            let re = regex::RegexBuilder::new(pat)
+                .case_insensitive(!case_sensitive)
+                .build()?;
             Ok(IgnoreRule { re, negate })
         })
         .collect()
@@ -249,7 +251,10 @@ impl Engine {
         Ok(Engine {
             inner: Arc::new(Inner {
                 couch,
-                runtime: Mutex::new(Runtime { max_size_bytes: cfg.max_size_mb.map(|m| m * 1024 * 1024), ignore }),
+                runtime: Mutex::new(Runtime {
+                    max_size_bytes: cfg.max_size_mb.map(|m| m * 1024 * 1024),
+                    ignore,
+                }),
                 cfg,
                 index: Mutex::new(index),
                 mem: Semaphore::new(budget),
@@ -260,7 +265,14 @@ impl Engine {
     }
 
     pub fn node_id(&self) -> String {
-        self.inner.index.lock().unwrap().get_meta(meta::NODE_ID).ok().flatten().unwrap_or_default()
+        self.inner
+            .index
+            .lock()
+            .unwrap()
+            .get_meta(meta::NODE_ID)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     }
 
     /// Wake the daemon from a backoff sleep (e.g. the network came back).
@@ -387,8 +399,15 @@ impl Engine {
             }
         }
 
-        let case_sensitive = preferred.get("handleFilenameCaseSensitive").and_then(Value::as_bool).unwrap_or(false);
-        let max_mb = self.inner.cfg.max_size_mb.unwrap_or_else(|| gate::max_size_mb(&preferred));
+        let case_sensitive = preferred
+            .get("handleFilenameCaseSensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max_mb = self
+            .inner
+            .cfg
+            .max_size_mb
+            .unwrap_or_else(|| gate::max_size_mb(&preferred));
         {
             let mut rt = self.inner.runtime.lock().unwrap();
             rt.max_size_bytes = if max_mb == 0 { None } else { Some(max_mb * 1024 * 1024) };
@@ -429,7 +448,10 @@ impl Engine {
         let start = Instant::now();
         self.reset_report();
         let gate = self.connect_gate(false).await?;
-        info!("gate ok: {} (version {}, {} docs)", gate.remote, gate.version, gate.doc_count);
+        info!(
+            "gate ok: {} (version {}, {} docs)",
+            gate.remote, gate.version, gate.doc_count
+        );
         let swept = vaultfs::sweep_temp_files(&self.inner.cfg.vault);
         if swept > 0 {
             info!("removed {swept} stale temp files");
@@ -439,7 +461,12 @@ impl Engine {
             let resp = self
                 .inner
                 .couch
-                .changes(&ChangesQuery { since, limit: self.inner.cfg.batch_limit, longpoll: false, heartbeat_ms: 0 })
+                .changes(&ChangesQuery {
+                    since,
+                    limit: self.inner.cfg.batch_limit,
+                    longpoll: false,
+                    heartbeat_ms: 0,
+                })
                 .await?;
             let n = resp.results.len();
             self.apply_batch(resp.results).await?;
@@ -607,7 +634,14 @@ impl Engine {
     }
 
     fn apply_skip(&self, f: &FileDoc, s: &Skip) -> Result<()> {
-        *self.inner.report.lock().unwrap().skipped.entry(s.label().to_string()).or_default() += 1;
+        *self
+            .inner
+            .report
+            .lock()
+            .unwrap()
+            .skipped
+            .entry(s.label().to_string())
+            .or_default() += 1;
         let note = match s {
             Skip::TooLarge(n) => format!("too large ({n} bytes)"),
             other => other.label().to_string(),
@@ -659,7 +693,10 @@ impl Engine {
                 self.with_index(|ix| ix.delete_doc(id))
             }
             RemoveOutcome::Diverged { .. } => {
-                warn!("{}: deleted remotely, but the local file has changes; keeping it", b.path);
+                warn!(
+                    "{}: deleted remotely, but the local file has changes; keeping it",
+                    b.path
+                );
                 self.inner.report.lock().unwrap().dirty += 1;
                 b.state = State::Dirty;
                 b.note = Some("deleted remotely; local changes kept".into());
@@ -694,7 +731,9 @@ impl Engine {
     async fn process_unit(&self, docs: Vec<FileDoc>) -> Result<()> {
         // Plan (local I/O): skip unchanged revisions, hash local files.
         let this = self.clone();
-        let plans = tokio::task::spawn_blocking(move || this.plan_unit(docs)).await.map_err(EngineError::other)??;
+        let plans = tokio::task::spawn_blocking(move || this.plan_unit(docs))
+            .await
+            .map_err(EngineError::other)??;
         if plans.is_empty() {
             return Ok(());
         }
@@ -707,7 +746,11 @@ impl Engine {
         let mut wanted: Vec<(String, u64)> = Vec::new();
         let mut seen = HashSet::new();
         for p in &plans {
-            let per_chunk = if p.doc.children.is_empty() { 0 } else { p.doc.size * 4 / 3 / p.doc.children.len() as u64 + 64 };
+            let per_chunk = if p.doc.children.is_empty() {
+                0
+            } else {
+                p.doc.size * 4 / 3 / p.doc.children.len() as u64 + 64
+            };
             for c in &p.doc.children {
                 if !p.doc.eden.contains_key(c) && seen.insert(c.clone()) {
                     wanted.push((c.clone(), per_chunk));
@@ -753,9 +796,14 @@ impl Engine {
                         changed = true;
                     }
                     if b.state == State::Dirty {
-                        let local = vaultfs::read_state(&self.inner.cfg.vault.join(&b.path)).map_err(EngineError::other)?;
+                        let local =
+                            vaultfs::read_state(&self.inner.cfg.vault.join(&b.path)).map_err(EngineError::other)?;
                         if local.as_ref().map(|l| &l.hash) == b.disk_hash.as_ref() {
-                            b.state = if doc.conflicts.is_empty() { State::Clean } else { State::Conflicted };
+                            b.state = if doc.conflicts.is_empty() {
+                                State::Clean
+                            } else {
+                                State::Conflicted
+                            };
                             b.note = None;
                             changed = true;
                         }
@@ -869,13 +917,21 @@ impl Engine {
             }
         }
         if missing > 0 {
-            return Err(format!("{missing} of {} chunks missing on the remote", doc.children.len()));
+            return Err(format!(
+                "{missing} of {} chunks missing on the remote",
+                doc.children.len()
+            ));
         }
         let mut r = self.inner.report.lock().unwrap();
         r.chunk_id_mismatches += id_mismatch;
         if out.len() as u64 != doc.size {
             r.size_mismatches += 1;
-            debug!("{}: size field {} but content is {} bytes", doc.path, doc.size, out.len());
+            debug!(
+                "{}: size field {} but content is {} bytes",
+                doc.path,
+                doc.size,
+                out.len()
+            );
         }
         Ok(out)
     }
@@ -892,9 +948,17 @@ impl Engine {
         let vault = &self.inner.cfg.vault;
         let target = vault.join(&doc.path);
         let remote_hash = vaultfs::hash_bytes(&bytes);
-        let state = if doc.conflicts.is_empty() { State::Clean } else { State::Conflicted };
-        let note = (!doc.conflicts.is_empty())
-            .then(|| format!("{} conflicting revision(s); resolve with an official client", doc.conflicts.len()));
+        let state = if doc.conflicts.is_empty() {
+            State::Clean
+        } else {
+            State::Conflicted
+        };
+        let note = (!doc.conflicts.is_empty()).then(|| {
+            format!(
+                "{} conflicting revision(s); resolve with an official client",
+                doc.conflicts.len()
+            )
+        });
         let row_for = |disk: &DiskState| FileRow {
             path: doc.path.clone(),
             doc_id: doc.id.clone(),
@@ -930,7 +994,11 @@ impl Engine {
             (Some(_), None) => false,
         };
         if !clean {
-            return self.mark_dirty(&doc, base, "local file differs from the last synced version; remote change not applied");
+            return self.mark_dirty(
+                &doc,
+                base,
+                "local file differs from the last synced version; remote change not applied",
+            );
         }
         let expect = match &local {
             None => Expect::Absent,
@@ -949,9 +1017,11 @@ impl Engine {
                 debug!("wrote {}", doc.path);
                 Ok(())
             }
-            Err(WriteError::Diverged { .. }) => {
-                self.mark_dirty(&doc, base, "local file changed during the write; remote change not applied")
-            }
+            Err(WriteError::Diverged { .. }) => self.mark_dirty(
+                &doc,
+                base,
+                "local file changed during the write; remote change not applied",
+            ),
             Err(e @ WriteError::Io { .. }) => self.defer(&doc, &e.to_string()),
         }
     }
@@ -964,7 +1034,9 @@ impl Engine {
             return;
         }
         let old = self.inner.cfg.vault.join(&b.path);
-        let Ok(Some(old_state)) = vaultfs::read_state(&old) else { return };
+        let Ok(Some(old_state)) = vaultfs::read_state(&old) else {
+            return;
+        };
         #[cfg(unix)]
         if old_state.ino == new_disk.ino {
             return; // same file on a case-insensitive filesystem
@@ -1015,7 +1087,13 @@ impl Engine {
         for p in &due {
             let doc = self.inner.couch.get_doc(&p.doc_id, true).await?;
             let doc = doc.unwrap_or_else(|| serde_json::json!({"_id": p.doc_id, "_deleted": true}));
-            rows.push(ChangeRow { seq: Value::Null, id: p.doc_id.clone(), changes: vec![], deleted: false, doc: Some(doc) });
+            rows.push(ChangeRow {
+                seq: Value::Null,
+                id: p.doc_id.clone(),
+                changes: vec![],
+                deleted: false,
+                doc: Some(doc),
+            });
         }
         self.apply_batch(rows).await?;
         Ok(due.len())
@@ -1031,7 +1109,9 @@ impl Engine {
     pub async fn daemon_pull_only(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut backoff = Backoff::default();
         let sweep_vault = self.inner.cfg.vault.clone();
-        tokio::task::spawn_blocking(move || vaultfs::sweep_temp_files(&sweep_vault)).await.ok();
+        tokio::task::spawn_blocking(move || vaultfs::sweep_temp_files(&sweep_vault))
+            .await
+            .ok();
         'outer: loop {
             if *shutdown.borrow() {
                 return Ok(());
@@ -1070,7 +1150,12 @@ impl Engine {
                 let _ = self.with_index(|ix| ix.set_meta(meta::DAEMON_SEEN, &vaultfs::now_ms().to_string()));
                 let wake_at = regate_at.min(next_pending);
                 let since = self.since()?;
-                let q = ChangesQuery { since, limit: self.inner.cfg.batch_limit, longpoll: true, heartbeat_ms: 30_000 };
+                let q = ChangesQuery {
+                    since,
+                    limit: self.inner.cfg.batch_limit,
+                    longpoll: true,
+                    heartbeat_ms: 30_000,
+                };
                 let res = tokio::select! {
                     r = self.inner.couch.changes(&q) => Some(r),
                     _ = tokio::time::sleep_until(wake_at.into()) => None,
@@ -1140,7 +1225,11 @@ impl Engine {
     // ------------------------------------------------------------------
 
     pub fn status(&self) -> Result<Status> {
-        status_from_index(&self.inner.index.lock().unwrap(), &self.inner.cfg.vault, &self.inner.cfg.index_path)
+        status_from_index(
+            &self.inner.index.lock().unwrap(),
+            &self.inner.cfg.vault,
+            &self.inner.cfg.index_path,
+        )
     }
 }
 

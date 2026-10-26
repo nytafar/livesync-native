@@ -62,8 +62,7 @@ pub fn decompress(data: &str) -> Result<Cow<'_, str>, CodecError> {
     if raw.is_empty() {
         return Ok(Cow::Borrowed(""));
     }
-    let inflated =
-        miniz_oxide::inflate::decompress_to_vec(&raw).map_err(|_| CodecError::Inflate)?;
+    let inflated = miniz_oxide::inflate::decompress_to_vec(&raw).map_err(|_| CodecError::Inflate)?;
     if converted {
         Ok(Cow::Owned(base64_encode(&inflated)))
     } else {
@@ -101,9 +100,6 @@ mod tests {
 
     #[test]
     fn percent_refused() {
-        assert_eq!(
-            decode_binary_piece("%abc"),
-            Err(CodecError::LegacyPercentEncoding)
-        );
+        assert_eq!(decode_binary_piece("%abc"), Err(CodecError::LegacyPercentEncoding));
     }
 }

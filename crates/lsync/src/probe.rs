@@ -110,7 +110,8 @@ fn write_note(vault: &Path, name: &str, body: &str) -> Result<()> {
         Some(s) => Expect::Hash(s.hash),
     };
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-    vaultfs::atomic_write(&target, body.as_bytes(), now, &expect).with_context(|| format!("writing {}", target.display()))?;
+    vaultfs::atomic_write(&target, body.as_bytes(), now, &expect)
+        .with_context(|| format!("writing {}", target.display()))?;
     Ok(())
 }
 
@@ -146,7 +147,12 @@ fn mask_names(m: EventMask) -> String {
         (EventMask::Q_OVERFLOW, "Q_OVERFLOW"),
         (EventMask::IGNORED, "IGNORED"),
     ];
-    names.iter().filter(|(f, _)| m.contains(*f)).map(|(_, n)| *n).collect::<Vec<_>>().join("|")
+    names
+        .iter()
+        .filter(|(f, _)| m.contains(*f))
+        .map(|(_, n)| *n)
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 struct Watcher {
@@ -202,7 +208,9 @@ fn start_watcher(vault: &Path) -> Result<Watcher> {
                             Some(n) => dir.join(n),
                             None => dir.clone(),
                         };
-                        if e.mask.contains(EventMask::ISDIR) && e.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO) {
+                        if e.mask.contains(EventMask::ISDIR)
+                            && e.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO)
+                        {
                             new_dirs.push(full.clone());
                         }
                         let rel = full.strip_prefix(&root).unwrap_or(&full).display().to_string();
@@ -226,7 +234,13 @@ fn start_watcher(vault: &Path) -> Result<Watcher> {
             }
         }
     });
-    Ok(Watcher { events, stop, handle: Some(handle), watched_dirs: watched, watch_errors: errors })
+    Ok(Watcher {
+        events,
+        stop,
+        handle: Some(handle),
+        watched_dirs: watched,
+        watch_errors: errors,
+    })
 }
 
 impl Watcher {
@@ -264,7 +278,11 @@ fn fs_checks(vault: &Path) -> Vec<(String, String)> {
             let content = std::fs::read(&a).unwrap_or_default();
             out.push((
                 "temp file + rename over existing file".into(),
-                if content == b"second" { "ok".into() } else { "content wrong after rename".into() },
+                if content == b"second" {
+                    "ok".into()
+                } else {
+                    "content wrong after rename".into()
+                },
             ));
             out.push((
                 "set mtime".into(),
@@ -286,7 +304,11 @@ fn fs_checks(vault: &Path) -> Vec<(String, String)> {
     let upper_exists = dir.join("CASE-PROBE.txt").exists();
     out.push((
         "file names".into(),
-        if upper_exists { "case-INsensitive".into() } else { "case-sensitive".into() },
+        if upper_exists {
+            "case-INsensitive".into()
+        } else {
+            "case-sensitive".into()
+        },
     ));
     // Characters Windows/Android-FAT forbid.
     let mut bad = Vec::new();
@@ -298,7 +320,14 @@ fn fs_checks(vault: &Path) -> Vec<(String, String)> {
     }
     out.push((
         "forbidden characters in names".into(),
-        if bad.is_empty() { "none of : ? \" * < > | \\".into() } else { format!("rejected: {}", bad.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(" ")) },
+        if bad.is_empty() {
+            "none of : ? \" * < > | \\".into()
+        } else {
+            format!(
+                "rejected: {}",
+                bad.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(" ")
+            )
+        },
     ));
     let _ = std::fs::remove_dir_all(&dir);
     out
@@ -306,7 +335,9 @@ fn fs_checks(vault: &Path) -> Vec<(String, String)> {
 
 fn mount_info(vault: &Path) -> String {
     let canon = std::fs::canonicalize(vault).unwrap_or_else(|_| vault.to_path_buf());
-    let Ok(m) = std::fs::read_to_string("/proc/mounts") else { return "unknown".into() };
+    let Ok(m) = std::fs::read_to_string("/proc/mounts") else {
+        return "unknown".into();
+    };
     let mut best: Option<(usize, String)> = None;
     for line in m.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
@@ -332,7 +363,10 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
     if !vault.is_dir() {
         bail!("{} is not a directory", vault.display());
     }
-    let mut p = Prompter { stdin: Box::leak(Box::new(std::io::stdin())).lock(), eof: false };
+    let mut p = Prompter {
+        stdin: Box::leak(Box::new(std::io::stdin())).lock(),
+        eof: false,
+    };
     let mut answers: Vec<(String, String)> = Vec::new();
     println!("lsync probe — vault: {}", vault.display());
     println!("This writes a few notes named lsync-probe*.md at the vault root and asks what Obsidian shows.");
@@ -343,12 +377,22 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
     }
 
     // ---- Check 1: outside writes while Obsidian is open ----
-    write_note(&vault, NOTE, &note_body("Step 1", "If you can read this, Obsidian found a file written by lsync."))?;
+    write_note(
+        &vault,
+        NOTE,
+        &note_body(
+            "Step 1",
+            "If you can read this, Obsidian found a file written by lsync.",
+        ),
+    )?;
     p.enter(&format!(
         "Step 1. Open Obsidian on this vault and open the note `{}` (use the file list or quick switcher). Then come back here.",
         NOTE.trim_end_matches(".md")
     ));
-    answers.push(("1. Note written before opening Obsidian shows 'Step 1'".into(), p.ask("Did the note exist and show 'Step 1'?").into()));
+    answers.push((
+        "1. Note written before opening Obsidian shows 'Step 1'".into(),
+        p.ask("Did the note exist and show 'Step 1'?").into(),
+    ));
 
     p.enter(&format!(
         "Step 2. When you press Enter, lsync waits {}s, then changes the note and creates `{}`. Switch to Obsidian right away and keep `{}` open on screen.",
@@ -358,40 +402,75 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
     ));
     countdown(args.delay, "writing");
     let t_open = Instant::now();
-    write_note(&vault, NOTE, &note_body("Step 2", "This text was replaced while the note was open in Obsidian."))?;
-    write_note(&vault, NOTE_OPEN, &note_body("New while open", "Created while Obsidian was in the foreground."))?;
+    write_note(
+        &vault,
+        NOTE,
+        &note_body("Step 2", "This text was replaced while the note was open in Obsidian."),
+    )?;
+    write_note(
+        &vault,
+        NOTE_OPEN,
+        &note_body("New while open", "Created while Obsidian was in the foreground."),
+    )?;
     println!("  written. Watch Obsidian, then come back.");
     answers.push((
         "2a. Open note updated to 'Step 2' without reopening".into(),
         p.ask("Did the open note change to 'Step 2' by itself?").into(),
     ));
-    answers.push(("2b. Time until it updated (user estimate)".into(), p.text("Roughly how long did it take? (e.g. instantly, 2s, only after reopening)")));
+    answers.push((
+        "2b. Time until it updated (user estimate)".into(),
+        p.text("Roughly how long did it take? (e.g. instantly, 2s, only after reopening)"),
+    ));
     answers.push((
         "2c. New file created while open appeared in the file list".into(),
-        p.ask(&format!("Did `{}` appear in Obsidian's file list?", NOTE_OPEN.trim_end_matches(".md"))).into(),
+        p.ask(&format!(
+            "Did `{}` appear in Obsidian's file list?",
+            NOTE_OPEN.trim_end_matches(".md")
+        ))
+        .into(),
     ));
     let open_secs = t_open.elapsed().as_secs();
 
     // ---- Check 1b: outside writes while Obsidian is in the background ----
     p.enter("Step 3. Make sure Obsidian is in the background (you are in the terminal now, so it is). Press Enter to write.");
-    write_note(&vault, NOTE, &note_body("Step 3", "This text was replaced while Obsidian was in the background."))?;
-    write_note(&vault, NOTE_BG, &note_body("New while in background", "Created while Obsidian was in the background."))?;
+    write_note(
+        &vault,
+        NOTE,
+        &note_body("Step 3", "This text was replaced while Obsidian was in the background."),
+    )?;
+    write_note(
+        &vault,
+        NOTE_BG,
+        &note_body(
+            "New while in background",
+            "Created while Obsidian was in the background.",
+        ),
+    )?;
     println!("  written. Wait ~{}s, then switch to Obsidian.", args.delay);
     std::thread::sleep(Duration::from_secs(args.delay.min(30)));
     answers.push((
         "3a. Note shows 'Step 3' after returning to Obsidian".into(),
-        p.ask("Switch to Obsidian now. Does the open note show 'Step 3'?").into(),
+        p.ask("Switch to Obsidian now. Does the open note show 'Step 3'?")
+            .into(),
     ));
     answers.push((
         "3b. File created while in background appeared".into(),
-        p.ask(&format!("Did `{}` appear in the file list?", NOTE_BG.trim_end_matches(".md"))).into(),
+        p.ask(&format!(
+            "Did `{}` appear in the file list?",
+            NOTE_BG.trim_end_matches(".md")
+        ))
+        .into(),
     ));
 
     // ---- Check 2: inotify sees Obsidian's saves ----
     let before = vaultfs::read_state(&vault.join(NOTE))?.map(|s| s.hash);
     let watcher = start_watcher(&vault)?;
     let (watched_dirs, watch_errors) = (watcher.watched_dirs, watcher.watch_errors.clone());
-    println!("\n  inotify: watching {} directories ({} could not be watched)", watcher.watched_dirs, watcher.watch_errors.len());
+    println!(
+        "\n  inotify: watching {} directories ({} could not be watched)",
+        watcher.watched_dirs,
+        watcher.watch_errors.len()
+    );
     let instructions = format!(
         "Step 4. In Obsidian: type a line into `{}` and wait 3 seconds; create a new note and type something; rename that note; delete it. Then come back here.",
         NOTE.trim_end_matches(".md")
@@ -409,7 +488,9 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
 
     // Summarise the events.
     let probe_events: Vec<&Ev> = events.iter().filter(|e| e.path == NOTE).collect();
-    let saw_note_write = probe_events.iter().any(|e| e.mask.contains("CLOSE_WRITE") || e.mask.contains("MOVED_TO") || e.mask.contains("MODIFY"));
+    let saw_note_write = probe_events
+        .iter()
+        .any(|e| e.mask.contains("CLOSE_WRITE") || e.mask.contains("MOVED_TO") || e.mask.contains("MODIFY"));
     let save_style = if probe_events.iter().any(|e| e.mask.contains("MOVED_TO")) {
         "temp file + rename"
     } else if probe_events.iter().any(|e| e.mask.contains("MODIFY")) {
@@ -424,7 +505,12 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
         }
     }
     let outside_obsidian_dir = events.iter().filter(|e| !e.path.starts_with(".obsidian")).count();
-    println!("  inotify: {} events ({} outside .obsidian/), {} for {NOTE}", events.len(), outside_obsidian_dir, probe_events.len());
+    println!(
+        "  inotify: {} events ({} outside .obsidian/), {} for {NOTE}",
+        events.len(),
+        outside_obsidian_dir,
+        probe_events.len()
+    );
     println!("  note content changed on disk: {note_changed}; inotify saw the save: {saw_note_write}");
 
     // ---- Report ----
@@ -452,30 +538,80 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
         let _ = writeln!(r, "- {q}: **{a}**");
     }
     let _ = writeln!(r, "- seconds spent in step 2: {open_secs}");
-    let pass1 = answers.iter().filter(|(q, _)| q.starts_with("2a") || q.starts_with("2c") || q.starts_with("3a") || q.starts_with("3b")).all(|(_, a)| a == "yes");
-    let _ = writeln!(r, "- **result: {}**", if pass1 { "PASS" } else { "FAIL or inconclusive" });
+    let pass1 = answers
+        .iter()
+        .filter(|(q, _)| q.starts_with("2a") || q.starts_with("2c") || q.starts_with("3a") || q.starts_with("3b"))
+        .all(|(_, a)| a == "yes");
+    let _ = writeln!(
+        r,
+        "- **result: {}**",
+        if pass1 { "PASS" } else { "FAIL or inconclusive" }
+    );
     let _ = writeln!(r, "\n## Check 2: inotify sees Obsidian's saves\n");
-    let _ = writeln!(r, "- directories watched: {watched_dirs} (one inotify watch each; {} failed)", watch_errors.len());
+    let _ = writeln!(
+        r,
+        "- directories watched: {watched_dirs} (one inotify watch each; {} failed)",
+        watch_errors.len()
+    );
     for e in watch_errors.iter().take(20) {
         let _ = writeln!(r, "  - watch failed: {e}");
     }
-    let _ = writeln!(r, "- events: {} total, {} outside `.obsidian/`", events.len(), outside_obsidian_dir);
+    let _ = writeln!(
+        r,
+        "- events: {} total, {} outside `.obsidian/`",
+        events.len(),
+        outside_obsidian_dir
+    );
     let _ = writeln!(r, "- event kinds: {kinds:?}");
     let _ = writeln!(r, "- `{NOTE}` changed on disk: {note_changed}");
-    let _ = writeln!(r, "- inotify events for `{NOTE}`: {} (save style: {save_style})", probe_events.len());
+    let _ = writeln!(
+        r,
+        "- inotify events for `{NOTE}`: {} (save style: {save_style})",
+        probe_events.len()
+    );
     let pass2 = note_changed && saw_note_write;
-    let _ = writeln!(r, "- **result: {}**", if pass2 { "PASS" } else if !note_changed { "inconclusive (the note was not edited)" } else { "FAIL" });
+    let _ = writeln!(
+        r,
+        "- **result: {}**",
+        if pass2 {
+            "PASS"
+        } else if !note_changed {
+            "inconclusive (the note was not edited)"
+        } else {
+            "FAIL"
+        }
+    );
     let _ = writeln!(r, "\n### Event log (first 300)\n\n```");
     for e in events.iter().take(300) {
-        let _ = writeln!(r, "{:>7}ms {:<28} {}{}", e.t_ms, e.mask, e.path, if e.cookie != 0 { format!(" (cookie {})", e.cookie) } else { String::new() });
+        let _ = writeln!(
+            r,
+            "{:>7}ms {:<28} {}{}",
+            e.t_ms,
+            e.mask,
+            e.path,
+            if e.cookie != 0 {
+                format!(" (cookie {})", e.cookie)
+            } else {
+                String::new()
+            }
+        );
     }
     let _ = writeln!(r, "```");
 
-    let report_path = args.report.clone().unwrap_or_else(|| PathBuf::from(format!("lsync-probe-report-{}.md", stamp())));
+    let report_path = args
+        .report
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(format!("lsync-probe-report-{}.md", stamp())));
     std::fs::write(&report_path, &r).with_context(|| format!("writing {}", report_path.display()))?;
     println!("\nreport written to {}", report_path.display());
-    println!("check 1 (Obsidian sees outside writes): {}", if pass1 { "PASS" } else { "FAIL/inconclusive" });
-    println!("check 2 (inotify sees Obsidian saves):  {}", if pass2 { "PASS" } else { "FAIL/inconclusive" });
+    println!(
+        "check 1 (Obsidian sees outside writes): {}",
+        if pass1 { "PASS" } else { "FAIL/inconclusive" }
+    );
+    println!(
+        "check 2 (inotify sees Obsidian saves):  {}",
+        if pass2 { "PASS" } else { "FAIL/inconclusive" }
+    );
 
     if !args.keep {
         for n in [NOTE, NOTE_OPEN, NOTE_BG] {

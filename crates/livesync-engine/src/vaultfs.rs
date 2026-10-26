@@ -99,7 +99,10 @@ pub enum WriteError {
 }
 
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> WriteError + '_ {
-    move |source| WriteError::Io { path: path.to_path_buf(), source }
+    move |source| WriteError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 fn matches(expect: &Expect, now: &Option<DiskState>) -> bool {
@@ -126,7 +129,11 @@ pub fn atomic_write(target: &Path, bytes: &[u8], mtime_ms: i64, expect: &Expect)
     fs::create_dir_all(dir).map_err(io_err(dir))?;
     let tmp = dir.join(temp_name());
     let result = (|| {
-        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(io_err(&tmp))?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(io_err(&tmp))?;
         f.write_all(bytes).map_err(io_err(&tmp))?;
         if mtime_ms > 0 {
             let t = UNIX_EPOCH + Duration::from_millis(mtime_ms as u64);
@@ -137,7 +144,10 @@ pub fn atomic_write(target: &Path, bytes: &[u8], mtime_ms: i64, expect: &Expect)
         drop(f);
         let now = read_state(target).map_err(io_err(target))?;
         if !matches(expect, &now) {
-            return Err(WriteError::Diverged { expected: expect.clone(), found: now.map(|s| s.hash) });
+            return Err(WriteError::Diverged {
+                expected: expect.clone(),
+                found: now.map(|s| s.hash),
+            });
         }
         fs::rename(&tmp, target).map_err(io_err(target))?;
         Ok(())
@@ -146,10 +156,12 @@ pub fn atomic_write(target: &Path, bytes: &[u8], mtime_ms: i64, expect: &Expect)
         let _ = fs::remove_file(&tmp);
     }
     result?;
-    let st = read_state(target).map_err(io_err(target))?.ok_or_else(|| WriteError::Io {
-        path: target.to_path_buf(),
-        source: io::Error::new(io::ErrorKind::NotFound, "file vanished after rename"),
-    })?;
+    let st = read_state(target)
+        .map_err(io_err(target))?
+        .ok_or_else(|| WriteError::Io {
+            path: target.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::NotFound, "file vanished after rename"),
+        })?;
     Ok(st)
 }
 
@@ -201,7 +213,8 @@ pub fn sweep_temp_files(root: &Path) -> usize {
                 if !name.starts_with('.') {
                     stack.push(e.path());
                 }
-            } else if name.starts_with(TEMP_PREFIX) && name.ends_with(TEMP_SUFFIX) && fs::remove_file(e.path()).is_ok() {
+            } else if name.starts_with(TEMP_PREFIX) && name.ends_with(TEMP_SUFFIX) && fs::remove_file(e.path()).is_ok()
+            {
                 removed += 1;
             }
         }
@@ -210,7 +223,10 @@ pub fn sweep_temp_files(root: &Path) -> usize {
 }
 
 pub fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -229,7 +245,10 @@ mod tests {
         assert_eq!(fs::read(&t).unwrap(), b"two");
         assert_eq!(s2.size, 3);
         // No temp files left behind.
-        let names: Vec<_> = fs::read_dir(t.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let names: Vec<_> = fs::read_dir(t.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(names.len(), 1);
     }
 
@@ -243,7 +262,10 @@ mod tests {
         assert!(matches!(e, WriteError::Diverged { .. }));
         assert_eq!(fs::read(&t).unwrap(), b"local edit");
         // Expect::Absent never replaces an existing file.
-        assert!(matches!(atomic_write(&t, b"r", 0, &Expect::Absent), Err(WriteError::Diverged { .. })));
+        assert!(matches!(
+            atomic_write(&t, b"r", 0, &Expect::Absent),
+            Err(WriteError::Diverged { .. })
+        ));
         assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1);
     }
 
@@ -253,11 +275,20 @@ mod tests {
         let t = d.path().join("dir/sub/x.md");
         let s = atomic_write(&t, b"base", 0, &Expect::Absent).unwrap();
         fs::write(&t, b"edited").unwrap();
-        assert!(matches!(remove_if_matches(d.path(), &t, &s.hash).unwrap(), RemoveOutcome::Diverged { .. }));
+        assert!(matches!(
+            remove_if_matches(d.path(), &t, &s.hash).unwrap(),
+            RemoveOutcome::Diverged { .. }
+        ));
         fs::write(&t, b"base").unwrap();
-        assert_eq!(remove_if_matches(d.path(), &t, &s.hash).unwrap(), RemoveOutcome::Removed);
+        assert_eq!(
+            remove_if_matches(d.path(), &t, &s.hash).unwrap(),
+            RemoveOutcome::Removed
+        );
         assert!(!d.path().join("dir").exists(), "empty parents pruned");
-        assert_eq!(remove_if_matches(d.path(), &t, &s.hash).unwrap(), RemoveOutcome::AlreadyGone);
+        assert_eq!(
+            remove_if_matches(d.path(), &t, &s.hash).unwrap(),
+            RemoveOutcome::AlreadyGone
+        );
     }
 
     #[test]

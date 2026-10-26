@@ -70,7 +70,10 @@ enum Cmd {
 fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 fn main() -> std::process::ExitCode {
@@ -95,7 +98,10 @@ pub fn peak_rss_kib() -> Option<u64> {
 }
 
 fn run(cli: Cli) -> Result<u8> {
-    let cfg_path = cli.config.clone().unwrap_or_else(|| config::default_config_path(&cli.profile));
+    let cfg_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| config::default_config_path(&cli.profile));
     let file_cfg = config::load(&cfg_path)?;
     let cfg = file_cfg.clone().merged(&cli.overrides);
 
@@ -146,7 +152,10 @@ fn run(cli: Cli) -> Result<u8> {
                         println!("  locked          {}", g.locked);
                         println!("  accepted nodes  {}", g.accepted_nodes);
                         println!("  our node id     {} (not registered: read-only)", g.node_id);
-                        println!("  tweaks adopted  {}", if g.adopted_tweaks_now { "now" } else { "unchanged" });
+                        println!(
+                            "  tweaks adopted  {}",
+                            if g.adopted_tweaks_now { "now" } else { "unchanged" }
+                        );
                         println!("  rebuild seen    {}", g.rebuild_detected);
                         println!("  salt present    {}", g.salt_present);
                         println!("  max file size   {} MB", g.max_size_mb);
@@ -181,7 +190,11 @@ fn run(cli: Cli) -> Result<u8> {
             } else {
                 println!("pull complete in {:.1}s", wall.as_secs_f64());
                 println!("  changes seen     {}", rep.changes);
-                println!("  files written    {} ({:.1} MB)", rep.written, rep.bytes_written as f64 / 1e6);
+                println!(
+                    "  files written    {} ({:.1} MB)",
+                    rep.written,
+                    rep.bytes_written as f64 / 1e6
+                );
                 println!("  already on disk  {}", rep.adopted);
                 println!("  unchanged        {}", rep.unchanged);
                 println!("  deleted          {}", rep.deleted);
@@ -190,7 +203,11 @@ fn run(cli: Cli) -> Result<u8> {
                 println!("  pending (retry)  {}", rep.pending);
                 println!("  skipped          {:?}", rep.skipped);
                 println!("  other docs       {}", rep.ignored_docs);
-                println!("  chunks fetched   {} ({:.1} MB)", rep.chunks_fetched, rep.chunk_bytes as f64 / 1e6);
+                println!(
+                    "  chunks fetched   {} ({:.1} MB)",
+                    rep.chunks_fetched,
+                    rep.chunk_bytes as f64 / 1e6
+                );
                 println!("  size mismatches  {}", rep.size_mismatches);
                 println!("  chunk-id misses  {}", rep.chunk_id_mismatches);
                 if let Some(k) = rss {
@@ -223,11 +240,18 @@ fn run(cli: Cli) -> Result<u8> {
 }
 
 fn rt() -> Result<tokio::runtime::Runtime> {
-    Ok(tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?)
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?)
 }
 
 fn absolute(p: &std::path::Path) -> Result<PathBuf> {
-    Ok(if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir()?.join(p) })
+    Ok(if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(p)
+    })
 }
 
 fn engine_for(cfg: &FileConfig, profile: &str) -> Result<Engine> {
@@ -239,7 +263,13 @@ fn engine_for(cfg: &FileConfig, profile: &str) -> Result<Engine> {
     if let Some(c) = r.concurrency {
         ec.concurrency = c.max(1);
     }
-    if ec.index_path.starts_with(&ec.vault) && !ec.index_path.strip_prefix(&ec.vault)?.to_string_lossy().starts_with('.') {
+    if ec.index_path.starts_with(&ec.vault)
+        && !ec
+            .index_path
+            .strip_prefix(&ec.vault)?
+            .to_string_lossy()
+            .starts_with('.')
+    {
         bail!("the state directory must not be a visible folder inside the vault");
     }
     Ok(Engine::open(couch, ec)?)
@@ -251,8 +281,17 @@ fn print_config(c: &FileConfig) {
     println!("  database   {}", show(&c.database));
     println!("  user       {}", show(&c.username));
     println!("  password   {}", if c.password.is_some() { "(set)" } else { "-" });
-    println!("  vault      {}", c.vault.as_ref().map(|p| p.display().to_string()).unwrap_or("-".into()));
-    println!("  state dir  {}", c.state_dir.as_ref().map(|p| p.display().to_string()).unwrap_or("(default)".into()));
+    println!(
+        "  vault      {}",
+        c.vault.as_ref().map(|p| p.display().to_string()).unwrap_or("-".into())
+    );
+    println!(
+        "  state dir  {}",
+        c.state_dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or("(default)".into())
+    );
     println!("  ignore re  {}", show(&c.ignore_regex));
 }
 
@@ -271,9 +310,18 @@ fn print_status(s: &livesync_engine::Status) {
     println!("vault           {}", s.vault);
     println!("index           {}", s.index);
     println!("node id         {}", s.node_id.as_deref().unwrap_or("-"));
-    println!("remote created  {}", s.remote_created.map(|c| c.to_string()).unwrap_or("-".into()));
+    println!(
+        "remote created  {}",
+        s.remote_created.map(|c| c.to_string()).unwrap_or("-".into())
+    );
     println!("version doc     {}", s.remote_version.as_deref().unwrap_or("-"));
-    println!("since           {}", s.since.as_deref().map(|v| v.chars().take(40).collect::<String>()).unwrap_or("-".into()));
+    println!(
+        "since           {}",
+        s.since
+            .as_deref()
+            .map(|v| v.chars().take(40).collect::<String>())
+            .unwrap_or("-".into())
+    );
     println!("last gate       {}", s.last_gate.as_deref().unwrap_or("-"));
     println!("last pull       {}", fmt_ms(s.last_pull_ms));
     println!("daemon seen     {}", fmt_ms(s.daemon_heartbeat_ms));

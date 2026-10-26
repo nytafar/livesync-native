@@ -75,7 +75,9 @@ impl FileConfig {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn xdg(var: &str, fallback: &str) -> PathBuf {
@@ -86,7 +88,9 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
 }
 
 pub fn default_config_path(profile: &str) -> PathBuf {
-    xdg("XDG_CONFIG_HOME", ".config").join("lsync").join(format!("{profile}.toml"))
+    xdg("XDG_CONFIG_HOME", ".config")
+        .join("lsync")
+        .join(format!("{profile}.toml"))
 }
 
 pub fn default_state_dir(profile: &str) -> PathBuf {
