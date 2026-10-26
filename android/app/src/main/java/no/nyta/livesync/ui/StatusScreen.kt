@@ -323,9 +323,11 @@ private fun removeProfile(app: LiveSyncApp, id: String) {
     app.profiles.update(id) { it.copy(paused = true) }
     // Its index must not be deleted while an engine still uses it.
     check(core.engine.stop(id)) { "the engine is still stopping; the profile is paused, try again in a minute" }
+    // Edits the engine set aside go to Download/LiveSync/ first; if they
+    // cannot, nothing is removed.
+    val kept = app.profiles.remove(id, java.io.File(Perms.sharedRoot(), "Download/LiveSync"))
     app.secrets.removeProfile(id)
-    app.profiles.remove(id)
-    core.log("profile $id removed")
+    core.log("profile $id removed${kept?.let { "; set-aside edits kept in ${it.path}" } ?: ""}")
 }
 
 private enum class Confirm(val title: String, val text: String, val action: String) {
@@ -357,7 +359,8 @@ private enum class Confirm(val title: String, val text: String, val action: Stri
     Remove(
         "Remove this vault profile?",
         "Stops syncing and forgets the sync index and the stored password. The vault folder and its files stay " +
-            "on the phone, and nothing changes on the server.",
+            "on the phone, and nothing changes on the server. Edits the sync had to set aside, if any, are moved " +
+            "to Download/LiveSync/.",
         "Remove",
     ),
 }

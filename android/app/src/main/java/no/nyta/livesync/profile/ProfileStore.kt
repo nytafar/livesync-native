@@ -44,11 +44,30 @@ class ProfileStore(private val file: File, private val stateRoot: File) {
         save(saved.copy(profiles = others + profile))
     }
 
-    /** Remove a profile and its sync index. The vault folder is left alone. */
-    fun remove(id: String) = synchronized(lock) {
+    /**
+     * Remove a profile and its sync index. The vault folder is left alone.
+     * Edits the engine had to set aside (`<state>/recovered/`, possibly their
+     * only copy) are first copied into [keepRecoveredIn]; if that fails,
+     * nothing is removed. Returns the folder they went to, if there were any.
+     */
+    @Throws(IOException::class)
+    fun remove(id: String, keepRecoveredIn: File): File? = synchronized(lock) {
+        val recovered = File(stateDir(id), "recovered")
+        val kept = if (recovered.walkTopDown().any { it.isFile }) {
+            val target = File(keepRecoveredIn, "recovered-$id-${System.currentTimeMillis()}")
+            if (!recovered.copyRecursively(target, overwrite = false) ||
+                recovered.walkTopDown().count { it.isFile } != target.walkTopDown().count { it.isFile }
+            ) {
+                throw IOException("could not keep the set-aside edits in ${target.path}")
+            }
+            target
+        } else {
+            null
+        }
         val saved = load()
         save(saved.copy(profiles = saved.profiles.filter { it.id != id }))
         stateDir(id).deleteRecursively()
+        kept
     }
 
     fun update(id: String, change: (Profile) -> Profile): Profile? = synchronized(lock) {

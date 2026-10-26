@@ -34,10 +34,41 @@ class ProfileStoreTest {
         assertEquals(listOf("Notes"), a.scopeFolders)
         s.stateDir("a").mkdirs()
         File(s.stateDir("a"), "index.sqlite").writeText("x")
-        s.remove("a")
+        val keep = File(tmp.root, "Download/LiveSync")
+        assertNull("nothing set aside, nothing kept", s.remove("a", keep))
         assertNull(store().get("a"))
         assertFalse("the sync index goes with the profile", s.stateDir("a").exists())
         assertEquals(listOf("b"), store().all().map { it.id })
+    }
+
+    @Test
+    fun setAsideEditsSurviveTheRemoval() {
+        val s = store()
+        s.put(profile("r", "shared/Obsidian/r"))
+        val rec = File(s.stateDir("r"), "recovered/notes")
+        rec.mkdirs()
+        File(rec, "a.md.1700000000000").writeText("the only copy of an edit")
+        val kept = s.remove("r", File(tmp.root, "Download/LiveSync"))!!
+        assertEquals("the only copy of an edit", File(kept, "notes/a.md.1700000000000").readText())
+        assertFalse(s.stateDir("r").exists())
+        assertNull(s.get("r"))
+    }
+
+    @Test
+    fun aRemovalThatCannotKeepTheSetAsideEditsRemovesNothing() {
+        val s = store()
+        s.put(profile("r", "shared/Obsidian/r"))
+        File(s.stateDir("r"), "recovered").mkdirs()
+        File(s.stateDir("r"), "recovered/a.md").writeText("edit")
+        val blocked = File(tmp.root, "blocked").apply { writeText("a file, not a folder") }
+        try {
+            s.remove("r", blocked)
+            fail("removed although the edits could not be kept")
+        } catch (e: java.io.IOException) {
+            // expected
+        }
+        assertTrue(File(s.stateDir("r"), "recovered/a.md").exists())
+        assertTrue(s.get("r") != null)
     }
 
     @Test

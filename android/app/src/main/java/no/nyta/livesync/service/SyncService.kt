@@ -54,7 +54,7 @@ class SyncService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        current = this
+        current.set(this)
         worker = HandlerThread("livesync-service").apply { start() }
         handler = Handler(worker.looper)
         goForeground()
@@ -331,14 +331,16 @@ class SyncService : Service() {
                 // now; stopping them here would stop its work. Its reconcile
                 // waits for this lock, so it runs after this teardown or not
                 // at all before the check.
-                if (current !== this) return@synchronized
+                if (current.get() !== this) return@synchronized
                 core?.log("service destroyed; stopping engines")
                 try {
                     core?.engine?.stopAll()
                 } catch (e: Exception) {
                     core?.log("stopping engines: ${e.message}", "error")
                 }
-                current = null
+                // Only if no newer instance took over meanwhile (its onCreate
+                // does not take the lock).
+                current.compareAndSet(this, null)
             }
         }
         worker.quitSafely()
@@ -347,8 +349,7 @@ class SyncService : Service() {
 
     companion object {
         /** The newest instance; an older one's teardown leaves the engines alone. */
-        @Volatile
-        private var current: SyncService? = null
+        private val current = java.util.concurrent.atomic.AtomicReference<SyncService?>(null)
 
         const val NOTIFICATION_ID = 1
         const val REFRESH_MS = 60_000L
