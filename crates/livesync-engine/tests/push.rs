@@ -2016,8 +2016,11 @@ async fn the_vault_lock_file_is_not_where_a_deleted_note_went() {
 
 /// Codex (third round): a note renamed while its new name is still being
 /// written keeps its old document until the new name is pushed, and never
-/// counts as deleted meanwhile.
+/// counts as deleted meanwhile. Needs paired rename events from the watcher
+/// (inotify; FSEvents does not pair them, and then a rewritten file is no
+/// longer known to be a rename).
 #[tokio::test]
+#[cfg_attr(not(target_os = "linux"), ignore = "needs paired rename events (inotify)")]
 async fn renames_still_being_written_do_not_trip_the_stop() {
     let env = Env::new().await;
     for i in 0..30 {
@@ -2034,8 +2037,10 @@ async fn renames_still_being_written_do_not_trip_the_stop() {
         let e = engine.clone();
         async move { e.run(rx).await }
     });
-    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The watcher is set up just before the daemon's first full pass, so
+    // once a probe file is pushed, it is watching.
+    env.write("probe.md", b"probe");
+    wait_until("the watcher", || env.remote("probe.md").is_some()).await;
     for i in 0..25 {
         env.mv(&format!("n{i:02}.md"), &format!("r{i:02}.md"));
     }

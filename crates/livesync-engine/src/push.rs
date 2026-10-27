@@ -179,14 +179,10 @@ impl RenameHints {
         self.pairs.retain(|p| p.2 >= cutoff);
     }
 
-    /// Where `path` went, following file or folder renames reported in the
-    /// last minute.
+    /// Where `path` went, following file or folder renames.
     pub(crate) fn dest(&self, path: &str) -> Option<String> {
-        let cutoff = Instant::now().checked_sub(Duration::from_secs(60));
-        self.pairs.iter().rev().find_map(|(from, to, at)| {
-            if cutoff.is_some_and(|c| *at < c) {
-                None
-            } else if path == from {
+        self.pairs.iter().rev().find_map(|(from, to, _)| {
+            if path == from {
                 Some(to.clone())
             } else {
                 path.strip_prefix(from.as_str())
@@ -223,6 +219,9 @@ pub(crate) struct DeleteHold {
     newest: Option<Instant>,
     /// When the undecided hold began.
     first: Option<Instant>,
+    /// Renamed documents whose new name is not pushed yet, and since when
+    /// they wait for it.
+    pending: HashMap<String, Instant>,
 }
 
 impl DeleteHold {
@@ -233,6 +232,7 @@ impl DeleteHold {
             seen: HashSet::new(),
             newest: None,
             first: None,
+            pending: HashMap::new(),
         }
     }
 
@@ -305,6 +305,18 @@ impl DeleteHold {
         if !refused {
             self.seen.clear();
         }
+    }
+
+    /// Whether a renamed document may keep waiting for its new name to be
+    /// pushed: for at most `max`, then it is judged as a deletion.
+    fn may_wait(&mut self, doc_id: &str) -> bool {
+        let since = *self.pending.entry(doc_id.to_string()).or_insert_with(Instant::now);
+        since.elapsed() < self.max
+    }
+
+    /// After a full pass: only the documents still waiting stay pending.
+    fn keep_pending(&mut self, ids: &HashSet<String>) {
+        self.pending.retain(|id, _| ids.contains(id));
     }
 
     /// Something is pending (a rename whose new name is not pushed yet):
@@ -1494,7 +1506,7 @@ impl Engine {
         &self,
         rows: Vec<FileRow>,
         hints: &RenameHints,
-        hold: Option<&mut DeleteHold>,
+        mut hold: Option<&mut DeleteHold>,
         unreadable: &[(String, String)],
         tally: Tally,
         ctx: &mut PassCtx,
@@ -1504,6 +1516,7 @@ impl Engine {
         if rows.is_empty() {
             if let Some(h) = hold.filter(|_| tally.scan.is_some()) {
                 h.observe(&[], tally.scan);
+                h.keep_pending(&HashSet::new());
             }
             return Ok(());
         }
@@ -1547,6 +1560,7 @@ impl Engine {
         if gone.is_empty() {
             if let Some(h) = hold.filter(|_| tally.scan.is_some()) {
                 h.observe(&[], tally.scan);
+                h.keep_pending(&HashSet::new());
             }
             return Ok(());
         }
@@ -1558,6 +1572,7 @@ impl Engine {
         let mut fates: Vec<(FileRow, Fate)> = Vec::new();
         let mut unknown: Vec<FileRow> = Vec::new();
         let mut claimed: HashSet<String> = HashSet::new();
+        let mut waiting: HashSet<String> = HashSet::new();
         for r in gone {
             let dest = hints.dest(&r.path);
             let failed_dest = dest.as_ref().is_some_and(|d| ctx.failed_paths.contains(d))
@@ -1582,16 +1597,19 @@ impl Engine {
                             fates.push((r, Fate::Delete { dest: Some(d) }));
                             continue;
                         }
-                        Claim::Pending => {
+                        Claim::Pending if hold.as_deref_mut().is_none_or(|h| h.may_wait(&r.doc_id)) => {
                             // Renamed, and the new name is still being
-                            // written: decide once it is pushed.
+                            // written: decide once it is pushed (for at
+                            // most the maximum hold in the daemon).
                             info!(
                                 "{}: renamed to {d}, which is not pushed yet; the old document is kept for now",
                                 r.path
                             );
                             ctx.dests_pending = true;
+                            waiting.insert(r.doc_id.clone());
                             continue;
                         }
+                        Claim::Pending => {}
                         Claim::No => {}
                     },
                 }
@@ -1657,7 +1675,6 @@ impl Engine {
             })?;
         }
         // In the daemon, wait for the burst to end.
-        let mut hold = hold;
         let held = match hold.as_deref_mut() {
             Some(h) => {
                 let before = h.due();
@@ -1673,6 +1690,11 @@ impl Engine {
             None => false,
         };
         ctx.deletes_held |= held;
+        if tally.scan.is_some() {
+            if let Some(h) = hold.as_deref_mut() {
+                h.keep_pending(&waiting);
+            }
+        }
         if ctx.dests_pending {
             // Look again soon: a full pass decides once the new names are
             // pushed (a partial pass may never see the old ones again).
@@ -2326,6 +2348,17 @@ mod tests {
         assert!(took >= Duration::from_millis(600), "{took:?}");
         assert!(took < Duration::from_millis(2000), "{took:?}");
         assert!(n >= 6, "{n}");
+    }
+
+    #[test]
+    fn a_rename_waits_for_its_new_name_for_at_most_the_maximum_hold() {
+        let mut h = DeleteHold::new(Duration::from_millis(10), Duration::from_millis(100));
+        assert!(h.may_wait("a"));
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!h.may_wait("a"), "waited past the maximum");
+        // Once it is no longer waiting, a later rename waits afresh.
+        h.keep_pending(&HashSet::new());
+        assert!(h.may_wait("a"));
     }
 
     /// Codex (third round): files other vanished files already account for
