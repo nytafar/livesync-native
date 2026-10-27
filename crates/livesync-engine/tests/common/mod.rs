@@ -99,6 +99,9 @@ pub struct MockState {
     pub db_missing: bool,
     /// IDs whose bodies a ranged `GET _all_docs?include_docs=true` returned.
     pub served_bodies: Vec<String>,
+    /// After the next full page of a ranged `_all_docs` read, drop the last
+    /// document it returned (another client's deletion between two pages).
+    pub delete_last_served_after_range_read: bool,
 }
 
 #[derive(Clone)]
@@ -775,6 +778,16 @@ async fn all_docs_range(State((st, _)): S, Query(q): Query<HashMap<String, Strin
     if include {
         let ids: Vec<String> = rows.iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
         s.served_bodies.extend(ids);
+    }
+    // Delete the last row served, as another client could between two pages.
+    if s.delete_last_served_after_range_read && rows.len() == limit {
+        s.delete_last_served_after_range_read = false;
+        if let Some(id) = rows.last().and_then(|r| r["id"].as_str()) {
+            let id = id.to_string();
+            let rev = s.docs[&id]["_rev"].clone();
+            s.docs
+                .insert(id.clone(), json!({"_id": id, "_rev": rev, "_deleted": true}));
+        }
     }
     Json(json!({"rows": rows}))
 }

@@ -116,6 +116,22 @@ async fn the_listing_pages_through_many_documents() {
 }
 
 #[tokio::test]
+async fn a_deletion_between_two_pages_loses_no_other_document() {
+    let m = Mock::start().await;
+    for i in 0..4500 {
+        m.put(
+            json!({"_id": format!("bulk/{i:05}.md"), "path": format!("Bulk/{i:05}.md"), "type": "plain",
+            "children": [], "ctime": 1, "mtime": 1, "size": 2, "eden": {}}),
+        );
+    }
+    // The first page's last document (counted on that page) is deleted
+    // before the second page starts at it.
+    m.state.lock().unwrap().delete_last_served_after_range_read = true;
+    let l = list_remote_folders(&couch(&m)).await.unwrap();
+    assert_eq!(l.folders, vec![entry("Bulk", 4500, 9000)]);
+}
+
+#[tokio::test]
 async fn encrypted_paths_are_refused_clearly() {
     let m = Mock::start().await;
     m.put_text("Notes/a.md", &["a"]);

@@ -92,17 +92,18 @@ pub async fn list_remote_folders(couch: &Couch) -> Result<FolderListing> {
     let mut tallies: BTreeMap<String, Tally> = BTreeMap::new();
     for (start, end) in ranges() {
         let mut from = start.map(str::to_string);
-        let mut skip_first = false;
+        // The last key counted. A page starts at it (inclusive), so it comes
+        // back first unless it was deleted meanwhile; only then is it skipped.
+        let mut cursor: Option<String> = None;
         loop {
-            let want = PAGE + usize::from(skip_first);
-            let rows = couch.all_docs_page(from.as_deref(), end, want, true).await?;
+            let rows = couch.all_docs_page(from.as_deref(), end, PAGE, true).await?;
             let n = rows.len();
             let mut last = None;
-            for (i, r) in rows.into_iter().enumerate() {
-                if skip_first && i == 0 {
+            for r in rows {
+                let Some(id) = r.key else { continue };
+                if cursor.as_deref() == Some(id.as_str()) {
                     continue;
                 }
-                let Some(id) = r.key else { continue };
                 last = Some(id.clone());
                 if id.starts_with("h:") || is_internal_id(&id) {
                     continue;
@@ -137,13 +138,13 @@ pub async fn list_remote_folders(couch: &Couch) -> Result<FolderListing> {
                     }
                 }
             }
-            if n < want {
+            if n < PAGE {
                 break;
             }
             match last {
                 Some(l) => {
-                    from = Some(l);
-                    skip_first = true;
+                    from = Some(l.clone());
+                    cursor = Some(l);
                 }
                 None => break,
             }

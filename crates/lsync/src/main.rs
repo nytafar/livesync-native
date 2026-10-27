@@ -406,8 +406,8 @@ async fn folders(cfg: &FileConfig, json: bool) -> Result<u8> {
     if let Some(v) = &cfg.vault {
         l.merge_local(&livesync_engine::local_top_folders(v));
     }
-    // A root file syncs unless the scope only lists folders.
-    let root_synced = scope.contains("root-file");
+    // A root file syncs unless the scope lists only the folders to sync.
+    let root_synced = scope.mode != livesync_model::scope::ScopeMode::Include;
     if json {
         let mut v = serde_json::to_value(&l)?;
         for (f, out) in l.folders.iter().zip(v["folders"].as_array_mut().into_iter().flatten()) {

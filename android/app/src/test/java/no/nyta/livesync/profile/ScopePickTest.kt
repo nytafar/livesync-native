@@ -25,6 +25,24 @@ class ScopePickTest {
     }
 
     @Test
+    fun typedEntriesMatchAsTheEngineNormalisesThem() {
+        // The engine reads `Notes\` and `/notes//` as `notes`.
+        assertTrue(ScopePick.ticked(listOf("Notes\\"), "notes"))
+        assertTrue(ScopePick.ticked(listOf("/notes//"), "Notes"))
+        assertEquals(emptyList<String>(), ScopePick.toggle(listOf("Notes\\"), "notes"))
+        assertEquals(listOf("Inputs\\corpora"), ScopePick.nestedIn(listOf("Inputs\\corpora"), "inputs"))
+    }
+
+    @Test
+    fun aNameTheFolderListCannotHoldCannotBePicked() {
+        // The typed list splits on commas, so "Work, Personal" would become two folders.
+        assertFalse(ScopePick.pickable("Work, Personal"))
+        assertTrue(ScopePick.pickable("Work & Personal"))
+        val typed = ProfileRules.parseFolders(ScopePick.toggle(emptyList(), "Work & Personal").joinToString("\n"))
+        assertTrue(ScopePick.ticked(typed, "Work & Personal"))
+    }
+
+    @Test
     fun rootFilesSyncUnlessOnlyFoldersAreListed() {
         assertTrue(ScopePick.rootSyncs(ScopeMode.ALL))
         assertTrue(ScopePick.rootSyncs(ScopeMode.EXCLUDE))

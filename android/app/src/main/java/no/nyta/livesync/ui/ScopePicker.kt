@@ -67,16 +67,18 @@ fun ServerFolders(
             l.folders.forEach { f ->
                 val ticked = ScopePick.ticked(folders, f.name)
                 val nested = ScopePick.nestedIn(folders, f.name)
+                val pickable = ScopePick.pickable(f.name)
+                val enabled = mode != ScopeMode.ALL && pickable
                 Row(
                     Modifier.fillMaxWidth().toggleable(
                         value = ticked,
-                        enabled = mode != ScopeMode.ALL,
+                        enabled = enabled,
                         role = Role.Checkbox,
                         onValueChange = { onToggle(f.name) },
                     ),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Checkbox(checked = ticked, onCheckedChange = null, enabled = mode != ScopeMode.ALL)
+                    Checkbox(checked = ticked, onCheckedChange = null, enabled = enabled)
                     Column(Modifier.padding(start = 8.dp)) {
                         Text("${f.name}/")
                         val detail = when {
@@ -84,6 +86,12 @@ fun ServerFolders(
                             else -> Formats.filesAndSize(f.files, f.bytes)
                         }
                         Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (!pickable) {
+                            Text(
+                                "Cannot be picked: the folder list reads a comma as two folders.",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
                         if (nested.isNotEmpty() && mode != ScopeMode.ALL) {
                             Text("Also listed inside: ${nested.joinToString(", ")}", style = MaterialTheme.typography.bodySmall)
                         }
