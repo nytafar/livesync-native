@@ -66,7 +66,7 @@ To rerun: `scripts/bench/snapshot.sh` once, then `scripts/bench/run.sh --contend
 
 - **It never overwrites or deletes a local edit it has not synced.** If the server changed too, your edit becomes a conflict for the desktop plugin to resolve.
 - **It fails closed.** Anything it doesn't recognise stops the sync instead of being guessed at, for example an unknown database version, encryption, or settings that changed since setup.
-- **Deletes are LiveSync's soft deletes,** and only for files that were in sync. A pass that would delete more than half of what it tracks stops and asks.
+- **Deletes are LiveSync's soft deletes,** and only for files that were in sync. A pass that would delete more than 20 files, when they are also more than half of what it tracks, stops and asks; so does one that finds the synced folders empty and would delete 3 or more. Smaller deletions go through without asking.
 - **It stays out of `.obsidian/` and every other dot-folder.**
 
 ## Status and limits
@@ -89,7 +89,7 @@ This is an independent client, not affiliated with the Self-hosted LiveSync proj
 
 - Follows the database's `_changes` feed with a `_selector` that leaves out chunks, then fetches chunks on demand through `POST _all_docs {keys}`.
 - **Pushes local changes** the way the official clients store them: the `v3-rabin-karp` splitter ported byte for byte (so chunk IDs match and deduplicate), chunks uploaded before the metadata that names them, metadata written against the revision the file was synced at. If the remote moved on meanwhile, the local edit is stored as a child of that revision instead (a conflict the desktop plugin resolves); nothing is overwritten.
-- **Deletes are soft deletes** (`deleted: true`) against the synced revision, only for files that were in sync. A move into `.trash/` is Obsidian's delete; a move out of the synced folders (or into another dot-folder) is not a delete. A pass that would delete more than half of the tracked files stops and asks instead.
+- **Deletes are soft deletes** (`deleted: true`) against the synced revision, only for files that were in sync. A move into `.trash/` is Obsidian's delete; a move out of the synced folders (or into another dot-folder) is not a delete. A pass that would delete more than 20 files with no known destination (`MASS_DELETE_MIN`), when they are also more than half of the tracked files, stops and asks instead, as does one that finds the synced folders empty and would delete 3 or more.
 - Watches the vault (one watch per folder, never `.obsidian/`), waits until a file has been stable for 2 s, and rescans every 15 minutes in case an event was missed.
 - **Folder scope:** all folders by default, or only some (`--include`), or all but some (`--exclude`), matched case-insensitively. Files outside the scope are invisible in both directions. Widening fetches the newly visible documents; narrowing stops tracking without touching the remote.
 - Registers itself in the milestone (`node_info`, `tweak_values`, `node_chunk_info`) after a complete fetch, and marks itself resolved after a fresh start or a rebuild elsewhere, so a rebuilt and locked database is recovered from automatically.

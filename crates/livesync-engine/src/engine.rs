@@ -154,8 +154,11 @@ pub struct EngineConfig {
     /// unchanged this long before the refetch counts as complete (the
     /// rebuilding device uploads for a while after the lock).
     pub rebuild_quiet: Duration,
-    /// Allow a single sync pass to delete more than half of the tracked files
-    /// (otherwise it stops and asks, in case the vault folder vanished).
+    /// Allow a single sync pass to delete files en masse: more than
+    /// `MASS_DELETE_MIN` (20) without a known destination that are also more
+    /// than half of the tracked files, or 3 or more when the synced folders
+    /// look empty (otherwise it stops and asks, in case the vault folder
+    /// vanished).
     pub allow_mass_delete: bool,
     /// Asked before any pass that could delete remote documents (a seam for
     /// the front-end, e.g. Android's "all files access" check). `None`: no

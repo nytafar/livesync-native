@@ -337,7 +337,7 @@ private enum class Confirm(val title: String, val text: String, val action: Stri
         "Switch to two-way sync?",
         "Edits, new files, renames and deletions on this phone will be written to the server and reach your " +
             "other devices. Files edited here while in pull-only mode are pushed now. Deletions are soft deletes, " +
-            "and a pass that would delete more than half of the files stops instead.",
+            "and a pass that would delete more than 20 files that are also more than half of the files stops instead.",
         "Switch to two-way",
     ),
     MassDelete(

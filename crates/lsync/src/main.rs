@@ -93,7 +93,8 @@ enum Cmd {
 
 #[derive(clap::Args, Debug, Clone, Default)]
 struct PushOpts {
-    /// Allow one pass to delete more than half of the tracked files remotely
+    /// Allow one pass to delete files en masse remotely (more than 20 that are
+    /// also more than half of the tracked files, or 3 when the vault looks empty)
     #[arg(long)]
     allow_mass_delete: bool,
     /// When the folder scope narrows, remove the clean local copies that fell out of it
