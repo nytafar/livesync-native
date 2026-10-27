@@ -239,6 +239,58 @@ async fn a_stop_saved_by_an_older_version_can_be_confirmed() {
     assert_eq!(rep.push.deleted, 25, "{:?}", rep.push);
 }
 
+/// Codex, second round: an old-format stop's confirmation that no longer
+/// matches stops anew, even where the ordinary rule would now let the files
+/// through (more files are tracked since); and once matched, it covers
+/// those documents only, also when the pass fails and a later one applies
+/// it.
+#[tokio::test]
+async fn an_old_format_confirmation_never_covers_more_than_it_showed() {
+    let env = Env::new().await;
+    for i in 0..60 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    let engine = env.engine_at(&env.mock.url);
+    engine.sync_once().await.unwrap();
+    env.remove(0..31);
+    engine.sync_once().await.unwrap();
+    // Forty new notes are pushed while the stop stands.
+    for i in 0..40 {
+        env.write(&format!("g{i:02}.md"), format!("new {i}").as_bytes());
+    }
+    let rep = engine.sync_once().await.unwrap();
+    assert_eq!(rep.push.safety_stops, 1);
+    env.index().delete_meta("safety_stop_docs").unwrap();
+    let old = engine.status().unwrap().safety_stop.unwrap();
+    assert!(old.contains("31 of 60"), "{old}");
+    // One more goes: 32 of 100 would not stop by itself.
+    env.remove(31..32);
+    assert_eq!(engine.allow_mass_delete_once(&old).unwrap(), Confirmation::Allowed);
+    let rep = engine.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0, "{:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 1);
+    let now = engine.status().unwrap().safety_stop.unwrap();
+    assert!(now.contains("32 of 100"), "{now}");
+
+    // Matched, then the pass fails at the deletions; 25 more go missing
+    // before the retry, which deletes the 32 it matched and stops on the 25.
+    env.index().delete_meta("safety_stop_docs").unwrap();
+    assert_eq!(engine.allow_mass_delete_once(&now).unwrap(), Confirmation::Allowed);
+    env.mock.state.lock().unwrap().fail_writes = 100;
+    assert!(engine.push_all(false).await.is_err());
+    env.mock.state.lock().unwrap().fail_writes = 0;
+    assert!(engine.mass_delete_allowed());
+    env.remove(32..57);
+    for i in 0..15 {
+        std::fs::remove_file(env.vault().join(format!("g{i:02}.md"))).unwrap();
+    }
+    let rep = engine.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 32, "{:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 1);
+    assert!((0..32).all(|i| env.deleted(&format!("f{i:02}.md"))));
+    assert!((32..57).all(|i| !env.deleted(&format!("f{i:02}.md"))));
+}
+
 /// Review of #10, second round: a pass that fails before it gets to the
 /// deletions does not use up the confirmation.
 #[tokio::test]

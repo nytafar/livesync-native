@@ -1792,25 +1792,42 @@ impl Engine {
         // the start of the pass.
         // Deletions the user confirmed after a stop go now; they leave the
         // count, as if deleted before this pass.
-        let confirmed_docs: Option<HashSet<String>> = match ctx.confirmed.take().map(|c| c.docs) {
+        // A stop saved by an older version showed fewer files than are
+        // missing now: none goes, and a new stop lists them.
+        let mut stop_anew = false;
+        let confirmed_docs: Option<HashSet<String>> = match ctx.confirmed.take() {
             None => None,
-            Some(ConfirmedDocs::Exactly(docs)) => Some(docs),
-            Some(ConfirmedDocs::UpTo(shown)) => {
+            Some(Confirmed {
+                docs: ConfirmedDocs::Exactly(docs),
+                ..
+            }) => Some(docs),
+            Some(Confirmed {
+                stop,
+                docs: ConfirmedDocs::UpTo(shown),
+            }) => {
                 let missing: HashSet<String> = fates
                     .iter()
                     .filter(|(_, f)| matches!(f, Fate::Delete { dest: None }))
                     .map(|(r, _)| r.doc_id.clone())
                     .collect();
                 if missing.len() as u64 <= shown {
+                    // From now on the confirmation covers these documents
+                    // and no others, also if this pass fails and a later
+                    // one applies it again.
+                    let mut once = self.inner.mass_delete_once.lock().unwrap();
+                    if once.as_ref().is_some_and(|c| c.stop == stop) {
+                        *once = Some(Confirmed {
+                            stop,
+                            docs: ConfirmedDocs::Exactly(missing.clone()),
+                        });
+                    }
                     Some(missing)
                 } else {
-                    // The stop (saved by an older version, without its list)
-                    // showed fewer: judge them again, so a new stop lists
-                    // them.
                     warn!(
                         "{} file(s) are missing, more than the {shown} the confirmed safety stop showed; none is deleted on that confirmation",
                         missing.len()
                     );
+                    stop_anew = true;
                     None
                 }
             }
@@ -1888,7 +1905,8 @@ impl Engine {
         }
         let missing = undestined + earlier;
         let of = tracked + earlier;
-        let mass = !held && undestined > 0 && missing > MASS_DELETE_MIN && missing * 2 > of;
+        let mass =
+            (!held || stop_anew) && undestined > 0 && (stop_anew || missing > MASS_DELETE_MIN && missing * 2 > of);
         let emptied = !held && tally.visible_empty && undestined >= EMPTIED_TREE_MIN;
         let mut withhold = held;
         if mass || emptied {
