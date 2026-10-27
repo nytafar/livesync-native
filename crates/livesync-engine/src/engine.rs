@@ -160,6 +160,11 @@ pub struct EngineConfig {
     /// look empty (otherwise it stops and asks, in case the vault folder
     /// vanished).
     pub allow_mass_delete: bool,
+    /// In the two-way daemon, local deletions with no known destination are
+    /// sent only once none has gone missing for this long; then the whole
+    /// burst is judged by the mass-delete stop at once (a burst the watcher
+    /// spreads over several passes is still one burst).
+    pub delete_hold: Duration,
     /// Asked before any pass that could delete remote documents (a seam for
     /// the front-end, e.g. Android's "all files access" check). `None`: no
     /// check beyond the engine's own.
@@ -209,6 +214,7 @@ impl EngineConfig {
             device_name: None,
             rebuild_quiet: Duration::from_secs(30),
             allow_mass_delete: false,
+            delete_hold: Duration::from_secs(10),
             access_check: None,
             vault_flock: true,
         }

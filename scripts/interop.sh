@@ -23,6 +23,9 @@
 #       mark resolved, orphan pushed back, a local edit kept as a branch)
 #   S7  both daemons running: edits, a rename and a delete on either side
 #       reach the other, and the two vault folders end up identical
+#   S8  the lsync daemon: 30 of 40 notes deleted in two bursts across settle
+#       windows still stop (nothing deleted remotely); a confirmed sync
+#       deletes them, and a second daemon takes the remote deletes in
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -90,6 +93,16 @@ same_file() { cmp -s "$1" "$2"; }
 file_is() { [[ -f "$1" && "$(cat "$1")" == "$2" ]]; }
 gone() { [[ ! -e "$1" ]]; }
 lsa_status() { lsa status --json; }
+
+wait_for() { # wait_for <seconds> <description> <command...>
+  local t=$1 what=$2; shift 2
+  local start=$SECONDS
+  while (( SECONDS - start < t )); do
+    if "$@" 2>/dev/null; then ok "$what ($((SECONDS - start)) s)"; return 0; fi
+    sleep 0.5
+  done
+  bad "$what (timed out after $t s)"
+}
 
 gen() { # gen <file> <kind> <bytes> [seed]
   python3 - "$@" <<'PY'
@@ -357,15 +370,6 @@ PIDS+=($!)
 LSYNC_DB=$DB LSYNC_VAULT=$W/vault LSYNC_STATE_DIR=$W/state LSYNC_CONFIG=$W/a.toml LSYNC_DEVICE_NAME=interop-a \
   "$BIN" daemon >>"$W/lsync-daemon.log" 2>&1 &
 PIDS+=($!)
-wait_for() { # wait_for <seconds> <description> <command...>
-  local t=$1 what=$2; shift 2
-  local start=$SECONDS
-  while (( SECONDS - start < t )); do
-    if "$@" 2>/dev/null; then ok "$what ($((SECONDS - start)) s)"; return 0; fi
-    sleep 0.5
-  done
-  bad "$what (timed out after $t s)"
-}
 wait_for 120 "the CLI daemon mirrored the database" test -f "$W/clivault-d/setup/init.md"
 mkdir -p "$W/vault/live"
 printf 'from lsync\n' > "$W/vault/live/from-lsync.md"
@@ -391,6 +395,50 @@ if [[ -z "$diffs" ]]; then
 else
   bad "the two vault folders differ:"
   echo "$diffs" | head -20 | sed 's/^/      /' | tee -a "$RESULTS"
+fi
+fi
+
+# --- S8: a mass delete split over two passes ------------------------------------
+if want S8; then
+log "S8 the lsync daemon: a mass delete in two bursts across settle windows still stops"
+lsc() { local rc=0; LSYNC_DB=$DB LSYNC_VAULT=$W/vault-c LSYNC_STATE_DIR=$W/state-c LSYNC_CONFIG=$W/c.toml \
+        LSYNC_DEVICE_NAME=interop-c "$BIN" --include s8 "$@" 2>>"$W/lsync-c.log" || rc=$?; [[ $rc == 0 || $rc == 3 ]] || return $rc; }
+lsc_field() { lsc status --json | jfield "$1"; }
+for i in $(seq -w 0 39); do mkdir -p "$W/vault-c/s8"; printf 'note %s\n' "$i" > "$W/vault-c/s8/n$i.md"; done
+lsc sync >/dev/null
+check "40 notes pushed" remote_live s8/n39.md
+LSYNC_DB=$DB LSYNC_VAULT=$W/vault-c LSYNC_STATE_DIR=$W/state-c LSYNC_CONFIG=$W/c.toml LSYNC_DEVICE_NAME=interop-c \
+  "$BIN" --include s8 daemon >>"$W/lsync-c-daemon.log" 2>&1 &
+C_PID=$!
+PIDS+=("$C_PID")
+lsc_up() { [[ "$(lsc_field '.get("daemon_heartbeat_ms")')" != null ]]; }
+lsc_stopped() { lsc status --json | grep -q '30 of 40'; }
+deleted_of() { local n=0 i; for i in $(seq -w "$1" "$2"); do remote_deleted "s8/n$i.md" && n=$((n + 1)); done; echo "$n"; }
+wait_for 60 "the daemon is up" lsc_up
+sleep 3
+for i in $(seq -w 0 14); do rm "$W/vault-c/s8/n$i.md"; done
+sleep 6 # three settle windows (the first burst gets passes of its own), within the 10 s delete hold
+for i in $(seq -w 15 29); do rm "$W/vault-c/s8/n$i.md"; done
+wait_for 60 "the daemon stops (30 of 40 missing)" lsc_stopped
+deleted=$(deleted_of 0 29)
+check "none of the 30 was deleted remotely ($deleted were)" test "$deleted" -eq 0
+kill "$C_PID" 2>/dev/null || true
+wait "$C_PID" 2>/dev/null || true
+if want S7; then
+  wait_for 60 "profile A's daemon (S7) has the 40 notes" file_is "$W/vault/s8/n29.md" "note 29"
+fi
+lsc sync --allow-mass-delete >/dev/null
+deleted=$(deleted_of 0 29)
+check "confirmed: all 30 deleted remotely ($deleted)" test "$deleted" -eq 30
+check "the other 10 stay" remote_live s8/n35.md
+check "the stop is cleared" test "$(lsc_field '.get("safety_stop")')" == null
+if want S7; then
+  # Profile A's daemon (S7) takes the 30 remote deletes in: they are not its
+  # own deletes, so they neither stop it nor go back up.
+  wait_for 60 "profile A's daemon applied the remote deletes" gone "$W/vault/s8/n29.md"
+  sleep 3
+  check "profile A's daemon did not stop on them" test "$(lsa_status | jfield '.get("safety_stop")')" == null
+  check "profile A kept the other 10" file_is "$W/vault/s8/n35.md" "note 35"
 fi
 fi
 

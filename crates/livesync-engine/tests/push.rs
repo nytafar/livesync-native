@@ -49,6 +49,7 @@ impl Env {
         cfg.concurrency = 2;
         cfg.rebuild_quiet = Duration::ZERO;
         cfg.settle = Duration::from_millis(200);
+        cfg.delete_hold = Duration::from_millis(500);
         f(&mut cfg);
         Engine::open(couch, cfg).unwrap()
     }
@@ -1522,4 +1523,217 @@ async fn a_stale_copy_stays_when_its_recovered_copy_cannot_be_saved() {
     assert_eq!(rep.push.deleted_locally, 1, "{rep:?}");
     assert!(env.read("gone.md").is_none());
     assert!(env.meta("reconcile_pending").is_none());
+}
+
+/// #10: in the daemon, a burst of deletes that reaches the push side in two
+/// parts (two settle windows, or a scan that ran in the middle of it) is
+/// judged as one: 30 of 40 deleted in two halves of 15 still stops, and
+/// neither half is deleted remotely.
+#[tokio::test]
+async fn a_mass_deletion_split_over_two_passes_still_stops() {
+    let env = Env::new().await;
+    for i in 0..40 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_secs(3);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for i in 0..15 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    // Several settle windows: the first half gets a partial pass of its own.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    for i in 15..30 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let gone = || -> Vec<String> {
+        (0..30)
+            .map(|i| format!("f{i:02}.md"))
+            .filter(|p| env.deleted(p))
+            .collect()
+    };
+    wait_until("the stop, or every deletion", || {
+        engine.status().unwrap().safety_stop.is_some() || gone().len() == 30
+    })
+    .await;
+    assert!(gone().is_empty(), "deleted remotely: {:?}", gone());
+    let st = engine.status().unwrap();
+    assert!(st.safety_stop.as_deref().unwrap().contains("30 of 40"), "{st:?}");
+
+    // The user confirms: the 30 go, once; the other 10 stay.
+    engine.allow_mass_delete_once();
+    wait_until("the confirmed deletions", || gone().len() == 30).await;
+    assert!((30..40).all(|i| !env.deleted(&format!("f{i:02}.md"))));
+    wait_until("the stop to clear", || {
+        engine.status().unwrap().safety_stop.is_none() && !engine.mass_delete_allowed()
+    })
+    .await;
+    // The permission is used up: the next mass deletion stops again.
+    for i in 30..40 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    wait_until("the next stop", || engine.status().unwrap().safety_stop.is_some()).await;
+    assert!(
+        (30..40).all(|i| !env.deleted(&format!("f{i:02}.md"))),
+        "an emptied vault went through"
+    );
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// #10: deleting a few notes now and then is never a mass deletion: each
+/// small burst goes out once it is over (after the hold, not before).
+#[tokio::test]
+async fn a_few_deletions_now_and_then_go_through_after_the_hold() {
+    let env = Env::new().await;
+    for i in 0..30 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_secs(2);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for round in 0..4 {
+        let names: Vec<String> = (round * 5..round * 5 + 5).map(|i| format!("f{i:02}.md")).collect();
+        for n in &names {
+            std::fs::remove_file(env.vault().join(n)).unwrap();
+        }
+        // Seen by a partial pass by now, but held.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(names.iter().all(|n| !env.deleted(n)), "sent before the hold ended");
+        wait_until("the small burst", || names.iter().all(|n| env.deleted(n))).await;
+    }
+    // 20 of 30 deleted in all, more than half, but never as one burst.
+    assert!(engine.status().unwrap().safety_stop.is_none());
+    assert!(!env.deleted("f20.md"));
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// #10: deletions that came from the server are not this device's: 30 of
+/// 40 deleted remotely, beside 5 deleted here, do not trip the stop, and
+/// the local ones go out.
+#[tokio::test]
+async fn remote_deletions_do_not_count_towards_the_stop() {
+    let env = Env::new().await;
+    for i in 0..40 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_secs(1);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for i in 0..30 {
+        env.mock.soft_delete(&format!("f{i:02}.md"));
+    }
+    for i in 30..35 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    wait_until("the remote deletions applied", || {
+        (0..30).all(|i| env.read(&format!("f{i:02}.md")).is_none())
+    })
+    .await;
+    wait_until("the local deletions sent", || {
+        (30..35).all(|i| env.deleted(&format!("f{i:02}.md")))
+    })
+    .await;
+    // Past the hold and its deciding pass.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let st = engine.status().unwrap();
+    assert!(st.safety_stop.is_none(), "{st:?}");
+    assert!((35..40).all(|i| !env.deleted(&format!("f{i:02}.md"))));
+    assert_eq!(st.counts.get("clean"), Some(&5), "{:?}", st.counts);
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// #10: a full pass that runs in the middle of a burst (here: the rest of
+/// the burst lands after its walk, and no watcher reports it, as on shared
+/// storage) does not delete the part it saw; the burst is judged once it
+/// is over.
+#[tokio::test]
+async fn a_scan_in_the_middle_of_a_mass_deletion_deletes_nothing() {
+    let env = Env::new().await;
+    for i in 0..40 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let vault = env.vault();
+    let rest_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Asked after the walk, before deciding: the rest of the burst lands now.
+    let check = livesync_engine::engine::AccessCheck::new({
+        let rest_done = rest_done.clone();
+        move || {
+            if !rest_done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                for i in 15..30 {
+                    std::fs::remove_file(vault.join(format!("f{i:02}.md"))).unwrap();
+                }
+            }
+            Ok(())
+        }
+    });
+    let engine = env.engine_with(|c| {
+        c.watch = false;
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_secs(1);
+        c.access_check = Some(check);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for i in 0..15 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    engine.rescan_now();
+    wait_until("the walk", || rest_done.load(std::sync::atomic::Ordering::SeqCst)).await;
+    // A second scan, as the next periodic rescan would be.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    engine.rescan_now();
+    let gone = || -> Vec<String> {
+        (0..30)
+            .map(|i| format!("f{i:02}.md"))
+            .filter(|p| env.deleted(p))
+            .collect()
+    };
+    wait_until("the stop, or every deletion", || {
+        engine.status().unwrap().safety_stop.is_some() || gone().len() == 30
+    })
+    .await;
+    assert!(gone().is_empty(), "deleted remotely: {:?}", gone());
+    let st = engine.status().unwrap();
+    assert!(st.safety_stop.as_deref().unwrap().contains("30 of 40"), "{st:?}");
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
 }

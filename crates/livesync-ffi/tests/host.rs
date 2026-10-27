@@ -431,17 +431,33 @@ fn a_confirmed_mass_delete_goes_through_once() {
     wait_until("registration", Duration::from_secs(20), || {
         env.status(&p).registered_ms.is_some()
     });
+    // Spread over half a second, as a file manager or a slow filesystem
+    // would: the first full pass after the registration runs in the middle
+    // of it (#10; before the hold, 16 or 17 of the 22 went out every time).
     for n in &names[..22] {
         std::fs::remove_file(Path::new(&p.vault_path).join(n)).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
     }
     env.host.sync_now("mass".into()).unwrap();
-    wait_until("the safety stop", Duration::from_secs(30), || {
-        env.status(&p).safety_stop.is_some()
-    });
+    // Wait for the stop, or for any deletion: a deletion means the stop was
+    // bypassed (#10); neither means the pass never ran.
+    let deleted = || -> Vec<&String> { names[..22].iter().filter(|n| soft_deleted(&env, n)).collect() };
+    let end = Instant::now() + Duration::from_secs(30);
+    while env.status(&p).safety_stop.is_none() && deleted().is_empty() {
+        assert!(
+            Instant::now() < end,
+            "timed out waiting for the safety stop: none of the 22 was deleted remotely, so the deciding pass never ran (status: {:?})",
+            env.status(&p)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let gone = deleted();
     assert!(
-        names[..22].iter().all(|n| !soft_deleted(&env, n)),
-        "deleted despite the stop"
+        gone.is_empty(),
+        "the safety stop was bypassed: {} of the 22 were deleted remotely without it: {gone:?}",
+        gone.len()
     );
+    assert!(env.status(&p).safety_stop.is_some());
     assert!(matches!(
         env.host.allow_mass_delete_once("nope".into()),
         Err(LiveSyncError::NotRunning { .. })

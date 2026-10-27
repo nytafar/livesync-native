@@ -49,7 +49,8 @@ type Result<T> = std::result::Result<T, EngineError>;
 
 /// The mass-delete stop: more than this many deletions without a known
 /// destination, and more than half of the files tracked at the start of the
-/// pass, need `allow_mass_delete`.
+/// pass, need `allow_mass_delete`. In the daemon the deletions of one burst
+/// are judged together (see `DeleteHold`).
 const MASS_DELETE_MIN: u64 = 20;
 /// When the whole visible tree is empty, this many deletions already stop.
 const EMPTIED_TREE_MIN: u64 = 3;
@@ -192,6 +193,74 @@ impl RenameHints {
     }
 }
 
+/// The daemon's hold on local deletes (#10). A deletion with no known
+/// destination is not sent when a pass first sees it: the watcher can spread
+/// one burst over several settle windows, and a full pass can run in the
+/// middle of it, and each part alone may stay under the mass-delete stop.
+/// So such deletions wait until no new one has turned up for `period`; then
+/// a full pass judges everything missing at that moment at once, as a single
+/// pass over the finished burst would. Partial passes never decide them.
+///
+/// Holding a deletion only keeps the remote copy longer. The hold lives in
+/// memory: if the process is killed or restarted, the rows are still
+/// tracked and the files still missing, so the next full pass finds them
+/// again and holds them anew. A sleeping device stops the (monotonic) clock,
+/// which only lengthens the hold.
+#[derive(Debug)]
+pub(crate) struct DeleteHold {
+    period: Duration,
+    /// Documents seen missing with no known destination.
+    seen: HashSet<String>,
+    /// When the newest of them was first seen, while undecided.
+    newest: Option<Instant>,
+}
+
+impl DeleteHold {
+    pub(crate) fn new(period: Duration) -> Self {
+        DeleteHold {
+            period,
+            seen: HashSet::new(),
+            newest: None,
+        }
+    }
+
+    /// When a full pass must decide on the held deletions.
+    pub(crate) fn due(&self) -> Option<Instant> {
+        self.newest.map(|t| t + self.period)
+    }
+
+    /// Note a pass's deletions with no known destination. Returns true when
+    /// they must be held, false when this (full) pass decides on them now.
+    /// `now` decides at once (a confirmed mass delete).
+    fn observe(&mut self, ids: &[&str], full: bool, now: bool) -> bool {
+        let at = Instant::now();
+        let mut fresh = false;
+        for id in ids {
+            fresh |= self.seen.insert((*id).to_string());
+        }
+        if full {
+            // A full pass sees every missing file: forget the ones that
+            // came back or were deleted since.
+            let current: HashSet<&str> = ids.iter().copied().collect();
+            self.seen.retain(|id| current.contains(id.as_str()));
+        }
+        if fresh {
+            self.newest = Some(at);
+        }
+        if ids.is_empty() {
+            if full {
+                self.newest = None;
+            }
+            return false;
+        }
+        if now || (full && self.due().is_none_or(|d| at >= d)) {
+            self.newest = None;
+            return false;
+        }
+        true
+    }
+}
+
 /// A file found on disk.
 #[derive(Debug, Clone)]
 struct Found {
@@ -235,6 +304,8 @@ struct PassCtx {
     /// file renamed to one of them is not deleted yet.
     failed_paths: HashSet<String>,
     failed_hashes: HashSet<String>,
+    /// Deletions were held for later (`DeleteHold`): no decision yet.
+    deletes_held: bool,
 }
 
 /// How to treat a file with no known revision.
@@ -514,7 +585,7 @@ impl Engine {
     /// for later instead of pushed now. Refuses (an error) while a full
     /// fetch is owed or this node still has to be marked resolved.
     pub async fn push_all(&self, defer_recent: bool) -> Result<PushReport> {
-        match self.full_pass(&RenameHints::default(), defer_recent).await? {
+        match self.full_pass(&RenameHints::default(), None, defer_recent).await? {
             Some((rep, _)) => Ok(rep),
             None => Err(EngineError::Other(format!(
                 "not pushing: {}; a two-way sync completes it first",
@@ -524,7 +595,14 @@ impl Engine {
     }
 
     /// `None`: pushes are held (see `Engine::pushes_held`); nothing was done.
-    async fn full_pass(&self, hints: &RenameHints, defer_recent: bool) -> Result<Option<(PushReport, Vec<String>)>> {
+    /// With a `hold` (the daemon), deletions with no known destination wait
+    /// for the burst to end; without one, this pass decides on them.
+    async fn full_pass(
+        &self,
+        hints: &RenameHints,
+        hold: Option<&mut DeleteHold>,
+        defer_recent: bool,
+    ) -> Result<Option<(PushReport, Vec<String>)>> {
         let _ops = self.inner.ops.lock().await;
         if let Some(why) = self.pushes_held()? {
             debug!("full pass held: {why}");
@@ -626,8 +704,13 @@ impl Engine {
         self.handle_vanished(
             vanished,
             hints,
+            hold,
             &walk.unreadable,
-            Tally { tracked, visible_empty },
+            Tally {
+                tracked,
+                visible_empty,
+                full: true,
+            },
             &mut ctx,
             &mut rep,
             &mut issues_seen,
@@ -641,13 +724,21 @@ impl Engine {
         if ctx.reconcile && !ctx.incomplete {
             self.with_index(|ix| ix.delete_meta(meta::RECONCILE))?;
         }
-        self.finish_pass(&rep, true)?;
+        // Held deletions are not decided yet: a stop shown for them stays.
+        self.finish_pass(&rep, !ctx.deletes_held)?;
         Ok(Some((rep, deferred)))
     }
 
     /// Look at specific paths (files, folders, or paths that vanished).
-    /// `None`: pushes are held; nothing was done.
-    async fn partial_pass(&self, paths: Vec<String>, hints: &RenameHints) -> Result<Option<PushReport>> {
+    /// `None`: pushes are held; nothing was done. Deletions with no known
+    /// destination are only noted in `hold`: a partial pass sees too little
+    /// to judge them.
+    async fn partial_pass(
+        &self,
+        paths: Vec<String>,
+        hints: &RenameHints,
+        hold: &mut DeleteHold,
+    ) -> Result<Option<PushReport>> {
         use std::io::ErrorKind::NotFound;
         let _ops = self.inner.ops.lock().await;
         if let Some(why) = self.pushes_held()? {
@@ -729,10 +820,12 @@ impl Engine {
         self.handle_vanished(
             vanished,
             hints,
+            Some(hold),
             &unreadable,
             Tally {
                 tracked,
                 visible_empty: false,
+                full: false,
             },
             &mut ctx,
             &mut rep,
@@ -1302,6 +1395,7 @@ impl Engine {
         &self,
         rows: Vec<FileRow>,
         hints: &RenameHints,
+        hold: Option<&mut DeleteHold>,
         unreadable: &[(String, String)],
         tally: Tally,
         ctx: &mut PassCtx,
@@ -1309,6 +1403,9 @@ impl Engine {
         issues_seen: &mut HashSet<String>,
     ) -> Result<()> {
         if rows.is_empty() {
+            if let Some(h) = hold.filter(|_| tally.full) {
+                h.observe(&[], true, false);
+            }
             return Ok(());
         }
         let n = rows.len();
@@ -1349,6 +1446,9 @@ impl Engine {
             }
         }
         if gone.is_empty() {
+            if let Some(h) = hold.filter(|_| tally.full) {
+                h.observe(&[], true, false);
+            }
             return Ok(());
         }
         // Decide every fate first.
@@ -1391,14 +1491,33 @@ impl Engine {
         // The mass-delete stop: deletions nobody can account for (no rename,
         // no move to `.trash/` or out of scope), against what was tracked at
         // the start of the pass.
-        let undestined = fates
+        let undestined_ids: Vec<&str> = fates
             .iter()
             .filter(|(_, f)| matches!(f, Fate::Delete { dest: None }))
-            .count() as u64;
+            .map(|(r, _)| r.doc_id.as_str())
+            .collect();
+        let undestined = undestined_ids.len() as u64;
         let tracked = tally.tracked;
-        let mass = undestined > MASS_DELETE_MIN && undestined * 2 > tracked;
-        let emptied = tally.visible_empty && undestined >= EMPTIED_TREE_MIN;
-        let mut withhold = false;
+        // In the daemon, wait for the burst to end; a confirmed mass delete
+        // is decided by the full pass that takes the confirmation.
+        let held = match hold {
+            Some(h) => {
+                let before = h.due();
+                let held = h.observe(&undestined_ids, tally.full, ctx.mass_delete_once);
+                if held && h.due() != before {
+                    info!(
+                        "{undestined} file(s) missing with no known destination; deleting them remotely once none has gone missing for {:.0?}",
+                        h.period
+                    );
+                }
+                held
+            }
+            None => false,
+        };
+        ctx.deletes_held |= held;
+        let mass = !held && undestined > MASS_DELETE_MIN && undestined * 2 > tracked;
+        let emptied = !held && tally.visible_empty && undestined >= EMPTIED_TREE_MIN;
+        let mut withhold = held;
         if mass || emptied {
             let msg = if emptied {
                 format!("the synced folders look empty: {undestined} of {tracked} tracked files are missing")
@@ -1631,6 +1750,7 @@ impl Engine {
         let mut started = false;
         let mut was_enabled = false;
         let mut hints = RenameHints::default();
+        let mut hold = DeleteHold::new(self.inner.cfg.delete_hold);
         let mut queue: HashMap<String, Settling> = HashMap::new();
         let mut full_due = true;
         let mut next_rescan = Instant::now() + self.inner.cfg.rescan_interval;
@@ -1686,9 +1806,13 @@ impl Engine {
             if Instant::now() >= next_rescan {
                 full_due = true;
             }
+            // Held deletions: the burst looks over; a full pass decides.
+            if hold.due().is_some_and(|d| Instant::now() >= d) {
+                full_due = true;
+            }
             let result = if full_due {
                 next_rescan = Instant::now() + self.inner.cfg.rescan_interval;
-                match self.full_pass(&hints, true).await {
+                match self.full_pass(&hints, Some(&mut hold), true).await {
                     Ok(Some((rep, deferred))) => {
                         full_due = false;
                         for p in deferred {
@@ -1705,7 +1829,7 @@ impl Engine {
                 if ready.is_empty() {
                     continue;
                 }
-                match self.partial_pass(ready.clone(), &hints).await {
+                match self.partial_pass(ready.clone(), &hints, &mut hold).await {
                     Ok(Some(rep)) => Ok(rep),
                     Ok(None) => {
                         // Held: look at them again once pushes resume.
@@ -1885,6 +2009,8 @@ struct Tally {
     tracked: u64,
     /// A full pass found no visible file at all (and nothing unreadable).
     visible_empty: bool,
+    /// A full pass (it saw every missing file).
+    full: bool,
 }
 
 #[cfg(test)]
@@ -1900,6 +2026,35 @@ mod tests {
         assert_eq!(h.dest("dir/x/y.md").as_deref(), Some(".trash/dir/x/y.md"));
         assert_eq!(h.dest("dirx/y.md"), None);
         assert!(in_trash(".trash/x.md") && !in_trash("a/.trash/x.md"));
+    }
+
+    #[test]
+    fn the_delete_hold_decides_once_a_burst_is_over() {
+        let mut h = DeleteHold::new(Duration::from_millis(100));
+        // A partial pass never decides; a new deletion starts the hold.
+        assert!(h.observe(&["a"], false, false));
+        assert!(h.due().is_some());
+        // A full pass within the hold waits too, and more deletions extend it.
+        assert!(h.observe(&["a", "b"], true, false));
+        let due = h.due().unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(Instant::now() >= due);
+        // Past the hold with nothing new: this full pass decides.
+        assert!(!h.observe(&["a", "b"], true, false));
+        assert!(h.due().is_none());
+        // Still missing (a stop) and nothing new: decided again at once.
+        assert!(!h.observe(&["a", "b"], true, false));
+        assert!(h.observe(&["a"], false, false), "a partial pass waits for a full one");
+        assert!(h.due().is_none(), "nothing new, nothing scheduled");
+        // One more deletion: the whole set waits again.
+        assert!(h.observe(&["a", "b", "c"], true, false));
+        // A confirmed mass delete decides at once.
+        assert!(!h.observe(&["a", "b", "c"], true, true));
+        assert!(h.due().is_none());
+        // Nothing missing any more: nothing held.
+        assert!(h.observe(&["d"], false, false));
+        assert!(!h.observe(&[], true, false));
+        assert!(h.due().is_none() && h.seen.is_empty());
     }
 
     #[test]
