@@ -35,8 +35,8 @@ class SyncService : Service() {
     private lateinit var handler: Handler
     private var network: NetworkMonitor? = null
 
-    /** Profiles that could not be started, with the reason (worker thread only). */
-    private val problems = mutableMapOf<String, String>()
+    /** Profiles that could not be started, with the reason (shared with the screens). */
+    private val problems get() = app.startProblems
     private var lastText: StatusSummary.Text = StatusSummary.Text("LiveSync", "Starting…", false)
     /** What the status notification shows now; unchanged text is not re-posted. */
     private val shown = PostGate<StatusSummary.Text>()
@@ -217,14 +217,19 @@ class SyncService : Service() {
         )
     }
 
-    private fun owesFirstFetch(core: Core, p: no.nyta.livesync.profile.Profile): Boolean {
+    private fun owesFirstFetch(core: Core, p: no.nyta.livesync.profile.Profile): Boolean =
+        !firstFetchSettled(core, p, countFailed = false)
+
+    /** Caught up, or (with [countFailed]) failed and only retrying later. */
+    private fun firstFetchSettled(core: Core, p: no.nyta.livesync.profile.Profile, countFailed: Boolean): Boolean {
         val st = try {
             core.status(p)
         } catch (e: Exception) {
             null
         }
         val hasIndex = st?.hasIndex ?: java.io.File(app.profiles.stateDir(p.id), "index.sqlite").exists()
-        return FirstSyncWaits.owesFirstFetch(hasIndex, st?.daemonHeartbeatMs)
+        val failed = countFailed && st?.runState == RunState.FAILED
+        return FirstSyncWaits.settled(hasIndex, st?.daemonHeartbeatMs, failed)
     }
 
     /**
@@ -251,11 +256,11 @@ class SyncService : Service() {
             } catch (e: Exception) {
                 null
             } ?: return@settle false
-            !owesFirstFetch(core, p)
+            firstFetchSettled(core, p, countFailed = true)
         }
         if (!done) return true
         lock.release()
-        core.log("first fetch caught up; wakelock released")
+        core.log("first fetch caught up (or failed); wakelock released")
         return false
     }
 
@@ -292,9 +297,9 @@ class SyncService : Service() {
             val value = stamped?.substringAfter(' ') ?: return
             if (prefs.getString(key, null) == value) return
             prefs.edit { putString(key, value) }
-            postAlert(id, title, text())
+            postAlert(id, p.id, title, text())
         }
-        val base = 1000 + (p.id.hashCode() and 0xffff) * 4
+        val base = alertBase(p.id)
         once("orphans-${p.id}", st.rebuildOrphans, base, "${p.name}: files pushed back after a rebuild") {
             st.rebuildOrphans!!.substringAfter(' ') + " Check them in Obsidian."
         }
@@ -303,10 +308,16 @@ class SyncService : Service() {
         }
     }
 
-    private fun postAlert(id: Int, title: String, text: String) {
+    private fun postAlert(id: Int, profileId: String, title: String, text: String) {
         if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return
+        // Opens that vault's status screen. The request code is the alert's
+        // own ID: extras do not tell PendingIntents apart, so with one code
+        // every alert would open the vault of whichever was posted last.
         val open = PendingIntent.getActivity(
-            this, 2, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            this, id,
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra(MainActivity.EXTRA_OPEN_PROFILE, profileId),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val n = NotificationCompat.Builder(this, LiveSyncApp.CHANNEL_ALERTS)
@@ -348,7 +359,7 @@ class SyncService : Service() {
         return NotificationCompat.Builder(this, LiveSyncApp.CHANNEL_STATUS)
             .setSmallIcon(R.drawable.ic_stat_sync)
             .setContentTitle(text.title)
-            .setContentText(text.text.lineSequence().firstOrNull() ?: "")
+            .setContentText(text.summary)
             .setStyle(NotificationCompat.BigTextStyle().bigText(text.text))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -435,6 +446,26 @@ class SyncService : Service() {
                     ?.log("cannot start the service ($reason): ${e.message}", "error")
             }
         }
+
+        /**
+         * Forget a removed profile's alert records and take down its alerts,
+         * so a vault added later under another ID starts clean and no alert
+         * opens a vault that is gone.
+         */
+        fun forgetAlerts(context: Context, profileId: String) {
+            context.getSharedPreferences("alerts", Context.MODE_PRIVATE).edit {
+                remove("orphans-$profileId")
+                remove("safety-$profileId")
+            }
+            val base = alertBase(profileId)
+            NotificationManagerCompat.from(context).apply {
+                cancel(base)
+                cancel(base + 1)
+            }
+        }
+
+        /** The first of a profile's alert notification IDs (the status notification is 1). */
+        private fun alertBase(profileId: String) = 1000 + (profileId.hashCode() and 0xffff) * 4
 
         fun syncNow(context: Context, profileId: String?) {
             val i = Intent(context, SyncService::class.java).setAction(ACTION_SYNC_NOW)

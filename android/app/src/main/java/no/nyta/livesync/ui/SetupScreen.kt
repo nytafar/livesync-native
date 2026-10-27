@@ -60,19 +60,23 @@ import no.nyta.livesync.service.SyncService
 import java.io.File
 
 /**
- * Onboarding (no [existing] profile) and settings (an existing one). The
+ * Onboarding and "Add vault" (no [existing] profile), and settings (an
+ * existing one). [onDone] gets the saved profile's ID. The
  * vault folder, server URL and database of an existing profile are fixed: its
  * sync index is bound to them; to change them, remove the profile and add it
  * again.
  */
 @Composable
-fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCancel: (() -> Unit)?) {
+fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, onCancel: (() -> Unit)?) {
     val ctx = LocalContext.current
     val focus = LocalFocusManager.current
     val scope = rememberCoroutineScope()
     val core = app.core.getOrThrow()
     val checks = rememberDeviceChecks()
     val editing = existing != null
+    // The new profile's ID, fixed for this screen (its Keystore alias and
+    // state folder are derived from it).
+    val newId = remember { app.profiles.newId() }
 
     var vaultPath by remember {
         mutableStateOf(existing?.vaultPath ?: File(Perms.defaultVaultParent(), "").path + "/")
@@ -126,7 +130,9 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
         deviceName = deviceName.trim(),
         createdAtMs = existing?.createdAtMs ?: System.currentTimeMillis(),
     )
-    val overlap = remember(cleanVault) { app.profiles.overlapping(draft) }
+    // Equal to, inside or above another vault's folder: said here, before
+    // saving (the store refuses it again when saving).
+    val overlap = remember(cleanVault) { app.profiles.clash(draft) }
     val urlProblem = ProfileRules.urlProblem(url)
     val scopeProblem = ProfileRules.scopeProblem(scopeMode, draft.scopeFolders)
     // What a connect test vouches for.
@@ -170,7 +176,12 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(16.dp),
     ) {
-        Text(if (editing) "Settings: ${existing?.name}" else "Set up LiveSync", style = MaterialTheme.typography.headlineSmall)
+        val title = when {
+            editing -> "Settings: ${existing?.name}"
+            onCancel != null -> "Add a vault"
+            else -> "Set up LiveSync"
+        }
+        Text(title, style = MaterialTheme.typography.headlineSmall)
         Text(
             "Keeps an Obsidian vault folder in two-way sync with your Self-hosted LiveSync CouchDB, " +
                 "whether or not Obsidian is open. Disable the LiveSync plugin in this vault on this phone.",
@@ -200,7 +211,7 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
             } else {
                 Text("The vault folder of a profile cannot change; remove the profile and add it again.", style = MaterialTheme.typography.bodySmall)
             }
-            overlap?.let { Banner("Overlaps \"${it.name}\" (${it.vaultPath}): vault folders may not be the same or inside each other.", Tone.ERROR) }
+            overlap?.let { Banner(it.message, Tone.ERROR) }
             report?.let { r ->
                 r.errors.forEach { Banner(it, Tone.ERROR) }
                 if (!editing) r.warnings.forEach { Banner(it, Tone.WARN) }
@@ -362,11 +373,12 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
                 saving = true
                 saveError = null
                 scope.launch {
-                    val err = withContext(Dispatchers.IO) { save(app, existing, draft, password) }
+                    val id = existing?.id ?: newId
+                    val err = withContext(Dispatchers.IO) { save(app, existing, draft.copy(id = id), password) }
                     if (err == null) {
                         SyncService.start(ctx, if (editing) "profile edited" else "profile created")
                         // Stays "Saving…" (and disabled) until the screen is gone.
-                        onDone()
+                        onDone(id)
                     } else {
                         saving = false
                         saveError = err
@@ -410,9 +422,8 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
 }
 
 /** Store the secret, then the profile. Returns an error message or null. */
-private fun save(app: LiveSyncApp, existing: Profile?, draft: Profile, password: String): String? {
-    val id = existing?.id ?: app.profiles.newId()
-    val profile = draft.copy(id = id)
+private fun save(app: LiveSyncApp, existing: Profile?, profile: Profile, password: String): String? {
+    val id = profile.id
     return try {
         if (password.isNotEmpty()) app.secrets.put(id, SecretStore.PASSWORD, password)
         app.profiles.put(profile)

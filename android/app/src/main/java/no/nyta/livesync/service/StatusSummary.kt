@@ -48,7 +48,19 @@ object StatusSummary {
             deletedElsewhere = st?.deletedElsewhere ?: 0,
         )
 
-    data class Text(val title: String, val text: String, val alert: Boolean)
+    /**
+     * The notification: [title], the one-line [summary] shown collapsed, and
+     * the full [text] (one line per vault) shown expanded.
+     */
+    data class Text(val title: String, val text: String, val alert: Boolean, val summary: String = text)
+
+    /**
+     * Whether an engine failed because another engine (another profile's, a
+     * Termux `lsync`, another app) holds this vault folder: the engine's
+     * vault lock refusal names the holder.
+     */
+    fun heldElsewhere(runMessage: String?): Boolean =
+        runMessage?.contains("another LiveSync engine is using") == true
 
     fun gateFailure(lastGate: String?): String? {
         val g = lastGate ?: return null
@@ -62,7 +74,11 @@ object StatusSummary {
         return when (p.runState) {
             "Stopped" -> "stopped" to false
             "Starting" -> "starting…" to false
-            "Failed" -> "error: ${p.runMessage ?: "unknown"} (retrying)" to true
+            "Failed" -> if (heldElsewhere(p.runMessage)) {
+                "not started: ${p.runMessage} (retrying)" to true
+            } else {
+                "error: ${p.runMessage ?: "unknown"} (retrying)" to true
+            }
             else -> {
                 gateFailure(p.lastGate)?.let { return "not syncing: $it" to true }
                 p.safetyStop?.let { return "safety stop: ${it.substringAfter(' ')}" to true }
@@ -84,13 +100,39 @@ object StatusSummary {
             val (text, alert) = phrase(lines[0], now)
             return Text("LiveSync · ${lines[0].name}", text, alert)
         }
-        val parts = lines.map { it.name to phrase(it, now) }
+        val parts = lines.map { it to phrase(it, now) }
         val alert = parts.any { it.second.second }
         return Text(
             "LiveSync · ${lines.size} vaults",
-            parts.joinToString("\n") { "${it.first}: ${it.second.first}" },
+            parts.joinToString("\n") { "${it.first.name}: ${it.second.first}" },
             alert,
+            counts(parts.map { (l, ph) -> l to ph.second }),
         )
+    }
+
+    /**
+     * One collapsed line for several vaults: the ones that need attention by
+     * name, the rest counted ("Work needs attention · 2 syncing · 1 paused").
+     */
+    private fun counts(lines: List<Pair<ProfileLine, Boolean>>): String {
+        val attention = lines.filter { it.second }.map { it.first.name }
+        val rest = lines.filter { !it.second }.map { it.first }
+        val buckets = linkedMapOf("syncing" to 0, "starting" to 0, "stopped" to 0, "paused" to 0)
+        for (l in rest) {
+            val b = when {
+                l.paused -> "paused"
+                l.runState == "Running" -> "syncing"
+                l.runState == "Starting" -> "starting"
+                else -> "stopped"
+            }
+            buckets[b] = buckets.getValue(b) + 1
+        }
+        val parts = mutableListOf<String>()
+        if (attention.isNotEmpty()) {
+            parts += attention.joinToString(", ") + if (attention.size == 1) " needs attention" else " need attention"
+        }
+        buckets.forEach { (what, n) -> if (n > 0) parts += "$n $what" }
+        return parts.joinToString(" · ")
     }
 
     /** `14:02` today, `3 Oct 14:02` otherwise. */

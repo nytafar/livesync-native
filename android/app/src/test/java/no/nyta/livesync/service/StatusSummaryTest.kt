@@ -49,6 +49,55 @@ class StatusSummaryTest {
         val t = StatusSummary.summarize(listOf(line("a"), line("b").copy(paused = true)))
         assertEquals("LiveSync · 2 vaults", t.title)
         assertEquals("a: pull-only\nb: paused", t.text)
+        assertEquals("1 syncing · 1 paused", t.summary)
+        assertFalse(t.alert)
+    }
+
+    @Test
+    fun theCollapsedLineNamesTheVaultsThatNeedAttentionAndCountsTheRest() {
+        val now = 1_761_550_000_000L
+        val lines = listOf(
+            line("Notes"),
+            line("Work", state = "Failed").copy(runMessage = "index: disk I/O error"),
+            line("Archive").copy(paused = true),
+            line("Inbox", state = "Starting"),
+            line("Media", gate = "1700000000000 failed: refused: milestone locked"),
+            line("Books"),
+        )
+        val t = StatusSummary.summarize(lines, now)
+        assertEquals("LiveSync · 6 vaults", t.title)
+        assertEquals("Work, Media need attention · 2 syncing · 1 starting · 1 paused", t.summary)
+        assertTrue(t.alert)
+        assertEquals(
+            listOf(
+                "Notes: pull-only",
+                "Work: error: index: disk I/O error (retrying)",
+                "Archive: paused",
+                "Inbox: starting…",
+                "Media: not syncing: refused: milestone locked",
+                "Books: pull-only",
+            ),
+            t.text.lines(),
+        )
+        // One vault: the collapsed line is its status.
+        val one = StatusSummary.summarize(listOf(line("Notes")), now)
+        assertEquals(one.text, one.summary)
+        assertEquals("Work needs attention · 1 syncing", StatusSummary.summarize(lines.take(2), now).summary)
+    }
+
+    @Test
+    fun aVaultHeldByAnotherEngineSaysSoAndNamesTheHolder() {
+        val msg = "another LiveSync engine is using the vault folder /storage/emulated/0/Documents/Obsidian/test: " +
+            "held by lsync (pid 4242, uid 2000); stop it first"
+        assertTrue(StatusSummary.heldElsewhere(msg))
+        assertFalse(StatusSummary.heldElsewhere("index: disk I/O error"))
+        assertFalse(StatusSummary.heldElsewhere(null))
+        val (text, alert) = StatusSummary.phrase(line("Test", state = "Failed").copy(runMessage = msg))
+        assertEquals("not started: $msg (retrying)", text)
+        assertTrue(alert)
+        val t = StatusSummary.summarize(listOf(line("Notes"), line("Test", state = "Failed").copy(runMessage = msg)))
+        assertEquals("Test needs attention · 1 syncing", t.summary)
+        assertTrue(t.text.contains("held by lsync (pid 4242, uid 2000)"))
     }
 
     @Test

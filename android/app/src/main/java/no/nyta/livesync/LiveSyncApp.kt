@@ -11,12 +11,20 @@ import no.nyta.livesync.profile.ProfileStore
 import no.nyta.livesync.secret.KeystoreCipher
 import no.nyta.livesync.secret.SecretStore
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 class LiveSyncApp : Application() {
     val profiles: ProfileStore by lazy {
         ProfileStore(File(filesDir, "profiles.json"), File(filesDir, "state"))
     }
     val secrets: SecretStore by lazy { SecretStore(File(filesDir, "secrets"), KeystoreCipher()) }
+
+    /**
+     * Per profile, why the service could not start it (no stored password,
+     * refused by the host), until it starts. Written by the service, read by
+     * the vault list and status screens and the notification.
+     */
+    val startProblems: MutableMap<String, String> = ConcurrentHashMap()
 
     /** The native core, or the reason it could not be loaded. */
     val core: Result<Core> by lazy {

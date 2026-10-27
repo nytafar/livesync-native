@@ -50,9 +50,20 @@ import no.nyta.livesync.service.SyncService
 
 private const val LOG_LINES = 200u
 
-/** The status and debug screen (spec test strategy "On device"). */
+/**
+ * One vault's status and debug screen (spec test strategy "On device").
+ * Everything on it acts on [profileId] only; the caller gives each vault a
+ * fresh instance (`key`).
+ */
 @Composable
-fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChanged: () -> Unit, onRemoved: () -> Unit) {
+fun StatusScreen(
+    app: LiveSyncApp,
+    profileId: String,
+    onBack: () -> Unit,
+    onEdit: () -> Unit,
+    onChanged: () -> Unit,
+    onRemoved: () -> Unit,
+) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val core = app.core.getOrThrow()
@@ -89,9 +100,10 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
     }
 
     Column(Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(16.dp)) {
+        TextButton(onClick = onBack) { Text("‹ All vaults") }
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("LiveSync · ${p.name}", style = MaterialTheme.typography.headlineSmall)
+                Text(p.name, style = MaterialTheme.typography.headlineSmall)
                 Text(p.vaultPath, style = MaterialTheme.typography.bodySmall)
             }
             TextButton(onClick = onEdit) { Text("Settings") }
@@ -103,8 +115,16 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
 
         val st = status
         SectionCard("Status") {
-            val (phrase, alert) = StatusSummary.phrase(StatusSummary.line(p, st, null))
+            val (phrase, alert) = StatusSummary.phrase(StatusSummary.line(p, st, app.startProblems[p.id]))
             Banner(phrase, if (alert) Tone.ERROR else if (st?.runState == RunState.RUNNING) Tone.OK else Tone.INFO)
+            if (st?.runState == RunState.FAILED && StatusSummary.heldElsewhere(st.runMessage)) {
+                Text(
+                    "Another sync engine (a Termux lsync, another app, or another copy of this one) is using this " +
+                        "folder, so this vault does not sync until it stops. Stop it, then press Sync now; " +
+                        "otherwise this vault tries again by itself, less often over time (at most every 15 minutes).",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
             st?.safetyStop?.let {
                 Banner("Safety stop: ${it.substringAfter(' ')}", Tone.ERROR)
                 Text(
@@ -231,7 +251,7 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
             }
         }
 
-        SectionCard("Log (last ${LOG_LINES})") {
+        SectionCard("Log (all vaults, last ${LOG_LINES})") {
             val listState = rememberLazyListState()
             LaunchedEffect(logs.size) { if (logs.isNotEmpty()) listState.scrollToItem(logs.size - 1) }
             LazyColumn(Modifier.heightIn(max = 360.dp).fillMaxWidth().horizontalScroll(rememberScrollState()), state = listState) {
@@ -319,7 +339,10 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
     }
 }
 
-/** Pause, stop (confirmed), then forget. Caller holds [EngineLifecycle.lock]. */
+/**
+ * Pause, stop (confirmed), then forget. Only this profile's engine stops;
+ * the others run on. Caller holds [EngineLifecycle.lock].
+ */
 private fun removeProfile(app: LiveSyncApp, id: String) {
     val core = app.core.getOrThrow()
     app.profiles.update(id) { it.copy(paused = true) }
@@ -329,6 +352,8 @@ private fun removeProfile(app: LiveSyncApp, id: String) {
     // cannot, nothing is removed.
     val kept = app.profiles.remove(id, java.io.File(Perms.sharedRoot(), "Download/LiveSync"))
     app.secrets.removeProfile(id)
+    app.startProblems.remove(id)
+    SyncService.forgetAlerts(app, id)
     core.log("profile $id removed${kept?.let { "; set-aside edits kept in ${it.path}" } ?: ""}")
 }
 

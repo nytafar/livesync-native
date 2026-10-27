@@ -13,6 +13,13 @@ class FirstSyncTest {
     }
 
     @Test
+    fun aFailedEngineDoesNotHoldTheWakelockThroughItsBackoff() {
+        assertFalse(FirstSyncWaits.settled(hasIndex = false, heartbeatMs = null, failed = false))
+        assertTrue("held by another engine, retrying later", FirstSyncWaits.settled(hasIndex = false, heartbeatMs = null, failed = true))
+        assertTrue(FirstSyncWaits.settled(hasIndex = true, heartbeatMs = 1_700_000_000_000, failed = false))
+    }
+
+    @Test
     fun theLockGoesWhenEveryProfileCaughtUpOrStopped() {
         val w = FirstSyncWaits()
         assertTrue(w.settle(emptySet()) { false })

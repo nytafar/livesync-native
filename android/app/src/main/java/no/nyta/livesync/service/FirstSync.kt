@@ -36,5 +36,14 @@ class FirstSyncWaits {
          * `_changes` finished ("remaining 0"), in both modes.
          */
         fun owesFirstFetch(hasIndex: Boolean, heartbeatMs: Long?): Boolean = !hasIndex || heartbeatMs == null
+
+        /**
+         * Whether the wakelock can stop waiting for a profile: it caught up,
+         * or its engine failed (another engine holds its vault folder, a
+         * broken index) and only retries minutes later. Keeping the CPU up
+         * through that backoff would burn battery for nothing.
+         */
+        fun settled(hasIndex: Boolean, heartbeatMs: Long?, failed: Boolean): Boolean =
+            failed || !owesFirstFetch(hasIndex, heartbeatMs)
     }
 }

@@ -1,5 +1,6 @@
 package no.nyta.livesync.profile
 
+import android.annotation.SuppressLint
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.File
@@ -7,13 +8,31 @@ import java.io.IOException
 import java.util.UUID
 
 /**
- * The profiles, in one JSON file in app-private storage. Multi-profile under
- * the hood (the UI creates one). Refuses a profile whose vault folder is the
- * same as, inside or above another profile's: flock does not work on shared
- * storage, so this check is the guard (spec "Designed for multiple vaults").
+ * The profiles (one per vault), in one JSON file in app-private storage.
+ * Refuses a profile whose vault folder is the same as, inside or above
+ * another profile's: flock does not work on shared storage, and the engine's
+ * host lock only catches the same folder, not one inside another, so this
+ * check is the guard (spec "Designed for multiple vaults").
+ *
+ * Two profiles may name the same server and database (different scopes, or
+ * different vault folders): each is its own node with its own index, state
+ * folder and Keystore alias, all keyed by the profile ID.
  */
 class ProfileStore(private val file: File, private val stateRoot: File) {
     class OverlapException(message: String) : Exception(message)
+
+    /** How a vault folder lies against another profile's. */
+    enum class Overlap { SAME, INSIDE, ABOVE }
+
+    /** A vault folder that overlaps [other]'s, and how. */
+    data class Clash(val other: Profile, val kind: Overlap) {
+        val message: String
+            get() = when (kind) {
+                Overlap.SAME -> "This is already the vault folder of \"${other.name}\"."
+                Overlap.INSIDE -> "This folder is inside the vault folder of \"${other.name}\" (${other.vaultPath})."
+                Overlap.ABOVE -> "This folder contains the vault folder of \"${other.name}\" (${other.vaultPath})."
+            } + " Two vaults cannot share a folder or sit inside each other."
+    }
 
     @Serializable
     private data class Saved(val version: Int = 1, val profiles: List<Profile> = emptyList())
@@ -21,6 +40,7 @@ class ProfileStore(private val file: File, private val stateRoot: File) {
     private val json = Json { ignoreUnknownKeys = true; prettyPrint = true; encodeDefaults = true }
     private val lock = Any()
 
+    /** Every profile, in the order they were added. */
     fun all(): List<Profile> = synchronized(lock) { load().profiles }
 
     fun get(id: String): Profile? = all().firstOrNull { it.id == id }
@@ -30,22 +50,23 @@ class ProfileStore(private val file: File, private val stateRoot: File) {
 
     fun newId(): String = UUID.randomUUID().toString().replace("-", "").take(12)
 
-    /** Add or replace a profile (matched by ID). */
+    /** Add a profile, or replace the one with its ID in place. */
     @Throws(OverlapException::class, IOException::class)
     fun put(profile: Profile) = synchronized(lock) {
         val saved = load()
-        overlapping(profile, saved.profiles)?.let { other ->
-            throw OverlapException(
-                "The vault folder overlaps \"${other.name}\" (${other.vaultPath}). " +
-                    "Two vaults cannot share a folder or sit inside each other."
-            )
+        clash(profile, saved.profiles)?.let { throw OverlapException(it.message) }
+        val replaced = saved.profiles.any { it.id == profile.id }
+        val profiles = if (replaced) {
+            saved.profiles.map { if (it.id == profile.id) profile else it }
+        } else {
+            saved.profiles + profile
         }
-        val others = saved.profiles.filter { it.id != profile.id }
-        save(saved.copy(profiles = others + profile))
+        save(saved.copy(profiles = profiles))
     }
 
     /**
-     * Remove a profile and its sync index. The vault folder is left alone.
+     * Remove a profile and its sync index. The vault folder is left alone,
+     * and so is every other profile.
      * Edits the engine had to set aside (`<state>/recovered/`, possibly their
      * only copy) are first copied into [keepRecoveredIn]; if that fails,
      * nothing is removed. Returns the folder they went to, if there were any.
@@ -78,8 +99,16 @@ class ProfileStore(private val file: File, private val stateRoot: File) {
     }
 
     /** The first other profile whose vault folder overlaps this one's. */
-    fun overlapping(profile: Profile, others: List<Profile> = all()): Profile? =
-        others.firstOrNull { it.id != profile.id && overlaps(it.vaultPath, profile.vaultPath) }
+    fun overlapping(profile: Profile, others: List<Profile> = all()): Profile? = clash(profile, others)?.other
+
+    /** The first other profile whose vault folder overlaps this one's, and how. */
+    fun clash(profile: Profile, others: List<Profile> = all()): Clash? {
+        for (o in others) {
+            if (o.id == profile.id) continue
+            relation(profile.vaultPath, o.vaultPath)?.let { return Clash(o, it) }
+        }
+        return null
+    }
 
     private fun load(): Saved {
         if (!file.exists()) return Saved()
@@ -95,8 +124,20 @@ class ProfileStore(private val file: File, private val stateRoot: File) {
 
     companion object {
         /**
+         * Other names of the primary shared storage, as links (`/sdcard`)
+         * point. Only a spelling, used when the link itself did not resolve:
+         * on the phone canonicalisation follows it (for any user) first.
+         */
+        @SuppressLint("SdCardPath")
+        private val SHARED_ALIASES = listOf("/sdcard", "/mnt/sdcard", "/storage/self/primary")
+        private const val SHARED = "/storage/emulated/0"
+
+        /**
          * Canonical (links resolved, including the longest existing ancestor of a
-         * folder that does not exist yet), lower-cased: shared storage folds case.
+         * folder that does not exist yet), lower-cased (shared storage folds
+         * case, and refusing two spellings elsewhere is harmless), without a
+         * trailing slash. A shared-storage alias the links did not resolve
+         * (no such link here, or not readable) is spelt `/storage/emulated/0`.
          */
         fun comparable(path: String): String {
             var base = File(path).absoluteFile.normalize()
@@ -111,14 +152,24 @@ class ProfileStore(private val file: File, private val stateRoot: File) {
                 base
             }
             for (seg in rest) resolved = File(resolved, seg)
-            return resolved.path.lowercase().trimEnd('/')
+            val p = resolved.path.trimEnd('/').lowercase()
+            val alias = SHARED_ALIASES.firstOrNull { p == it || p.startsWith("$it/") } ?: return p
+            return SHARED + p.removePrefix(alias)
+        }
+
+        /** How folder [a] lies against folder [b] (component-wise), or null when apart. */
+        fun relation(a: String, b: String): Overlap? {
+            val x = comparable(a)
+            val y = comparable(b)
+            return when {
+                x == y -> Overlap.SAME
+                y.isEmpty() || x.startsWith("$y/") -> Overlap.INSIDE
+                x.isEmpty() || y.startsWith("$x/") -> Overlap.ABOVE
+                else -> null
+            }
         }
 
         /** Same folder, or one inside the other (component-wise). */
-        fun overlaps(a: String, b: String): Boolean {
-            val x = comparable(a)
-            val y = comparable(b)
-            return x == y || x.startsWith("$y/") || y.startsWith("$x/") || x.isEmpty() || y.isEmpty()
-        }
+        fun overlaps(a: String, b: String): Boolean = relation(a, b) != null
     }
 }

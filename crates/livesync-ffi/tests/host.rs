@@ -676,3 +676,80 @@ fn a_cancelled_listing_ends_at_once_and_closes_its_connection() {
         Err(LiveSyncError::Other { .. })
     ));
 }
+
+#[test]
+fn two_profiles_on_one_database_with_disjoint_scopes_run_at_once_as_separate_nodes() {
+    let env = Env::new();
+    env.mock.put_text("notes/a.md", &["note"]);
+    env.mock.put_text("work/b.md", &["work"]);
+    let mut p1 = env.profile("one", "vault-one");
+    p1.scope_kind = ScopeKind::Include;
+    p1.scope_folders = vec!["notes".into()];
+    let mut p2 = env.profile("two", "vault-two");
+    p2.scope_kind = ScopeKind::Include;
+    p2.scope_folders = vec!["work".into()];
+    env.host.start(p1.clone()).unwrap();
+    env.host.start(p2.clone()).unwrap();
+    wait_until("both vaults", Duration::from_secs(20), || {
+        read(&p1, "notes/a.md").as_deref() == Some("note") && read(&p2, "work/b.md").as_deref() == Some("work")
+    });
+    assert!(read(&p1, "work/b.md").is_none());
+    assert!(read(&p2, "notes/a.md").is_none());
+    let (s1, s2) = (env.status(&p1), env.status(&p2));
+    assert_eq!((s1.run_state, s2.run_state), (RunState::Running, RunState::Running));
+    let (n1, n2) = (s1.node_id.unwrap(), s2.node_id.unwrap());
+    assert_ne!(n1, n2, "each profile is its own node");
+    let mut active = env.host.active_profiles();
+    active.sort();
+    assert_eq!(active, vec!["one".to_string(), "two".to_string()]);
+
+    // Stopping one leaves the other running.
+    assert!(env.host.stop("one".into()));
+    assert_eq!(env.status(&p2).run_state, RunState::Running);
+    assert_eq!(env.host.active_profiles(), vec!["two".to_string()]);
+    env.mock.put_text("work/c.md", &["more"]);
+    wait_until("the other vault still syncing", Duration::from_secs(20), || {
+        read(&p2, "work/c.md").as_deref() == Some("more")
+    });
+    env.host.stop_all();
+}
+
+#[test]
+fn a_vault_held_by_another_engine_fails_only_that_profile_and_names_the_holder() {
+    let env = Env::new();
+    // Another host in this process stands in for a Termux lsync: the vault
+    // lock refuses within one process as across processes.
+    let other = LiveSync::new(String::new()).unwrap();
+    let held = env.profile("termux", "shared-vault");
+    other.start(held.clone()).unwrap();
+    wait_until("the holder running", Duration::from_secs(20), || {
+        other
+            .status(held.id.clone(), held.vault_path.clone(), held.state_dir.clone())
+            .run_state
+            == RunState::Running
+    });
+    let p = env.profile("app", "shared-vault");
+    let fine = env.profile("fine", "vault-fine");
+    env.host.start(p.clone()).unwrap();
+    env.host.start(fine.clone()).unwrap();
+    wait_until("the refusal", Duration::from_secs(20), || {
+        env.status(&p).run_state == RunState::Failed
+    });
+    let msg = env.status(&p).run_message.unwrap_or_default();
+    assert!(
+        msg.contains("another LiveSync engine is using the vault folder"),
+        "{msg}"
+    );
+    assert!(msg.contains("pid"), "names the holder: {msg}");
+    wait_until("the other profile", Duration::from_secs(20), || {
+        env.status(&fine).run_state == RunState::Running
+    });
+    // Once the holder stops, Sync now starts it at once (not after the backoff).
+    assert!(other.stop(held.id.clone()));
+    env.host.sync_now(p.id.clone()).unwrap();
+    wait_until("the profile running", Duration::from_secs(10), || {
+        env.status(&p).run_state == RunState::Running
+    });
+    assert_eq!(env.status(&fine).run_state, RunState::Running);
+    env.host.stop_all();
+}

@@ -27,8 +27,10 @@ Requires Android 11 or later. Build the APK with `scripts/build-apk.sh` (see [AG
 1. Grant all-files access, notifications and the battery exemption on the setup screen.
 2. Pick a **new** folder under `Documents/Obsidian/`.
 3. Enter your CouchDB URL, database, user and password, then press Test connection.
-4. Choose the folders to sync: a passing test lists the server's top-level folders with their file counts and sizes; tick them, or type a path.
+4. Choose the folders to sync: a passing test lists the server's top-level folders with their file counts and sizes (on mobile data only when you tap "List the folders on the server", since it reads about 1 KB per file); tick them, or type a path.
 5. Save. Once the first sync finishes, open the folder in Obsidian ("Open folder as vault") and leave the LiveSync plugin off there.
+
+The home screen lists every vault with one line of status; "Add vault" sets up another one the same way. Vault folders may not be the same or inside each other, but two vaults may sync different folders of the same database: each is its own device to the other LiveSync clients. One notification summarises all of them, and removing a vault stops only that one.
 
 ### `lsync`, the command-line client
 
@@ -169,7 +171,7 @@ Exit codes:
 | `crates/lsync` | The CLI, including `probe` |
 | `crates/livesync-ffi` | UniFFI surface for the app: one host, one engine per profile, connect test, status, logs |
 | `crates/uniffi-bindgen` | UniFFI's Kotlin binding generator, pinned to the same version |
-| `android/` | The Android app (Kotlin, Compose): foreground service, onboarding, status screen |
+| `android/` | The Android app (Kotlin, Compose): foreground service, onboarding, vault list, status screens |
 | `tools/golden` | Node program pinned to `@vrtmrz/livesync-commonlib` 0.2.1; it emits the fixtures in `fixtures/golden` |
 | `scripts/` | APK and Termux builds, dev-database environment, a vault comparison script, and `interop.sh` (the M2 scenarios against the official CLI) |
 
