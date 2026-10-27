@@ -16,8 +16,16 @@
 # the keystore is never created: a missing properties file is an error.
 #
 # Version: LIVESYNC_VERSION_CODE and LIVESYNC_VERSION_NAME override the
-# defaults (commit count; <crate version>-m2b+<sha>). The release workflow
-# sets both.
+# defaults (928; <crate version>-api28+<sha>). The release workflow sets both.
+#
+# Branch android9-minsdk28 (minSdk 28, for Android 9): the default versionCode
+# is fixed at API28_VERSION_CODE, inside 900-999. Release codes are
+# VERSION_CODE_BASE (1000, release.yml) plus the run number, so always 1001 or
+# more: no release can share this code, a release (should one ever support
+# Android 9) installs over this build as an ordinary upgrade, and this build
+# never replaces an installed release (Android refuses the downgrade). Hand builds from main use the commit count (60 when this was
+# set), far below. Raise it within 900-999 if a newer API 28 build must
+# install over an older one with a lower code.
 #
 # Flags: --skip-checks  build only (no unit tests, no lint)
 #        --unsigned     no signing; output is livesync-android-<version>-unsigned.apk
@@ -83,8 +91,9 @@ fi
 CRATE_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 SHA=$(git rev-parse --short=8 HEAD)
 DIRTY=$(git diff --quiet HEAD -- . ':!dist' 2>/dev/null || echo "-dirty")
-VERSION_NAME=${LIVESYNC_VERSION_NAME:-"$CRATE_VERSION-m2b+$SHA$DIRTY"}
-VERSION_CODE=${LIVESYNC_VERSION_CODE:-$(git rev-list --count HEAD)}
+API28_VERSION_CODE=928
+VERSION_NAME=${LIVESYNC_VERSION_NAME:-"$CRATE_VERSION-api28+$SHA$DIRTY"}
+VERSION_CODE=${LIVESYNC_VERSION_CODE:-$API28_VERSION_CODE}
 [[ "$VERSION_CODE" =~ ^[1-9][0-9]*$ ]] || { echo "bad versionCode $VERSION_CODE" >&2; exit 1; }
 
 GEN="$ROOT/android/app/build/generated"
