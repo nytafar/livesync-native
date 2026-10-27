@@ -1,10 +1,87 @@
 # livesync-android
 
-A native client for [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync): a Rust sync engine that talks to the LiveSync CouchDB database directly and keeps a plain folder (an Obsidian vault) in step with it. The engine becomes the core of an always-on Android app. For now it ships as the `lsync` command-line tool for Linux and for Termux on Android.
+**Self-hosted LiveSync for Android that keeps syncing when Obsidian is closed.**
 
-**Status: milestone M2b, the Android app.** `lsync sync` and `lsync daemon` pull and push; `lsync pull` and `lsync daemon --pull-only` stay read-only. The Android app (`android/`, built by `scripts/build-apk.sh`) runs the same engine always-on in a foreground service, pull-only or two-way per vault. End-to-end encryption (M3) is not here yet.
+[Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync) keeps Obsidian vaults in sync through your own CouchDB. On the desktop it works well. On Android it struggles:
 
-## What it does
+- **It only syncs while Obsidian is open.** The plugin runs inside the app, and Android suspends it in the background. Notes edited elsewhere arrive only after you open Obsidian, and then you wait while it catches up.
+- **It keeps the whole database on the phone.** The plugin stores a full replica in Obsidian's IndexedDB: every document and every chunk, including old revisions. For our vault that is 1.8 GB and over 300,000 documents.
+- **It does the heavy work on Obsidian's UI thread.** Chunking, hashing and replication share the thread you type on.
+
+So we rebuilt the client: a small native sync engine in Rust that talks to the same CouchDB database, wire-compatible with the official plugin. It runs on its own, always on, and keeps a plain folder in sync. Obsidian opens that folder as an ordinary vault, with the LiveSync plugin turned off on that device. The desktop plugin and the official CLI keep working against the same database.
+
+## Two ways to run it
+
+### Android app
+
+A foreground service keeps one or more vault folders in sync, whether or not Obsidian is open.
+
+- Edits from other devices land in the phone's vault in under a second, and phone edits are pushed about 2 s after Obsidian saves them.
+- It keeps only a small index on the phone and fetches content on demand: the first sync of 2,458 files took 62 s.
+- It comes back by itself after a reboot or an app update.
+- Each vault can be pull-only (read-only, the safe way to start) or two-way, and can sync all folders, only some, or all but some.
+- The password is encrypted with a key in the Android Keystore.
+
+Requires Android 11 or later. Build the APK with `scripts/build-apk.sh` (see [AGENTS.md](AGENTS.md)), install it, then:
+
+1. Grant all-files access, notifications and the battery exemption on the setup screen.
+2. Pick a **new** folder under `Documents/Obsidian/`.
+3. Enter your CouchDB URL, database, user and password, then press Test connection.
+4. Save. Once the first sync finishes, open the folder in Obsidian ("Open folder as vault") and leave the LiveSync plugin off there.
+
+### `lsync`, the command-line client
+
+The same engine as a single binary for Linux (and Termux on Android): one-shot pulls and syncs, or a long-running daemon for a server or a desktop without Obsidian.
+
+```sh
+printf '%s' "$PASSWORD" | lsync --url https://couch.example.net --db vault --user me \
+    --vault ~/Notes configure --password-stdin
+lsync connect            # check that the database is compatible
+lsync daemon             # two-way, continuously
+lsync daemon --pull-only # follow the server, never write to it
+```
+
+Full usage is under [Reference](#reference).
+
+## How it compares
+
+Measured on a copy of the same database, with the same folders excluded, on the same Linux machine.
+
+| | lsync | Official LiveSync CLI | Obsidian plugin |
+|---|---|---|---|
+| First sync (wall time) | _pending_ | _pending_ | _pending_ |
+| Peak memory | _pending_ | _pending_ | _pending_ |
+| Local state on disk | _pending_ | _pending_ | _pending_ |
+| Catch-up after 1,000 changes | _pending_ | _pending_ | _pending_ |
+| Change to file, live | _pending_ | _pending_ | _pending_ |
+| Idle CPU and memory | _pending_ | _pending_ | _pending_ |
+
+_Benchmark in progress; the scripts are in `scripts/bench/`._
+
+## Safety
+
+- **It never overwrites or deletes a local edit it has not synced.** If the server changed too, your edit becomes a conflict for the desktop plugin to resolve.
+- **It fails closed.** Anything it doesn't recognise stops the sync instead of being guessed at, for example an unknown database version, encryption, or settings that changed since setup.
+- **Deletes are LiveSync's soft deletes,** and only for files that were in sync. A pass that would delete more than half of what it tracks stops and asks.
+- **It stays out of `.obsidian/` and every other dot-folder.**
+
+## Status and limits
+
+Working: pull-only and two-way sync, the Android app and the CLI, tested against the official CLI and on a Samsung S22+ (Android 16) syncing a real 10,000-file vault.
+
+Not yet:
+- end-to-end encryption and path obfuscation; such databases are refused;
+- setup import (QR or setup URI);
+- merging conflicts on the device: they are left for the desktop plugin;
+- Hidden File Sync and Customisation Sync (`.obsidian/`);
+- release builds and an app-store listing.
+
+This is an independent client, not affiliated with the Self-hosted LiveSync project.
+
+## Reference
+
+<details>
+<summary>What the engine does, in detail</summary>
 
 - Follows the database's `_changes` feed with a `_selector` that leaves out chunks, then fetches chunks on demand through `POST _all_docs {keys}`.
 - **Pushes local changes** the way the official clients store them: the `v3-rabin-karp` splitter ported byte for byte (so chunk IDs match and deduplicate), chunks uploaded before the metadata that names them, metadata written against the revision the file was synced at. If the remote moved on meanwhile, the local edit is stored as a child of that revision instead (a conflict the desktop plugin resolves); nothing is overwritten.
@@ -37,7 +114,10 @@ A native client for [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-li
   - an index that belongs to another remote or another vault folder.
 - If the milestone's `created` changes (the database was rebuilt elsewhere), it resets the index and refetches. Files that are still clean are refreshed; edited ones are kept.
 
-## Usage
+</details>
+
+<details>
+<summary>Full <code>lsync</code> usage, environment and exit codes</summary>
 
 ```sh
 # Save a profile (config at ~/.config/lsync/<profile>.toml, mode 0600)
@@ -68,6 +148,8 @@ Exit codes:
 - 2: refused by a gate.
 - 3: pull or sync finished, but something needs attention (dirty or pending files, local files that cannot sync, a safety stop).
 - 4: probe failed or was inconclusive.
+
+</details>
 
 ## Layout
 
