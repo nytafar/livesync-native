@@ -1757,7 +1757,7 @@ async fn a_scan_that_began_inside_the_hold_does_not_decide() {
         let calls = calls.clone();
         move || {
             if calls.fetch_add(1, Ordering::SeqCst) == 1 {
-                std::thread::sleep(Duration::from_millis(1200));
+                std::thread::sleep(Duration::from_millis(3200));
                 for i in 15..30 {
                     std::fs::remove_file(vault.join(format!("f{i:02}.md"))).unwrap();
                 }
@@ -1765,10 +1765,11 @@ async fn a_scan_that_began_inside_the_hold_does_not_decide() {
             Ok(())
         }
     });
+    // A long hold, so the second scan surely starts inside it.
     let engine = env.engine_with(|c| {
         c.watch = false;
         c.rescan_interval = Duration::from_secs(3600);
-        c.delete_hold = Duration::from_secs(1);
+        c.delete_hold = Duration::from_secs(3);
         c.access_check = Some(check);
     });
     let (tx, rx) = tokio::sync::watch::channel(false);
