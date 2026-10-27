@@ -986,3 +986,43 @@ async fn the_pull_only_daemon_records_its_first_catch_up_as_a_pull() {
         .unwrap();
     assert!(env.mock.writes().is_empty());
 }
+
+// Codex (issue #1 review): the widening scan pages `_all_docs` from the last
+// key seen. When that document is deleted between two pages, the next page
+// starts at the following one, which must not be skipped.
+#[tokio::test]
+async fn a_widening_scan_loses_no_document_to_a_deletion_between_pages() {
+    use livesync_model::scope::{Scope, ScopeMode};
+    let env = Env::new().await;
+    let m = &env.mock;
+    m.put_text("other/a.md", &["a"]);
+    // The scan for `wide` covers every ID starting with `w`: 4,998 others
+    // sort first, so its first page (5,000 IDs) ends at wide/00001.md.
+    let doc = |p: String| json!({"_id": p, "path": p, "type": "plain", "children": [], "ctime": 1, "mtime": 1, "size": 0, "eden": {}});
+    for i in 0..4_998 {
+        m.put(doc(format!("wa/{i:05}.md")));
+    }
+    for i in 0..10 {
+        m.put(doc(format!("wide/{i:05}.md")));
+    }
+    let only = |p: &[&str]| {
+        let p: Vec<String> = p.iter().map(|s| s.to_string()).collect();
+        move |c: &mut EngineConfig| {
+            c.scope = Scope::new(ScopeMode::Include, &p).unwrap();
+            c.batch_limit = 1000;
+        }
+    };
+    env.engine_with(only(&["other"])).pull_once().await.unwrap();
+    assert!(env.read("wide/00000.md").is_none());
+    // wide/00001.md goes away before the next page starts at it.
+    m.state.lock().unwrap().delete_last_served_after_range_read = true;
+    env.engine_with(only(&["other", "wide"])).pull_once().await.unwrap();
+    assert!(env.read("wide/00001.md").is_none());
+    let missing: Vec<String> = (0..10)
+        .filter(|&i| i != 1)
+        .map(|i| format!("wide/{i:05}.md"))
+        .filter(|p| env.read(p).is_none())
+        .collect();
+    assert!(missing.is_empty(), "not fetched: {missing:?}");
+    assert!(env.mock.writes().is_empty());
+}

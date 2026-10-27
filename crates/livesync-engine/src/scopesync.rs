@@ -182,33 +182,35 @@ impl Engine {
     async fn scan_ids(&self, start: Option<&str>, end: Option<&str>) -> Result<Vec<String>> {
         let mut out = Vec::new();
         let mut from = start.map(str::to_string);
-        let mut skip_first = false;
+        // The last ID taken. A page starts at it (inclusive), so it comes
+        // back first unless it was deleted meanwhile; only then is it skipped.
+        let mut cursor: Option<String> = None;
         loop {
             let rows = self
                 .inner
                 .couch
-                .all_docs_page(from.as_deref(), end, PAGE + usize::from(skip_first), false)
+                .all_docs_page(from.as_deref(), end, PAGE, false)
                 .await?;
             let n = rows.len();
             let mut last = None;
-            for (i, r) in rows.into_iter().enumerate() {
-                if skip_first && i == 0 {
+            for r in rows {
+                let Some(id) = r.key else { continue };
+                if cursor.as_deref() == Some(id.as_str()) {
                     continue;
                 }
-                let Some(id) = r.key else { continue };
                 last = Some(id.clone());
                 if id.starts_with("h:") || id.starts_with("_design/") || is_internal_id(&id) {
                     continue;
                 }
                 out.push(id);
             }
-            if n < PAGE + usize::from(skip_first) {
+            if n < PAGE {
                 return Ok(out);
             }
             match last {
                 Some(l) => {
-                    from = Some(l);
-                    skip_first = true;
+                    from = Some(l.clone());
+                    cursor = Some(l);
                 }
                 None => return Ok(out),
             }
