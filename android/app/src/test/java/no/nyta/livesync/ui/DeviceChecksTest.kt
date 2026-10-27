@@ -26,4 +26,14 @@ class DeviceChecksTest {
         assertFalse(base.copy(boox = true).booxOk)
         assertTrue(base.copy(boox = true, booxConfirmed = true).booxOk)
     }
+
+    @Test
+    fun booxStepsOnlyOnAndroid9And10() {
+        assertTrue(Perms.booxChecks(sdk = 28, manufacturer = "ONYX", brand = "ONYX"))
+        assertTrue(Perms.booxChecks(sdk = 29, manufacturer = "Onyx", brand = "other"))
+        assertTrue(Perms.booxChecks(sdk = 28, manufacturer = null, brand = "onyx"))
+        // Android 11+ keeps the setup screen it had, on a Boox too.
+        assertFalse(Perms.booxChecks(sdk = 30, manufacturer = "ONYX", brand = "ONYX"))
+        assertFalse(Perms.booxChecks(sdk = 28, manufacturer = "samsung", brand = "samsung"))
+    }
 }

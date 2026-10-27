@@ -64,9 +64,17 @@ object Perms {
 
     fun isSamsung(): Boolean = Build.MANUFACTURER.equals("samsung", ignoreCase = true)
 
-    /** Onyx Boox e-ink devices, which freeze background apps on their own. */
-    fun isBoox(): Boolean =
-        Build.MANUFACTURER.equals("onyx", ignoreCase = true) || Build.BRAND.equals("onyx", ignoreCase = true)
+    /**
+     * Whether to show the Boox steps: an Onyx Boox e-ink device, which freezes
+     * background apps on its own, on Android 9 or 10 (this branch's target).
+     * Android 11+ keeps the setup screen it had, Boox or not.
+     */
+    fun booxChecks(
+        sdk: Int = Build.VERSION.SDK_INT,
+        manufacturer: String? = Build.MANUFACTURER,
+        brand: String? = Build.BRAND,
+    ): Boolean = sdk < StorageAccess.ALL_FILES_SDK &&
+        (manufacturer.equals("onyx", ignoreCase = true) || brand.equals("onyx", ignoreCase = true))
 
     fun appDetailsIntent(ctx: Context): Intent =
         Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:${ctx.packageName}".toUri())

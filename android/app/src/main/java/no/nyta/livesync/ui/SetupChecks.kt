@@ -64,7 +64,7 @@ fun readChecks(ctx: Context) = DeviceChecks(
     samsung = Perms.isSamsung(),
     samsungNeverSleepingConfirmed = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         .getBoolean(KEY_NEVER_SLEEPING, false),
-    boox = Perms.isBoox(),
+    boox = Perms.booxChecks(),
     booxConfirmed = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_BOOX, false),
 )
 
