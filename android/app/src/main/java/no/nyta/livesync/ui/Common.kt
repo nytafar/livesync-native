@@ -92,9 +92,9 @@ fun fmtTime(ms: Long?): String? {
     return SimpleDateFormat("d MMM HH:mm:ss", Locale.getDefault()).format(Date(ms)) + " ($rel)"
 }
 
-/** `"<ms> ok: version 12 ..."` → `ok: version 12 ... (14:02:11)`. */
+/** `"<ms> ok: version 12 created <ms> ..."` → `ok: version 12 created 7 Apr 2026 13:22 ... — 27 Oct 14:02:11 (5s ago)`. */
 fun fmtStamped(s: String?): String? {
     if (s == null) return null
     val ms = s.substringBefore(' ').toLongOrNull() ?: return s
-    return "${s.substringAfter(' ')} — ${fmtTime(ms)}"
+    return "${Formats.gateText(s.substringAfter(' '))} — ${fmtTime(ms)}"
 }

@@ -346,6 +346,10 @@ pub struct Status {
     /// A full fetch is owed, or this node still has to be marked resolved;
     /// pushes are held until the two-way side completes it.
     pub needs_full_fetch: bool,
+    /// Part of `needs_full_fetch`: this node still has to be marked resolved
+    /// after a remote lock, which only the two-way side does. A read-only
+    /// pull completes a plain owed fetch, never this.
+    pub resolve_owed: bool,
     pub safety_stop: Option<String>,
     /// After a rebuild: the refetch is waiting (or owes a wait) for the
     /// remote to stop changing. `<ms> <description>`.
@@ -2495,6 +2499,7 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
         registered_ms: num(meta::REGISTERED)?,
         last_push_ms: num(meta::LAST_PUSH)?,
         needs_full_fetch: ix.get_meta(meta::NEEDS_FETCH)?.is_some() || ix.get_meta(meta::RESOLVE_OWED)?.is_some(),
+        resolve_owed: ix.get_meta(meta::RESOLVE_OWED)?.is_some(),
         safety_stop: ix.get_meta(meta::SAFETY_STOP)?,
         rebuild_wait: ix.get_meta(meta::REBUILD_WAIT)?,
         rebuild_orphans: ix

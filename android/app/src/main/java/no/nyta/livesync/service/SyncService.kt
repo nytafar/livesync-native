@@ -39,6 +39,8 @@ class SyncService : Service() {
     private val problems = mutableMapOf<String, String>()
     private var lastText: StatusSummary.Text = StatusSummary.Text("LiveSync", "Starting…", false)
     private var firstSyncLock: PowerManager.WakeLock? = null
+    /** Profiles the first-sync wakelock is held for (worker thread). */
+    private val firstSync = FirstSyncWaits()
 
     private val app get() = application as LiveSyncApp
 
@@ -47,6 +49,13 @@ class SyncService : Service() {
             updateNotification()
             // Uptime-based: does not wake a sleeping phone just to redraw.
             handler.postDelayed(this, REFRESH_MS)
+        }
+    }
+
+    /** While the first-sync wakelock is held: release it once every first fetch caught up. */
+    private val firstSyncCheck = object : Runnable {
+        override fun run() {
+            if (checkFirstSync()) handler.postDelayed(this, FIRST_SYNC_CHECK_MS)
         }
     }
 
@@ -165,9 +174,7 @@ class SyncService : Service() {
                 }
                 continue
             }
-            if (p.id !in active && !java.io.File(app.profiles.stateDir(p.id), "index.sqlite").exists()) {
-                holdFirstSyncWakeLock()
-            }
+            if (p.id !in active && owesFirstFetch(core, p)) holdFirstSyncWakeLock(p.id)
             try {
                 core.engine.start(cfg)
                 problems.remove(p.id)
@@ -190,15 +197,62 @@ class SyncService : Service() {
      * CPU up for a bounded while so it is not stretched over hours of Doze
      * when the screen goes off. Later syncs need no wakelock.
      */
-    private fun holdFirstSyncWakeLock() {
+    private fun holdFirstSyncWakeLock(profileId: String) {
         val lock = firstSyncLock ?: getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "livesync:first-sync")
             .also {
                 it.setReferenceCounted(false)
                 firstSyncLock = it
             }
+        firstSync.add(profileId)
         lock.acquire(FIRST_SYNC_WAKELOCK_MS)
-        app.core.getOrNull()?.log("holding a wakelock for up to ${FIRST_SYNC_WAKELOCK_MS / 60_000} min for a first fetch")
+        handler.removeCallbacks(firstSyncCheck)
+        handler.postDelayed(firstSyncCheck, FIRST_SYNC_CHECK_MS)
+        app.core.getOrNull()?.log(
+            "holding a wakelock for up to ${FIRST_SYNC_WAKELOCK_MS / 60_000} min for the first fetch of $profileId",
+        )
+    }
+
+    private fun owesFirstFetch(core: Core, p: no.nyta.livesync.profile.Profile): Boolean {
+        val st = try {
+            core.status(p)
+        } catch (e: Exception) {
+            null
+        }
+        val hasIndex = st?.hasIndex ?: java.io.File(app.profiles.stateDir(p.id), "index.sqlite").exists()
+        return FirstSyncWaits.owesFirstFetch(hasIndex, st?.daemonHeartbeatMs)
+    }
+
+    /**
+     * Release the first-sync wakelock once every profile it is held for has
+     * caught up (or stopped). Returns whether to check again.
+     */
+    private fun checkFirstSync(): Boolean {
+        val lock = firstSyncLock ?: return false
+        val core = app.core.getOrNull() ?: return false
+        if (!lock.isHeld) {
+            // The cap ran out first.
+            firstSync.clear()
+            core.log("first-fetch wakelock ended at its ${FIRST_SYNC_WAKELOCK_MS / 60_000} min cap")
+            return false
+        }
+        val active = try {
+            core.engine.activeProfiles().toSet()
+        } catch (e: Exception) {
+            emptySet()
+        }
+        val done = firstSync.settle(active) { id ->
+            val p = try {
+                app.profiles.get(id)
+            } catch (e: Exception) {
+                null
+            } ?: return@settle false
+            !owesFirstFetch(core, p)
+        }
+        if (!done) return true
+        lock.release()
+        core.log("first fetch caught up; wakelock released")
+        return false
     }
 
     private fun updateNotification() {
@@ -324,6 +378,7 @@ class SyncService : Service() {
         network?.stop()
         firstSyncLock?.let { if (it.isHeld) it.release() }
         handler.removeCallbacks(refresh)
+        handler.removeCallbacks(firstSyncCheck)
         val core = app.core.getOrNull()
         handler.post {
             synchronized(EngineLifecycle.lock) {
@@ -354,6 +409,7 @@ class SyncService : Service() {
         const val NOTIFICATION_ID = 1
         const val REFRESH_MS = 60_000L
         const val FIRST_SYNC_WAKELOCK_MS = 20 * 60_000L
+        const val FIRST_SYNC_CHECK_MS = 5_000L
         const val ACTION_RECONCILE = "no.nyta.livesync.RECONCILE"
         const val ACTION_SYNC_NOW = "no.nyta.livesync.SYNC_NOW"
         const val EXTRA_PROFILE = "profile"

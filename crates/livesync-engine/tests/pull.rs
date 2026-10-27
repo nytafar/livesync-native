@@ -337,6 +337,11 @@ async fn gates_fail_closed() {
     env.mock.update_milestone(|m| m["locked"] = json!(true));
     let g = env.engine().connect_gate(false).await.unwrap();
     assert!(g.fetch_to_resolve && g.needs_full_fetch);
+    // A read-only pull completes the fetch but cannot mark this node
+    // resolved: status says which of the two is still owed.
+    env.engine().pull_once().await.unwrap();
+    let st = env.engine().status().unwrap();
+    assert!(st.needs_full_fetch && st.resolve_owed, "{st:?}");
 
     // Unsupported remote settings.
     for (k, v) in [

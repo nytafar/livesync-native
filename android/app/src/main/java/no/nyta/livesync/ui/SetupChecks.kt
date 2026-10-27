@@ -31,6 +31,14 @@ data class DeviceChecks(
     val samsungNeverSleepingConfirmed: Boolean,
 ) {
     val essentialsOk get() = allFiles && battery
+
+    /**
+     * One UI's own app sleeping is dealt with. With the battery exemption
+     * granted, One UI no longer offers the app in its "Never sleeping apps"
+     * list (seen on an S22+, One UI on Android 16), so the exemption is what
+     * this checks; without it, the user's own tick that they added the app.
+     */
+    val samsungSleepOk get() = !samsung || battery || samsungNeverSleepingConfirmed
 }
 
 private const val PREFS = "ui"
@@ -85,13 +93,23 @@ fun SetupChecksCard(checks: DeviceChecks, onChanged: () -> Unit = {}) {
             "Without this exemption Android stops the sync when the phone sleeps.",
             if (checks.battery) null else "Exempt",
         ) { Perms.launch(ctx, Perms.batteryIntent(ctx), Perms.appDetailsIntent(ctx)) }
-        if (checks.samsung) {
+        if (checks.samsung && checks.battery) {
+            CheckRow(
+                "Samsung: app sleeping",
+                true,
+                "Checked through the battery exemption above. With it, Android exempts LiveSync from app standby " +
+                    "and One UI stops offering it in its \"Never sleeping apps\" list, so there is nothing to add " +
+                    "there. If the sync still stops while the phone sleeps, check that Apps → LiveSync → Battery " +
+                    "is \"Unrestricted\".",
+                null,
+            ) {}
+        } else if (checks.samsung) {
             CheckRow(
                 "Samsung: never sleeping",
                 neverSleeping,
-                "One UI also puts apps to sleep on its own. Open Settings → Battery (or Device care → Battery) → " +
-                    "Background usage limits → Never sleeping apps → + → LiveSync. Also check that " +
-                    "Apps → LiveSync → Battery is \"Unrestricted\".",
+                "One UI also puts apps to sleep on its own. Grant the battery exemption above, which covers this; " +
+                    "or open Settings → Battery (or Device care → Battery) → Background usage limits → Never " +
+                    "sleeping apps → + → LiveSync.",
                 "Open",
             ) { Perms.launch(ctx, Perms.samsungBatteryIntent(), Perms.appDetailsIntent(ctx)) }
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -102,6 +120,8 @@ fun SetupChecksCard(checks: DeviceChecks, onChanged: () -> Unit = {}) {
                 })
                 Text("LiveSync is on the \"Never sleeping apps\" list", style = MaterialTheme.typography.bodySmall)
             }
+        }
+        if (checks.samsung) {
             TextButton(onClick = { Perms.launch(ctx, Perms.dontKillMyAppIntent()) }) {
                 Text("More on dontkillmyapp.com")
             }

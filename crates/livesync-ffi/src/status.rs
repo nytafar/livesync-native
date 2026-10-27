@@ -141,6 +141,10 @@ pub struct ProfileStatus {
     /// A full fetch or a resolution is owed; pushes are held until a two-way
     /// run completes it.
     pub needs_full_fetch: bool,
+    /// Part of `needs_full_fetch`: this node must still be marked resolved
+    /// after a remote lock. Only a two-way run does that; a pull-only run
+    /// completes a plain owed fetch by itself.
+    pub resolve_owed: bool,
     /// `"<ms> <text>"`: a mass deletion was refused and waits for the user.
     pub safety_stop: Option<String>,
     /// A confirmed mass delete is waiting for its (one) full push pass.
@@ -230,6 +234,7 @@ pub(crate) fn from_engine(
         attention: vec![],
         scope: None,
         needs_full_fetch: false,
+        resolve_owed: false,
         safety_stop: None,
         mass_delete_allowed: false,
         rebuild_wait: None,
@@ -278,6 +283,7 @@ pub(crate) fn from_engine(
     out.local_issues = st.local_issues.len() as i64;
     out.scope = st.scope.clone();
     out.needs_full_fetch = st.needs_full_fetch;
+    out.resolve_owed = st.resolve_owed;
     out.safety_stop = st.safety_stop.clone();
     out.rebuild_wait = st.rebuild_wait.clone();
     out.rebuild_orphans = st.rebuild_orphans.clone();

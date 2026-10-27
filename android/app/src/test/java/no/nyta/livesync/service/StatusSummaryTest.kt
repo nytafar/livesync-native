@@ -52,12 +52,33 @@ class StatusSummaryTest {
     }
 
     @Test
-    fun nudgesAreDebounced() {
-        val g = NudgeGate(quietMs = 1000)
-        assertTrue(g.shouldReport(true, false, 0))
-        assertFalse(g.shouldReport(true, false, 500))
-        assertTrue(g.shouldReport(false, false, 600))
-        assertTrue(g.shouldReport(true, false, 700))
-        assertTrue(g.shouldReport(true, false, 1800))
+    fun onlyRealNetworkTransitionsArePassedOn() {
+        val wifi = 1L shl 1
+        val cell = 1L shl 0
+        val g = NetworkGate()
+        assertTrue("a first network", g.seen(1, wifi, validated = false, metered = false))
+        assertTrue("it became usable", g.seen(1, wifi, validated = true, metered = false))
+        // The phone run: the same validated network reported over and over.
+        repeat(4) { assertFalse(g.seen(1, wifi, validated = true, metered = false)) }
+        assertFalse("losing validation is not an up", g.seen(1, wifi, validated = false, metered = false))
+        assertTrue("validated again", g.seen(1, wifi, validated = true, metered = false))
+        assertTrue("switched to mobile data", g.seen(2, cell, validated = true, metered = true))
+        assertFalse("a stale loss of the old network", g.lost(1))
+        assertTrue(g.lost(2))
+        assertFalse("lost twice", g.lost(2))
+        assertTrue("back on the same network", g.seen(2, cell, validated = true, metered = true))
+        assertTrue("metered changed", g.seen(2, cell, validated = true, metered = false))
+    }
+
+    @Test
+    fun aSwitchBeneathAVpnIsATransition() {
+        val wifi = 1L shl 1
+        val cell = 1L shl 0
+        val vpn = 1L shl 4
+        val g = NetworkGate()
+        assertTrue(g.seen(7, vpn or wifi, validated = true, metered = false))
+        assertFalse(g.seen(7, vpn or wifi, validated = true, metered = false))
+        // Same VPN network, same flags, now over cellular.
+        assertTrue(g.seen(7, vpn or cell, validated = true, metered = false))
     }
 }

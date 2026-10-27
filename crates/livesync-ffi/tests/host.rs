@@ -512,3 +512,40 @@ fn a_profile_whose_engine_has_not_let_go_stays_unreleased_on_every_stop() {
     let lock = Path::new(&p.state_dir).join("lsync.lock");
     assert!(livesync_engine::platform::LockFile::try_acquire(&lock).is_err());
 }
+
+/// What the app reads to tell a first fetch that is still running from one
+/// that has caught up (the first-sync wakelock), and a plain owed fetch,
+/// which pull-only completes, from an owed resolution, which it cannot.
+#[test]
+fn a_new_pull_only_profile_owes_nothing_once_caught_up() {
+    let env = Env::new();
+    env.mock.put_text("n.md", &["n"]);
+    let p = env.profile("fresh", "vault-fresh");
+    let st = env.status(&p);
+    assert!(!st.has_index && st.daemon_heartbeat_ms.is_none());
+    env.host.start(p.clone()).unwrap();
+    wait_until("caught up", Duration::from_secs(20), || {
+        env.status(&p).daemon_heartbeat_ms.is_some()
+    });
+    assert!(
+        read(&p, "n.md").is_some(),
+        "the heartbeat came before the fetch finished"
+    );
+    let st = env.status(&p);
+    assert!(!st.needs_full_fetch && !st.resolve_owed, "{:?}", st.status_json);
+    env.host.stop_all();
+
+    // Locked on the server: the fetch completes, the resolution stays owed.
+    let env = Env::new();
+    env.mock.put_text("n.md", &["n"]);
+    env.mock.update_milestone(|m| m["locked"] = serde_json::json!(true));
+    let p = env.profile("locked", "vault-locked");
+    env.host.start(p.clone()).unwrap();
+    wait_until("caught up", Duration::from_secs(20), || {
+        env.status(&p).daemon_heartbeat_ms.is_some()
+    });
+    let st = env.status(&p);
+    assert!(st.needs_full_fetch && st.resolve_owed, "{:?}", st.status_json);
+    assert!(env.mock.writes().is_empty(), "pull-only wrote: {:?}", env.mock.writes());
+    env.host.stop_all();
+}

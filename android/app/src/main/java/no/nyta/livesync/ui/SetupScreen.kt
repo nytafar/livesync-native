@@ -34,6 +34,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -63,6 +64,7 @@ import java.io.File
 @Composable
 fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCancel: (() -> Unit)?) {
     val ctx = LocalContext.current
+    val focus = LocalFocusManager.current
     val scope = rememberCoroutineScope()
     val core = app.core.getOrThrow()
     val checks = rememberDeviceChecks()
@@ -273,19 +275,33 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
         Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             if (onCancel != null) OutlinedButton(onClick = onCancel) { Text("Cancel") }
             Button(enabled = canSave, onClick = {
+                // A tap while the keyboard is closing can be lost: the IME
+                // padding shrinks and the scrolled button moves under the
+                // finger, which cancels the press. Close it here, and show
+                // "Saving…" so a tap that did land is plain to see.
+                focus.clearFocus()
                 saving = true
                 saveError = null
                 scope.launch {
                     val err = withContext(Dispatchers.IO) { save(app, existing, draft, password) }
-                    saving = false
                     if (err == null) {
                         SyncService.start(ctx, if (editing) "profile edited" else "profile created")
+                        // Stays "Saving…" (and disabled) until the screen is gone.
                         onDone()
                     } else {
+                        saving = false
                         saveError = err
                     }
                 }
-            }) { Text(if (editing) "Save and restart" else "Save and start syncing") }
+            }) {
+                if (saving) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Saving…")
+                } else {
+                    Text(if (editing) "Save and restart" else "Save and start syncing")
+                }
+            }
         }
         if (!canSave) {
             val why = when {
@@ -364,7 +380,7 @@ fun GateCard(g: GateResult) {
         KeyValue("Remote", g.remote)
         KeyValue("Version doc", g.version.toString())
         KeyValue("Documents", g.docCount.toString())
-        KeyValue("Created", g.created.toString())
+        KeyValue("Created", Formats.created(g.created))
         KeyValue("Locked", if (g.locked) "yes${if (g.fetchToResolve) " (resolved by the first full fetch)" else ""}" else "no")
         KeyValue("Accepted nodes", g.acceptedNodes.toString())
         KeyValue("Max file size", "${g.maxSizeMb} MB")

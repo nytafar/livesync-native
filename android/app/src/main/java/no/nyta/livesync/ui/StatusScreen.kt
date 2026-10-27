@@ -97,7 +97,7 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
             TextButton(onClick = onEdit) { Text("Settings") }
         }
 
-        if (!checks.essentialsOk || !checks.notifications || (checks.samsung && !checks.samsungNeverSleepingConfirmed)) {
+        if (!checks.essentialsOk || !checks.notifications || !checks.samsungSleepOk) {
             SetupChecksCard(checks)
         }
 
@@ -129,13 +129,15 @@ fun StatusScreen(app: LiveSyncApp, profileId: String, onEdit: () -> Unit, onChan
                 )
             }
             st?.lastError?.let { Banner("Last error: ${fmtStamped(it)}", Tone.WARN) }
-            if (st?.needsFullFetch == true) {
-                Banner(
-                    if (p.pullOnly) "A full fetch or a resolution is owed; pull-only runs cannot complete it, so pushes stay held until two-way sync runs."
-                    else "A full fetch or a resolution is owed; pushes are held until it completes.",
-                    Tone.INFO,
+            st?.let {
+                Formats.fetchOwedBanner(
+                    needsFullFetch = it.needsFullFetch,
+                    resolveOwed = it.resolveOwed,
+                    rebuildWait = it.rebuildWait != null,
+                    pullOnly = p.pullOnly,
+                    running = it.runState == RunState.RUNNING || it.runState == RunState.STARTING,
                 )
-            }
+            }?.let { Banner(it, Tone.INFO) }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(if (p.pullOnly) "Pull only (read-only)" else "Two-way")
