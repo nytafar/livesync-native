@@ -527,9 +527,10 @@ struct PassCtx {
     failed_hashes: HashSet<String>,
     /// Deletions were held for later (`DeleteHold`): no decision yet.
     deletes_held: bool,
-    /// Some files a burst or its stop depends on could not be checked
-    /// (`Engine::depended_on`).
-    unchecked: bool,
+    /// Some of the files `confirmed` covers could not be checked: it is not
+    /// applied in this pass, and not used up, but waits for a pass that can
+    /// check them all.
+    confirmation_waits: bool,
     /// A renamed file's new name is not pushed yet; the old document waits.
     dests_pending: bool,
 }
@@ -995,9 +996,9 @@ impl Engine {
             &mut issues_seen,
         )
         .await?;
-        // A confirmation this pass did not get to apply, because the stop's
-        // files could not be checked, waits for a pass that can.
-        let unapplied = ctx.confirmed.is_some() && ctx.unchecked;
+        // A confirmation this pass did not apply, because some of its files
+        // could not be checked, waits for a pass that can check them all.
+        let unapplied = ctx.confirmed.is_some() && ctx.confirmation_waits;
         if let Some(stop) = confirming.filter(|_| !unapplied) {
             let mut once = self.inner.mass_delete_once.lock().unwrap();
             // Unless the user confirmed another stop meanwhile.
@@ -1746,15 +1747,30 @@ impl Engine {
         // Some of the files a burst or its stop depends on could not be
         // checked (they may still be gone): this pass cannot tell that the
         // burst is over, nor that the stop is. Other files it could not
-        // check do not matter to either.
+        // check do not matter to either. As far as this pass knows, those
+        // files are still missing (`hidden`): a stop judges them so, and
+        // still lists them.
         let blocked = self.depended_on(&unchecked, hold.as_deref())?;
+        let hidden: HashSet<String> = blocked.clone().unwrap_or_default();
+        // A confirmation is applied whole, by a pass that can check all the
+        // files it covers.
+        ctx.confirmation_waits = match &ctx.confirmed {
+            Some(Confirmed {
+                docs: ConfirmedDocs::Exactly(d),
+                ..
+            }) => unchecked.iter().any(|id| d.contains(id)),
+            Some(Confirmed {
+                docs: ConfirmedDocs::UpTo(_),
+                ..
+            }) => !unchecked.is_empty(),
+            None => false,
+        };
         let unchecked = blocked.is_some();
         if tally.scan.is_some() {
             if let Some(h) = hold.as_deref_mut() {
                 h.checked(blocked);
             }
         }
-        ctx.unchecked |= unchecked;
         ctx.deletes_held |= unchecked;
         if gone.is_empty() {
             return self.nothing_vanished(hold, &tally, unchecked);
@@ -1854,7 +1870,12 @@ impl Engine {
         // A stop saved by an older version showed fewer files than are
         // missing now: none goes, and a new stop lists them.
         let mut stop_anew = false;
-        let confirmed_docs: Option<HashSet<String>> = match ctx.confirmed.take() {
+        let applied = if ctx.confirmation_waits {
+            None
+        } else {
+            ctx.confirmed.take()
+        };
+        let confirmed_docs: Option<HashSet<String>> = match applied {
             None => None,
             Some(Confirmed {
                 docs: ConfirmedDocs::Exactly(docs),
@@ -1963,7 +1984,10 @@ impl Engine {
             }
             ctx.deletes_held = true;
         }
-        let missing = undestined + earlier;
+        // The burst's or the stop's files this pass could not check count as
+        // still missing; they are not sent either way.
+        let refusing = undestined + hidden.len() as u64;
+        let missing = refusing + earlier;
         let of = tracked + earlier;
         let mass =
             (!held || stop_anew) && undestined > 0 && (stop_anew || missing > MASS_DELETE_MIN && missing * 2 > of);
@@ -1976,16 +2000,16 @@ impl Engine {
                     format!(
                         "{empty}{missing} of {of} tracked files went missing from the vault in one burst, {earlier} of them already deleted remotely"
                     ),
-                    format!("the other {undestined}"),
+                    format!("the other {refusing}"),
                 )
             } else if emptied {
                 (
-                    format!("{empty}{undestined} of {tracked} tracked files are missing"),
+                    format!("{empty}{refusing} of {tracked} tracked files are missing"),
                     "them".to_string(),
                 )
             } else {
                 (
-                    format!("{undestined} of {tracked} tracked files are missing from the vault"),
+                    format!("{refusing} of {tracked} tracked files are missing from the vault"),
                     "them".to_string(),
                 )
             };
@@ -1994,7 +2018,11 @@ impl Engine {
             } else {
                 let msg = format!("{msg}; not deleting {them} remotely (allow mass deletes if this is intended)");
                 warn!("{msg}");
-                let refused: HashSet<String> = undestined_ids.iter().map(|id| id.to_string()).collect();
+                let refused: HashSet<String> = undestined_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .chain(hidden.iter().cloned())
+                    .collect();
                 self.with_index(|ix| {
                     // The same files refused again: the same stop, so a
                     // confirmation of it still matches.
@@ -2004,7 +2032,9 @@ impl Engine {
                             .and_then(|d| serde_json::from_str::<HashSet<String>>(&d).ok())
                             .is_some_and(|d| d == refused);
                     if !same {
-                        let docs = serde_json::to_string(&undestined_ids).unwrap_or_default();
+                        let mut docs: Vec<&String> = refused.iter().collect();
+                        docs.sort();
+                        let docs = serde_json::to_string(&docs).unwrap_or_default();
                         ix.set_meta(meta::SAFETY_STOP, &format!("{} {msg}", vaultfs::now_ms()))?;
                         ix.set_meta(meta::SAFETY_STOP_DOCS, &docs)?;
                     }

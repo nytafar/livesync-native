@@ -1301,6 +1301,55 @@ async fn a_confirmation_waits_while_its_files_cannot_be_checked() {
     assert!(!e.mass_delete_allowed());
 }
 
+/// Round 3 (Codex): the same when only some of the stop's files cannot be
+/// checked and the others are still gone. Nothing goes on the confirmation,
+/// the stop stays as it was (the files it cannot check still count as
+/// missing), and the confirmation waits; then it deletes all 25.
+#[tokio::test]
+async fn a_confirmation_waits_while_some_of_its_files_cannot_be_checked() {
+    let env = Env::new().await;
+    for i in 0..20 {
+        env.write(&format!("sub/f{i:02}.md"), format!("{i}").as_bytes());
+        env.write(&format!("g{i:02}.md"), format!("g {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    for i in 0..10 {
+        std::fs::remove_file(env.vault().join(format!("sub/f{i:02}.md"))).unwrap();
+    }
+    for i in 0..15 {
+        std::fs::remove_file(env.vault().join(format!("g{i:02}.md"))).unwrap();
+    }
+    let e = env.engine();
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.safety_stops, 1, "{:?}", rep.push);
+    let stop = e.status().unwrap().safety_stop.expect("a stop");
+    assert!(stop.contains("25 of 40"), "{stop}");
+    let locked = Unreadable::new(env.vault().join("sub"));
+    // Without a confirmation, the stop stays as it was.
+    let rep = e.sync_once().await;
+    let kept = env.meta("safety_stop");
+    assert_eq!(rep.as_ref().map(|r| r.push.deleted).ok(), Some(0), "{rep:?}");
+    assert_eq!(kept.as_deref(), Some(stop.as_str()), "the stop changed or cleared");
+    assert_eq!(
+        e.allow_mass_delete_once(&stop).unwrap(),
+        livesync_engine::Confirmation::Allowed
+    );
+    let rep = e.sync_once().await;
+    let (stopped, allowed) = (env.meta("safety_stop"), e.mass_delete_allowed());
+    drop(locked);
+    assert_eq!(
+        rep.unwrap().push.deleted,
+        0,
+        "applied while some of its files could not be checked"
+    );
+    assert_eq!(stopped.as_deref(), Some(stop.as_str()), "the stop changed or cleared");
+    assert!(allowed, "the confirmation was used up");
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 25, "{:?}", rep.push);
+    assert!(e.status().unwrap().safety_stop.is_none());
+    assert!(!e.mass_delete_allowed());
+}
+
 /// Round 3: a one-shot sync counts a burst the daemon left open without a
 /// stop (killed in the middle of it): 45 of 100 already sent and 27 more
 /// missing is "72 of 100", not "27 of 55".
