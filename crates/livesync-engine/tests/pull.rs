@@ -758,18 +758,27 @@ async fn pending_retry_deletes_only_on_a_deleted_404() {
 }
 
 // Item 9: a case-only rename on a case-sensitive filesystem still replaces
-// the old name (the case-insensitive guard must not leave it behind).
+// the old name (the case-insensitive guard must not leave it behind). Checked
+// on the names in the directory, not with `exists`, which on a folding
+// filesystem (APFS) finds either spelling.
 #[tokio::test]
 async fn case_only_rename_on_a_case_sensitive_fs_removes_the_old_name() {
     let env = Env::new().await;
     let m = &env.mock;
+    let names = || {
+        let mut n: Vec<String> = std::fs::read_dir(env.vault().join("Dir"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
+    };
     m.put_text("Dir/Note.md", &["same"]);
     env.engine().pull_once().await.unwrap();
-    assert!(env.vault().join("Dir/Note.md").exists());
+    assert_eq!(names(), ["Note.md"]);
     m.put_text("Dir/note.md", &["same"]);
     env.engine().pull_once().await.unwrap();
-    assert!(env.vault().join("Dir/note.md").exists());
-    assert!(!env.vault().join("Dir/Note.md").exists());
+    assert_eq!(names(), ["note.md"]);
     assert_eq!(env.row("dir/note.md").unwrap().path, "Dir/note.md");
 }
 

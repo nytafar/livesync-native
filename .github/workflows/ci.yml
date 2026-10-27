@@ -40,7 +40,7 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: cargo test
-        run: cargo test
+        run: cargo test --no-fail-fast
 
   android:
     name: android app
