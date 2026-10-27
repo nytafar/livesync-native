@@ -7,13 +7,14 @@
 //! what ends one is local and fatal, such as an index error, and is shown as
 //! `Failed` with the error until the next attempt.
 
+use crate::folders::FolderList;
 use crate::profile::{paths_overlap, ProfileConfig};
 use crate::status::{self, GateResult, ProfileStatus};
 use crate::{logging, LiveSyncError};
 use livesync_engine::engine::status_from_index;
 use livesync_engine::engine::{AccessCheck, STATE_LOCK};
 use livesync_engine::platform::{LockError, LockFile};
-use livesync_engine::{Engine, Index};
+use livesync_engine::{Engine, EngineError, Index};
 use livesync_remote::Couch;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -54,6 +55,8 @@ const RETRY_MAX: Duration = Duration::from_secs(15 * 60);
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A run this long counts as healthy: the next failure starts the delays over.
 const HEALTHY_RUN: Duration = Duration::from_secs(10 * 60);
+/// How long a folder listing may take (a slow mobile link, a large database).
+const LIST_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The front-end's answer to "is the whole vault still visible to this
 /// process?" (Android: all-files access is still granted). Asked before any
@@ -600,6 +603,65 @@ impl LiveSync {
             cfg.database, result.outcome, result.message
         );
         result
+    }
+
+    /// The remote's top-level folders with their live file counts and sizes,
+    /// plus the files at the vault root, for picking a folder scope; the vault
+    /// folder's own top-level folders are merged in (local-only ones marked)
+    /// when it exists. Reads file metadata documents only, never chunks, and
+    /// never writes to the remote. Works for settings that are not saved yet
+    /// (no engine, no index). Refuses a database with encrypted paths.
+    pub fn list_folders(&self, cfg: ProfileConfig) -> Result<FolderList, LiveSyncError> {
+        let url = cfg.url.trim();
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(LiveSyncError::Invalid {
+                msg: "the server URL must start with https:// or http://".into(),
+            });
+        }
+        if cfg.database.trim().is_empty() {
+            return Err(LiveSyncError::Invalid {
+                msg: "no database name".into(),
+            });
+        }
+        let couch = Couch::new(&cfg.remote()).map_err(|e| LiveSyncError::Invalid { msg: e.to_string() })?;
+        let listed = self
+            .rt
+            .block_on(async { tokio::time::timeout(LIST_TIMEOUT, livesync_engine::list_remote_folders(&couch)).await });
+        let mut l = match listed {
+            Ok(Ok(l)) => l,
+            Ok(Err(EngineError::Remote(e))) => {
+                warn!("listing the folders of {}: {e}", cfg.database);
+                return Err(LiveSyncError::Remote {
+                    msg: crate::explain_remote(&e),
+                });
+            }
+            Ok(Err(e)) => {
+                warn!("listing the folders of {}: {e}", cfg.database);
+                return Err(e.into());
+            }
+            Err(_) => {
+                return Err(LiveSyncError::Remote {
+                    msg: format!(
+                        "the server did not list its folders within {} s",
+                        LIST_TIMEOUT.as_secs()
+                    ),
+                })
+            }
+        };
+        let vault = Path::new(&cfg.vault_path);
+        if vault.is_absolute() {
+            l.merge_local(&livesync_engine::local_top_folders(vault));
+        }
+        info!(
+            "listed {} folder(s) of {}: {} files, {} documents read, {} bytes in {} ms",
+            l.folders.len(),
+            cfg.database,
+            l.files,
+            l.docs_read,
+            l.bytes_fetched,
+            l.elapsed_ms
+        );
+        Ok(l.into())
     }
 
     /// Accept changed PREFERRED tweak values on the remote (the gate's

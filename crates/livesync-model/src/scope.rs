@@ -31,6 +31,18 @@ impl Default for Scope {
     }
 }
 
+/// How much of a folder a scope syncs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Coverage {
+    /// Everything under it.
+    Whole,
+    /// Some of it: a listed folder lies further down.
+    Part,
+    /// Nothing under it.
+    None,
+}
+
 /// What became visible when the scope changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Widening {
@@ -158,6 +170,21 @@ impl Scope {
         }
     }
 
+    /// How much of the folder `dir` (vault-relative) syncs, for showing a
+    /// scope against a folder list.
+    pub fn coverage(&self, dir: &str) -> Coverage {
+        let key = js_to_lower_case(dir.trim_matches('/'));
+        let nested = self.prefixes.iter().any(|p| p != &key && under(p, &key));
+        match self.mode {
+            ScopeMode::All => Coverage::Whole,
+            ScopeMode::Include if self.covered(&key) => Coverage::Whole,
+            ScopeMode::Exclude if self.covered(&key) => Coverage::None,
+            _ if nested => Coverage::Part,
+            ScopeMode::Include => Coverage::None,
+            ScopeMode::Exclude => Coverage::Whole,
+        }
+    }
+
     /// One-line description for logs and status.
     pub fn describe(&self) -> String {
         match self.mode {
@@ -196,6 +223,19 @@ mod tests {
         assert!(!inc.may_contain_under("projects/beta"));
         assert!(!exc.may_contain_under("Private/sub"));
         assert!(exc.may_contain_under("public"));
+    }
+
+    #[test]
+    fn coverage_of_a_folder() {
+        let inc = s(ScopeMode::Include, &["Notes", "inputs/corpora"]);
+        assert_eq!(inc.coverage("notes"), Coverage::Whole);
+        assert_eq!(inc.coverage("Inputs"), Coverage::Part);
+        assert_eq!(inc.coverage("other"), Coverage::None);
+        let exc = s(ScopeMode::Exclude, &["inputs/corpora", "Private"]);
+        assert_eq!(exc.coverage("private"), Coverage::None);
+        assert_eq!(exc.coverage("INPUTS"), Coverage::Part);
+        assert_eq!(exc.coverage("notes"), Coverage::Whole);
+        assert_eq!(Scope::all().coverage("x"), Coverage::Whole);
     }
 
     #[test]

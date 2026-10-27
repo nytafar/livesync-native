@@ -97,6 +97,8 @@ pub struct MockState {
     /// Store the next `PUT`, then answer 500 as if the response was lost.
     pub lose_next_put_response: bool,
     pub db_missing: bool,
+    /// IDs whose bodies a ranged `GET _all_docs?include_docs=true` returned.
+    pub served_bodies: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -491,6 +493,11 @@ impl Mock {
             .collect()
     }
 
+    /// IDs whose bodies ranged `_all_docs` reads returned, in order.
+    pub fn served_bodies(&self) -> Vec<String> {
+        self.state.lock().unwrap().served_bodies.clone()
+    }
+
     pub fn clear_requests(&self) {
         self.state.lock().unwrap().requests.clear();
     }
@@ -747,7 +754,8 @@ async fn all_docs_range(State((st, _)): S, Query(q): Query<HashMap<String, Strin
     let end = key("end_key");
     let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(usize::MAX);
     let include = q.get("include_docs").map(String::as_str) == Some("true");
-    let s = st.lock().unwrap();
+    let mut guard = st.lock().unwrap();
+    let s = &mut *guard;
     // Raw (code point) collation, as CouchDB uses for `_all_docs`.
     let rows: Vec<Value> = s
         .docs
@@ -764,6 +772,10 @@ async fn all_docs_range(State((st, _)): S, Query(q): Query<HashMap<String, Strin
             }
         })
         .collect();
+    if include {
+        let ids: Vec<String> = rows.iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
+        s.served_bodies.extend(ids);
+    }
     Json(json!({"rows": rows}))
 }
 

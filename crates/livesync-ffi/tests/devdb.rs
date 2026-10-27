@@ -84,3 +84,61 @@ fn pull_only_profile_mirrors_the_dev_database_without_writing() {
     assert_eq!(before.update_seq, after.update_seq, "pull-only must not write");
     assert_eq!(before.doc_count, after.doc_count);
 }
+
+#[test]
+#[ignore = "needs the dev CouchDB (source scripts/dev-env.sh)"]
+fn listing_the_dev_database_folders_is_quick_and_read_only() {
+    let url = env("LSYNC_URL");
+    assert!(
+        url.contains("127.0.0.1:8411") && !url.contains("8410"),
+        "refusing anything but the dev container"
+    );
+    let db = env("LSYNC_DB");
+    let remote = RemoteConfig {
+        url: url.clone(),
+        database: db.clone(),
+        username: Some(env("LSYNC_USER")),
+        password: Some(env("LSYNC_PASSWORD")),
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let couch = Couch::new(&remote).unwrap();
+    let before = rt.block_on(couch.db_info()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let host = LiveSync::new(String::new()).unwrap();
+    let cfg = ProfileConfig {
+        id: "dev".into(),
+        vault_path: dir.path().join("vault").display().to_string(),
+        state_dir: dir.path().join("state").display().to_string(),
+        url,
+        database: db,
+        username: remote.username.clone().unwrap(),
+        password: remote.password.clone().unwrap(),
+        scope_kind: ScopeKind::All,
+        scope_folders: vec![],
+        pull_only: true,
+        device_name: "ffi-devdb-test".into(),
+        ignore_regex: String::new(),
+    };
+    let t0 = Instant::now();
+    let l = host.list_folders(cfg).unwrap();
+    let wall = t0.elapsed();
+    for f in &l.folders {
+        println!("{:>7} {:>12}  {}/", f.files, f.bytes, f.name);
+    }
+    println!(
+        "{} files ({} at the root) in {} folders; {} docs read, {} bytes fetched, {} ms in the core, {:.0?} wall",
+        l.files,
+        l.root_files,
+        l.folders.len(),
+        l.docs_read,
+        l.bytes_fetched,
+        l.elapsed_ms,
+        wall
+    );
+    assert!(l.files > 0 && !l.folders.is_empty());
+    assert!(l.folders.iter().all(|f| !f.name.starts_with('.')));
+    assert!(wall < Duration::from_secs(5), "took {wall:.0?}");
+    let after = rt.block_on(couch.db_info()).unwrap();
+    assert_eq!(before.update_seq, after.update_seq, "listing must not write");
+    assert_eq!(before.doc_count, after.doc_count);
+}

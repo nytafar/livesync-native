@@ -27,6 +27,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -49,6 +50,7 @@ import no.nyta.livesync.profile.Profile
 import no.nyta.livesync.profile.ProfileRules
 import no.nyta.livesync.profile.ProfileStore
 import no.nyta.livesync.profile.ScopeMode
+import no.nyta.livesync.profile.ScopePick
 import no.nyta.livesync.profile.VaultCheck
 import no.nyta.livesync.profile.VaultReport
 import no.nyta.livesync.secret.SecretStore
@@ -89,6 +91,11 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
     var testing by remember { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
     var saveError by remember { mutableStateOf<String?>(null) }
+    var folderLoad by remember { mutableStateOf<FolderLoad>(FolderLoad.Idle) }
+    // The connect-test key the list was made for (setup), so changed
+    // credentials hide a stale list.
+    var folderKey by remember { mutableStateOf<String?>(null) }
+    var folderGen by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(vaultPath, checks.allFiles) {
         report = if (vaultPath.trimEnd('/').isEmpty()) null else withContext(Dispatchers.IO) {
@@ -119,6 +126,36 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
     val testPassed = gate?.outcome == GateOutcome.PASSED && testedKey == testKey
     val vaultOk = report?.errors?.isEmpty() == true && overlap == null
     val canTest = urlProblem == null && draft.database.isNotEmpty() && (password.isNotEmpty() || editing) && !testing
+
+    fun loadFolders(pw: String, key: String) {
+        val gen = ++folderGen
+        val p = draft.copy(id = existing?.id ?: "connect-test")
+        folderKey = key
+        folderLoad = FolderLoad.Loading
+        scope.launch {
+            val r = withContext(Dispatchers.IO) { runCatching { core.listFolders(p, pw) } }
+            if (gen != folderGen) return@launch
+            folderLoad = r.fold({ FolderLoad.Loaded(it) }, { FolderLoad.Failed(it.message ?: it.toString()) })
+        }
+    }
+
+    fun reloadFolders() {
+        val key = testKey
+        val typed = password
+        scope.launch {
+            val pw = typed.ifEmpty {
+                existing?.let { withContext(Dispatchers.IO) { app.secrets.get(it.id, SecretStore.PASSWORD) } } ?: ""
+            }
+            loadFolders(pw, key)
+        }
+    }
+
+    // Settings: the server's folders with the current scope ticked, using the
+    // stored password (the server and database of a profile are fixed).
+    LaunchedEffect(existing?.id) {
+        if (existing != null) reloadFolders()
+    }
+
     val canSave = checks.allFiles && vaultOk && urlProblem == null && scopeProblem == null &&
         draft.database.isNotEmpty() && (testPassed || !credentialsChanged) && !saving
 
@@ -199,7 +236,37 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
             )
         }
 
-        SectionCard("4. Folders to sync") {
+        SectionCard("4. Connect test") {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Button(enabled = canTest, onClick = {
+                    testing = true
+                    gate = null
+                    val key = testKey
+                    scope.launch {
+                        val pw = password.ifEmpty { existing?.let { app.secrets.get(it.id, SecretStore.PASSWORD) } ?: "" }
+                        val r = withContext(Dispatchers.IO) {
+                            runCatching { core.connectTest(draft.copy(id = existing?.id ?: "connect-test"), pw) }
+                        }
+                        val g = r.getOrElse { e ->
+                            GateResult(GateOutcome.FAILED, e.message ?: e.toString(), "", 0, 0, 0, false, 0, false, false, 0, false)
+                        }
+                        gate = g
+                        testedKey = key
+                        testing = false
+                        // Before anything syncs: what is on the server, to pick folders from.
+                        if (g.outcome == GateOutcome.PASSED) loadFolders(pw, key)
+                    }
+                }) { Text("Test connection") }
+                if (testing) {
+                    Spacer(Modifier.width(12.dp))
+                    CircularProgressIndicator(Modifier.size(24.dp))
+                }
+            }
+            gate?.let { GateCard(it) }
+            if (!credentialsChanged) Text("Not needed unless you change the user name or password.", style = MaterialTheme.typography.bodySmall)
+        }
+
+        SectionCard("5. Folders to sync") {
             ScopeOption("All folders", scopeMode == ScopeMode.ALL) { scopeMode = ScopeMode.ALL }
             ScopeOption("Only these folders", scopeMode == ScopeMode.INCLUDE) { scopeMode = ScopeMode.INCLUDE }
             ScopeOption("Everything except these folders", scopeMode == ScopeMode.EXCLUDE) { scopeMode = ScopeMode.EXCLUDE }
@@ -211,6 +278,18 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
                     isError = scopeProblem != null,
                     supportingText = { scopeProblem?.let { Text(it) } },
                 )
+            }
+            val shown = if (editing || folderKey == testKey) folderLoad else FolderLoad.Idle
+            ServerFolders(
+                load = shown,
+                mode = scopeMode,
+                folders = draft.scopeFolders,
+                onToggle = { name -> foldersText = ScopePick.toggle(ProfileRules.parseFolders(foldersText), name).joinToString("\n") },
+                onReload = if (editing || testPassed) ({ reloadFolders() }) else null,
+            )
+            if (shown !is FolderLoad.Loaded && scopeMode != ScopeMode.ALL) {
+                // Without the server's list (not tested yet, offline, encrypted
+                // paths): the vault's own folders, as before.
                 val top = remember(report) { if (report?.isDirectory == true) VaultCheck.topFolders(File(cleanVault)) else emptyList() }
                 if (top.isNotEmpty()) {
                     Text("Folders in the vault now:", style = MaterialTheme.typography.bodySmall)
@@ -220,6 +299,9 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
                     }
                 }
             }
+            if (!editing && shown == FolderLoad.Idle) {
+                Text("A passing connect test lists the folders on the server here.", style = MaterialTheme.typography.bodySmall)
+            }
             Text(
                 "Files outside the chosen folders are never written here and never pushed; nothing is deleted on " +
                     "the server when you narrow the list. Dot-folders (.obsidian, .trash) never sync.",
@@ -227,7 +309,7 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
             )
         }
 
-        SectionCard("5. Mode") {
+        SectionCard("6. Mode") {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Pull only (read-only)")
@@ -239,33 +321,6 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
                 }
                 Switch(checked = pullOnly, onCheckedChange = { pullOnly = it })
             }
-        }
-
-        SectionCard("6. Connect test") {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Button(enabled = canTest, onClick = {
-                    testing = true
-                    gate = null
-                    val key = testKey
-                    scope.launch {
-                        val pw = password.ifEmpty { existing?.let { app.secrets.get(it.id, SecretStore.PASSWORD) } ?: "" }
-                        val r = withContext(Dispatchers.IO) {
-                            runCatching { core.connectTest(draft.copy(id = existing?.id ?: "connect-test"), pw) }
-                        }
-                        gate = r.getOrElse { e ->
-                            GateResult(GateOutcome.FAILED, e.message ?: e.toString(), "", 0, 0, 0, false, 0, false, false, 0, false)
-                        }
-                        testedKey = key
-                        testing = false
-                    }
-                }) { Text("Test connection") }
-                if (testing) {
-                    Spacer(Modifier.width(12.dp))
-                    CircularProgressIndicator(Modifier.size(24.dp))
-                }
-            }
-            gate?.let { GateCard(it) }
-            if (!credentialsChanged) Text("Not needed unless you change the user name or password.", style = MaterialTheme.typography.bodySmall)
         }
 
         saveError?.let { Banner(it, Tone.ERROR) }

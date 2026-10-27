@@ -571,3 +571,52 @@ fn a_new_pull_only_profile_owes_nothing_once_caught_up() {
     assert!(env.mock.writes().is_empty(), "pull-only wrote: {:?}", env.mock.writes());
     env.host.stop_all();
 }
+
+#[test]
+fn list_folders_reads_the_remote_and_marks_local_only_folders() {
+    let env = Env::new();
+    env.mock.put_text("Notes/a.md", &["aa"]);
+    env.mock.put_text("inputs/media/b.png", &["bbb"]);
+    env.mock.put_text("root.md", &["r"]);
+    env.mock.put_text(".obsidian/app.json", &["{}"]);
+    let p = env.profile("f", "vault-f");
+    // Before the vault folder exists: the remote only.
+    let l = env.host.list_folders(p.clone()).unwrap();
+    let names: Vec<(&str, i64, bool, bool)> = l
+        .folders
+        .iter()
+        .map(|f| (f.name.as_str(), f.files, f.remote, f.local))
+        .collect();
+    assert_eq!(names, vec![("inputs", 1, true, false), ("Notes", 1, true, false)]);
+    assert_eq!((l.root_files, l.root_bytes, l.files), (1, 1, 3));
+    // With one: local folders are merged, local-only ones marked.
+    for d in ["notes", "Drafts", ".trash"] {
+        std::fs::create_dir_all(Path::new(&p.vault_path).join(d)).unwrap();
+    }
+    let l = env.host.list_folders(p.clone()).unwrap();
+    let names: Vec<(&str, bool, bool)> = l.folders.iter().map(|f| (f.name.as_str(), f.remote, f.local)).collect();
+    assert_eq!(
+        names,
+        vec![("Drafts", false, true), ("inputs", true, false), ("Notes", true, true)]
+    );
+    assert!(env.mock.writes().is_empty(), "{:?}", env.mock.writes());
+    assert!(!Path::new(&p.state_dir).exists(), "no state folder is created");
+
+    let mut closed = p.clone();
+    closed.url = "http://127.0.0.1:9".into();
+    assert!(matches!(
+        env.host.list_folders(closed),
+        Err(LiveSyncError::Remote { .. })
+    ));
+    let mut bad = p.clone();
+    bad.url = "ftp://x".into();
+    assert!(matches!(env.host.list_folders(bad), Err(LiveSyncError::Invalid { .. })));
+    env.mock.put(
+        serde_json::json!({"_id": "f:abc", "path": "/\\:%=x", "type": "plain", "children": [],
+        "ctime": 1, "mtime": 1, "size": 1, "eden": {}}),
+    );
+    match env.host.list_folders(p) {
+        Err(LiveSyncError::Refused { msg }) => assert!(msg.contains("encrypt"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+}

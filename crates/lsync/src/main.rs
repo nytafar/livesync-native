@@ -81,6 +81,14 @@ enum Cmd {
         #[command(flatten)]
         push: PushOpts,
     },
+    /// List the remote's top-level folders (files and size each) against the
+    /// folder scope, to choose includes or excludes. Reads file metadata only,
+    /// never chunks, and never writes to the remote
+    Folders {
+        /// Print JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show index state, last gate result and files needing attention
     Status {
         #[arg(long)]
@@ -173,6 +181,7 @@ fn run(cli: Cli) -> Result<u8> {
             Ok(0)
         }
         Cmd::Probe(args) => probe::run(args),
+        Cmd::Folders { json } => rt()?.block_on(folders(&cfg, json)),
         Cmd::Connect { adopt_tweaks, json } => rt()?.block_on(async {
             let engine = engine_for(&cfg, &cli.profile, &PushOpts::default())?;
             match engine.connect_gate(adopt_tweaks).await {
@@ -370,6 +379,86 @@ async fn run_sync(engine: &Engine, json: bool, fetch: bool) -> Result<u8> {
         || rep.push.failed > 0
         || rep.push.orphans_pushed > 0;
     Ok(if attention { 3 } else { 0 })
+}
+
+async fn folders(cfg: &FileConfig, json: bool) -> Result<u8> {
+    use livesync_model::scope::Coverage;
+    let url = cfg.url.clone().unwrap_or_default();
+    let database = cfg.database.clone().unwrap_or_default();
+    if url.is_empty() || database.is_empty() {
+        bail!("no remote configured (use --url/--db, LSYNC_URL/LSYNC_DB or `lsync configure`)");
+    }
+    let scope = cfg.scope()?;
+    let couch = Couch::new(&livesync_remote::RemoteConfig {
+        url,
+        database,
+        username: cfg.username.clone(),
+        password: cfg.password.clone(),
+    })?;
+    let mut l = match livesync_engine::list_remote_folders(&couch).await {
+        Ok(l) => l,
+        Err(EngineError::Refused(r)) => {
+            eprintln!("folders refused: {r}");
+            return Ok(2);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(v) = &cfg.vault {
+        l.merge_local(&livesync_engine::local_top_folders(v));
+    }
+    // A root file syncs unless the scope only lists folders.
+    let root_synced = scope.contains("root-file");
+    if json {
+        let mut v = serde_json::to_value(&l)?;
+        for (f, out) in l.folders.iter().zip(v["folders"].as_array_mut().into_iter().flatten()) {
+            out["coverage"] = serde_json::to_value(scope.coverage(&f.name))?;
+        }
+        v["root_synced"] = root_synced.into();
+        v["scope"] = scope.describe().into();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(0);
+    }
+    let mark = |c: Coverage| match c {
+        Coverage::Whole => "yes",
+        Coverage::Part => "part",
+        Coverage::None => "no",
+    };
+    println!("folder scope: {}", scope.describe());
+    println!("{:<5} {:>8} {:>10}  folder", "sync", "files", "size");
+    for f in &l.folders {
+        let note = if f.remote { "" } else { "  (local only)" };
+        println!(
+            "{:<5} {:>8} {:>10}  {}/{note}",
+            mark(scope.coverage(&f.name)),
+            f.files,
+            human_bytes(f.bytes),
+            f.name
+        );
+    }
+    println!(
+        "{:<5} {:>8} {:>10}  (files at the vault root)",
+        if root_synced { "yes" } else { "no" },
+        l.root_files,
+        human_bytes(l.root_bytes)
+    );
+    println!(
+        "{} live files in {} folders; read {} documents ({} fetched) in {:.1}s",
+        l.files,
+        l.folders.iter().filter(|f| f.remote).count(),
+        l.docs_read,
+        human_bytes(l.bytes_fetched),
+        l.elapsed_ms as f64 / 1000.0
+    );
+    Ok(0)
+}
+
+fn human_bytes(b: u64) -> String {
+    match b {
+        b if b >= 1_000_000_000 => format!("{:.1} GB", b as f64 / 1e9),
+        b if b >= 1_000_000 => format!("{:.1} MB", b as f64 / 1e6),
+        b if b >= 1_000 => format!("{:.1} kB", b as f64 / 1e3),
+        b => format!("{b} B"),
+    }
 }
 
 fn rt() -> Result<tokio::runtime::Runtime> {

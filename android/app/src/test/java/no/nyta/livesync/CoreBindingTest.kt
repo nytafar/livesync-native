@@ -64,6 +64,25 @@ class CoreBindingTest {
     }
 
     @Test
+    fun listingFoldersCrossesTheBoundary() {
+        val host = LiveSync(File(tmp.root, "logs").path)
+        val cfg = Core.toConfig(profile("vault"), File(tmp.root, "state/p1").path, "secret-pw")
+        try {
+            host.listFolders(cfg)
+            fail("listed folders without a server")
+        } catch (e: LiveSyncException.Remote) {
+            assertTrue(e.message!!.contains("cannot reach"))
+        }
+        try {
+            host.listFolders(cfg.copy(url = "ftp://x"))
+            fail("an ftp URL was accepted")
+        } catch (e: LiveSyncException.Invalid) {
+            // expected
+        }
+        host.close()
+    }
+
+    @Test
     fun hostRunsAProfileAndReportsState() {
         val host = LiveSync(File(tmp.root, "logs").path)
         val seen = CopyOnWriteArrayList<RunState>()

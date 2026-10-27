@@ -27,7 +27,8 @@ Requires Android 11 or later. Build the APK with `scripts/build-apk.sh` (see [AG
 1. Grant all-files access, notifications and the battery exemption on the setup screen.
 2. Pick a **new** folder under `Documents/Obsidian/`.
 3. Enter your CouchDB URL, database, user and password, then press Test connection.
-4. Save. Once the first sync finishes, open the folder in Obsidian ("Open folder as vault") and leave the LiveSync plugin off there.
+4. Choose the folders to sync: a passing test lists the server's top-level folders with their file counts and sizes; tick them, or type a path.
+5. Save. Once the first sync finishes, open the folder in Obsidian ("Open folder as vault") and leave the LiveSync plugin off there.
 
 ### `lsync`, the command-line client
 
@@ -137,6 +138,8 @@ lsync daemon --pull-only    # follow changes, read-only
 lsync fetch                 # start over from the remote (upstream's "Fetch"), clears a lock
 lsync status                # index summary, last gate result, files needing attention
 
+lsync folders               # the server's top-level folders (files, size) against the folder scope;
+                            # reads file metadata only, never chunks, and never writes
 lsync --include Notes,Projects configure   # sync only these folders (saved in the profile)
 lsync --exclude Private configure          # sync everything except these
 lsync --all-folders configure              # back to everything

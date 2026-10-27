@@ -20,6 +20,17 @@ class FormatsTest {
     }
 
     @Test
+    fun sizesAreShortDecimalUnits() {
+        assertEquals("0 B", Formats.size(0, en))
+        assertEquals("999 B", Formats.size(999, en))
+        assertEquals("7.0 kB", Formats.size(7_000, en))
+        assertEquals("365.2 MB", Formats.size(365_200_000, en))
+        assertEquals("1.8 GB", Formats.size(1_800_000_000, en))
+        assertEquals("4481 files · 365.2 MB", Formats.filesAndSize(4481, 365_200_000, en))
+        assertEquals("1 file · 5 B", Formats.filesAndSize(1, 5, en))
+    }
+
+    @Test
     fun theGateSummaryShowsCreatedAsADate() {
         assertEquals(
             "ok: version 12 created 7 Apr 2026 13:22 locked false",

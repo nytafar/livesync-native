@@ -7,6 +7,8 @@
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
@@ -183,6 +185,8 @@ pub struct Couch {
     user: Option<String>,
     password: Option<String>,
     label: String,
+    /// Response body bytes read by this client and its clones.
+    rx_bytes: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Couch {
@@ -254,11 +258,18 @@ impl Couch {
             user,
             password,
             label,
+            rx_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// Response body bytes read so far by this client and its clones (the
+    /// decoded JSON responses; 404 bodies of single-document reads excluded).
+    pub fn bytes_received(&self) -> u64 {
+        self.rx_bytes.load(Ordering::Relaxed)
     }
 
     fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -287,12 +298,13 @@ impl Couch {
         Ok(resp)
     }
 
-    async fn json<T: serde::de::DeserializeOwned>(what: &str, resp: reqwest::Response) -> Result<T> {
+    async fn json<T: serde::de::DeserializeOwned>(&self, what: &str, resp: reqwest::Response) -> Result<T> {
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(|e| RemoteError::Transport {
             what: what.into(),
             source: e,
         })?;
+        self.rx_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes[..bytes.len().min(500)]).into_owned();
             return Err(RemoteError::Http {
@@ -310,13 +322,13 @@ impl Couch {
     /// `GET /` on the server.
     pub async fn server_root(&self) -> Result<Value> {
         let r = self.send("server root", self.http.get(self.server.clone())).await?;
-        Self::json("server root", r).await
+        self.json("server root", r).await
     }
 
     /// `GET /{db}`.
     pub async fn db_info(&self) -> Result<DbInfo> {
         let r = self.send("database info", self.http.get(self.db.clone())).await?;
-        Self::json("database info", r).await
+        self.json("database info", r).await
     }
 
     /// `GET /{db}/{id}`, `None` on 404. Supports `_local/<name>` IDs.
@@ -353,7 +365,7 @@ impl Couch {
         if r.status() == StatusCode::CONFLICT {
             return Ok(PutOutcome::Conflict);
         }
-        let v: Value = Self::json(&what, r).await?;
+        let v: Value = self.json(&what, r).await?;
         let rev = v
             .get("rev")
             .and_then(Value::as_str)
@@ -375,7 +387,7 @@ impl Couch {
             json!({ "docs": docs, "new_edits": false })
         };
         let r = self.send("_bulk_docs", self.http.post(url).json(&body)).await?;
-        Self::json("_bulk_docs", r).await
+        self.json("_bulk_docs", r).await
     }
 
     /// `POST /{db}/_all_docs` with `keys` and without bodies: which documents
@@ -385,7 +397,7 @@ impl Couch {
         let r = self
             .send("_all_docs", self.http.post(url).json(&json!({ "keys": keys })))
             .await?;
-        let resp: AllDocsResponse = Self::json("_all_docs", r).await?;
+        let resp: AllDocsResponse = self.json("_all_docs", r).await?;
         Ok(resp.rows)
     }
 
@@ -413,7 +425,7 @@ impl Couch {
             }
         }
         let r = self.send("_all_docs", self.http.get(url)).await?;
-        let resp: AllDocsResponse = Self::json("_all_docs", r).await?;
+        let resp: AllDocsResponse = self.json("_all_docs", r).await?;
         Ok(resp.rows)
     }
 
@@ -445,7 +457,7 @@ impl Couch {
                 None => DocFetch::Missing(String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).into_owned()),
             });
         }
-        Self::json(&what, r).await.map(DocFetch::Found)
+        self.json(&what, r).await.map(DocFetch::Found)
     }
 
     /// Filtered `_changes` with `include_docs` and `conflicts`.
@@ -472,7 +484,7 @@ impl Couch {
         let r = self
             .send("_changes", self.http.post(url).json(&changes_selector()))
             .await?;
-        Self::json("_changes", r).await
+        self.json("_changes", r).await
     }
 
     /// `POST /{db}/_all_docs?include_docs=true` with `keys`.
@@ -484,7 +496,7 @@ impl Couch {
         let r = self
             .send("_all_docs", self.http.post(url).json(&json!({ "keys": keys })))
             .await?;
-        let resp: AllDocsResponse = Self::json("_all_docs", r).await?;
+        let resp: AllDocsResponse = self.json("_all_docs", r).await?;
         Ok(resp.rows)
     }
 }

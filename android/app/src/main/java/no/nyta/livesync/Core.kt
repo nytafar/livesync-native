@@ -1,5 +1,6 @@
 package no.nyta.livesync
 
+import no.nyta.livesync.core.FolderList
 import no.nyta.livesync.core.GateResult
 import no.nyta.livesync.core.LiveSync
 import no.nyta.livesync.core.ProfileConfig
@@ -45,6 +46,14 @@ class Core(
 
     fun connectTest(p: Profile, password: String): GateResult =
         host.connectTest(toConfig(p, profiles.stateDir(p.id).path, password), scratchDir.path)
+
+    /**
+     * The server's top-level folders (files and size each) for the scope
+     * picker, with the vault's local-only folders marked. Reads metadata only
+     * and never writes to the server. Throws `LiveSyncException`.
+     */
+    fun listFolders(p: Profile, password: String): FolderList =
+        host.listFolders(toConfig(p, profiles.stateDir(p.id).path, password))
 
     fun status(p: Profile): ProfileStatus = host.status(p.id, p.vaultPath, profiles.stateDir(p.id).path)
 

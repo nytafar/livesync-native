@@ -15,6 +15,18 @@ object Formats {
     fun created(ms: Long, locale: Locale = Locale.getDefault(), tz: TimeZone = TimeZone.getDefault()): String =
         if (ms <= 0) "–" else dateTime(ms, locale, tz)
 
+    /** A byte count in decimal units, one decimal: `365.2 MB`. */
+    fun size(bytes: Long, locale: Locale = Locale.getDefault()): String = when {
+        bytes >= 1_000_000_000 -> String.format(locale, "%.1f GB", bytes / 1e9)
+        bytes >= 1_000_000 -> String.format(locale, "%.1f MB", bytes / 1e6)
+        bytes >= 1_000 -> String.format(locale, "%.1f kB", bytes / 1e3)
+        else -> "$bytes B"
+    }
+
+    /** `4481 files · 365.2 MB`. */
+    fun filesAndSize(files: Long, bytes: Long, locale: Locale = Locale.getDefault()): String =
+        "$files ${if (files == 1L) "file" else "files"} · ${size(bytes, locale)}"
+
     private val createdInGate = Regex("""\bcreated (\d{10,})\b""")
 
     /**
