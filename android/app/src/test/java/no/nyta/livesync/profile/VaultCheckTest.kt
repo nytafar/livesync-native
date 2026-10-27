@@ -3,6 +3,7 @@ package no.nyta.livesync.profile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeFalse
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -48,5 +49,25 @@ class VaultCheckTest {
         assertTrue(r.warnings.any { it.contains("LiveSync plugin") })
         assertTrue("warnings do not block", r.errors.isEmpty())
         assertEquals(listOf("notes"), VaultCheck.topFolders(v))
+    }
+
+    @Test
+    fun anUnwritableFolderNamesTheAccessThisReleaseUses() {
+        val v = File(root, "Documents/Obsidian/ro").apply { mkdirs() }
+        assertTrue(v.setWritable(false, false))
+        try {
+            assumeFalse("running as root: every folder is writable", v.canWrite())
+            // Android 11+ keeps main's wording; Android 9 and 10 name the storage permission.
+            assertEquals(
+                listOf("The folder cannot be written (is all-files access granted?)"),
+                VaultCheck.inspect(v.path, root).errors,
+            )
+            assertEquals(
+                listOf("The folder cannot be written (is storage access granted?)"),
+                VaultCheck.inspect(v.path, root, access = "storage access").errors,
+            )
+        } finally {
+            v.setWritable(true, false)
+        }
     }
 }

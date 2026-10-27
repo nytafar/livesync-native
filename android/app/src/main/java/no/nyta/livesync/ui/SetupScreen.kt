@@ -112,7 +112,7 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
 
     LaunchedEffect(vaultPath, checks.allFiles) {
         report = if (vaultPath.trimEnd('/').isEmpty()) null else withContext(Dispatchers.IO) {
-            VaultCheck.inspect(vaultPath.trimEnd('/'), Perms.sharedRoot())
+            VaultCheck.inspect(vaultPath.trimEnd('/'), Perms.sharedRoot(), Perms.storageAccess().phrase)
         }
     }
     val cleanVault = vaultPath.trimEnd('/')

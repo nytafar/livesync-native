@@ -24,8 +24,10 @@ object VaultCheck {
     /**
      * Inspect a folder. [sharedRoot] is the root of shared storage (the vault
      * must be inside it, and not in another app's private `Android/` folder).
+     * [access] names the grant that makes it writable on this Android release
+     * (`StorageAccess.phrase`): all-files access from Android 11, storage access below.
      */
-    fun inspect(path: String, sharedRoot: File): VaultReport {
+    fun inspect(path: String, sharedRoot: File, access: String = "all-files access"): VaultReport {
         val dir = File(path)
         val errors = mutableListOf<String>()
         val warnings = mutableListOf<String>()
@@ -46,7 +48,7 @@ object VaultCheck {
         val isDir = dir.isDirectory
         if (exists && !isDir) errors += "This is a file, not a folder"
         val writable = if (isDir) dir.canWrite() else dir.parentFile?.let { canCreateIn(it) } ?: false
-        if (!writable && errors.isEmpty()) errors += "The folder cannot be written (is all-files access granted?)"
+        if (!writable && errors.isEmpty()) errors += "The folder cannot be written (is $access granted?)"
         val files = if (isDir) countFiles(dir) else 0
         val obsidian = File(dir, ".obsidian").isDirectory
         val pluginOn = obsidian && liveSyncEnabled(dir)
