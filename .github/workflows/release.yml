@@ -40,7 +40,7 @@ env:
   # (those used the commit count; the phone had versionCode VERSION_CODE_FLOOR
   # when this was set up). Only ever raise VERSION_CODE_BASE.
   VERSION_CODE_BASE: "1000"
-  VERSION_CODE_FLOOR: "29"
+  VERSION_CODE_FLOOR: "30"
 
 jobs:
   version:

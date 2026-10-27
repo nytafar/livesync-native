@@ -49,6 +49,23 @@ scripts/build-android.sh         # -> target/aarch64-linux-android/release/lsync
 
 The binary links only `libc`, `libm` and `libdl`. TLS is rustls with bundled webpki roots, so it needs no JVM and no platform verifier.
 
+## CI and releasing
+
+`.github/workflows/ci.yml` runs the gate on Linux and macOS and the Android gate (`scripts/build-apk.sh --unsigned`) on every push and PR.
+
+A release is a pushed tag; `.github/workflows/release.yml` does the rest:
+
+```sh
+git tag -a v0.2.0 -m "v0.2.0" && git push origin v0.2.0
+gh run watch "$(gh run list -w Release -L1 --json databaseId -q '.[0].databaseId')"
+```
+
+- Tags are `v<major>.<minor>.<patch>[-<pre>]`; a `-<pre>` tag makes a pre-release. The APK's versionName is the tag without `v`; its versionCode is `VERSION_CODE_BASE` (in the workflow) plus the workflow's run number, so it rises with every run. Only ever raise the base; renaming the workflow file resets the run number.
+- Assets: `livesync-android-<version>.apk` (signed with the sideload key), `lsync-<version>-<target>.tar.gz` for `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin` and `aarch64-linux-android` (Termux), `SHA256SUMS`, notes with the commits since the previous tag.
+- Signing comes from repository secrets `SIDELOAD_KEYSTORE_BASE64`, `SIDELOAD_STORE_PASSWORD`, `SIDELOAD_KEY_PASSWORD` (and optional `SIDELOAD_KEY_ALIAS`, default `livesync`); the optional repository variable `SIDELOAD_CERT_SHA256` pins the signer. A tag push without them fails; it is never released unsigned.
+- `gh workflow run release.yml -f version=0.0.0-ci-test` builds the same assets into a draft release (unsigned when the secrets are missing) without creating a tag. Delete it afterwards: `gh release delete v0.0.0-ci-test --yes`.
+- A hand build with `scripts/build-apk.sh` uses the commit count as versionCode, which is below every CI release: set `LIVESYNC_VERSION_CODE` above the installed one to install it over a release.
+
 ## Dev database: rules
 
 - **Never connect to the real CouchDB (port 8410).** Development uses only the dev container `lsync-dev-couchdb` at `127.0.0.1:8411`. Its credentials are in `~/.config/livesync-android/dev.env`.
