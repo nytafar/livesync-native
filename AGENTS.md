@@ -68,6 +68,22 @@ KEEP=1 ONLY="S4 S6" scripts/interop.sh
 
 It creates `lsync-it-<run>` on the dev container, drives the official CLI (`~/code/ref/obsidian-livesync/src/apps/cli/dist/index.cjs`, run with `node` directly) and `lsync` through the M2 scenarios, and prints PASS/FAIL lines. It refuses any URL other than `127.0.0.1:8411`.
 
+## Benchmark against the official clients
+
+Not part of the gate. `scripts/bench/` compares lsync with the official LiveSync CLI and the official plug-in (in a throwaway, headless Obsidian) on clones of one snapshot of the real database, with the phone's folder excludes:
+
+```sh
+scripts/bench/snapshot.sh          # once: copy the real `vault` into bench-snap on the dev container
+scripts/bench/run.sh --reps 3      # cold sync, catch-up, idle, live latency -> $BENCH_WORK/results.jsonl
+python3 scripts/bench/summarise.py "$BENCH_WORK"
+```
+
+- `snapshot.sh` is the one script allowed to touch port 8410, and only to read: the dev container replicates from it with `use_checkpoints: false` (nothing is written to the source) and the `_local` LiveSync docs are copied with GETs.
+- Every run writes to its own `bench-*` clone on the dev container, re-cloned for each repetition.
+- lsync runs as the `lsync-bench` systemd user unit (`scripts/bench/install-unit.sh` installs it, never enables it; profile in `~/.config/lsync/bench.toml`, mode 0600).
+- The plug-in contender needs `npm run build` in the official repo and an extracted Obsidian AppImage at `~/scratch/lsync-bench/obsidian/squashfs-root` (`OBSIDIAN_DIR` overrides). It uses its own `--user-data-dir`, HOME and remote-debugging port (9333, never 9222).
+- `run.sh` turns on CORS on the dev container (the same origins as the real server), which the plug-in needs.
+
 ## End-to-end check against the dev database
 
 ```sh

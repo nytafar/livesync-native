@@ -45,18 +45,22 @@ Full usage is under [Reference](#reference).
 
 ## How it compares
 
-Measured on a copy of the same database, with the same folders excluded, on the same Linux machine.
+Measured on oma (i9-10900K, btrfs on NVMe, Linux), on clones of one snapshot of a real 425,000-document database (about 2,200 files in scope after the phone's folder excludes), with lsync's release build, the official LiveSync CLI 1.0.40 and Node 26. Medians of 3 runs for lsync and 1–2 for the CLI.
 
 | | lsync | Official LiveSync CLI | Obsidian plugin |
 |---|---|---|---|
-| First sync (wall time) | _pending_ | _pending_ | _pending_ |
-| Peak memory | _pending_ | _pending_ | _pending_ |
-| Local state on disk | _pending_ | _pending_ | _pending_ |
-| Catch-up after 1,000 changes | _pending_ | _pending_ | _pending_ |
-| Change to file, live | _pending_ | _pending_ | _pending_ |
-| Idle CPU and memory | _pending_ | _pending_ | _pending_ |
+| First sync (wall time) | 21 s | 20–25 min | deferred |
+| CPU time, first sync | 2.4 s | 1,440–1,760 s | deferred |
+| Peak memory, first sync | 96 MB | 2.9 GB | deferred |
+| Local state on disk | 2.2 MB (SQLite index) | 156 MB (full PouchDB replica) | deferred |
+| Catch-up after 1,000 changes | 3.7 s | 12 min | deferred |
+| Change on the server to file, live | 0.01 s | 0.8 s | deferred |
+| File change to the server, live | 2.5 s | 0.9 s | deferred |
+| Idle (4 min) | 0.02 s CPU, 27 MB | 0.2 s CPU, 430 MB | deferred |
 
-_Benchmark in progress; the scripts are in `scripts/bench/`._
+Both clients wrote the same 2,202 files byte for byte (lsync also writes the two conflicted files, which the CLI skips). The CLI's slow first sync is mostly one upstream hot spot: its key-value store rewrites a 34 MB JSON file on every write. The desktop plugin doesn't use that store, so the CLI numbers are not the plugin's. lsync waits 2 s for a changed file to settle before it pushes, which guards against half-written files. That is why it is slower in that one row.
+
+To rerun: `scripts/bench/snapshot.sh` once, then `scripts/bench/run.sh --contenders lsync,official` and `python3 scripts/bench/summarise.py "$BENCH_WORK"`. See `AGENTS.md` for the prerequisites.
 
 ## Safety
 

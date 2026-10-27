@@ -1,0 +1,18 @@
+# lsync as a long-lived daemon on a desktop host, against a dev database.
+# Installed by scripts/bench/install-unit.sh as ~/.config/systemd/user/lsync-bench.service.
+# The profile's settings (remote, database, vault, scope, password) live in
+# ~/.config/lsync/bench.toml (mode 0600), written by `lsync --profile bench configure`.
+[Unit]
+Description=lsync daemon (profile bench, dev CouchDB)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@BIN@ --profile bench daemon
+Restart=on-failure
+RestartSec=5
+# The engine logs to stderr; journald keeps it (journalctl --user -u lsync-bench).
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

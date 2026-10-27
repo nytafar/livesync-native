@@ -3,3 +3,4 @@ tools/golden/node_modules/
 *.sqlite
 *.sqlite-*
 dist/
+__pycache__/
