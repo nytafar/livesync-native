@@ -6,6 +6,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -299,23 +300,27 @@ class SyncService : Service() {
             prefs.edit { putString(key, value) }
             postAlert(id, p.id, title, text())
         }
-        val base = alertBase(p.id)
-        once("orphans-${p.id}", st.rebuildOrphans, base, "${p.name}: files pushed back after a rebuild") {
+        once("orphans-${p.id}", st.rebuildOrphans, ALERT_ORPHANS, "${p.name}: files pushed back after a rebuild") {
             st.rebuildOrphans!!.substringAfter(' ') + " Check them in Obsidian."
         }
-        once("safety-${p.id}", st.safetyStop, base + 1, "${p.name}: deletions held back") {
+        once("safety-${p.id}", st.safetyStop, ALERT_SAFETY, "${p.name}: deletions held back") {
             st.safetyStop!!.substringAfter(' ') + " Open LiveSync to decide."
         }
     }
 
-    private fun postAlert(id: Int, profileId: String, title: String, text: String) {
+    /**
+     * Post a vault's alert of one [kind]. A notification is named by the
+     * vault's ID as its tag plus [kind], so no two vaults share one.
+     */
+    private fun postAlert(kind: Int, profileId: String, title: String, text: String) {
         if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return
-        // Opens that vault's status screen. The request code is the alert's
-        // own ID: extras do not tell PendingIntents apart, so with one code
-        // every alert would open the vault of whichever was posted last.
+        // Opens that vault's status screen. Extras do not tell PendingIntents
+        // apart, so the vault and the kind go into the intent's data: with
+        // one identity, every alert would open the vault posted last.
         val open = PendingIntent.getActivity(
-            this, id,
+            this, kind,
             Intent(this, MainActivity::class.java)
+                .setData(Uri.fromParts("livesync-alert", profileId, kind.toString()))
                 .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 .putExtra(MainActivity.EXTRA_OPEN_PROFILE, profileId),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
@@ -329,7 +334,7 @@ class SyncService : Service() {
             .setContentIntent(open)
             .build()
         try {
-            NotificationManagerCompat.from(this).notify(id, n)
+            NotificationManagerCompat.from(this).notify(alertTag(profileId), kind, n)
         } catch (e: SecurityException) {
             // Permission revoked meanwhile.
         }
@@ -457,15 +462,16 @@ class SyncService : Service() {
                 remove("orphans-$profileId")
                 remove("safety-$profileId")
             }
-            val base = alertBase(profileId)
             NotificationManagerCompat.from(context).apply {
-                cancel(base)
-                cancel(base + 1)
+                cancel(alertTag(profileId), ALERT_ORPHANS)
+                cancel(alertTag(profileId), ALERT_SAFETY)
             }
         }
 
-        /** The first of a profile's alert notification IDs (the status notification is 1). */
-        private fun alertBase(profileId: String) = 1000 + (profileId.hashCode() and 0xffff) * 4
+        /** A vault's alerts: tagged with its full ID, never a hash that two IDs can share. */
+        private fun alertTag(profileId: String) = "alert-$profileId"
+        private const val ALERT_ORPHANS = 1
+        private const val ALERT_SAFETY = 2
 
         fun syncNow(context: Context, profileId: String?) {
             val i = Intent(context, SyncService::class.java).setAction(ACTION_SYNC_NOW)
