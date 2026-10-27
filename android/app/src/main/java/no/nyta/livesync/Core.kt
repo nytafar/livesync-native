@@ -1,5 +1,6 @@
 package no.nyta.livesync
 
+import no.nyta.livesync.core.Cancel
 import no.nyta.livesync.core.FolderList
 import no.nyta.livesync.core.GateResult
 import no.nyta.livesync.core.LiveSync
@@ -50,10 +51,11 @@ class Core(
     /**
      * The server's top-level folders (files and size each) for the scope
      * picker, with the vault's local-only folders marked. Reads metadata only
-     * and never writes to the server. Throws `LiveSyncException`.
+     * and never writes to the server. Throws `LiveSyncException`; `Other`
+     * when [cancel] was cancelled, which ends the download at once.
      */
-    fun listFolders(p: Profile, password: String): FolderList =
-        host.listFolders(toConfig(p, profiles.stateDir(p.id).path, password))
+    fun listFolders(p: Profile, password: String, cancel: Cancel?): FolderList =
+        host.listFolders(toConfig(p, profiles.stateDir(p.id).path, password), cancel)
 
     fun status(p: Profile): ProfileStatus = host.status(p.id, p.vaultPath, profiles.stateDir(p.id).path)
 

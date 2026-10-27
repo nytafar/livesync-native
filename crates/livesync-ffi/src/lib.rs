@@ -15,7 +15,7 @@ pub mod logging;
 pub mod profile;
 pub mod status;
 
-pub use folders::{FolderInfo, FolderList};
+pub use folders::{Cancel, FolderInfo, FolderList};
 pub use host::{LiveSync, RunState, StatusListener, VaultAccess};
 pub use profile::{check_scope, paths_overlap, ProfileConfig, ScopeKind};
 pub use status::{AttentionItem, GateOutcome, GateResult, ProfileStatus, StateCount};

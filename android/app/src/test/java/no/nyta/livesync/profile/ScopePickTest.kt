@@ -52,4 +52,17 @@ class ScopePickTest {
         assertTrue(ScopePick.rootSyncs(ScopeMode.EXCLUDE))
         assertFalse(ScopePick.rootSyncs(ScopeMode.INCLUDE))
     }
+
+    @Test
+    fun aTickMeansWhatIsSaved() {
+        // Typed with slack around the slashes: saved without it, and ticked as such.
+        val saved = ProfileRules.parseFolders("/ Notes\n inputs / corpora \nArchive\\")
+        assertEquals(listOf("Notes", "inputs/corpora", "Archive"), saved)
+        assertTrue(ScopePick.ticked(saved, "Notes"))
+        assertTrue(ScopePick.ticked(saved, "archive"))
+        assertEquals(listOf("inputs/corpora"), ScopePick.nestedIn(saved, "inputs"))
+        // A name with a space at either end is not the trimmed entry.
+        assertFalse(ScopePick.ticked(saved, " Notes"))
+        assertFalse(ScopePick.ticked(listOf(" Notes"), "Notes"))
+    }
 }

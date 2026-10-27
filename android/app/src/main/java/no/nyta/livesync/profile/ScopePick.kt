@@ -7,11 +7,17 @@ import java.util.Locale
  * typed list stays the source of truth: a tap adds or removes exactly that
  * folder, and typed entries further down (`inputs/corpora`) are left alone.
  * Entries are compared as the engine normalises them: `/` and `\` both
- * separate, empty segments drop out, case does not matter.
+ * separate, empty segments drop out, case does not matter, and nothing is
+ * trimmed (the typed list trims when it is parsed, see
+ * [ProfileRules.parseFolders]).
  */
 object ScopePick {
+    /**
+     * The engine's `normalise_prefix`, exactly: no trimming, so a name with a
+     * space at either end never matches the trimmed entry the list saves.
+     */
     private fun key(s: String) =
-        s.trim().split('/', '\\').filter { it.isNotEmpty() }.joinToString("/").lowercase(Locale.ROOT)
+        s.split('/', '\\').filter { it.isNotEmpty() }.joinToString("/").lowercase(Locale.ROOT)
 
     /**
      * Whether a tap may add [name] to the typed list and have it saved as

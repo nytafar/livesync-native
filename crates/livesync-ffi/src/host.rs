@@ -7,7 +7,7 @@
 //! what ends one is local and fatal, such as an index error, and is shown as
 //! `Failed` with the error until the next attempt.
 
-use crate::folders::FolderList;
+use crate::folders::{Cancel, FolderList};
 use crate::profile::{paths_overlap, ProfileConfig};
 use crate::status::{self, GateResult, ProfileStatus};
 use crate::{logging, LiveSyncError};
@@ -611,7 +611,8 @@ impl LiveSync {
     /// when it exists. Reads file metadata documents only, never chunks, and
     /// never writes to the remote. Works for settings that are not saved yet
     /// (no engine, no index). Refuses a database with encrypted paths.
-    pub fn list_folders(&self, cfg: ProfileConfig) -> Result<FolderList, LiveSyncError> {
+    /// [`Cancel::cancel`] on `cancel` ends it at once with `Other`.
+    pub fn list_folders(&self, cfg: ProfileConfig, cancel: Option<Arc<Cancel>>) -> Result<FolderList, LiveSyncError> {
         let url = cfg.url.trim();
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return Err(LiveSyncError::Invalid {
@@ -624,9 +625,23 @@ impl LiveSync {
             });
         }
         let couch = Couch::new(&cfg.remote()).map_err(|e| LiveSyncError::Invalid { msg: e.to_string() })?;
-        let listed = self
-            .rt
-            .block_on(async { tokio::time::timeout(LIST_TIMEOUT, livesync_engine::list_remote_folders(&couch)).await });
+        let listed = self.rt.block_on(async {
+            let listing = tokio::time::timeout(LIST_TIMEOUT, livesync_engine::list_remote_folders(&couch));
+            match &cancel {
+                // Dropping the listing closes its connection: nothing more is fetched.
+                Some(c) => tokio::select! {
+                    l = listing => Some(l),
+                    _ = c.cancelled() => None,
+                },
+                None => Some(listing.await),
+            }
+        });
+        let Some(listed) = listed else {
+            info!("listing the folders of {} cancelled", cfg.database);
+            return Err(LiveSyncError::Other {
+                msg: "the listing was cancelled".into(),
+            });
+        };
         let mut l = match listed {
             Ok(Ok(l)) => l,
             Ok(Err(EngineError::Remote(e))) => {

@@ -1,5 +1,6 @@
 package no.nyta.livesync
 
+import no.nyta.livesync.core.Cancel
 import no.nyta.livesync.core.GateOutcome
 import no.nyta.livesync.core.LiveSync
 import no.nyta.livesync.core.LiveSyncException
@@ -10,7 +11,9 @@ import no.nyta.livesync.core.checkScope
 import no.nyta.livesync.core.coreVersion
 import no.nyta.livesync.core.pathsOverlap
 import no.nyta.livesync.profile.Profile
+import no.nyta.livesync.profile.ProfileRules
 import no.nyta.livesync.profile.ScopeMode
+import no.nyta.livesync.profile.ScopePick
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -68,18 +71,47 @@ class CoreBindingTest {
         val host = LiveSync(File(tmp.root, "logs").path)
         val cfg = Core.toConfig(profile("vault"), File(tmp.root, "state/p1").path, "secret-pw")
         try {
-            host.listFolders(cfg)
+            host.listFolders(cfg, null)
             fail("listed folders without a server")
         } catch (e: LiveSyncException.Remote) {
             assertTrue(e.message!!.contains("cannot reach"))
         }
         try {
-            host.listFolders(cfg.copy(url = "ftp://x"))
+            host.listFolders(cfg.copy(url = "ftp://x"), null)
             fail("an ftp URL was accepted")
         } catch (e: LiveSyncException.Invalid) {
             // expected
         }
+        // Cancelled before the call: no request, refused as cancelled.
+        val cancel = Cancel()
+        cancel.cancel()
+        assertTrue(cancel.isCancelled())
+        try {
+            host.listFolders(cfg, cancel)
+            fail("a cancelled listing ran")
+        } catch (e: LiveSyncException.Other) {
+            assertTrue(e.message!!.contains("cancelled"))
+        }
+        cancel.close()
         host.close()
+    }
+
+    @Test
+    fun aTickedFolderIsOneTheEngineReadsTheSavedScopeAsListing() {
+        // What the picker shows ticked against what the engine makes of the
+        // saved list (its own normalisation, through check_scope).
+        val typed = listOf("/ Notes", "Notes\\", " notes /", "Work & Personal", "inputs/corpora", "a\\b", "  Archive  ,x", "My Notes")
+        val names = listOf("Notes", "notes", "Work & Personal", "inputs", "Archive", "a", "x", "My Notes", " Notes")
+        for (t in typed) {
+            val saved = ProfileRules.parseFolders(t)
+            val engine = checkScope(ScopeKind.INCLUDE, saved)
+            for (n in names) {
+                val listed = ScopePick.pickable(n) && engine.contains(checkScope(ScopeKind.INCLUDE, listOf(n)).single())
+                val ticked = ScopePick.pickable(n) && ScopePick.ticked(saved, n)
+                assertEquals("typed \"$t\", folder \"$n\"", listed, ticked)
+            }
+        }
+        assertEquals(listOf("notes"), checkScope(ScopeKind.INCLUDE, ProfileRules.parseFolders("/ Notes")))
     }
 
     @Test

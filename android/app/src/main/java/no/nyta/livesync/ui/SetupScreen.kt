@@ -25,6 +25,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -44,6 +45,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import no.nyta.livesync.LiveSyncApp
+import no.nyta.livesync.core.Cancel
 import no.nyta.livesync.core.GateOutcome
 import no.nyta.livesync.core.GateResult
 import no.nyta.livesync.profile.Profile
@@ -92,10 +94,17 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
     var saving by remember { mutableStateOf(false) }
     var saveError by remember { mutableStateOf<String?>(null) }
     var folderLoad by remember { mutableStateOf<FolderLoad>(FolderLoad.Idle) }
-    // The connect-test key the list was made for (setup), so changed
-    // credentials hide a stale list.
+    // The connect-test key (server, user, typed password) the list was made
+    // for, so changed credentials hide a stale list, in setup and settings.
     var folderKey by remember { mutableStateOf<String?>(null) }
     var folderGen by remember { mutableIntStateOf(0) }
+    // The listing in flight. A listing reads every file's metadata (about
+    // 15 MB on a large vault); leaving the screen cancels it in the core,
+    // which closes its connection, instead of letting it run to its timeout.
+    val folderCancel = remember { arrayOfNulls<Cancel>(1) }
+    DisposableEffect(Unit) {
+        onDispose { folderCancel[0]?.cancel() }
+    }
 
     LaunchedEffect(vaultPath, checks.allFiles) {
         report = if (vaultPath.trimEnd('/').isEmpty()) null else withContext(Dispatchers.IO) {
@@ -130,10 +139,13 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
     fun loadFolders(pw: String, key: String) {
         val gen = ++folderGen
         val p = draft.copy(id = existing?.id ?: "connect-test")
+        val cancel = Cancel()
+        folderCancel[0]?.cancel()
+        folderCancel[0] = cancel
         folderKey = key
         folderLoad = FolderLoad.Loading
         scope.launch {
-            val r = withContext(Dispatchers.IO) { runCatching { core.listFolders(p, pw) } }
+            val r = withContext(Dispatchers.IO) { runCatching { core.listFolders(p, pw, cancel) } }
             if (gen != folderGen) return@launch
             folderLoad = r.fold({ FolderLoad.Loaded(it) }, { FolderLoad.Failed(it.message ?: it.toString()) })
         }
@@ -150,12 +162,8 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
         }
     }
 
-    // Settings: the server's folders with the current scope ticked, using the
-    // stored password (the server and database of a profile are fixed).
-    LaunchedEffect(existing?.id) {
-        if (existing != null) reloadFolders()
-    }
-
+    // Settings list only when asked ("List the folders on the server"), with
+    // the stored password: never again on every open.
     val canSave = checks.allFiles && vaultOk && urlProblem == null && scopeProblem == null &&
         draft.database.isNotEmpty() && (testPassed || !credentialsChanged) && !saving
 
@@ -253,8 +261,9 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
                         gate = g
                         testedKey = key
                         testing = false
-                        // Before anything syncs: what is on the server, to pick folders from.
-                        if (g.outcome == GateOutcome.PASSED) loadFolders(pw, key)
+                        // Before anything syncs: what is on the server, to pick
+                        // folders from. On mobile data only when asked.
+                        if (g.outcome == GateOutcome.PASSED && !Perms.metered(ctx)) loadFolders(pw, key)
                     }
                 }) { Text("Test connection") }
                 if (testing) {
@@ -279,13 +288,15 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
                     supportingText = { scopeProblem?.let { Text(it) } },
                 )
             }
-            val shown = if (editing || folderKey == testKey) folderLoad else FolderLoad.Idle
+            // Only a list made with the credentials now on the screen.
+            val shown = if (folderKey == testKey) folderLoad else FolderLoad.Idle
+            val canList = editing || testPassed
             ServerFolders(
                 load = shown,
                 mode = scopeMode,
                 folders = draft.scopeFolders,
                 onToggle = { name -> foldersText = ScopePick.toggle(ProfileRules.parseFolders(foldersText), name).joinToString("\n") },
-                onReload = if (editing || testPassed) ({ reloadFolders() }) else null,
+                onReload = if (canList) ({ reloadFolders() }) else null,
             )
             if (shown !is FolderLoad.Loaded && scopeMode != ScopeMode.ALL) {
                 // Without the server's list (not tested yet, offline, encrypted
@@ -299,8 +310,21 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: () -> Unit, onCanc
                     }
                 }
             }
-            if (!editing && shown == FolderLoad.Idle) {
-                Text("A passing connect test lists the folders on the server here.", style = MaterialTheme.typography.bodySmall)
+            if (shown == FolderLoad.Idle) {
+                if (canList) {
+                    OutlinedButton(onClick = { reloadFolders() }) { Text("List the folders on the server") }
+                    Text(
+                        if (Perms.metered(ctx)) {
+                            "You are on mobile data: listing reads every file's details from the server, about " +
+                                "1 KB per file (some 15 MB for 20,000 files)."
+                        } else {
+                            "Reads every file's details from the server, about 1 KB per file."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                } else {
+                    Text("A passing connect test lists the folders on the server here.", style = MaterialTheme.typography.bodySmall)
+                }
             }
             Text(
                 "Files outside the chosen folders are never written here and never pushed; nothing is deleted on " +

@@ -581,7 +581,7 @@ fn list_folders_reads_the_remote_and_marks_local_only_folders() {
     env.mock.put_text(".obsidian/app.json", &["{}"]);
     let p = env.profile("f", "vault-f");
     // Before the vault folder exists: the remote only.
-    let l = env.host.list_folders(p.clone()).unwrap();
+    let l = env.host.list_folders(p.clone(), None).unwrap();
     let names: Vec<(&str, i64, bool, bool)> = l
         .folders
         .iter()
@@ -593,7 +593,7 @@ fn list_folders_reads_the_remote_and_marks_local_only_folders() {
     for d in ["notes", "Drafts", ".trash"] {
         std::fs::create_dir_all(Path::new(&p.vault_path).join(d)).unwrap();
     }
-    let l = env.host.list_folders(p.clone()).unwrap();
+    let l = env.host.list_folders(p.clone(), None).unwrap();
     let names: Vec<(&str, bool, bool)> = l.folders.iter().map(|f| (f.name.as_str(), f.remote, f.local)).collect();
     assert_eq!(
         names,
@@ -605,18 +605,74 @@ fn list_folders_reads_the_remote_and_marks_local_only_folders() {
     let mut closed = p.clone();
     closed.url = "http://127.0.0.1:9".into();
     assert!(matches!(
-        env.host.list_folders(closed),
+        env.host.list_folders(closed, None),
         Err(LiveSyncError::Remote { .. })
     ));
     let mut bad = p.clone();
     bad.url = "ftp://x".into();
-    assert!(matches!(env.host.list_folders(bad), Err(LiveSyncError::Invalid { .. })));
+    assert!(matches!(
+        env.host.list_folders(bad, None),
+        Err(LiveSyncError::Invalid { .. })
+    ));
     env.mock.put(
         serde_json::json!({"_id": "f:abc", "path": "/\\:%=x", "type": "plain", "children": [],
         "ctime": 1, "mtime": 1, "size": 1, "eden": {}}),
     );
-    match env.host.list_folders(p) {
+    match env.host.list_folders(p, None) {
         Err(LiveSyncError::Refused { msg }) => assert!(msg.contains("encrypt"), "{msg}"),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn a_cancelled_listing_ends_at_once_and_closes_its_connection() {
+    let env = Env::new();
+    // Accepts connections and never answers: the listing would wait 90 s.
+    let hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = hole.local_addr().unwrap();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let keep = held.clone();
+    std::thread::spawn(move || {
+        for c in hole.incoming().flatten() {
+            keep.lock().unwrap().push(c);
+        }
+    });
+    let mut p = env.profile("cancel", "vault-cancel");
+    p.url = format!("http://{addr}");
+    let cancel = livesync_ffi::Cancel::new();
+    let host = env.host.clone();
+    let c = cancel.clone();
+    let listing = std::thread::spawn(move || {
+        let t0 = Instant::now();
+        (host.list_folders(p, Some(c)), t0.elapsed())
+    });
+    wait_until("the listing request", Duration::from_secs(10), || {
+        !held.lock().unwrap().is_empty()
+    });
+    cancel.cancel();
+    let (result, took) = listing.join().unwrap();
+    match result {
+        Err(LiveSyncError::Other { msg }) => assert!(msg.contains("cancelled"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    // The request's connection is closed: the server side reads EOF.
+    let mut conn = held.lock().unwrap().remove(0);
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = Vec::new();
+    use std::io::Read;
+    conn.read_to_end(&mut buf).expect("EOF, not a read timeout");
+    assert!(
+        String::from_utf8_lossy(&buf).contains("GET "),
+        "the request reached the server"
+    );
+
+    // Cancelled before the call: refused without a request.
+    let early = livesync_ffi::Cancel::new();
+    early.cancel();
+    let q = env.profile("cancel2", "vault-cancel2");
+    assert!(matches!(
+        env.host.list_folders(q, Some(early)),
+        Err(LiveSyncError::Other { .. })
+    ));
 }

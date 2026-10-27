@@ -16,6 +16,10 @@ import androidx.core.net.toUri
 
 /** The Android permissions and settings the app depends on (spec D3, risk 6). */
 object Perms {
+    /** Whether the active network costs per byte (mobile data, a metered hotspot); true when unknown. */
+    fun metered(ctx: Context): Boolean =
+        ctx.getSystemService(android.net.ConnectivityManager::class.java)?.isActiveNetworkMetered ?: true
+
     fun allFilesAccess(): Boolean = Environment.isExternalStorageManager()
 
     fun allFilesIntent(ctx: Context): Intent =

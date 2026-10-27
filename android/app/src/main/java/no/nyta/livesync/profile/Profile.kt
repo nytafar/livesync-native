@@ -62,9 +62,20 @@ object ProfileRules {
             host.startsWith("10.") || host == "localhost" || host.startsWith("127."))
     }
 
-    /** Split a folder list typed one per line or separated by commas. */
+    /**
+     * Split a folder list typed one per line or separated by commas. Each
+     * entry is saved as the engine will read it, so what the picker ticks is
+     * what syncs: `/` and `\` separate, empty segments drop out, and spaces
+     * around each segment are typing slack (`/ Notes` is `Notes`, never
+     * ` Notes`). A folder name that really starts or ends with a space can
+     * therefore not be listed (the picker says so).
+     */
     fun parseFolders(text: String): List<String> =
-        text.split('\n', ',').map { it.trim().trim('/') }.filter { it.isNotEmpty() }
+        text.split('\n', ',').map { normaliseFolder(it) }.filter { it.isNotEmpty() }
+
+    /** One typed folder entry as it is saved (see [parseFolders]). */
+    fun normaliseFolder(entry: String): String =
+        entry.split('/', '\\').map { it.trim() }.filter { it.isNotEmpty() }.joinToString("/")
 
     /** Problems with a folder scope, or null. Mirrors the engine's rules. */
     fun scopeProblem(mode: ScopeMode, folders: List<String>): String? {

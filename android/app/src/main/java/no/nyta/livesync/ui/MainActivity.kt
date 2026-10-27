@@ -1,5 +1,6 @@
 package no.nyta.livesync.ui
 
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -43,6 +44,13 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize()) { AppRoot(app) }
             }
         }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // The activity is not recreated (see the manifest): pick the system
+        // bars' light or dark style again after a dark-mode switch.
+        enableEdgeToEdge()
     }
 }
 

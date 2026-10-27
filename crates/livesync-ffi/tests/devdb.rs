@@ -120,7 +120,7 @@ fn listing_the_dev_database_folders_is_quick_and_read_only() {
         ignore_regex: String::new(),
     };
     let t0 = Instant::now();
-    let l = host.list_folders(cfg).unwrap();
+    let l = host.list_folders(cfg, None).unwrap();
     let wall = t0.elapsed();
     for f in &l.folders {
         println!("{:>7} {:>12}  {}/", f.files, f.bytes, f.name);

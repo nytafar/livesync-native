@@ -2,6 +2,50 @@
 //! shows them (spec "Picking folders from the server (M2)").
 
 use livesync_engine::{FolderEntry, FolderListing};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+/// Cancels a listing in flight: the app hands one to `list_folders` and
+/// cancels it when the user leaves the screen, so a listing nobody waits for
+/// stops downloading at once instead of running to its timeout.
+#[derive(Debug, Default, uniffi::Object)]
+pub struct Cancel {
+    flag: AtomicBool,
+    notify: Notify,
+}
+
+#[uniffi::export]
+impl Cancel {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Cancel::default())
+    }
+
+    /// Stop the call this was handed to (now or when it starts).
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
+
+impl Cancel {
+    /// Resolves once [`Cancel::cancel`] was called, before or after.
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            // Registered before the check, so a cancel in between still wakes it.
+            let woken = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            woken.await;
+        }
+    }
+}
 
 /// One top-level folder.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
