@@ -806,6 +806,54 @@ async fn a_second_engine_on_the_same_state_or_vault_is_refused() {
         .expect("free again once the first engine is gone");
 }
 
+// Issue #9: on a filesystem without flock (Android's shared storage, where it
+// fails with ENOSYS) two profiles on one vault folder are still refused, the
+// refusal names the holder, and nothing is written to the vault by it.
+#[tokio::test]
+async fn two_profiles_on_one_vault_without_flock_are_refused() {
+    let env = Env::new().await;
+    let no_flock = |c: &mut EngineConfig| c.vault_flock = false;
+    let first = env.engine_try(no_flock).unwrap();
+    let st = first.status().unwrap();
+    let mode = st.vault_lock.unwrap();
+    assert!(mode.starts_with("host lock only"), "{mode}");
+    let lock = env.vault().join(livesync_engine::engine::VAULT_LOCK);
+    let recorded = std::fs::read(&lock).unwrap();
+
+    let second_state = env.dir.path().join("profile-2/index.sqlite");
+    for flock in [false, true] {
+        let r = env.engine_try(|c| {
+            c.index_path = second_state.clone();
+            c.vault_flock = flock;
+        });
+        let msg = match r {
+            Err(EngineError::Busy(m)) => m,
+            other => panic!("expected busy, got {:?}", other.err()),
+        };
+        assert!(msg.contains(&format!("pid {}", std::process::id())), "{msg}");
+        assert!(
+            msg.contains(&env.dir.path().join("state").display().to_string()),
+            "{msg}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&lock).unwrap(),
+        recorded,
+        "a refused engine wrote the lock file"
+    );
+
+    drop(first);
+    let second = env
+        .engine_try(|c| {
+            c.index_path = second_state.clone();
+            c.vault_flock = false;
+        })
+        .expect("free again once the first engine is gone");
+    let rec = livesync_engine::platform::read_holder(&lock).unwrap();
+    assert_eq!(rec.state_dir, second_state.parent().unwrap().display().to_string());
+    drop(second);
+}
+
 /// Log lines emitted on this thread while the guard lives (the engine's
 /// synchronous steps run on the test thread under the current-thread runtime).
 #[derive(Clone, Default)]

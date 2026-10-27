@@ -3,6 +3,7 @@
 
 use crate::fsrules::{FsRules, PROBED_CHARS};
 use crate::index::{FileRow, Index, LocalIssue, PendingRow, State};
+use crate::platform::{self, Holder, VaultLock, VaultLockError};
 use crate::vaultfs::{self, DiskState, Expect, LockError, LockFile, RemoveOutcome, WriteError};
 use futures::stream::{self, StreamExt};
 use livesync_model::chunk::chunk_id_xxhash64;
@@ -48,6 +49,8 @@ pub(crate) mod meta_keys {
     pub const SCOPE: &str = "scope";
     /// The probed filesystem rules (JSON).
     pub const FS_RULES: &str = "fs_rules";
+    /// Which vault locks the last open took (`VaultLock::mode`), for status.
+    pub const VAULT_LOCK: &str = "vault_lock";
     /// Set when a full fetch is owed: a fresh index, a rebuild seen on the
     /// remote, or an explicit `request_full_fetch`. Cleared by the two-way
     /// side once it caught up (after the quiet wait when one is owed) and
@@ -95,7 +98,8 @@ pub const COLLISION_NOTE: &str = "case collision with";
 
 /// Lock file in the state directory (next to the index).
 pub const STATE_LOCK: &str = "lsync.lock";
-/// Lock file at the vault root, so two profiles cannot share a vault either.
+/// Lock file at the vault root, so two profiles cannot share a vault either
+/// (flocked where the filesystem allows it; see `platform::lock_vault`).
 pub const VAULT_LOCK: &str = ".lsync.lock";
 
 /// Minimum spacing between pending retries in the daemon, so a retry that
@@ -157,6 +161,10 @@ pub struct EngineConfig {
     /// the front-end, e.g. Android's "all files access" check). `None`: no
     /// check beyond the engine's own.
     pub access_check: Option<AccessCheck>,
+    /// Take an flock on the vault's `.lsync.lock` as well as the host lock
+    /// (default). `false` behaves as if flock failed with ENOSYS, as on
+    /// Android's shared storage, so tests can run that path anywhere.
+    pub vault_flock: bool,
 }
 
 /// A front-end check that the vault is fully visible to this process (for
@@ -199,6 +207,7 @@ impl EngineConfig {
             rebuild_quiet: Duration::from_secs(30),
             allow_mass_delete: false,
             access_check: None,
+            vault_flock: true,
         }
     }
 }
@@ -341,6 +350,9 @@ pub struct Status {
     pub local_issues: Vec<LocalIssue>,
     pub scope: Option<String>,
     pub fs_rules: Option<String>,
+    /// The vault locks the engine took at its last open, e.g. "flock and
+    /// host lock" or "host lock only (flock: ...)" on Android's shared storage.
+    pub vault_lock: Option<String>,
     pub registered_ms: Option<i64>,
     pub last_push_ms: Option<i64>,
     /// A full fetch is owed, or this node still has to be marked resolved;
@@ -412,7 +424,6 @@ pub(crate) struct Inner {
     pub(crate) state_dir: PathBuf,
     /// What the vault's filesystem can hold (probed at open).
     pub(crate) fs: FsRules,
-    _locks: Vec<LockFile>,
     pub(crate) index: Mutex<Index>,
     pub(crate) runtime: Mutex<Runtime>,
     mem: Semaphore,
@@ -435,6 +446,11 @@ pub(crate) struct Inner {
     fold_lock: Mutex<()>,
     /// The milestone the gate read last (for log lines).
     last_milestone: Mutex<Option<Value>>,
+    // Fields drop in declaration order: the vault lock goes before the state
+    // lock, and the state lock last of all, so whoever waits for the state
+    // lock (the FFI host restarting a profile) finds the vault free too.
+    _vault_lock: VaultLock,
+    _state_lock: LockFile,
 }
 
 #[derive(Clone)]
@@ -507,24 +523,35 @@ impl Engine {
         std::fs::create_dir_all(&cfg.vault).map_err(EngineError::other)?;
         let canon = std::fs::canonicalize(&cfg.vault).map_err(EngineError::other)?;
         let state_dir = cfg.index_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let mut locks = Vec::new();
-        for (path, required) in [(state_dir.join(STATE_LOCK), true), (canon.join(VAULT_LOCK), false)] {
-            match LockFile::try_acquire(&path) {
-                Ok(l) => locks.push(l),
-                Err(LockError::Busy(p)) => {
-                    return Err(EngineError::Busy(format!(
-                        "another lsync process is using this {} ({} is locked); stop it first",
-                        if required { "state directory" } else { "vault" },
-                        p.display()
-                    )))
-                }
-                // The state-dir lock is the one that must work; a vault on a
-                // filesystem without locking only loses the cross-profile check.
-                Err(e) if required => return Err(EngineError::other(e)),
-                Err(e) => warn!("{e}; continuing without the vault lock"),
+        let holder = Holder::current(&state_dir);
+        let state_lock = match LockFile::try_acquire(&state_dir.join(STATE_LOCK)) {
+            Ok(l) => l,
+            Err(LockError::Busy(p)) => {
+                let by = platform::read_holder(&p)
+                    .map(|h| format!(", held by {h}"))
+                    .unwrap_or_default();
+                return Err(EngineError::Busy(format!(
+                    "another LiveSync engine is using this state folder ({} is locked{by}); stop it first",
+                    p.display()
+                )));
             }
+            Err(e) => return Err(EngineError::other(e)),
+        };
+        if let Err(e) = state_lock.record(&holder) {
+            debug!("cannot record the holder in {}: {e}", state_lock.path.display());
         }
+        // Never run without a vault lock: two engines on one folder would
+        // each take the other's writes for local edits.
+        let vault_lock = match platform::lock_vault(&canon, &canon.join(VAULT_LOCK), &holder, cfg.vault_flock) {
+            Ok(l) => l,
+            Err(e @ VaultLockError::Busy { .. }) => return Err(EngineError::Busy(format!("{e}; stop it first"))),
+            Err(e @ VaultLockError::Unavailable { .. }) => {
+                return Err(EngineError::Other(format!("{e}; not starting without a vault lock")))
+            }
+        };
+        info!("vault lock: {}", vault_lock.mode());
         let index = Index::open(&cfg.index_path)?;
+        index.set_meta(meta::VAULT_LOCK, vault_lock.mode())?;
         let probed = FsRules::probe(&canon);
         let probe_ok = probed.is_ok();
         let mut fs = match probed {
@@ -579,7 +606,6 @@ impl Engine {
                 vault_canon: canon.to_string_lossy().into_owned(),
                 state_dir,
                 fs,
-                _locks: locks,
                 runtime: Mutex::new(Runtime {
                     max_size_bytes: cfg.max_size_mb.map(|m| m * 1024 * 1024),
                     ignore,
@@ -599,6 +625,8 @@ impl Engine {
                 push_enabled: AtomicBool::new(false),
                 fold_lock: Mutex::new(()),
                 last_milestone: Mutex::new(None),
+                _vault_lock: vault_lock,
+                _state_lock: state_lock,
             }),
         })
     }
@@ -2502,6 +2530,7 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
             .and_then(|s| serde_json::from_str::<Scope>(&s).ok())
             .map(|s| s.describe()),
         fs_rules: ix.get_meta(meta::FS_RULES)?,
+        vault_lock: ix.get_meta(meta::VAULT_LOCK)?,
         registered_ms: num(meta::REGISTERED)?,
         last_push_ms: num(meta::LAST_PUSH)?,
         needs_full_fetch: ix.get_meta(meta::NEEDS_FETCH)?.is_some() || ix.get_meta(meta::RESOLVE_OWED)?.is_some(),

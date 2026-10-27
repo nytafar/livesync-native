@@ -105,7 +105,7 @@ This is an independent client, not affiliated with the Self-hosted LiveSync proj
   - a second document whose name folds to the same file on a case-insensitive filesystem ("case collision with …").
 - **Handles errors one file at a time.** A local I/O error on one file (unreadable, a file where a folder should be) defers that file to the retry queue; the rest of the batch and the changes sequence move on.
 - Creates an empty `.nomedia` at the vault root, so MediaStore and Google Photos leave the vault's images alone.
-- Allows one process per state directory and per vault (lock files `lsync.lock` in the state directory and `.lsync.lock` at the vault root).
+- Allows one engine per state directory and per vault folder, whichever profile or process it comes from. The state directory is locked with `flock` on `lsync.lock`. The vault folder is locked with `flock` on `.lsync.lock` at its root and with a host lock (an abstract Unix socket on Linux and Android, a flock in `/tmp` on macOS), because flock does not work on Android's shared storage. The kernel releases both when the process dies, so a crash, a force-stop or a reboot never leaves the vault locked. A second engine refuses to start and names the holder (process, pid, uid, state folder); `lsync status` shows which locks were taken.
 - Catches a local edit that lands while a remote change is being written (the old file is held open across the swap and checked again), and puts it back as a local edit.
 - **Fails closed.** It refuses to sync when it meets any of these:
   - a server that is not CouchDB;

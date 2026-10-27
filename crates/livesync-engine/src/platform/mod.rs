@@ -2,13 +2,17 @@
 //! engine where `cfg(target_os)` may appear (spec "Platform seams").
 //!
 //! The watcher uses the `notify` crate (inotify on Linux and Android, FSEvents
-//! on macOS, ReadDirectoryChangesW on Windows); the profile lock is `flock`
-//! through `std::fs::File::try_lock` on every Unix.
+//! on macOS, ReadDirectoryChangesW on Windows). The profile lock is `flock`
+//! through `std::fs::File::try_lock` for the state directory, and for the
+//! vault folder `flock` plus a host lock (`vault_lock`), because flock fails
+//! on Android's shared storage.
 
 mod lock;
 mod notify_watcher;
+mod vault_lock;
 
-pub use lock::{LockError, LockFile};
+pub use lock::{read_holder, Holder, LockError, LockFile};
+pub use vault_lock::{lock_vault, VaultLock, VaultLockError};
 
 use crate::watcher::{WatchSender, Watcher};
 use std::io;
@@ -34,6 +38,39 @@ pub fn watcher_backend() -> &'static str {
 /// A short platform name for the milestone's `node_info.platform`.
 pub fn platform_name() -> &'static str {
     std::env::consts::OS
+}
+
+/// This process's user ID, where the platform has one.
+pub fn current_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid has no preconditions and cannot fail.
+        Some(unsafe { libc::getuid() })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// A short name for this process, for lock holder records: the first word
+/// of `/proc/self/cmdline` where there is one (the package name of an
+/// Android app, which runs as `app_process`), else the executable's name.
+pub fn process_name() -> String {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if let Ok(cmd) = std::fs::read("/proc/self/cmdline") {
+            let first = cmd.split(|&b| b == 0).next().unwrap_or_default();
+            let first = String::from_utf8_lossy(first);
+            if let Some(name) = first.rsplit('/').next().filter(|n| !n.is_empty()) {
+                return name.to_string();
+            }
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default()
 }
 
 /// This machine's host name, for the default device name.

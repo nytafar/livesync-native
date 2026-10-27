@@ -478,6 +478,7 @@ fn print_status(s: &livesync_engine::Status) {
     println!("last push       {}", fmt_ms(s.last_push_ms));
     println!("registered      {}", fmt_ms(s.registered_ms));
     println!("folders         {}", s.scope.as_deref().unwrap_or("-"));
+    println!("vault lock      {}", s.vault_lock.as_deref().unwrap_or("-"));
     if s.needs_full_fetch {
         println!("full fetch      owed; pushes are held until a two-way sync completes it");
     }
