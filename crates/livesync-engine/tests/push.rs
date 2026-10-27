@@ -471,6 +471,7 @@ async fn case_collisions_are_skipped_and_reported() {
     // Two local names for one document (case-insensitive IDs on a
     // case-sensitive filesystem): one is pushed, the other reported.
     let env = Env::new().await;
+    require_case_sensitive!(env.dir.path());
     env.write("Same.md", b"one");
     env.write("same.md", b"two");
     let rep = env.engine().sync_once().await.unwrap();
@@ -1360,6 +1361,7 @@ async fn a_lost_put_response_does_not_make_a_conflict_with_ourselves() {
 #[tokio::test]
 async fn a_case_only_rename_is_pushed() {
     let env = Env::new().await;
+    require_case_sensitive!(env.dir.path());
     let cs = |c: &mut EngineConfig| c.case_insensitive = Some(false);
     env.write("Note.md", b"n");
     env.engine_with(cs).sync_once().await.unwrap();

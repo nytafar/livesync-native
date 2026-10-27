@@ -771,3 +771,27 @@ async fn fallback(State((st, _)): S, method: Method, uri: Uri) -> Response {
     record(&st, method.as_str(), uri.path());
     (StatusCode::METHOD_NOT_ALLOWED, "not supported by mock").into_response()
 }
+
+/// Whether `dir`'s filesystem keeps `A` and `a` apart, probed as the engine
+/// does. Tests that need two spellings on disk at once check this and say
+/// so when they cannot run (macOS's default APFS folds case).
+pub fn case_sensitive(dir: &std::path::Path) -> bool {
+    !livesync_engine::fsrules::FsRules::probe(dir)
+        .expect("probe the test filesystem")
+        .case_insensitive
+}
+
+/// Skip the rest of a test on a case-folding filesystem, loudly.
+#[macro_export]
+macro_rules! require_case_sensitive {
+    ($dir:expr) => {
+        if !$crate::common::case_sensitive($dir) {
+            eprintln!(
+                "SKIPPED (rest of {}): {} folds case; this needs a case-sensitive filesystem",
+                module_path!(),
+                $dir.display()
+            );
+            return;
+        }
+    };
+}
