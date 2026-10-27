@@ -1103,6 +1103,44 @@ async fn an_unreadable_folder_is_not_read_as_deleted() {
     assert!(env.engine().status().unwrap().local_issues.is_empty());
 }
 
+/// Codex, second round: a pass that cannot check the stopped files (their
+/// folder is unreadable for a while) neither ends the burst the stop
+/// counted nor the stop; once readable, they stop again.
+#[tokio::test]
+async fn an_unreadable_folder_does_not_end_a_stopped_burst() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new().await;
+    for i in 0..30 {
+        env.write(&format!("sub/f{i:02}.md"), format!("{i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    // As a daemon left it: 30 deletions of the burst already sent.
+    let sent: Vec<String> = (0..30).map(|i| format!("sent{i:02}.md")).collect();
+    {
+        let ix = Index::open(&env.index_path()).unwrap();
+        ix.set_meta("delete_burst_sent", &serde_json::to_string(&sent).unwrap())
+            .unwrap();
+        ix.set_meta("safety_stop", "1 30 of 60 tracked files ...").unwrap();
+    }
+    for i in 0..3 {
+        std::fs::remove_file(env.vault().join(format!("sub/f{i:02}.md"))).unwrap();
+    }
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.safety_stops, 1, "{:?}", rep.push);
+    assert!(env.meta("safety_stop").unwrap().contains("33 of 60"));
+    let sub = env.vault().join("sub");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let rep = env.engine().sync_once().await;
+    let kept = (env.meta("delete_burst_sent"), env.meta("safety_stop"));
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(rep.unwrap().push.deleted, 0);
+    assert!(kept.0.is_some(), "the burst was forgotten");
+    assert!(kept.1.is_some(), "the stop was cleared");
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0, "{:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 1);
+}
+
 /// H1: once the conflict ends in a deletion, a conflicted local copy is
 /// still not removed; it is kept and reported.
 #[tokio::test]

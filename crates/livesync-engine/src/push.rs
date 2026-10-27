@@ -370,6 +370,16 @@ impl DeleteHold {
         }
     }
 
+    /// The deciding pass could not check every file: it cannot tell that
+    /// the burst is over, so the burst goes on (as after a cut), and the
+    /// look whether it is over comes a quiet period later, not at once.
+    fn unchecked(&mut self) {
+        self.cut = true;
+        if !self.burst.is_empty() {
+            self.last_new = Some(Instant::now());
+        }
+    }
+
     /// The user confirmed the stop: the burst is answered.
     fn answered(&mut self) {
         self.burst.clear();
@@ -1658,7 +1668,7 @@ impl Engine {
         issues_seen: &mut HashSet<String>,
     ) -> Result<()> {
         if rows.is_empty() {
-            return self.nothing_vanished(hold, &tally);
+            return self.nothing_vanished(hold, &tally, false);
         }
         let n = rows.len();
         // The vault folder itself must be there; an unmounted card or a
@@ -1677,10 +1687,14 @@ impl Engine {
             }
         }
         // Only files the filesystem says are not there count as vanished.
+        // Some could not be checked: this pass cannot tell that a burst is
+        // over (its files may still be gone).
         let mut gone: Vec<FileRow> = Vec::new();
+        let mut unchecked = false;
         for r in rows {
             if unreadable.iter().any(|(p, _)| under(&r.path, p)) {
                 rep.unreadable += 1;
+                unchecked = true;
                 continue;
             }
             match std::fs::symlink_metadata(self.inner.cfg.vault.join(&r.path)) {
@@ -1694,11 +1708,14 @@ impl Engine {
                         rep.issues += 1;
                     }
                     rep.unreadable += 1;
+                    unchecked = true;
                 }
             }
         }
+        // Nor that a stop shown for them is over.
+        ctx.deletes_held |= unchecked;
         if gone.is_empty() {
-            return self.nothing_vanished(hold, &tally);
+            return self.nothing_vanished(hold, &tally, unchecked);
         }
         // Decide every fate first. A deletion counts as a rename or a move
         // into `.trash/` only when its destination is there (and, inside the
@@ -1958,10 +1975,13 @@ impl Engine {
             let sent: &[&str] = if withhold { &[] } else { &undestined_ids };
             match hold {
                 Some(h) => {
+                    if unchecked {
+                        h.unchecked();
+                    }
                     h.decided(withhold, sent);
                     self.save_burst(&burst_before, &h.burst)?;
                 }
-                None if !withhold => self.with_index(|ix| ix.delete_meta(meta::DELETE_BURST))?,
+                None if !withhold && !unchecked => self.with_index(|ix| ix.delete_meta(meta::DELETE_BURST))?,
                 None => {}
             }
         }
@@ -1999,7 +2019,9 @@ impl Engine {
 
     /// A pass found nothing missing. In a full pass that is a decision too:
     /// nothing is held, and a burst the maximum hold cut is over once quiet.
-    fn nothing_vanished(&self, hold: Option<&mut DeleteHold>, tally: &Tally) -> Result<()> {
+    /// Unless some files could not be checked (`unchecked`): then the burst
+    /// and a stop it led to stay as they are.
+    fn nothing_vanished(&self, hold: Option<&mut DeleteHold>, tally: &Tally, unchecked: bool) -> Result<()> {
         if tally.scan.is_none() {
             return Ok(());
         }
@@ -2007,10 +2029,15 @@ impl Engine {
             Some(h) => {
                 let before = h.burst.clone();
                 h.observe(&[], tally.scan);
+                if unchecked {
+                    h.unchecked();
+                    return Ok(());
+                }
                 h.decided(false, &[]);
                 h.keep_pending(&HashSet::new());
                 self.save_burst(&before, &h.burst)
             }
+            None if unchecked => Ok(()),
             None => self.with_index(|ix| ix.delete_meta(meta::DELETE_BURST)),
         }
     }
@@ -2686,6 +2713,16 @@ mod tests {
         h.decided(false, &[]);
         assert!(h.burst.is_empty());
         assert!(h.due().is_none());
+
+        // A quiet pass that could not check every file does not end it,
+        // and looks again a quiet period later, not at once.
+        h.resume(ids[..4].iter().map(|s| s.to_string()).collect(), false);
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(h.observe(&[], walk()), Some(4));
+        h.unchecked();
+        h.decided(false, &[]);
+        assert_eq!(h.burst.len(), 4, "an incomplete look ended the burst");
+        assert!(h.due().is_some_and(|d| d > Instant::now()));
     }
 
     #[test]
