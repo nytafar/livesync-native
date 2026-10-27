@@ -65,7 +65,7 @@ gh run watch "$(gh run list -w Release -L1 --json databaseId -q '.[0].databaseId
 - Signing comes from repository secrets `SIDELOAD_KEYSTORE_BASE64`, `SIDELOAD_STORE_PASSWORD`, `SIDELOAD_KEY_PASSWORD` (and optional `SIDELOAD_KEY_ALIAS`, default `livesync`); the optional repository variable `SIDELOAD_CERT_SHA256` pins the signer. A tag push without them fails; it is never released unsigned.
 - `gh workflow run release.yml -f version=0.0.0-ci-test` builds the same assets into a draft release (unsigned when the secrets are missing) without creating a tag. Delete it afterwards: `gh release delete v0.0.0-ci-test --yes`.
 - A hand build with `scripts/build-apk.sh` uses the commit count as versionCode, which is below every CI release: set `LIVESYNC_VERSION_CODE` above the installed one to install it over a release.
-- On branch `android9-minsdk28` (minSdk 28) a hand build's versionCode is fixed at 928 (`API28_VERSION_CODE` in the script): below every release code, so it never collides with one and never installs over a release.
+- On branch `android9-minsdk28` (minSdk 28) a hand build's versionCode is fixed at 928 (`API28_VERSION_CODE` in the script): below every release code, so it never collides with one and never installs over a release. Because minSdk is 28 it also installs on Android 11+, and over a main hand build (commit-count versionCode, about 60) it installs as an upgrade. After that every main hand build is refused as a downgrade until the app is uninstalled (which loses its settings) or the main build sets `LIVESYNC_VERSION_CODE` above 928.
 
 ## Dev database: rules
 

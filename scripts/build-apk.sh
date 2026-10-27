@@ -23,9 +23,13 @@
 # VERSION_CODE_BASE (1000, release.yml) plus the run number, so always 1001 or
 # more: no release can share this code, a release (should one ever support
 # Android 9) installs over this build as an ordinary upgrade, and this build
-# never replaces an installed release (Android refuses the downgrade). Hand builds from main use the commit count (60 when this was
-# set), far below. Raise it within 900-999 if a newer API 28 build must
-# install over an older one with a lower code.
+# never replaces an installed release (Android refuses the downgrade). Hand
+# builds from main use the commit count (60 when this was set), so on an
+# Android 11+ phone running a main hand build this build installs as an
+# upgrade, and main hand builds are then refused until the app is uninstalled
+# (losing its settings) or LIVESYNC_VERSION_CODE is set above 928. Raise the
+# code within 900-999 if a newer API 28 build must install over an older one
+# with a lower code.
 #
 # Flags: --skip-checks  build only (no unit tests, no lint)
 #        --unsigned     no signing; output is livesync-android-<version>-unsigned.apk
