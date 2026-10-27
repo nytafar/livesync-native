@@ -41,6 +41,7 @@ import kotlinx.coroutines.withContext
 import no.nyta.livesync.EngineLifecycle
 import no.nyta.livesync.LiveSyncApp
 import no.nyta.livesync.core.GateResult
+import no.nyta.livesync.core.LiveSyncException
 import no.nyta.livesync.core.ProfileStatus
 import no.nyta.livesync.core.RunState
 import no.nyta.livesync.profile.Profile
@@ -71,6 +72,10 @@ fun StatusScreen(
     var status by remember { mutableStateOf<ProfileStatus?>(null) }
     var logs by remember { mutableStateOf<List<String>>(emptyList()) }
     var confirm by remember { mutableStateOf<Confirm?>(null) }
+    // The safety stop the open "Allow these deletions" dialog answers, as it
+    // was when the dialog opened, and what came of the last answer.
+    var massStop by remember { mutableStateOf<String?>(null) }
+    var stopNote by remember { mutableStateOf<String?>(null) }
     var gateResult by remember { mutableStateOf<GateResult?>(null) }
     var busy by remember { mutableStateOf<String?>(null) }
     var showRaw by remember { mutableStateOf(false) }
@@ -132,9 +137,21 @@ fun StatusScreen(
                         "and press Sync now. If you really deleted these files, allow the deletions once.",
                     style = MaterialTheme.typography.bodySmall,
                 )
-                OutlinedButton(enabled = !p.pullOnly && st.runState == RunState.RUNNING, onClick = { confirm = Confirm.MassDelete }) {
+                OutlinedButton(enabled = !p.pullOnly && st.runState == RunState.RUNNING, onClick = {
+                    massStop = it
+                    stopNote = null
+                    confirm = Confirm.MassDelete
+                }) {
                     Text("Allow these deletions…")
                 }
+                stopNote?.let { note -> Banner(note, Tone.WARN) }
+            }
+            st?.deletesWaiting?.takeIf { it > 0u }?.let {
+                Banner(
+                    "$it deletes waiting: they go to the server once no other file has gone missing for a few " +
+                        "seconds, so a large deletion is caught by the safety stop as a whole.",
+                    Tone.INFO,
+                )
             }
             if (st?.massDeleteAllowed == true) Banner("Deleting the missing files at the next full sync pass…", Tone.WARN)
             st?.rebuildWait?.let { Banner("Waiting for a rebuild elsewhere to finish: ${fmtStamped(it)}", Tone.INFO) }
@@ -295,16 +312,30 @@ fun StatusScreen(
         AlertDialog(
             onDismissRequest = { confirm = null },
             title = { Text(c.title) },
-            text = { Text(c.text) },
+            text = {
+                val stop = massStop?.substringAfter(' ')
+                Text(if (c == Confirm.MassDelete && stop != null) "${c.text}\n\nThe stop: $stop" else c.text)
+            },
             dismissButton = { TextButton(onClick = { confirm = null }) { Text("Cancel") } },
             confirmButton = {
                 TextButton(onClick = {
                     confirm = null
                     when (c) {
                         Confirm.TwoWay -> update("switched to two-way") { it.copy(pullOnly = false) }
-                        Confirm.MassDelete -> scope.launch {
-                            val r = withContext(Dispatchers.IO) { runCatching { core.engine.allowMassDeleteOnce(p.id) } }
-                            busy = r.exceptionOrNull()?.let { "Allow deletions: ${it.message}" }
+                        Confirm.MassDelete -> massStop?.let { shown ->
+                            scope.launch {
+                                val r = withContext(Dispatchers.IO) {
+                                    runCatching { core.engine.allowMassDeleteOnce(p.id, shown) }
+                                }
+                                stopNote = when (val e = r.exceptionOrNull()) {
+                                    null -> null
+                                    is LiveSyncException.StopChanged ->
+                                        "Not allowed: the safety stop changed while you were deciding (more files went " +
+                                            "missing). Nothing was deleted. Look at the stop again and allow it if you " +
+                                            "still want to."
+                                    else -> "Allow deletions: ${e.message}"
+                                }
+                            }
                         }
                         Confirm.Adopt -> scope.launch {
                             gateResult = withContext(Dispatchers.IO) {

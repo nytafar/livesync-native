@@ -81,7 +81,13 @@ pub(crate) mod meta_keys {
     pub const SAFETY_STOP: &str = "safety_stop";
     /// The documents a mass-delete stop refused to delete (JSON list of
     /// IDs): what `allow_mass_delete_once` lets through, and nothing else.
+    /// Older versions did not record it.
     pub const SAFETY_STOP_DOCS: &str = "safety_stop_docs";
+    /// How many deletions of a burst the daemon's maximum hold cut into
+    /// parts were already sent: while the burst goes on, or a stop it led
+    /// to stands, later parts are judged together with them (`DeleteHold`).
+    /// Kept here so a restart does not forget them.
+    pub const DELETE_BURST: &str = "delete_burst_sent";
 }
 
 /// Aborts a spawned task when dropped.
@@ -446,9 +452,9 @@ pub(crate) struct Inner {
     report: Mutex<PullReport>,
     /// The two-way daemon's push totals for this session (`push_report`).
     pub(crate) push_report: Mutex<crate::push::PushReport>,
-    /// The next full push pass may delete these documents, which a stop
-    /// refused and the user confirmed (`allow_mass_delete_once`).
-    pub(crate) mass_delete_once: Mutex<Option<std::collections::HashSet<String>>>,
+    /// The next full push pass that gets to the deletions may delete what
+    /// a stop refused and the user confirmed (`allow_mass_delete_once`).
+    pub(crate) mass_delete_once: Mutex<Option<crate::push::Confirmed>>,
     /// Deletions the daemon holds until their burst is over (`DeleteHold`).
     pub(crate) deletes_waiting: std::sync::atomic::AtomicU64,
     pub(crate) nudge: Notify,

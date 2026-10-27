@@ -14,7 +14,7 @@ use crate::{logging, LiveSyncError};
 use livesync_engine::engine::status_from_index;
 use livesync_engine::engine::{AccessCheck, STATE_LOCK};
 use livesync_engine::platform::{LockError, LockFile};
-use livesync_engine::{Engine, EngineError, Index};
+use livesync_engine::{Confirmation, Engine, EngineError, Index};
 use livesync_remote::Couch;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -442,12 +442,15 @@ impl LiveSync {
         self.start_locked(cfg)
     }
 
-    /// The user confirmed a mass-delete safety stop: the next full push pass,
-    /// and only that one, deletes the files the stop showed
-    /// (`Engine::allow_mass_delete_once`); it is asked for at once. Files
-    /// that went missing since are judged as usual. `Invalid` when no
-    /// mass-delete stop is shown.
-    pub fn allow_mass_delete_once(&self, profile_id: String) -> Result<(), LiveSyncError> {
+    /// The user confirmed a mass-delete safety stop: `safety_stop` is the
+    /// stop the dialog showed (`ProfileStatus.safety_stop`, as it was when
+    /// the dialog opened). The next full push pass, and only that one,
+    /// deletes the files that stop showed (`Engine::allow_mass_delete_once`);
+    /// it is asked for at once. Files that went missing since are judged as
+    /// usual. `StopChanged` when the stop shown now is another one (nothing
+    /// is allowed; show it and ask again), `Invalid` when no mass-delete
+    /// stop is shown.
+    pub fn allow_mass_delete_once(&self, profile_id: String, safety_stop: String) -> Result<(), LiveSyncError> {
         let shared = self.slot_shared(&profile_id).ok_or_else(|| LiveSyncError::NotRunning {
             msg: format!("profile {profile_id} is not started"),
         })?;
@@ -459,10 +462,21 @@ impl LiveSync {
         let engine = shared.engine().ok_or_else(|| LiveSyncError::NotRunning {
             msg: format!("no engine is running for profile {profile_id}"),
         })?;
-        if !engine.allow_mass_delete_once()? {
-            return Err(LiveSyncError::Invalid {
-                msg: "no mass-delete safety stop is shown; nothing to allow".into(),
-            });
+        match engine.allow_mass_delete_once(&safety_stop)? {
+            Confirmation::Allowed => {}
+            Confirmation::NoStop => {
+                return Err(LiveSyncError::Invalid {
+                    msg: "no mass-delete safety stop is shown; nothing to allow".into(),
+                })
+            }
+            Confirmation::Changed(now) => {
+                let now = now.split_once(' ').map_or(now.as_str(), |(_, text)| text);
+                return Err(LiveSyncError::StopChanged {
+                    msg: format!(
+                        "the safety stop changed after it was shown, so nothing was allowed; it now says: {now}"
+                    ),
+                });
+            }
         }
         warn!("profile {profile_id}: the deletions the safety stop showed are allowed for the next full push pass (confirmed by the user)");
         Ok(())

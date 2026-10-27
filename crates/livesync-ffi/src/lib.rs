@@ -38,6 +38,10 @@ pub enum LiveSyncError {
     /// A compatibility gate refused.
     #[error("{msg}")]
     Refused { msg: String },
+    /// The safety stop the user confirmed is no longer the one shown (more
+    /// files went missing and a new stop was recorded): nothing was allowed.
+    #[error("{msg}")]
+    StopChanged { msg: String },
     #[error("{msg}")]
     Remote { msg: String },
     #[error("{msg}")]

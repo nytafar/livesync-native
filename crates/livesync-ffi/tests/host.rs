@@ -433,7 +433,7 @@ fn a_confirmed_mass_delete_goes_through_once() {
     });
     // With no stop shown there is nothing to allow.
     assert!(matches!(
-        env.host.allow_mass_delete_once("mass".into()),
+        env.host.allow_mass_delete_once("mass".into(), String::new()),
         Err(LiveSyncError::Invalid { .. })
     ));
     assert!(!env.status(&p).mass_delete_allowed);
@@ -463,13 +463,24 @@ fn a_confirmed_mass_delete_goes_through_once() {
         "the safety stop was bypassed: {} of the 22 were deleted remotely without it: {gone:?}",
         gone.len()
     );
-    assert!(env.status(&p).safety_stop.is_some());
+    let stop = env.status(&p).safety_stop.unwrap();
     assert!(matches!(
-        env.host.allow_mass_delete_once("nope".into()),
+        env.host.allow_mass_delete_once("nope".into(), stop.clone()),
         Err(LiveSyncError::NotRunning { .. })
     ));
+    // An answer to another stop than the one shown allows nothing.
+    match env
+        .host
+        .allow_mass_delete_once("mass".into(), "1 5 of 9 tracked files are missing".into())
+    {
+        Err(LiveSyncError::StopChanged { msg }) => {
+            assert!(msg.contains(stop.split_once(' ').unwrap().1), "{msg}")
+        }
+        other => panic!("a stale confirmation was not refused: {other:?}"),
+    }
+    assert!(!env.status(&p).mass_delete_allowed);
 
-    env.host.allow_mass_delete_once("mass".into()).unwrap();
+    env.host.allow_mass_delete_once("mass".into(), stop).unwrap();
     wait_until("the deletions", Duration::from_secs(40), || {
         names[..22].iter().all(|n| soft_deleted(&env, n))
     });
@@ -491,7 +502,7 @@ fn pull_only_profiles_cannot_allow_mass_deletes() {
     let p = env.profile("po", "vault-po");
     env.host.start(p).unwrap();
     assert!(matches!(
-        env.host.allow_mass_delete_once("po".into()),
+        env.host.allow_mass_delete_once("po".into(), String::new()),
         Err(LiveSyncError::Invalid { .. })
     ));
     env.host.stop_all();

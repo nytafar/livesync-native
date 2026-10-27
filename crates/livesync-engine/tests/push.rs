@@ -1571,7 +1571,11 @@ async fn a_mass_deletion_split_over_two_passes_still_stops() {
     assert!(st.safety_stop.as_deref().unwrap().contains("30 of 40"), "{st:?}");
 
     // The user confirms: the 30 go, once; the other 10 stay.
-    assert!(engine.allow_mass_delete_once().unwrap());
+    let stop = st.safety_stop.unwrap();
+    assert_eq!(
+        engine.allow_mass_delete_once(&stop).unwrap(),
+        livesync_engine::Confirmation::Allowed
+    );
     wait_until("the confirmed deletions", || gone().len() == 30).await;
     assert!((30..40).all(|i| !env.deleted(&format!("f{i:02}.md"))));
     wait_until("the stop to clear", || {
@@ -2062,6 +2066,83 @@ async fn renames_still_being_written_do_not_trip_the_stop() {
     .await;
     stopped |= engine.status().unwrap().safety_stop.is_some();
     assert!(!stopped, "the renames tripped the stop");
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// Review of #10, second round: a wipe slower than the maximum hold goes
+/// out in parts, but each part is judged together with the parts of the
+/// same burst sent before it (against what was tracked before them), so the
+/// stop trips before half of the vault is deleted remotely. The stop stands
+/// across a restart and a one-shot sync, and confirming it deletes the rest.
+#[tokio::test]
+async fn a_slow_wipe_over_several_maximum_holds_stops_before_half_is_gone() {
+    let env = Env::new().await;
+    for i in 0..60 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let daemon = |env: &Env| {
+        env.engine_with(|c| {
+            c.settle = Duration::from_millis(150);
+            c.rescan_interval = Duration::from_secs(3600);
+            c.delete_hold = Duration::from_secs(1);
+            c.delete_hold_max = Duration::from_secs(2);
+        })
+    };
+    let engine = daemon(&env);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let gone = || (0..60).filter(|i| env.deleted(&format!("f{i:02}.md"))).count();
+    // About 13 files per 2 s window: no window alone is a mass deletion.
+    for i in 0..60 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    wait_until("the stop", || engine.status().unwrap().safety_stop.is_some()).await;
+    let sent = gone();
+    assert!(sent > 0, "the burst was never cut by the maximum hold");
+    assert!(sent * 2 <= 60, "{sent} of 60 deleted remotely before the stop");
+    // Once the wipe is over, nothing more goes.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(gone(), sent);
+    let st = engine.status().unwrap();
+    assert!(st.safety_stop.as_deref().unwrap().contains("60 of 60"), "{st:?}");
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    drop(engine);
+
+    // The stop stands for a one-shot sync after a restart ...
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.safety_stops, 1, "{:?}", rep.push);
+    assert_eq!(gone(), sent);
+    // ... and for a daemon started anew.
+    let engine = daemon(&env);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert_eq!(gone(), sent);
+    let stop = engine.status().unwrap().safety_stop.expect("the stop stands");
+
+    // The user confirms it: the rest go.
+    assert_eq!(
+        engine.allow_mass_delete_once(&stop).unwrap(),
+        livesync_engine::Confirmation::Allowed
+    );
+    wait_until("the confirmed deletions", || gone() == 60).await;
+    wait_until("the stop to clear", || {
+        engine.status().unwrap().safety_stop.is_none() && !engine.mass_delete_allowed()
+    })
+    .await;
+    assert!(env.meta("delete_burst_sent").is_none());
     tx.send(true).unwrap();
     task.await.unwrap().unwrap();
 }

@@ -22,4 +22,4 @@ pub mod watcher;
 pub use engine::{AccessCheck, Engine, EngineConfig, EngineError, GateReport, PullReport, Status, SyncReport};
 pub use folders::{list_remote_folders, local_top_folders, FolderEntry, FolderListing};
 pub use index::{FileRow, Index, LocalIssue, State};
-pub use push::PushReport;
+pub use push::{Confirmation, PushReport};
