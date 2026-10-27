@@ -12,7 +12,7 @@ mod notify_watcher;
 mod vault_lock;
 
 pub use lock::{read_holder, Holder, LockError, LockFile};
-pub use vault_lock::{lock_vault, VaultLock, VaultLockError};
+pub use vault_lock::{lock_vault, record_path, VaultLock, VaultLockError};
 
 use crate::watcher::{WatchSender, Watcher};
 use std::io;

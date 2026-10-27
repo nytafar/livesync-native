@@ -14,7 +14,9 @@
 //!     Unix-socket namespace. Binding is exclusive across every process and
 //!     uid in the network namespace and needs no file. Android apps (and
 //!     Termux, and the adb shell) share one network namespace.
-//!   - Other Unix (macOS): flock on a file in `/tmp`.
+//!   - Other Unix (macOS): flock on a file in `/var/tmp`. Not `/tmp`, which
+//!     macOS's periodic `clean-tmps` empties of files untouched for three
+//!     days, even while a long-running holder still has them locked.
 //!   - Elsewhere: none.
 //!
 //! The host lock is keyed twice: by the folder's (device, inode) and by its
@@ -26,8 +28,15 @@
 //!
 //! At least one of the two must be taken; when neither is available, the
 //! engine refuses to start rather than run unguarded. Contention on either
-//! is a refusal. The lock file also carries the holder's [`Holder`] record,
-//! written once when the lock is taken, so a refused engine can name it.
+//! is a refusal.
+//!
+//! The lock file itself stays empty and never changes, so a tool that
+//! replicates dot-files (and might rename a copy over it, which would leave
+//! the holder's flock on an orphaned inode) has no reason to touch it. The
+//! holder's record goes next to it, in `.lsync.holder`, written once when the
+//! lock is taken so a refused engine can name the holder. It is minimal
+//! ([`Holder::for_vault`]: process name, pid, uid, host), because whatever
+//! replicates dot-files carries it to other machines.
 
 use super::lock::{read_holder, write_holder, Holder, LockError, LockFile};
 use std::io;
@@ -100,7 +109,7 @@ pub fn lock_vault(vault: &Path, lock_file: &Path, holder: &Holder, flock: bool) 
 
 fn simulated_no_flock(p: &Path) -> Result<LockFile, LockError> {
     // The lock file still exists afterwards, as on FUSE (open works, flock
-    // does not), so the holder record has somewhere to go.
+    // does not).
     let open = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -134,7 +143,7 @@ fn lock_vault_with(
 ) -> Result<VaultLock, VaultLockError> {
     let busy = || VaultLockError::Busy {
         vault: vault.to_path_buf(),
-        holder: read_holder(lock_file),
+        holder: read_holder(&record_path(lock_file)),
     };
     let host = match host_lock(vault) {
         Ok(h) => Ok(h),
@@ -160,14 +169,20 @@ fn lock_vault_with(
             })
         }
     };
-    if let Err(e) = write_holder(lock_file, holder) {
-        debug!("cannot record the holder in {}: {e}", lock_file.display());
+    let record = record_path(lock_file);
+    if let Err(e) = write_holder(&record, &holder.for_vault()) {
+        debug!("cannot record the holder in {}: {e}", record.display());
     }
     Ok(VaultLock {
         _host: host,
         _file: file,
         mode,
     })
+}
+
+/// Where the holder's record goes: `.lsync.holder` next to `.lsync.lock`.
+pub fn record_path(lock_file: &Path) -> PathBuf {
+    lock_file.with_extension("holder")
 }
 
 /// The host lock's keys for a vault folder: its (device, inode), and its
@@ -198,8 +213,14 @@ fn host_lock(vault: &Path) -> Result<HostLock, HostError> {
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn host_lock(vault: &Path) -> Result<HostLock, HostError> {
-    host_lock_in(vault, Path::new("/tmp"))
+    host_lock_in(vault, Path::new(HOST_LOCK_DIR))
 }
+
+/// Where the flock host lock keeps its files: local, shared by all users,
+/// and (unlike `/tmp`) not emptied by macOS's periodic `clean-tmps`.
+#[cfg(unix)]
+#[cfg_attr(any(target_os = "linux", target_os = "android"), allow(dead_code))]
+const HOST_LOCK_DIR: &str = "/var/tmp";
 
 #[cfg(not(unix))]
 fn host_lock(_vault: &Path) -> Result<HostLock, HostError> {
@@ -222,8 +243,8 @@ fn bind_abstract(name: &str) -> Result<Held, HostError> {
     }
 }
 
-/// The host lock as flock files in a shared local directory (`/tmp` on
-/// macOS). Built on every Unix so its tests run on Linux too.
+/// The host lock as flock files in a shared local directory
+/// (`HOST_LOCK_DIR` on macOS). Built on every Unix so its tests run on Linux too.
 #[cfg(unix)]
 #[cfg_attr(any(target_os = "linux", target_os = "android"), allow(dead_code))]
 fn host_lock_in(vault: &Path, dir: &Path) -> Result<HostLock, HostError> {
@@ -250,8 +271,11 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn holder(state: &str) -> Holder {
-        Holder::current(Path::new(state))
+    /// A holder told apart by its process name (they all share our pid).
+    fn holder(name: &str) -> Holder {
+        let mut h = Holder::current(Path::new("/state"));
+        h.process = name.to_string();
+        h
     }
 
     fn vault_in(d: &Path, name: &str) -> (PathBuf, PathBuf) {
@@ -280,7 +304,7 @@ mod tests {
             // A second profile (another state folder), with or without flock.
             for second_flock in [true, false] {
                 let got = holder_of(lock_vault(&v, &f, &holder("/state/two"), second_flock));
-                assert_eq!(got.map(|h| h.state_dir), Some("/state/one".to_string()));
+                assert_eq!(got.map(|h| h.process), Some("/state/one".to_string()));
             }
             drop(first);
             lock_vault(&v, &f, &holder("/state/two"), flock).expect("free once the first is gone");
@@ -299,6 +323,10 @@ mod tests {
         let msg = refused.to_string();
         assert!(msg.contains(&format!("pid {}", std::process::id())), "{msg}");
         assert!(msg.contains("/state/one"), "{msg}");
+        // The lock file itself stays empty; the record is beside it.
+        assert_eq!(fs::metadata(&f).unwrap().len(), 0);
+        assert!(record_path(&f).ends_with(".lsync.holder"));
+        assert_eq!(read_holder(&record_path(&f)).unwrap().state_dir, "");
     }
 
     #[test]
@@ -342,10 +370,11 @@ mod tests {
         let (v, f) = vault_in(d.path(), "vault");
         let mut dead = holder("/s/dead");
         dead.pid = 999_999;
-        write_holder_new(&f, &dead);
+        write_holder_new(&record_path(&f), &dead);
         let l = lock_vault(&v, &f, &holder("/s/new"), false).unwrap();
-        assert_eq!(read_holder(&f).unwrap().state_dir, "/s/new");
+        assert_eq!(read_holder(&record_path(&f)).unwrap().process, "/s/new");
         drop(l);
+        fs::write(record_path(&f), b"garbage").unwrap();
         fs::write(&f, b"garbage").unwrap();
         lock_vault(&v, &f, &holder("/s/new"), false).unwrap();
     }
@@ -369,5 +398,32 @@ mod tests {
         ));
         drop(first);
         lock_vault_with(&v, &f, &holder("/s/2"), &simulated_no_flock, &host).unwrap();
+    }
+
+    /// The macOS host lock in its real directory (`/var/tmp`, present on
+    /// Linux too): exclusive, and its files are removed again afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn the_flock_host_lock_works_in_its_real_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let (v, f) = vault_in(d.path(), "vault");
+        let dir = Path::new(HOST_LOCK_DIR);
+        let host = |p: &Path| host_lock_in(p, dir);
+        let first = lock_vault_with(&v, &f, &holder("/s/1"), &simulated_no_flock, &host).unwrap();
+        assert!(matches!(
+            lock_vault_with(&v, &f, &holder("/s/2"), &simulated_no_flock, &host),
+            Err(VaultLockError::Busy { .. })
+        ));
+        drop(first);
+        for key in host_keys(&v) {
+            let p = dir.join(format!("livesync-native-vault-v1-{key}.lock"));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o644, "{}", p.display());
+            }
+            fs::remove_file(p).unwrap();
+        }
     }
 }

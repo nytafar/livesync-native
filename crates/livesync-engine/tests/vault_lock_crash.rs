@@ -4,7 +4,7 @@
 //! child briefly inherits every descriptor of this process between fork and
 //! exec, which would hold other tests' locks for that moment.
 
-use livesync_engine::platform::{lock_vault, read_holder, Holder, VaultLockError};
+use livesync_engine::platform::{lock_vault, read_holder, record_path, Holder, VaultLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -56,7 +56,7 @@ fn a_killed_holder_frees_the_vault_at_once() {
     }
     match lock_vault(&v, &f, &me, false) {
         Err(VaultLockError::Busy { holder: Some(h), .. }) => {
-            assert_eq!((h.pid, h.state_dir.as_str()), (child.id(), "/state/child"));
+            assert_eq!(h.pid, child.id());
         }
         other => panic!("expected busy with a named holder, got {other:?}"),
     }
@@ -68,6 +68,6 @@ fn a_killed_holder_frees_the_vault_at_once() {
     child.kill().unwrap();
     child.wait().unwrap();
     let held = lock_vault(&v, &f, &me, false).expect("free as soon as the holder is gone");
-    assert_eq!(read_holder(&f).unwrap().state_dir, "/state/parent");
+    assert_eq!(read_holder(&record_path(&f)).unwrap().pid, std::process::id());
     drop(held);
 }

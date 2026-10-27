@@ -44,11 +44,16 @@ pub struct Holder {
     pub process: String,
     #[serde(default)]
     pub host: String,
-    /// The holder's state directory (which profile).
-    #[serde(default)]
+    /// The holder's state directory (which profile). Only in the state
+    /// folder's record, never in the vault's (see `for_vault`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub state_dir: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub since_ms: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
 }
 
 impl Holder {
@@ -61,6 +66,20 @@ impl Holder {
             host: super::hostname(),
             state_dir: state_dir.display().to_string(),
             since_ms: crate::vaultfs::now_ms(),
+        }
+    }
+}
+
+impl Holder {
+    /// The record kept in the vault folder: enough to name the process
+    /// (name, pid, uid, and the host, without which a pid on a shared
+    /// network folder means nothing), but no local paths or times. Other
+    /// tools may replicate the vault's dot-files to other machines.
+    pub fn for_vault(&self) -> Holder {
+        Holder {
+            state_dir: String::new(),
+            since_ms: 0,
+            ..self.clone()
         }
     }
 }
@@ -119,7 +138,38 @@ impl LockFile {
     /// Take the lock without waiting. An existing lock file is opened
     /// read-only, so a refused attempt never writes to it (no change event
     /// for the holder's watcher, no write on shared storage).
+    ///
+    /// The lock counts only if the path still names the locked file
+    /// afterwards: a lock file removed or replaced between open and lock (a
+    /// temp cleaner, a sync tool renaming a copy in) is opened again.
     pub fn try_acquire(path: &Path) -> Result<LockFile, LockError> {
+        for _ in 0..3 {
+            let l = Self::try_acquire_once(path)?;
+            if l.is_current() {
+                return Ok(l);
+            }
+        }
+        Err(LockError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::other("the lock file keeps being replaced"),
+        })
+    }
+
+    /// Whether the lock path still names the file this lock holds. A lock
+    /// whose file was removed or replaced no longer stops anyone: the next
+    /// engine creates a new file and locks that. `true` where the platform
+    /// has no file identity.
+    pub fn is_current(&self) -> bool {
+        let held = self._file.metadata().ok();
+        let named = fs::metadata(&self.path).ok();
+        match (held.as_ref().and_then(super::file_id), named.as_ref()) {
+            (Some(h), Some(n)) => super::file_id(n) == Some(h),
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    }
+
+    fn try_acquire_once(path: &Path) -> Result<LockFile, LockError> {
         let io_err = |source| LockError::Io {
             path: path.to_path_buf(),
             source,
@@ -168,10 +218,10 @@ impl LockFile {
     }
 }
 
-/// Replace a lock file's holder record. Only the lock's holder calls this.
+/// Replace a holder record. Only the lock's holder calls this.
 pub(crate) fn write_holder(path: &Path, holder: &Holder) -> io::Result<()> {
     let json = serde_json::to_vec(holder).map_err(io::Error::other)?;
-    let mut f = OpenOptions::new().write(true).truncate(true).open(path)?;
+    let mut f = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
     f.write_all(&json)
 }
 
@@ -205,6 +255,37 @@ mod tests {
         assert!(LockFile::try_acquire(&p).is_err());
         let after = (fs::read(&p).unwrap(), fs::metadata(&p).unwrap().modified().unwrap());
         assert_eq!(before, after);
+    }
+
+    /// A lock whose file was removed (macOS cleans `/tmp`) or replaced (a
+    /// sync tool renamed a copy in) no longer counts, and a fresh
+    /// acquisition locks the file the path names now.
+    #[test]
+    fn a_removed_or_replaced_lock_file_is_noticed() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("lsync.lock");
+        let held = LockFile::try_acquire(&p).unwrap();
+        assert!(held.is_current());
+        fs::remove_file(&p).unwrap();
+        assert!(!held.is_current());
+        let other = LockFile::try_acquire(&p).unwrap();
+        assert!(other.is_current());
+        drop(other);
+        fs::write(d.path().join("copy"), b"").unwrap();
+        fs::rename(d.path().join("copy"), &p).unwrap();
+        assert!(!held.is_current());
+    }
+
+    #[test]
+    fn the_vault_record_has_no_paths_or_times() {
+        let full = Holder::current(Path::new("/home/someone/.local/state/lsync/p"));
+        let v = full.for_vault();
+        let json = String::from_utf8(serde_json::to_vec(&v).unwrap()).unwrap();
+        assert!(!json.contains("state_dir") && !json.contains("since_ms"), "{json}");
+        assert_eq!(
+            (v.pid, v.uid, &v.process, &v.host),
+            (full.pid, full.uid, &full.process, &full.host)
+        );
     }
 
     #[test]

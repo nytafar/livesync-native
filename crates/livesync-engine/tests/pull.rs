@@ -818,7 +818,21 @@ async fn two_profiles_on_one_vault_without_flock_are_refused() {
     let mode = st.vault_lock.unwrap();
     assert!(mode.starts_with("host lock only"), "{mode}");
     let lock = env.vault().join(livesync_engine::engine::VAULT_LOCK);
-    let recorded = std::fs::read(&lock).unwrap();
+    let record = livesync_engine::platform::record_path(&lock);
+    let snapshot = || {
+        [&lock, &record].map(|p| {
+            (
+                std::fs::read(p).unwrap(),
+                std::fs::metadata(p).unwrap().modified().unwrap(),
+            )
+        })
+    };
+    let before = snapshot();
+    // The lock file stays empty; the record beside it names the process
+    // but carries no local paths.
+    assert!(before[0].0.is_empty());
+    let text = String::from_utf8(before[1].0.clone()).unwrap();
+    assert!(!text.contains("state"), "{text}");
 
     let second_state = env.dir.path().join("profile-2/index.sqlite");
     for flock in [false, true] {
@@ -831,15 +845,11 @@ async fn two_profiles_on_one_vault_without_flock_are_refused() {
             other => panic!("expected busy, got {:?}", other.err()),
         };
         assert!(msg.contains(&format!("pid {}", std::process::id())), "{msg}");
-        assert!(
-            msg.contains(&env.dir.path().join("state").display().to_string()),
-            "{msg}"
-        );
+        assert!(msg.contains(&livesync_engine::platform::process_name()), "{msg}");
     }
-    assert_eq!(
-        std::fs::read(&lock).unwrap(),
-        recorded,
-        "a refused engine wrote the lock file"
+    assert!(
+        snapshot() == before,
+        "a refused engine wrote the lock file or the record"
     );
 
     drop(first);
@@ -849,8 +859,9 @@ async fn two_profiles_on_one_vault_without_flock_are_refused() {
             c.vault_flock = false;
         })
         .expect("free again once the first engine is gone");
-    let rec = livesync_engine::platform::read_holder(&lock).unwrap();
-    assert_eq!(rec.state_dir, second_state.parent().unwrap().display().to_string());
+    let rec = livesync_engine::platform::read_holder(&record).unwrap();
+    assert_eq!(rec.pid, std::process::id());
+    assert_eq!(std::fs::metadata(&lock).unwrap().len(), 0);
     drop(second);
 }
 
