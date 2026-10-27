@@ -81,4 +81,37 @@ class StatusSummaryTest {
         // Same VPN network, same flags, now over cellular.
         assertTrue(g.seen(7, vpn or cell, validated = true, metered = false))
     }
+
+    @Test
+    fun theTextHoldsStillBetweenRefreshes() {
+        // Issue #3: the minute refresh re-posted an unchanged notification.
+        val now = 1_761_550_000_000L
+        val l = line().copy(lastActivityMs = now - 5 * 60_000)
+        assertEquals(StatusSummary.summarize(listOf(l), now), StatusSummary.summarize(listOf(l), now + 60_000))
+        assertEquals(StatusSummary.summarize(listOf(l), now), StatusSummary.summarize(listOf(l), now + 30 * 60_000))
+    }
+
+    @Test
+    fun onlyAChangedTextIsPosted() {
+        val g = PostGate<StatusSummary.Text>()
+        val posts = mutableListOf<String>()
+        val post = { t: StatusSummary.Text -> posts += t.text; true }
+        val a = StatusSummary.Text("LiveSync · hvelv", "pull-only · last change 14:02", false)
+        g.post(a, post = post)
+        repeat(3) { g.post(a.copy(), post = post) }
+        assertEquals("an unchanged refresh is not posted", listOf(a.text), posts)
+        val b = a.copy(text = "pull-only · last change 14:07")
+        g.post(b, post = post)
+        g.post(b, post = post)
+        assertEquals(listOf(a.text, b.text), posts)
+        // startForeground always posts; the record follows it.
+        g.post(a, always = true, post = post)
+        g.post(b, post = post)
+        assertEquals(listOf(a.text, b.text, a.text, b.text), posts)
+        // A post that did not land is retried.
+        g.post(a) { false }
+        g.post(a, post = post)
+        assertEquals(b.text, posts[3])
+        assertEquals(a.text, posts.last())
+    }
 }

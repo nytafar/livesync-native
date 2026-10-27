@@ -101,3 +101,25 @@ object StatusSummary {
         return SimpleDateFormat(fmt, Locale.getDefault()).format(Date(ms))
     }
 }
+
+/**
+ * Posts the status notification only when what it says changes: every post
+ * wakes the CPU, and a refresh with the same text is a wasted one. A post
+ * and its record happen under one lock, so with posts from two threads (the
+ * worker, and `startForeground` on the main thread) the record always
+ * matches the post that landed last.
+ */
+class PostGate<T : Any> {
+    private var shown: T? = null
+
+    /**
+     * Run [post] for [t] unless [t] is already shown ([always]: regardless).
+     * [post] returns whether it showed [t]; if not, what is shown is unknown
+     * and the next call posts again.
+     */
+    @Synchronized fun post(t: T, always: Boolean = false, post: (T) -> Boolean) {
+        if (!always && t == shown) return
+        shown = null
+        if (post(t)) shown = t
+    }
+}

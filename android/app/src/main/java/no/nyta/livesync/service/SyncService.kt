@@ -38,6 +38,8 @@ class SyncService : Service() {
     /** Profiles that could not be started, with the reason (worker thread only). */
     private val problems = mutableMapOf<String, String>()
     private var lastText: StatusSummary.Text = StatusSummary.Text("LiveSync", "Starting…", false)
+    /** What the status notification shows now; unchanged text is not re-posted. */
+    private val shown = PostGate<StatusSummary.Text>()
     private var firstSyncLock: PowerManager.WakeLock? = null
     /** Profiles the first-sync wakelock is held for (worker thread). */
     private val firstSync = FirstSyncWaits()
@@ -46,6 +48,8 @@ class SyncService : Service() {
 
     private val refresh = object : Runnable {
         override fun run() {
+            // Re-reads the status; posts only if the text changed (the times
+            // in it are clock times, so they do not tick by themselves).
             updateNotification()
             // Uptime-based: does not wake a sleeping phone just to redraw.
             handler.postDelayed(this, REFRESH_MS)
@@ -321,17 +325,18 @@ class SyncService : Service() {
         app.core.getOrNull()?.log("alert: $title")
     }
 
-    private fun notifyNow() {
-        if (NotificationManagerCompat.from(this).areNotificationsEnabled()) {
-            try {
-                NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, buildNotification())
-            } catch (e: SecurityException) {
-                // Notification permission revoked meanwhile.
-            }
+    private fun notifyNow() = shown.post(lastText) { text ->
+        if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return@post false
+        try {
+            NotificationManagerCompat.from(this).notify(NOTIFICATION_ID, buildNotification(text))
+            true
+        } catch (e: SecurityException) {
+            // Notification permission revoked meanwhile.
+            false
         }
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(text: StatusSummary.Text = lastText): Notification {
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
@@ -342,9 +347,9 @@ class SyncService : Service() {
         )
         return NotificationCompat.Builder(this, LiveSyncApp.CHANNEL_STATUS)
             .setSmallIcon(R.drawable.ic_stat_sync)
-            .setContentTitle(lastText.title)
-            .setContentText(lastText.text.lineSequence().firstOrNull() ?: "")
-            .setStyle(NotificationCompat.BigTextStyle().bigText(lastText.text))
+            .setContentTitle(text.title)
+            .setContentText(text.text.lineSequence().firstOrNull() ?: "")
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text.text))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setSilent(true)
@@ -360,7 +365,10 @@ class SyncService : Service() {
     private fun goForeground(): Boolean = try {
         // specialUse exists from Android 14; below it the service needs no type.
         val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), type)
+        shown.post(lastText, always = true) { text ->
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(text), type)
+            true
+        }
         true
     } catch (e: Exception) {
         // ForegroundServiceStartNotAllowedException (Android 12+) and friends:

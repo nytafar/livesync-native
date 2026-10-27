@@ -1123,9 +1123,10 @@ impl Engine {
                     }
                     if is_internal_id(&f.id) {
                         ignored += 1;
-                    } else if classify_path(&f.path).is_none() && !self.inner.cfg.scope.contains(&f.path) {
-                        // Outside the folder scope: invisible. No row, and a
-                        // remote deletion never touches the local file.
+                    } else if !self.inner.cfg.scope.contains(&f.path) {
+                        // Outside the folder scope: invisible, whatever the
+                        // path (dot-paths too). No row, and a remote deletion
+                        // never touches the local file.
                         *self
                             .inner
                             .report
@@ -2325,6 +2326,11 @@ impl Engine {
                         }
                     };
                     if r.is_ok() {
+                        // A completed catch-up is a pull: the first one of
+                        // the run, and any later one that brought changes.
+                        if !caught_up_once || self.report().changes > 0 {
+                            self.with_index(|ix| ix.set_meta(meta::LAST_PULL, &vaultfs::now_ms().to_string()))?;
+                        }
                         old_scope = Some(self.inner.cfg.scope.clone());
                         caught_up_once = true;
                     }

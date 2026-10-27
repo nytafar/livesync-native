@@ -18,7 +18,7 @@ use livesync_model::scope::{Scope, Widening};
 use livesync_remote::ChangeRow;
 use serde_json::Value;
 use std::collections::BTreeSet;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 type Result<T> = std::result::Result<T, EngineError>;
 
@@ -81,7 +81,11 @@ impl Engine {
             (Some(_), None) => Scope::all(),
         };
         let rows = self.with_index(|ix| ix.all_rows())?;
-        let (mut dropped, mut removed) = (0usize, 0usize);
+        // Rows that fell out with a scope change, and stray rows that were
+        // never in the old scope either (older builds recorded skipped
+        // dot-paths under excluded folders): both are dropped, but only the
+        // first are news.
+        let (mut dropped, mut stray, mut removed) = (0usize, 0usize, 0usize);
         for r in rows.iter().filter(|r| !scope.contains(&r.path)) {
             if self.inner.cfg.remove_out_of_scope_copies && matches!(r.state, State::Clean | State::Conflicted) {
                 if let Some(h) = &r.disk_hash {
@@ -95,11 +99,18 @@ impl Engine {
                 }
             }
             self.with_index(|ix| ix.delete_path(&r.path))?;
-            dropped += 1;
+            if old.contains(&r.path) {
+                dropped += 1;
+            } else {
+                stray += 1;
+            }
         }
         let pending = self.with_index(|ix| ix.pending(None))?;
         for p in pending.iter().filter(|p| !scope.contains(id_to_scope_path(&p.doc_id))) {
             self.with_index(|ix| ix.remove_pending(&p.doc_id))?;
+        }
+        if stray > 0 {
+            debug!("dropped {stray} index row(s) that were never in the folder scope");
         }
         if dropped > 0 {
             info!(

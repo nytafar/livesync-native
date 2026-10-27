@@ -795,3 +795,125 @@ async fn a_second_engine_on_the_same_state_or_vault_is_refused() {
     env.engine_try(|_| {})
         .expect("free again once the first engine is gone");
 }
+
+/// Log lines emitted on this thread while the guard lives (the engine's
+/// synchronous steps run on the test thread under the current-thread runtime).
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    fn start() -> (Captured, tracing::subscriber::DefaultGuard) {
+        let c = Captured::default();
+        let w = c.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || w.clone())
+            .finish();
+        (c.clone(), tracing::subscriber::set_default(sub))
+    }
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+fn index_paths(env: &Env) -> Vec<String> {
+    Index::open(&env.dir.path().join("state/index.sqlite"))
+        .unwrap()
+        .all_rows()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect()
+}
+
+// Phone run (issue #3): dot-paths under an excluded folder were recorded as
+// skipped rows, and the next start reported a scope change that never was.
+#[tokio::test]
+async fn a_pull_records_no_rows_outside_the_folder_scope() {
+    use livesync_model::scope::{Scope, ScopeMode};
+    let env = Env::new().await;
+    let m = &env.mock;
+    m.put_text("notes/a.md", &["a"]);
+    m.put_text("notes/.hidden.md", &["in scope, skipped"]);
+    m.put_text("private/b.md", &["b"]);
+    m.put_text("private/vault/.obsidian/app.json", &["{}"]);
+    m.put_text("private/.DS_Store", &["x"]);
+    m.put_text("Private/Mixed/.trash/c.md", &["c"]);
+    let excl = || Scope::new(ScopeMode::Exclude, &["private".into()]).unwrap();
+
+    env.engine_with(|c| c.scope = excl()).pull_once().await.unwrap();
+    let paths = index_paths(&env);
+    assert!(
+        paths.iter().all(|p| excl().contains(p)),
+        "rows outside the scope: {paths:?}"
+    );
+    // Skipped dot-paths inside the scope still have their row.
+    assert_eq!(env.row("notes/.hidden.md").unwrap().state, State::Skipped);
+    assert!(env.read("private/b.md").is_none());
+
+    // An index with stray rows from an older build: the next start drops
+    // them without claiming the scope changed.
+    let ix = Index::open(&env.dir.path().join("state/index.sqlite")).unwrap();
+    let mut stray = env.row("notes/.hidden.md").unwrap();
+    stray.path = "private/vault/.obsidian/app.json".into();
+    stray.doc_id = "private/vault/.obsidian/app.json".into();
+    ix.upsert(&stray).unwrap();
+    drop(ix);
+    let (log, guard) = Captured::start();
+    env.engine_with(|c| c.scope = excl()).pull_once().await.unwrap();
+    drop(guard);
+    assert!(env.row("private/vault/.obsidian/app.json").is_none());
+    assert!(
+        !log.text().contains("folder scope is now"),
+        "unchanged scope logged as a change:\n{}",
+        log.text()
+    );
+
+    // A real narrowing still says so.
+    let (log, guard) = Captured::start();
+    let narrower = Scope::new(ScopeMode::Exclude, &["private".into(), "notes".into()]).unwrap();
+    env.engine_with(|c| c.scope = narrower).pull_once().await.unwrap();
+    drop(guard);
+    assert!(env.row("notes/a.md").is_none());
+    assert!(log.text().contains("folder scope is now"), "{}", log.text());
+}
+
+// Issue #3: "Last pull" is set once the pull-only daemon's first catch-up is
+// done, not only when a later change arrives.
+#[tokio::test]
+async fn the_pull_only_daemon_records_its_first_catch_up_as_a_pull() {
+    let env = Env::new().await;
+    env.mock.put_text("first.md", &["1"]);
+    let engine = env.engine_with(|c| c.regate_interval = Duration::from_secs(60));
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let e2 = engine.clone();
+    let h = tokio::spawn(async move { e2.daemon_pull_only(rx).await });
+    let mut st = engine.status().unwrap();
+    for _ in 0..200 {
+        st = engine.status().unwrap();
+        if st.daemon_heartbeat_ms.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(st.daemon_heartbeat_ms.is_some(), "never caught up");
+    assert!(st.last_pull_ms.is_some(), "no last pull after the first catch-up");
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), h)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(env.mock.writes().is_empty());
+}

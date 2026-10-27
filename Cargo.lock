@@ -944,6 +944,7 @@ dependencies = [
  "futures",
  "livesync-model",
  "livesync-remote",
+ "log",
  "notify",
  "rand 0.8.8",
  "regex",
@@ -954,6 +955,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-log",
+ "tracing-subscriber",
  "unicode-normalization",
  "xxhash-rust",
 ]

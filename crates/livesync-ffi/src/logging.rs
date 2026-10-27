@@ -120,12 +120,16 @@ pub fn init() {
         let filter = tracing_subscriber::EnvFilter::new(
             "warn,livesync_engine=info,livesync_remote=info,livesync_model=info,livesync_ffi=info,app=info",
         );
-        let _ = tracing_subscriber::fmt()
+        let sub = tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_ansi(false)
             .with_target(false)
             .with_writer(TeeWriter)
-            .try_init();
+            .finish();
+        if tracing::subscriber::set_global_default(sub).is_ok() {
+            // Our own `log` bridge: it passes known-harmless library warnings on at debug.
+            let _ = livesync_engine::logbridge::init();
+        }
     });
 }
 

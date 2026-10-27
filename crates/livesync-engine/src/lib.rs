@@ -11,6 +11,7 @@
 pub mod engine;
 pub mod fsrules;
 pub mod index;
+pub mod logbridge;
 pub mod platform;
 pub mod push;
 mod scopesync;
