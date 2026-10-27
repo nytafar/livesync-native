@@ -124,15 +124,21 @@ private fun AppRoot(app: LiveSyncApp, openRequest: String?, onOpenHandled: () ->
                 onAdd = { screen = Screen.Setup(null) },
             )
         }
-        is Screen.Setup -> SetupScreen(
-            app = app,
-            existing = s.editId?.let { id -> profiles.firstOrNull { it.id == id } },
-            onDone = { id ->
-                version++
-                screen = Screen.Status(id)
-            },
-            onCancel = back?.let { b -> { screen = b } },
-        )
+        is Screen.Setup -> if (s.editId != null && profiles.none { it.id == s.editId }) {
+            // The settings of a vault that is gone (removed while they were
+            // open) must not turn into an "Add vault" form with its values.
+            screen = Screen.Vaults
+        } else {
+            SetupScreen(
+                app = app,
+                existing = s.editId?.let { id -> profiles.firstOrNull { it.id == id } },
+                onDone = { id ->
+                    version++
+                    screen = Screen.Status(id)
+                },
+                onCancel = back?.let { b -> { screen = b } },
+            )
+        }
         is Screen.Status -> if (profiles.none { it.id == s.id }) {
             screen = Screen.Vaults
         } else {
@@ -151,7 +157,7 @@ private fun AppRoot(app: LiveSyncApp, openRequest: String?, onOpenHandled: () ->
                         // refresh the list, and leave the screen only if it
                         // still shows the removed vault.
                         version++
-                        if (screen == Screen.Status(s.id)) screen = Screen.Vaults
+                        if (screen == Screen.Status(s.id) || screen == Screen.Setup(s.id)) screen = Screen.Vaults
                     },
                 )
             }
