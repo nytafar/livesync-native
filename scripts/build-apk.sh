@@ -117,7 +117,10 @@ if [[ $UNSIGNED == 1 ]]; then
 else
   APK=android/app/build/outputs/apk/release/app-release.apk
   [[ -f "$APK" ]] || { echo "no signed APK at $APK (is the signing file readable?)" >&2; exit 1; }
-  "$BUILD_TOOLS/apksigner" verify --print-certs "$APK" | grep -E "Signer #1 certificate (DN|SHA-256)"
+  # apksigner reports verification errors on stdout, so don't filter them away.
+  certs=$("$BUILD_TOOLS/apksigner" verify --print-certs "$APK" 2>&1) || {
+    echo "apksigner verify failed for $APK:" >&2; echo "$certs" >&2; exit 1; }
+  grep -E "Signer #1 certificate (DN|SHA-256)" <<<"$certs"
   OUT="dist/livesync-android-$VERSION_NAME.apk"
 fi
 cp "$APK" "$OUT"
