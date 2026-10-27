@@ -179,10 +179,14 @@ impl RenameHints {
         self.pairs.retain(|p| p.2 >= cutoff);
     }
 
-    /// Where `path` went, following file or folder renames.
+    /// Where `path` went, following file or folder renames reported in the
+    /// last minute.
     pub(crate) fn dest(&self, path: &str) -> Option<String> {
-        self.pairs.iter().rev().find_map(|(from, to, _)| {
-            if path == from {
+        let cutoff = Instant::now().checked_sub(Duration::from_secs(60));
+        self.pairs.iter().rev().find_map(|(from, to, at)| {
+            if cutoff.is_some_and(|c| *at < c) {
+                None
+            } else if path == from {
                 Some(to.clone())
             } else {
                 path.strip_prefix(from.as_str())
@@ -303,6 +307,16 @@ impl DeleteHold {
         }
     }
 
+    /// Something is pending (a rename whose new name is not pushed yet):
+    /// make sure a full pass comes after the hold period.
+    fn recheck(&mut self) {
+        if self.newest.is_none() {
+            let at = Instant::now();
+            self.newest = Some(at);
+            self.first = Some(at);
+        }
+    }
+
     /// The document's file is there: a later deletion of it is new.
     fn forget(&mut self, doc_id: &str) {
         self.seen.remove(doc_id);
@@ -357,6 +371,8 @@ struct PassCtx {
     failed_hashes: HashSet<String>,
     /// Deletions were held for later (`DeleteHold`): no decision yet.
     deletes_held: bool,
+    /// A renamed file's new name is not pushed yet; the old document waits.
+    dests_pending: bool,
 }
 
 /// How to treat a file with no known revision.
@@ -431,6 +447,15 @@ fn is_tracked(s: State) -> bool {
 
 fn same_content(a: &Value, b: &Value) -> bool {
     a.get("children") == b.get("children") && a.get("type") == b.get("type")
+}
+
+/// Whether a destination accounts for a vanished file (`claim_dest`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    Yes,
+    /// There, but not pushed yet.
+    Pending,
+    No,
 }
 
 /// What became of a vanished file.
@@ -1552,12 +1577,23 @@ impl Engine {
                         fates.push((r, Fate::OutOfScope(d)));
                         continue;
                     }
-                    Fate::Delete { .. } => {
-                        if self.claim_dest(&d, &mut claimed)? {
+                    Fate::Delete { .. } => match self.claim_dest(&d, &mut claimed)? {
+                        Claim::Yes => {
                             fates.push((r, Fate::Delete { dest: Some(d) }));
                             continue;
                         }
-                    }
+                        Claim::Pending => {
+                            // Renamed, and the new name is still being
+                            // written: decide once it is pushed.
+                            info!(
+                                "{}: renamed to {d}, which is not pushed yet; the old document is kept for now",
+                                r.path
+                            );
+                            ctx.dests_pending = true;
+                            continue;
+                        }
+                        Claim::No => {}
+                    },
                 }
             }
             // The same content appeared under a new name in this pass.
@@ -1565,7 +1601,7 @@ impl Engine {
                 Some(paths) => {
                     let mut hit = None;
                     while let Some(d) = paths.pop() {
-                        if self.claim_dest(&d, &mut claimed)? {
+                        if self.claim_dest(&d, &mut claimed)? == Claim::Yes {
                             hit = Some(d);
                             break;
                         }
@@ -1580,11 +1616,13 @@ impl Engine {
             }
         }
         if !unknown.is_empty() {
-            let found = self.find_moved_out(&unknown).await?;
+            let found = self.find_moved_out(&unknown, &claimed).await?;
             for r in unknown {
                 let fate = match found.get(&r.doc_id) {
                     Some(d) => match self.fate_of(d) {
-                        Fate::Delete { .. } if !self.claim_dest(d, &mut claimed)? => Fate::Delete { dest: None },
+                        Fate::Delete { .. } if self.claim_dest(d, &mut claimed)? != Claim::Yes => {
+                            Fate::Delete { dest: None }
+                        }
                         f => f,
                     },
                     None => Fate::Delete { dest: None },
@@ -1635,6 +1673,14 @@ impl Engine {
             None => false,
         };
         ctx.deletes_held |= held;
+        if ctx.dests_pending {
+            // Look again soon: a full pass decides once the new names are
+            // pushed (a partial pass may never see the old ones again).
+            if let Some(h) = hold.as_deref_mut() {
+                h.recheck();
+            }
+            ctx.deletes_held = true;
+        }
         let mass = !held && undestined > MASS_DELETE_MIN && undestined * 2 > tracked;
         let emptied = !held && tally.visible_empty && undestined >= EMPTIED_TREE_MIN;
         let mut withhold = held;
@@ -1696,25 +1742,28 @@ impl Engine {
     /// Whether a deletion's destination accounts for it: not claimed by
     /// another vanished file in this pass, a file on disk now, and inside
     /// the synced folders also on the server (tracked with a synced
-    /// revision, as after its push in this pass). Claims it if so.
-    fn claim_dest(&self, dest: &str, claimed: &mut HashSet<String>) -> Result<bool> {
+    /// revision, as after its push in this pass). Claims it if so. A
+    /// destination that is there but not pushed yet (still being written)
+    /// is `Pending`.
+    fn claim_dest(&self, dest: &str, claimed: &mut HashSet<String>) -> Result<Claim> {
         if claimed.contains(dest) {
-            return Ok(false);
+            return Ok(Claim::No);
         }
         let there = std::fs::symlink_metadata(self.inner.cfg.vault.join(dest)).is_ok_and(|m| m.is_file());
         if !there {
-            return Ok(false);
+            return Ok(Claim::No);
         }
         if !in_trash(dest) {
             let synced = self
                 .row_for_local(dest)?
                 .is_some_and(|r| r.base_rev.is_some() && is_tracked(r.state));
             if !synced {
-                return Ok(false);
+                claimed.insert(dest.to_string());
+                return Ok(Claim::Pending);
             }
         }
         claimed.insert(dest.to_string());
-        Ok(true)
+        Ok(Claim::Yes)
     }
 
     fn fate_of(&self, dest: &str) -> Fate {
@@ -1731,8 +1780,14 @@ impl Engine {
 
     /// Look for vanished files outside the synced area (other dot-folders,
     /// excluded folders, ignored names, `.trash/`), matched by size, mtime
-    /// and content hash. Returns doc ID -> where it is now.
-    async fn find_moved_out(&self, rows: &[FileRow]) -> Result<HashMap<String, String>> {
+    /// and content hash, leaving out paths in `exclude` (destinations other
+    /// vanished files already account for). Returns doc ID -> where it is
+    /// now. Each file found accounts for one vanished file, and only where
+    /// that is unambiguous: when more vanished files share a size, mtime and
+    /// hash than files with them were found, none of them counts as moved
+    /// (a stale copy left from an earlier move must not account for a new
+    /// deletion, pass after pass).
+    async fn find_moved_out(&self, rows: &[FileRow], exclude: &HashSet<String>) -> Result<HashMap<String, String>> {
         let mut want: HashMap<(u64, i64), Vec<FileRow>> = HashMap::new();
         for r in rows {
             if let (Some(s), Some(m), Some(_)) = (r.disk_size, r.disk_mtime, &r.disk_hash) {
@@ -1743,18 +1798,20 @@ impl Engine {
             return Ok(HashMap::new());
         }
         let this = self.clone();
+        let exclude = exclude.clone();
         tokio::task::spawn_blocking(move || {
             const MAX_ENTRIES: usize = 200_000;
             let root = this.inner.cfg.vault.clone();
-            let mut out = HashMap::new();
+            // (size, mtime, hash) -> paths found with them.
+            let mut found: BTreeMap<(u64, i64, String), Vec<String>> = BTreeMap::new();
             let mut stack = vec![root.clone()];
             let mut seen = 0usize;
-            while let Some(dir) = stack.pop() {
+            'walk: while let Some(dir) = stack.pop() {
                 let Ok(rd) = std::fs::read_dir(&dir) else { continue };
                 for e in rd.flatten() {
                     seen += 1;
                     if seen > MAX_ENTRIES {
-                        return out;
+                        break 'walk;
                     }
                     let Ok(ft) = e.file_type() else { continue };
                     let Some(rel) = rel_of(&root, &e.path()) else { continue };
@@ -1768,7 +1825,11 @@ impl Engine {
                     }
                     // Our own vault lock file is no note's new home (an empty
                     // note with its mtime would match it).
-                    if !ft.is_file() || this.local_visible(&rel) || rel == crate::engine::VAULT_LOCK {
+                    if !ft.is_file()
+                        || this.local_visible(&rel)
+                        || rel == crate::engine::VAULT_LOCK
+                        || exclude.contains(&rel)
+                    {
                         continue;
                     }
                     let Ok(md) = e.metadata() else { continue };
@@ -1778,13 +1839,24 @@ impl Engine {
                     let Ok(Some(st)) = vaultfs::read_state(&e.path()) else {
                         continue;
                     };
-                    // One file found accounts for one vanished file.
-                    if let Some(c) = cands
-                        .iter()
-                        .find(|c| c.disk_hash.as_deref() == Some(st.hash.as_str()) && !out.contains_key(&c.doc_id))
-                    {
-                        out.insert(c.doc_id.clone(), rel.clone());
+                    if cands.iter().any(|c| c.disk_hash.as_deref() == Some(st.hash.as_str())) {
+                        found.entry((md.len(), mtime_ms(&md), st.hash)).or_default().push(rel);
                     }
+                }
+            }
+            let mut out = HashMap::new();
+            for ((size, mtime, hash), mut paths) in found {
+                let mut owners: Vec<&FileRow> = want[&(size, mtime)]
+                    .iter()
+                    .filter(|r| r.disk_hash.as_deref() == Some(hash.as_str()))
+                    .collect();
+                if owners.len() > paths.len() {
+                    continue;
+                }
+                owners.sort_by(|a, b| a.path.cmp(&b.path));
+                paths.sort();
+                for (r, p) in owners.into_iter().zip(paths) {
+                    out.insert(r.doc_id.clone(), p);
                 }
             }
             out
@@ -2254,6 +2326,65 @@ mod tests {
         assert!(took >= Duration::from_millis(600), "{took:?}");
         assert!(took < Duration::from_millis(2000), "{took:?}");
         assert!(n >= 6, "{n}");
+    }
+
+    /// Codex (third round): files other vanished files already account for
+    /// are left out, and a copy shared by more vanished files than copies
+    /// accounts for none of them.
+    #[tokio::test]
+    async fn found_files_are_matched_one_to_one_and_only_unambiguously() {
+        use crate::engine::EngineConfig;
+        use livesync_remote::{Couch, RemoteConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join(".trash")).unwrap();
+        for n in ["a", "b"] {
+            let p = vault.join(format!(".trash/{n}.md"));
+            std::fs::write(&p, b"same").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+                .unwrap();
+        }
+        let couch = Couch::new(&RemoteConfig {
+            url: "http://127.0.0.1:9".into(),
+            database: "db".into(),
+            username: None,
+            password: None,
+        })
+        .unwrap();
+        let engine = Engine::open(couch, EngineConfig::new(vault, dir.path().join("state/index.sqlite"))).unwrap();
+        let hash = vaultfs::hash_bytes(b"same");
+        let row = |p: &str| FileRow {
+            path: p.into(),
+            doc_id: p.into(),
+            base_rev: Some("1-a".into()),
+            base_children: vec![],
+            disk_mtime: Some(1_700_000_000_000),
+            disk_size: Some(4),
+            disk_hash: Some(hash.clone()),
+            state: State::Clean,
+            note: None,
+        };
+        // `.trash/a.md` already accounts for another note.
+        let claimed: HashSet<String> = [".trash/a.md".to_string()].into();
+        let found = engine.find_moved_out(&[row("b.md")], &claimed).await.unwrap();
+        assert_eq!(found.get("b.md").map(String::as_str), Some(".trash/b.md"));
+        // Two vanished, one copy left: neither counts as moved.
+        let found = engine
+            .find_moved_out(&[row("b.md"), row("c.md")], &claimed)
+            .await
+            .unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        // Two and two: one each.
+        let found = engine
+            .find_moved_out(&[row("b.md"), row("c.md")], &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_ne!(found["b.md"], found["c.md"]);
     }
 
     #[test]

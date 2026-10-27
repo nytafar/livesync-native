@@ -1905,10 +1905,18 @@ async fn one_new_file_accounts_for_one_vanished_twin_only() {
     assert_eq!(rep.push.deleted, 1, "only the one rename went out: {rep:?}");
     let st = env.engine().status().unwrap();
     assert!(st.safety_stop.as_deref().unwrap().contains("24 of 40"), "{st:?}");
+    // Later passes do not let the new file account for another one.
+    for _ in 0..5 {
+        let rep = env.engine().sync_once().await.unwrap();
+        assert_eq!(rep.push.deleted, 0, "{rep:?}");
+        assert_eq!(rep.push.safety_stops, 1, "{rep:?}");
+    }
 }
 
 /// Review of #10: the same for files found outside the synced folders: one
-/// empty file in `.trash/` accounts for one vanished empty note.
+/// empty file in `.trash/` cannot tell which of 25 vanished empty notes it
+/// is, so none counts as moved, on this pass or any later one (Codex: a
+/// stale copy accounted for one more note per pass).
 #[tokio::test]
 async fn one_file_in_the_trash_accounts_for_one_vanished_twin_only() {
     let env = Env::new().await;
@@ -1925,11 +1933,21 @@ async fn one_file_in_the_trash_accounts_for_one_vanished_twin_only() {
     }
     env.write(".trash/empty00.md", b"");
     set_mtime(&env, ".trash/empty00.md", 1_700_000_000);
+    for _ in 0..6 {
+        let rep = env.engine().sync_once().await.unwrap();
+        assert_eq!(rep.push.safety_stops, 1, "{rep:?}");
+        assert_eq!(rep.push.deleted, 0, "{rep:?}");
+        let st = env.engine().status().unwrap();
+        assert!(st.safety_stop.as_deref().unwrap().contains("25 of 40"), "{st:?}");
+    }
+    // As many copies as vanished notes: those are moves.
+    for i in 1..25 {
+        env.write(&format!(".trash/empty{i:02}.md"), b"");
+        set_mtime(&env, &format!(".trash/empty{i:02}.md"), 1_700_000_000);
+    }
     let rep = env.engine().sync_once().await.unwrap();
-    assert_eq!(rep.push.safety_stops, 1, "{rep:?}");
-    assert_eq!(rep.push.deleted, 1, "only the one move into .trash/ went out: {rep:?}");
-    let st = env.engine().status().unwrap();
-    assert!(st.safety_stop.as_deref().unwrap().contains("24 of 40"), "{st:?}");
+    assert_eq!(rep.push.safety_stops, 0, "{rep:?}");
+    assert_eq!(rep.push.deleted, 25, "{rep:?}");
 }
 
 /// Review of #10: a trickle of deletions that never lets the hold end is
@@ -1994,4 +2012,51 @@ async fn the_vault_lock_file_is_not_where_a_deleted_note_went() {
     assert_eq!(rep.push.out_of_scope, 0, "{rep:?}");
     assert_eq!(rep.push.deleted, 1, "{rep:?}");
     assert!(env.deleted("twin.md"));
+}
+
+/// Codex (third round): a note renamed while its new name is still being
+/// written keeps its old document until the new name is pushed, and never
+/// counts as deleted meanwhile.
+#[tokio::test]
+async fn renames_still_being_written_do_not_trip_the_stop() {
+    let env = Env::new().await;
+    for i in 0..30 {
+        env.write(&format!("n{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_millis(500);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for i in 0..25 {
+        env.mv(&format!("n{i:02}.md"), &format!("r{i:02}.md"));
+    }
+    // Keep writing the new names for well over the hold.
+    let mut stopped = false;
+    for round in 0..15 {
+        for i in 0..25 {
+            env.write(&format!("r{i:02}.md"), format!("note {i}, edit {round}").as_bytes());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stopped |= engine.status().unwrap().safety_stop.is_some();
+    }
+    wait_until("the renames", || {
+        (0..25).all(|i| {
+            env.deleted(&format!("n{i:02}.md"))
+                && env.remote(&format!("r{i:02}.md")).as_deref() == Some(format!("note {i}, edit 14").as_bytes())
+        })
+    })
+    .await;
+    stopped |= engine.status().unwrap().safety_stop.is_some();
+    assert!(!stopped, "the renames tripped the stop");
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
 }
