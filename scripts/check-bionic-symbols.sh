@@ -2,8 +2,9 @@
 # Check that an arm64 Android ELF only needs symbols the platform has at a
 # given API level: every undefined, non-weak dynamic symbol must be defined by
 # one of its NEEDED libraries' NDK stubs for that level (libc, libm, libdl,
-# liblog, ...). A symbol that only exists from a later level would make
-# dlopen fail on the older device.
+# liblog, ...), and every NEEDED library must exist at that level. A symbol
+# or library that only exists from a later level would make dlopen fail on
+# the older device.
 #
 # Usage: scripts/check-bionic-symbols.sh <lib.so or binary> <api level>
 # Needs ANDROID_NDK_HOME (default: the newest NDK under ~/Android/Sdk/ndk).
@@ -26,7 +27,10 @@ for lib in $needed; do
   if [[ -f "$stubs/$lib" ]]; then
     "$nm" -D --defined-only "$stubs/$lib" | awk '{print $NF}' | sed 's/@.*//' >> "$defined"
   else
-    echo "note: $lib has no NDK stub at API $api; its symbols are not checked" >&2
+    # The loader needs every DT_NEEDED library, used or not; this check knows
+    # only the platform's, so a bundled library has to be checked on its own.
+    echo "$(basename "$elf") needs $lib, which API $api does not provide" >&2
+    exit 1
   fi
 done
 sort -u -o "$defined" "$defined"
