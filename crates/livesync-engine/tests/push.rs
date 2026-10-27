@@ -1141,6 +1141,201 @@ async fn an_unreadable_folder_does_not_end_a_stopped_burst() {
     assert_eq!(rep.push.safety_stops, 1);
 }
 
+/// A folder made unreadable for the length of a test, readable again when
+/// the test ends (so the temporary directory can be removed).
+struct Unreadable(PathBuf);
+
+impl Unreadable {
+    fn new(dir: PathBuf) -> Unreadable {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        Unreadable(dir)
+    }
+}
+
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// Round 3: an unreadable folder the burst does not depend on neither keeps
+/// the burst open (so later, separate deletions do not join it) nor makes
+/// the daemon walk the whole vault again every hold period.
+#[tokio::test]
+async fn an_unreadable_folder_does_not_keep_a_burst_open() {
+    let env = Env::new().await;
+    for i in 0..5 {
+        env.write(&format!("locked/l{i}.md"), format!("locked {i}").as_bytes());
+    }
+    for i in 0..35 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let _locked = Unreadable::new(env.vault().join("locked"));
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_millis(500);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let deleted = |r: std::ops::Range<usize>| r.filter(|i| env.deleted(&format!("f{i:02}.md"))).count();
+    // A small burst goes out after the hold.
+    for i in 0..10 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    wait_until("the first burst", || deleted(0..10) == 10).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // Idle: nothing schedules a full walk of its own.
+    let before = engine.push_report().passes;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    let idle = engine.push_report().passes - before;
+    // A later burst is judged on its own: 15 of 30, no stop. Counted with
+    // the first, it would be "25 of 40 ... in one burst".
+    for i in 10..25 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    wait_until("the second burst, or a stop", || {
+        deleted(10..25) == 15 || engine.status().unwrap().safety_stop.is_some()
+    })
+    .await;
+    let stop = engine.status().unwrap().safety_stop;
+    assert!(
+        idle <= 1 && stop.is_none(),
+        "{idle} passes in 3 idle seconds; the later burst: {stop:?}"
+    );
+    assert_eq!(deleted(10..25), 15);
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// Round 3: a stop whose files all came back clears, even while a folder
+/// it does not list cannot be read; and confirming such a stop clears it
+/// too, using the confirmation up.
+#[tokio::test]
+async fn a_stop_clears_when_its_files_come_back_beside_an_unreadable_folder() {
+    let env = Env::new().await;
+    for i in 0..5 {
+        env.write(&format!("locked/l{i}.md"), format!("locked {i}").as_bytes());
+    }
+    for i in 0..26 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let _locked = Unreadable::new(env.vault().join("locked"));
+    let e = env.engine();
+    let wipe = || {
+        for i in 0..25 {
+            std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+        }
+    };
+    let restore = || {
+        for i in 0..25 {
+            env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+        }
+    };
+    wipe();
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.safety_stops, 1, "{:?}", rep.push);
+    assert!(env.meta("safety_stop").unwrap().contains("25 of 31"));
+    restore();
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0);
+    assert!(e.status().unwrap().safety_stop.is_none(), "the stop stayed");
+
+    wipe();
+    e.sync_once().await.unwrap();
+    let stop = e.status().unwrap().safety_stop.expect("a stop");
+    restore();
+    assert_eq!(
+        e.allow_mass_delete_once(&stop).unwrap(),
+        livesync_engine::Confirmation::Allowed
+    );
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0);
+    assert!(e.status().unwrap().safety_stop.is_none(), "the stop stayed");
+    assert!(!e.mass_delete_allowed());
+    assert!((0..25).all(|i| !env.deleted(&format!("f{i:02}.md"))));
+}
+
+/// Round 3: a confirmation of a stop whose files cannot be checked when it
+/// is applied waits for a pass that can check them.
+#[tokio::test]
+async fn a_confirmation_waits_while_its_files_cannot_be_checked() {
+    let env = Env::new().await;
+    for i in 0..30 {
+        env.write(&format!("sub/f{i:02}.md"), format!("{i}").as_bytes());
+    }
+    for i in 0..10 {
+        env.write(&format!("g{i}.md"), format!("g {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    for i in 0..25 {
+        std::fs::remove_file(env.vault().join(format!("sub/f{i:02}.md"))).unwrap();
+    }
+    let e = env.engine();
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.safety_stops, 1, "{:?}", rep.push);
+    let stop = e.status().unwrap().safety_stop.expect("a stop");
+    let locked = Unreadable::new(env.vault().join("sub"));
+    assert_eq!(
+        e.allow_mass_delete_once(&stop).unwrap(),
+        livesync_engine::Confirmation::Allowed
+    );
+    let rep = e.sync_once().await;
+    let (stopped, allowed) = (env.meta("safety_stop"), e.mass_delete_allowed());
+    drop(locked);
+    assert_eq!(rep.unwrap().push.deleted, 0);
+    assert_eq!(stopped.as_deref(), Some(stop.as_str()), "the stop changed or cleared");
+    assert!(allowed, "the confirmation was used up unapplied");
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 25, "{:?}", rep.push);
+    assert!(e.status().unwrap().safety_stop.is_none());
+    assert!(!e.mass_delete_allowed());
+}
+
+/// Round 3: a one-shot sync counts a burst the daemon left open without a
+/// stop (killed in the middle of it): 45 of 100 already sent and 27 more
+/// missing is "72 of 100", not "27 of 55".
+#[tokio::test]
+async fn a_one_shot_sync_counts_a_burst_the_daemon_left_open() {
+    let env = Env::new().await;
+    for i in 0..55 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let sent: Vec<String> = (0..45).map(|i| format!("sent{i:02}.md")).collect();
+    Index::open(&env.index_path())
+        .unwrap()
+        .set_meta("delete_burst_sent", &serde_json::to_string(&sent).unwrap())
+        .unwrap();
+    for i in 0..27 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0, "{:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 1);
+    let stop = env.meta("safety_stop").unwrap();
+    assert!(stop.contains("72 of 100") && stop.contains("in one burst"), "{stop}");
+    assert!(env.meta("delete_burst_sent").is_some());
+    // Within bounds, a one-shot decision ends the burst.
+    for i in 0..27 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    std::fs::remove_file(env.vault().join("f00.md")).unwrap();
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 1, "{:?}", rep.push);
+    assert!(env.meta("delete_burst_sent").is_none());
+    assert!(env.meta("safety_stop").is_none());
+}
+
 /// H1: once the conflict ends in a deletion, a conflicted local copy is
 /// still not removed; it is kept and reported.
 #[tokio::test]

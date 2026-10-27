@@ -224,6 +224,11 @@ impl RenameHints {
 /// with quiet periods between them are separate bursts. A stop keeps the
 /// burst's count until it is confirmed or the files come back.
 ///
+/// A full pass that cannot check some of the files the burst or its stop
+/// depends on (their folder became unreadable, say) neither ends the burst
+/// nor clears the stop. Files it cannot check that belong to neither do not
+/// matter to them.
+///
 /// Holding a deletion only keeps the remote copy longer. The hold lives in
 /// memory: if the process is killed or restarted, the rows are still
 /// tracked and the files still missing, so the next full pass finds them
@@ -252,8 +257,15 @@ pub(crate) struct DeleteHold {
     last_new: Option<Instant>,
     /// The last decision was a stop, not answered yet: the burst stays.
     refused: bool,
-    /// The decision being made was forced by the maximum: the burst goes on.
+    /// The decision being made was forced by the maximum, or its pass could
+    /// not check some of the burst's files: the burst goes on.
     cut: bool,
+    /// The burst's or its stop's documents the last full pass could not
+    /// check (`Some(empty)`: a stop saved without its list, so which ones is
+    /// not known). They stay seen and the burst cannot end, but no look of
+    /// its own is scheduled for that: the next full pass that comes anyway
+    /// (the periodic rescan, Sync now, a confirmation) looks again.
+    unchecked: Option<HashSet<String>>,
 }
 
 impl DeleteHold {
@@ -269,6 +281,7 @@ impl DeleteHold {
             last_new: None,
             refused: false,
             cut: false,
+            unchecked: None,
         }
     }
 
@@ -296,7 +309,7 @@ impl DeleteHold {
     /// a burst the maximum cut is over.
     pub(crate) fn due(&self) -> Option<Instant> {
         self.hold_due().or_else(|| {
-            let open = !self.burst.is_empty() && !self.refused;
+            let open = !self.burst.is_empty() && !self.refused && self.unchecked.is_none();
             self.last_new.filter(|_| open).map(|t| t + self.period)
         })
     }
@@ -330,9 +343,12 @@ impl DeleteHold {
         }
         if scan.is_some() {
             // A full pass sees every missing file: forget the ones that
-            // came back or were deleted since.
+            // came back or were deleted since. Those it could not check are
+            // not known to be back.
             let current: HashSet<&str> = ids.iter().copied().collect();
-            self.seen.retain(|id| current.contains(id.as_str()));
+            let unchecked = self.unchecked.as_ref();
+            self.seen
+                .retain(|id| current.contains(id.as_str()) || unchecked.is_some_and(|u| u.contains(id)));
         }
         if fresh {
             self.last_new = Some(at);
@@ -346,7 +362,7 @@ impl DeleteHold {
         if !over {
             return None;
         }
-        self.cut = !self.quiet(walked);
+        self.cut = !self.quiet(walked) || self.unchecked.is_some();
         self.newest = None;
         self.first = None;
         Some(self.burst.len() as u64)
@@ -362,7 +378,10 @@ impl DeleteHold {
         if refused {
             return;
         }
-        self.seen.clear();
+        match &self.unchecked {
+            Some(u) => self.seen.retain(|id| u.contains(id)),
+            None => self.seen.clear(),
+        }
         if self.cut {
             self.burst.extend(sent.iter().map(|id| id.to_string()));
         } else {
@@ -370,14 +389,17 @@ impl DeleteHold {
         }
     }
 
-    /// The deciding pass could not check every file: it cannot tell that
-    /// the burst is over, so the burst goes on (as after a cut), and the
-    /// look whether it is over comes a quiet period later, not at once.
-    fn unchecked(&mut self) {
-        self.cut = true;
-        if !self.burst.is_empty() {
-            self.last_new = Some(Instant::now());
+    /// A full pass is about to judge what is missing (call before
+    /// `observe`): the burst's or its stop's documents it could not check,
+    /// `None` if it could check all of them. Such a pass cannot tell that
+    /// the burst is over, so the burst goes on (as after a cut). It does
+    /// not schedule another look of its own, so an unreadable folder does
+    /// not make the daemon walk the vault every `period`.
+    fn checked(&mut self, unchecked: Option<HashSet<String>>) {
+        if let Some(u) = &unchecked {
+            self.seen.extend(u.iter().cloned());
         }
+        self.unchecked = unchecked;
     }
 
     /// The user confirmed the stop: the burst is answered.
@@ -505,6 +527,9 @@ struct PassCtx {
     failed_hashes: HashSet<String>,
     /// Deletions were held for later (`DeleteHold`): no decision yet.
     deletes_held: bool,
+    /// Some files a burst or its stop depends on could not be checked
+    /// (`Engine::depended_on`).
+    unchecked: bool,
     /// A renamed file's new name is not pushed yet; the old document waits.
     dests_pending: bool,
 }
@@ -970,7 +995,10 @@ impl Engine {
             &mut issues_seen,
         )
         .await?;
-        if let Some(stop) = confirming {
+        // A confirmation this pass did not get to apply, because the stop's
+        // files could not be checked, waits for a pass that can.
+        let unapplied = ctx.confirmed.is_some() && ctx.unchecked;
+        if let Some(stop) = confirming.filter(|_| !unapplied) {
             let mut once = self.inner.mass_delete_once.lock().unwrap();
             // Unless the user confirmed another stop meanwhile.
             if once.as_ref().is_some_and(|c| c.stop == stop) {
@@ -1668,6 +1696,11 @@ impl Engine {
         issues_seen: &mut HashSet<String>,
     ) -> Result<()> {
         if rows.is_empty() {
+            if tally.scan.is_some() {
+                if let Some(h) = hold.as_deref_mut() {
+                    h.checked(None);
+                }
+            }
             return self.nothing_vanished(hold, &tally, false);
         }
         let n = rows.len();
@@ -1687,14 +1720,12 @@ impl Engine {
             }
         }
         // Only files the filesystem says are not there count as vanished.
-        // Some could not be checked: this pass cannot tell that a burst is
-        // over (its files may still be gone).
         let mut gone: Vec<FileRow> = Vec::new();
-        let mut unchecked = false;
+        let mut unchecked: Vec<String> = Vec::new();
         for r in rows {
             if unreadable.iter().any(|(p, _)| under(&r.path, p)) {
                 rep.unreadable += 1;
-                unchecked = true;
+                unchecked.push(r.doc_id);
                 continue;
             }
             match std::fs::symlink_metadata(self.inner.cfg.vault.join(&r.path)) {
@@ -1708,11 +1739,22 @@ impl Engine {
                         rep.issues += 1;
                     }
                     rep.unreadable += 1;
-                    unchecked = true;
+                    unchecked.push(r.doc_id);
                 }
             }
         }
-        // Nor that a stop shown for them is over.
+        // Some of the files a burst or its stop depends on could not be
+        // checked (they may still be gone): this pass cannot tell that the
+        // burst is over, nor that the stop is. Other files it could not
+        // check do not matter to either.
+        let blocked = self.depended_on(&unchecked, hold.as_deref())?;
+        let unchecked = blocked.is_some();
+        if tally.scan.is_some() {
+            if let Some(h) = hold.as_deref_mut() {
+                h.checked(blocked);
+            }
+        }
+        ctx.unchecked |= unchecked;
         ctx.deletes_held |= unchecked;
         if gone.is_empty() {
             return self.nothing_vanished(hold, &tally, unchecked);
@@ -1877,7 +1919,11 @@ impl Engine {
         // In the daemon, wait for the burst to end. A decision counts the
         // deletions its burst already sent (when the maximum hold cut it
         // into parts) as missing too, against what was tracked before them.
-        let burst_before = hold.as_deref().map(|h| h.burst.clone()).unwrap_or_default();
+        let burst_before = match hold.as_deref() {
+            Some(h) => h.burst.clone(),
+            None => self.saved_burst()?,
+        };
+        let mut saved = burst_before.clone();
         let earlier = match hold.as_deref_mut() {
             Some(h) => {
                 if tally.scan.is_some() {
@@ -1894,14 +1940,11 @@ impl Engine {
                 decision
             }
             // A one-shot pass decides now. It has no burst of its own, but
-            // keeps the count of a stop a burst led to.
+            // counts one a daemon left open (killed in the middle of it,
+            // say), and the count of a stop a burst led to.
             None => {
-                let mut burst = match self.with_index(|ix| ix.get_meta(meta::SAFETY_STOP))? {
-                    Some(_) => self.saved_burst()?,
-                    None => HashSet::new(),
-                };
-                self.prune_burst(&mut burst)?;
-                Some(burst.len() as u64)
+                self.prune_burst(&mut saved)?;
+                Some(saved.len() as u64)
             }
         };
         let held = earlier.is_none();
@@ -1975,13 +2018,17 @@ impl Engine {
             let sent: &[&str] = if withhold { &[] } else { &undestined_ids };
             match hold {
                 Some(h) => {
-                    if unchecked {
-                        h.unchecked();
-                    }
                     h.decided(withhold, sent);
                     self.save_burst(&burst_before, &h.burst)?;
                 }
-                None if !withhold && !unchecked => self.with_index(|ix| ix.delete_meta(meta::DELETE_BURST))?,
+                // A one-shot decision without a stop ends the burst, as a
+                // quiet period would; unless it could not check the burst's
+                // files: then what it sends joins the burst.
+                None if !withhold && unchecked => {
+                    saved.extend(sent.iter().map(|id| id.to_string()));
+                    self.save_burst(&burst_before, &saved)?;
+                }
+                None if !withhold => self.with_index(|ix| ix.delete_meta(meta::DELETE_BURST))?,
                 None => {}
             }
         }
@@ -2019,8 +2066,8 @@ impl Engine {
 
     /// A pass found nothing missing. In a full pass that is a decision too:
     /// nothing is held, and a burst the maximum hold cut is over once quiet.
-    /// Unless some files could not be checked (`unchecked`): then the burst
-    /// and a stop it led to stay as they are.
+    /// Unless some of the files the burst or its stop depends on could not
+    /// be checked (`unchecked`): then they stay as they are.
     fn nothing_vanished(&self, hold: Option<&mut DeleteHold>, tally: &Tally, unchecked: bool) -> Result<()> {
         if tally.scan.is_none() {
             return Ok(());
@@ -2030,7 +2077,6 @@ impl Engine {
                 let before = h.burst.clone();
                 h.observe(&[], tally.scan);
                 if unchecked {
-                    h.unchecked();
                     return Ok(());
                 }
                 h.decided(false, &[]);
@@ -2040,6 +2086,28 @@ impl Engine {
             None if unchecked => Ok(()),
             None => self.with_index(|ix| ix.delete_meta(meta::DELETE_BURST)),
         }
+    }
+
+    /// Which of the documents a pass could not check (`unchecked`) a burst
+    /// or its stop depends on: the ones the hold saw missing (held, or
+    /// refused by the stop) and the ones the standing stop lists. `None`
+    /// when none of them. With a stop saved without its list, any document
+    /// may be one of its files: `Some`, with those the hold saw.
+    fn depended_on(&self, unchecked: &[String], hold: Option<&DeleteHold>) -> Result<Option<HashSet<String>>> {
+        if unchecked.is_empty() {
+            return Ok(None);
+        }
+        let (stop, docs) =
+            self.with_index(|ix| Ok((ix.get_meta(meta::SAFETY_STOP)?, ix.get_meta(meta::SAFETY_STOP_DOCS)?)))?;
+        let listed: Option<HashSet<String>> = docs.and_then(|d| serde_json::from_str(&d).ok());
+        let unlisted = stop.is_some() && listed.is_none();
+        let stopped = |id: &String| stop.is_some() && listed.as_ref().is_some_and(|l| l.contains(id));
+        let theirs: HashSet<String> = unchecked
+            .iter()
+            .filter(|id| hold.is_some_and(|h| h.seen.contains(*id)) || stopped(id))
+            .cloned()
+            .collect();
+        Ok((unlisted || !theirs.is_empty()).then_some(theirs))
     }
 
     /// Keep a burst's deletions across restarts (`meta::DELETE_BURST`).
@@ -2714,15 +2782,25 @@ mod tests {
         assert!(h.burst.is_empty());
         assert!(h.due().is_none());
 
-        // A quiet pass that could not check every file does not end it,
-        // and looks again a quiet period later, not at once.
+        // A quiet pass that could not check a file the burst depends on (one
+        // it holds) does not end the burst, still counts that file as seen,
+        // and schedules no look of its own.
         h.resume(ids[..4].iter().map(|s| s.to_string()).collect(), false);
+        assert!(holds(h.observe(&["y", "z"], walk())));
         std::thread::sleep(Duration::from_millis(120));
-        assert_eq!(h.observe(&[], walk()), Some(4));
-        h.unchecked();
-        h.decided(false, &[]);
-        assert_eq!(h.burst.len(), 4, "an incomplete look ended the burst");
-        assert!(h.due().is_some_and(|d| d > Instant::now()));
+        h.checked(Some(HashSet::from(["y".to_string()])));
+        assert_eq!(h.observe(&["z"], walk()), Some(4));
+        h.decided(false, &["z"]);
+        assert_eq!(h.burst.len(), 5, "an incomplete look ended the burst");
+        assert!(h.seen.contains("y") && !h.seen.contains("z"));
+        assert!(h.due().is_none(), "an incomplete look scheduled another");
+        // Checked again and still gone: not a new deletion, judged at once
+        // with the burst; after a quiet period that ends it.
+        h.checked(None);
+        assert_eq!(h.observe(&["y"], walk()), Some(5));
+        h.decided(false, &["y"]);
+        assert!(h.burst.is_empty() && h.seen.is_empty());
+        assert!(h.due().is_none());
     }
 
     #[test]

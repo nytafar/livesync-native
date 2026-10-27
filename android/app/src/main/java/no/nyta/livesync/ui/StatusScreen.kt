@@ -73,9 +73,11 @@ fun StatusScreen(
     var logs by remember { mutableStateOf<List<String>>(emptyList()) }
     var confirm by remember { mutableStateOf<Confirm?>(null) }
     // The safety stop the open "Allow these deletions" dialog answers, as it
-    // was when the dialog opened, and what came of the last answer.
+    // was when the dialog opened, and what came of the last answer: the
+    // stop shown when the answer came back, and the note, shown only under
+    // that stop.
     var massStop by remember { mutableStateOf<String?>(null) }
-    var stopNote by remember { mutableStateOf<String?>(null) }
+    var stopNote by remember { mutableStateOf<Pair<String?, String>?>(null) }
     var gateResult by remember { mutableStateOf<GateResult?>(null) }
     var busy by remember { mutableStateOf<String?>(null) }
     var showRaw by remember { mutableStateOf(false) }
@@ -119,6 +121,11 @@ fun StatusScreen(
         }
 
         val st = status
+        // A note about an answer belongs to the stop it was given under: a
+        // later, different stop starts without it.
+        LaunchedEffect(st?.safetyStop) {
+            if (stopNote != null && stopNote?.first != st?.safetyStop) stopNote = null
+        }
         SectionCard("Status") {
             val (phrase, alert) = StatusSummary.phrase(StatusSummary.line(p, st, app.startProblems[p.id]))
             Banner(phrase, if (alert) Tone.ERROR else if (st?.runState == RunState.RUNNING) Tone.OK else Tone.INFO)
@@ -139,12 +146,12 @@ fun StatusScreen(
                 )
                 OutlinedButton(enabled = !p.pullOnly && st.runState == RunState.RUNNING, onClick = {
                     massStop = it
-                    stopNote = null
+                    stopNote = null // a new answer replaces it
                     confirm = Confirm.MassDelete
                 }) {
                     Text("Allow these deletions…")
                 }
-                stopNote?.let { note -> Banner(note, Tone.WARN) }
+                stopNote?.takeIf { n -> n.first == it }?.let { n -> Banner(n.second, Tone.WARN) }
             }
             st?.deletesWaiting?.takeIf { it > 0u }?.let {
                 Banner(
@@ -327,6 +334,11 @@ fun StatusScreen(
                                 val r = withContext(Dispatchers.IO) {
                                     runCatching { core.engine.allowMassDeleteOnce(p.id, shown) }
                                 }
+                                // The stop shown now, which the note is about
+                                // (for a changed stop, the new one).
+                                val now = withContext(Dispatchers.IO) { runCatching { core.status(p) }.getOrNull() }
+                                if (now != null) status = now
+                                val under = now?.safetyStop ?: status?.safetyStop
                                 stopNote = when (val e = r.exceptionOrNull()) {
                                     null -> null
                                     is LiveSyncException.StopChanged ->
@@ -334,7 +346,7 @@ fun StatusScreen(
                                             "missing). Nothing was deleted. Look at the stop again and allow it if you " +
                                             "still want to."
                                     else -> "Allow deletions: ${e.message}"
-                                }
+                                }?.let { under to it }
                             }
                         }
                         Confirm.Adopt -> scope.launch {
