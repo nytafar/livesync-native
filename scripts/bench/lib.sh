@@ -16,12 +16,15 @@ export CLI_JS=${LSYNC_CLI_JS:-$HOME/code/ref/obsidian-livesync/src/apps/cli/dist
 export BIN=${LSYNC_BIN:-$BENCH_REPO/target/release/lsync}
 # Work area on disk (not /tmp, which is tmpfs here: vault writes would land in RAM).
 export BENCH_WORK=${BENCH_WORK:-$HOME/scratch/lsync-bench}
-# The phone's folder scope (finding-m2b-phone-run).
-export SCOPE_EXCLUDE=${SCOPE_EXCLUDE:-inputs/corpora,inputs/media,contexts/myrvann,efforts/nyta-seo}
-# The same scope as an upstream syncIgnoreRegEx (patterns joined by `|[]|`).
+# The folder scope, supplied by whoever runs the benchmark (no default):
+#   SCOPE_EXCLUDE=Archive,Attachments
+# and the same scope as an upstream syncIgnoreRegEx (patterns joined by `|[]|`):
+#   SCOPE_IGNORE_REGEX='^Archive/|[]|^Attachments/'
 # Upstream matches these case-sensitively against the vault path; lsync's
-# folder scope is case-insensitive. The vault has no case variants of these.
-export SCOPE_IGNORE_REGEX='^inputs/corpora/|[]|^inputs/media/|[]|^contexts/myrvann/|[]|^efforts/nyta-seo/'
+# folder scope is case-insensitive, so the vault should have no case variants.
+: "${SCOPE_EXCLUDE:?set SCOPE_EXCLUDE (comma-separated folders, e.g. Archive,Attachments)}"
+: "${SCOPE_IGNORE_REGEX:?set SCOPE_IGNORE_REGEX (e.g. '^Archive/|[]|^Attachments/')}"
+export SCOPE_EXCLUDE SCOPE_IGNORE_REGEX
 # Ignore rule both clients get on top of the scope (dev-env.sh sets the same for lsync).
 export BASE_IGNORE_REGEX='\/\.git\/'
 

@@ -9,7 +9,7 @@
 # Configure the profile first, e.g.:
 #   source scripts/dev-env.sh
 #   target/release/lsync --profile bench configure --db <dev-db> --vault <folder> \
-#     --exclude inputs/corpora,inputs/media,contexts/myrvann,efforts/nyta-seo
+#     --exclude Archive,Attachments
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user

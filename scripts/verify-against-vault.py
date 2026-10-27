@@ -2,7 +2,7 @@
 """Compare an lsync-pulled folder with the desktop vault (read-only on both).
 
 For every file in the pulled folder, compare bytes with the same path under the
-reference vault (default ~/hvelv) and classify:
+reference vault (--reference, required) and classify:
 
   identical
   different    explained when the reference file changed after the copy time
@@ -78,7 +78,7 @@ def changed_after(st, cutoff):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pulled", help="folder produced by `lsync pull`")
-    ap.add_argument("--reference", default=os.path.expanduser("~/hvelv"), help="desktop vault (read only)")
+    ap.add_argument("--reference", required=True, help="desktop vault (read only)")
     ap.add_argument("--copy-time", default="2026-10-26 18:00", help="local time the database copy was taken")
     ap.add_argument("--index", help="lsync index.sqlite (to explain conflicted/skipped entries)")
     ap.add_argument("--max-size-mb", type=int, default=50)

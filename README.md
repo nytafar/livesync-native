@@ -45,7 +45,7 @@ Full usage is under [Reference](#reference).
 
 ## How it compares
 
-Measured on oma (i9-10900K, btrfs on NVMe, Linux), on clones of one snapshot of a real 425,000-document database (about 2,200 files in scope after the phone's folder excludes), with lsync's release build, the official LiveSync CLI 1.0.40 and Node 26. Medians of 3 runs for lsync and 1–2 for the CLI.
+Measured on a Linux desktop (i9-10900K, btrfs on NVMe, Linux), on clones of one snapshot of a real 425,000-document database (about 2,200 files in scope after the phone's folder excludes), with lsync's release build, the official LiveSync CLI 1.0.40 and Node 26. Medians of 3 runs for lsync and 1–2 for the CLI.
 
 | | lsync | Official LiveSync CLI | Obsidian plugin |
 |---|---|---|---|

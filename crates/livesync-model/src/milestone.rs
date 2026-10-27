@@ -137,7 +137,7 @@ mod tests {
     fn device() -> DeviceInfo {
         DeviceInfo {
             device_name: "phone".into(),
-            vault_name: "hvelv".into(),
+            vault_name: "notes".into(),
             app_version: "lsync".into(),
             plugin_version: "0.1.0".into(),
             platform: Some("android".into()),

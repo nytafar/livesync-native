@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Build, test and safety rules for this repo. Project docs (spec, research, findings, handoffs) live outside the repo in `~/hvelv/repos/livesync-android/`.
+Build, test and safety rules for this repo. Project docs (spec, research, findings, handoffs) live outside the repo.
 
 ## Gate
 
@@ -109,10 +109,10 @@ source scripts/dev-env.sh
 export LSYNC_VAULT=/tmp/lsync-e2e/vault LSYNC_STATE_DIR=/tmp/lsync-e2e/state
 ./target/release/lsync connect
 ./target/release/lsync pull --json
-scripts/verify-against-vault.py /tmp/lsync-e2e/vault --index /tmp/lsync-e2e/state/index.sqlite
+scripts/verify-against-vault.py /tmp/lsync-e2e/vault --reference <desktop-vault> --index /tmp/lsync-e2e/state/index.sqlite
 ```
 
-`verify-against-vault.py` only reads the reference vault (`~/hvelv`). It explains differences by:
+`verify-against-vault.py` only reads the reference vault (`--reference`, required). It explains differences by:
 
 - the reference file changing after the copy time;
 - the reference vault's `.gitignore`, which the desktop LiveSync node uses as ignore file;

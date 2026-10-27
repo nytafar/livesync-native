@@ -11,7 +11,7 @@ class ProfileRulesTest {
     @Test
     fun urls() {
         assertNull(ProfileRules.urlProblem("https://obsidian.example.net"))
-        assertNull(ProfileRules.urlProblem("http://100.79.1.2:5984/"))
+        assertNull(ProfileRules.urlProblem("http://100.64.1.2:5984/"))
         assertNotNull(ProfileRules.urlProblem(""))
         assertNotNull(ProfileRules.urlProblem("obsidian.example.net"))
         assertNotNull(ProfileRules.urlProblem("ftp://h"))
@@ -30,6 +30,6 @@ class ProfileRulesTest {
         assertNotNull(ProfileRules.scopeProblem(ScopeMode.EXCLUDE, listOf(".obsidian")))
         assertNotNull(ProfileRules.scopeProblem(ScopeMode.EXCLUDE, listOf("a/../b")))
         assertNull(ProfileRules.scopeProblem(ScopeMode.INCLUDE, listOf("Notes")))
-        assertEquals("hvelv", ProfileRules.defaultName("/storage/emulated/0/Documents/Obsidian/hvelv/"))
+        assertEquals("notes", ProfileRules.defaultName("/storage/emulated/0/Documents/Obsidian/notes/"))
     }
 }

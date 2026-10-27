@@ -20,7 +20,7 @@ pub enum ScopeKind {
 pub struct ProfileConfig {
     /// Stable profile ID (also keys the app's secret and state folder).
     pub id: String,
-    /// Vault folder (absolute, e.g. `/storage/emulated/0/Documents/Obsidian/hvelv`).
+    /// Vault folder (absolute, e.g. `/storage/emulated/0/Documents/Obsidian/notes`).
     pub vault_path: String,
     /// Folder for the sync index, outside the vault (app-private storage).
     pub state_dir: String,

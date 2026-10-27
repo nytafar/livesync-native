@@ -6,13 +6,13 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class StatusSummaryTest {
-    private fun line(name: String = "hvelv", state: String = "Running", gate: String? = "1700000000000 ok: version 12", conflicted: Long = 0) =
+    private fun line(name: String = "notes", state: String = "Running", gate: String? = "1700000000000 ok: version 12", conflicted: Long = 0) =
         ProfileLine(name, false, null, state, null, true, gate, null, conflicted, null, 0)
 
     @Test
     fun oneProfile() {
         val t = StatusSummary.summarize(listOf(line()))
-        assertEquals("LiveSync · hvelv", t.title)
+        assertEquals("LiveSync · notes", t.title)
         assertEquals("pull-only", t.text)
         assertFalse(t.alert)
     }
@@ -96,7 +96,7 @@ class StatusSummaryTest {
         val g = PostGate<StatusSummary.Text>()
         val posts = mutableListOf<String>()
         val post = { t: StatusSummary.Text -> posts += t.text; true }
-        val a = StatusSummary.Text("LiveSync · hvelv", "pull-only · last change 14:02", false)
+        val a = StatusSummary.Text("LiveSync · notes", "pull-only · last change 14:02", false)
         g.post(a, post = post)
         repeat(3) { g.post(a.copy(), post = post) }
         assertEquals("an unchanged refresh is not posted", listOf(a.text), posts)
