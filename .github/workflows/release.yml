@@ -1,0 +1,298 @@
+# Release on a pushed tag v*: the signed sideload APK, lsync for five targets,
+# SHA256SUMS and short notes, as a GitHub Release. AGENTS.md "Releasing".
+#
+# workflow_dispatch builds the same assets into a draft release (no tag is
+# created until the draft is published), for testing the pipeline; it may
+# build an unsigned APK when the signing secrets are missing. A tag push never
+# does: it fails on signing instead.
+#
+# Signing secrets (repository secrets):
+#   SIDELOAD_KEYSTORE_BASE64  the PKCS12 keystore, base64
+#   SIDELOAD_STORE_PASSWORD   its store password
+#   SIDELOAD_KEY_PASSWORD     the key's password
+#   SIDELOAD_KEY_ALIAS        optional, default "livesync"
+# Optional repository variable SIDELOAD_CERT_SHA256: the signer certificate's
+# SHA-256 (hex); when set the APK must be signed by exactly that certificate.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the v, e.g. 0.0.0-ci-test (draft release v<version>)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # versionCode = VERSION_CODE_BASE + this workflow's run number, so every
+  # release run is higher than the last and than every earlier hand build
+  # (those used the commit count; the phone had versionCode VERSION_CODE_FLOOR
+  # when this was set up). Only ever raise VERSION_CODE_BASE.
+  VERSION_CODE_BASE: "1000"
+  VERSION_CODE_FLOOR: "29"
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      code: ${{ steps.v.outputs.code }}
+      draft: ${{ steps.v.outputs.draft }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            tag=$GITHUB_REF_NAME draft=false
+          else
+            tag=v${INPUT_VERSION#v} draft=true
+          fi
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag $tag is not v<major>.<minor>.<patch>[-<pre>]"
+            exit 1
+          fi
+          version=${tag#v}
+          code=$((VERSION_CODE_BASE + GITHUB_RUN_NUMBER))
+          if (( code <= VERSION_CODE_FLOOR )); then
+            echo "::error::versionCode $code is not above the floor $VERSION_CODE_FLOOR"
+            exit 1
+          fi
+          prerelease=false
+          [[ "$version" == *-* ]] && prerelease=true
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "code=$code"
+            echo "draft=$draft"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "release $tag: version $version, versionCode $code, draft $draft, prerelease $prerelease" >> "$GITHUB_STEP_SUMMARY"
+
+  cli:
+    name: lsync ${{ matrix.target }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, via: zigbuild }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, via: zigbuild }
+          - { target: aarch64-apple-darwin, os: macos-latest, via: cargo }
+          - { target: x86_64-apple-darwin, os: macos-latest, via: cargo }
+          - { target: aarch64-linux-android, os: ubuntu-latest, via: ndk }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      LSYNC_RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain
+        if: matrix.via != 'ndk'
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.via != 'ndk'
+        with:
+          key: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        if: matrix.via == 'zigbuild'
+        with:
+          version: 0.15.2
+      - uses: taiki-e/install-action@v2
+        if: matrix.via == 'zigbuild'
+        with:
+          tool: cargo-zigbuild
+      - uses: ./.github/actions/android-env
+        if: matrix.via == 'ndk'
+      - name: Build
+        run: |
+          set -euo pipefail
+          case "${{ matrix.via }}" in
+            zigbuild) cargo zigbuild --release --locked -p lsync --target "$TARGET" ;;
+            cargo)    cargo build --release --locked -p lsync --target "$TARGET" ;;
+            ndk)      cargo ndk -t arm64-v8a -P 30 build --release --locked -p lsync ;;
+          esac
+          bin=target/$TARGET/release/lsync
+          file "$bin"
+          case "$TARGET" in
+            *-linux-musl)
+              file "$bin" | grep -Eq 'static(-pie)? ?linked' || { echo "::error::$bin is not static"; exit 1; } ;;
+          esac
+          case "$TARGET" in
+            x86_64-unknown-linux-musl|aarch64-apple-darwin) "$bin" --version ;;
+            x86_64-apple-darwin) arch -x86_64 "$bin" --version || echo "no Rosetta here; not run" ;;
+          esac
+          name=lsync-${LSYNC_RELEASE_VERSION}-${TARGET}
+          mkdir -p "pkg/$name" dist
+          cp "$bin" "pkg/$name/lsync"
+          cp README.md "pkg/$name/"
+          tar -C pkg -czf "dist/$name.tar.gz" "$name"
+          ls -l dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  apk:
+    name: APK
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
+      cert: ${{ steps.cert.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/android-env
+      - name: Signing keystore
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.SIDELOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.SIDELOAD_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.SIDELOAD_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIDELOAD_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$KEYSTORE_B64" || -z "$STORE_PASSWORD" || -z "$KEY_PASSWORD" ]]; then
+            if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+              echo "::error::signing secrets missing: set SIDELOAD_KEYSTORE_BASE64, SIDELOAD_STORE_PASSWORD and SIDELOAD_KEY_PASSWORD (AGENTS.md \"Releasing\"). A tagged release is never built unsigned."
+              exit 1
+            fi
+            echo "::warning::signing secrets missing: building an UNSIGNED APK (test run only; it cannot be installed)"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          dir="$RUNNER_TEMP/signing"
+          mkdir -p "$dir" && chmod 700 "$dir"
+          umask 077
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$dir/sideload.jks"
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$dir/sideload.jks" "$STORE_PASSWORD" "${KEY_ALIAS:-livesync}" "$KEY_PASSWORD" > "$dir/sideload.properties"
+          echo "LIVESYNC_SIGNING=$dir/sideload.properties" >> "$GITHUB_ENV"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+      - name: Build (unit tests, lint, assembleRelease)
+        env:
+          LIVESYNC_VERSION_CODE: ${{ needs.version.outputs.code }}
+          LIVESYNC_VERSION_NAME: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.signing.outputs.signed }}" == true ]]; then
+            scripts/build-apk.sh
+          else
+            scripts/build-apk.sh --unsigned
+          fi
+      - name: Signer certificate
+        id: cert
+        if: steps.signing.outputs.signed == 'true'
+        env:
+          WANT: ${{ vars.SIDELOAD_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          apk=$(ls dist/*.apk)
+          apksigner=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner
+          got=$("$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          echo "sha256=$got" >> "$GITHUB_OUTPUT"
+          echo "signer certificate SHA-256: $got"
+          want=$(printf '%s' "$WANT" | tr -d ': ' | tr 'A-F' 'a-f')
+          if [[ -n "$want" && "$got" != "$want" ]]; then
+            echo "::error::the APK is signed by $got, not the sideload certificate $want; it would not install over the current app"
+            exit 1
+          fi
+      - name: Remove the keystore
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/signing"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+  release:
+    needs: [version, cli, apk]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.version.outputs.tag }}
+      VERSION: ${{ needs.version.outputs.version }}
+      CODE: ${{ needs.version.outputs.code }}
+      DRAFT: ${{ needs.version.outputs.draft }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+      SIGNED: ${{ needs.apk.outputs.signed }}
+      CERT: ${{ needs.apk.outputs.cert }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: assets
+          merge-multiple: true
+      - name: Checksums and notes
+        run: |
+          set -euo pipefail
+          (cd assets && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          apk=$(cd assets && ls *.apk)
+          if [[ "$SIGNED" == true ]]; then
+            apk_line="Signed with the sideload key (certificate SHA-256 \`$CERT\`): installs over the current app."
+          else
+            apk_line="**UNSIGNED test build: it cannot be installed.** Set the signing secrets before tagging."
+          fi
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_SHA^" 2>/dev/null || true)
+          {
+            echo "## LiveSync for Android $VERSION"
+            echo
+            echo "- **App:** \`$apk\` (versionName $VERSION, versionCode $CODE). $apk_line"
+            echo "- **lsync CLI:** \`lsync-$VERSION-<target>.tar.gz\` for Linux x86_64 and aarch64 (static, musl), macOS arm64 and x86_64, and Android aarch64 (Termux)."
+            echo "- **Checksums:** \`sha256sum -c SHA256SUMS\`"
+            echo
+            if [[ -n "$prev" ]]; then
+              echo "### Changes since $prev"
+              range="$prev..$GITHUB_SHA"
+            else
+              echo "### Changes"
+              range="$GITHUB_SHA"
+            fi
+            echo
+            git log --no-merges --format='- %s' "$range" | head -40
+          } > notes.md
+          cat notes.md
+      - name: Publish
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::a release $TAG exists already; delete it (gh release delete $TAG) to rebuild it"
+            exit 1
+          fi
+          args=(--title "LiveSync for Android $VERSION" --notes-file notes.md)
+          if [[ "$DRAFT" == true ]]; then
+            args+=(--draft --target "$GITHUB_SHA")
+          else
+            args+=(--verify-tag)
+          fi
+          [[ "$PRERELEASE" == true ]] && args+=(--prerelease)
+          gh release create "$TAG" "${args[@]}" assets/*
+          gh release view "$TAG" --json url,isDraft,assets --jq '{url, isDraft, assets: [.assets[].name]}'

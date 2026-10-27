@@ -12,16 +12,24 @@
 # Signing: a sideload keystore outside the repo, created on first use:
 #   ~/.config/livesync-android/sideload.jks         (mode 0600)
 #   ~/.config/livesync-android/sideload.properties  (mode 0600; its passwords)
-# Override the properties file with LIVESYNC_SIGNING=<path>.
+# Override the properties file with LIVESYNC_SIGNING=<path>. Under CI (CI=true)
+# the keystore is never created: a missing properties file is an error.
+#
+# Version: LIVESYNC_VERSION_CODE and LIVESYNC_VERSION_NAME override the
+# defaults (commit count; <crate version>-m2b+<sha>). The release workflow
+# sets both.
 #
 # Flags: --skip-checks  build only (no unit tests, no lint)
+#        --unsigned     no signing; output is livesync-android-<version>-unsigned.apk
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 SKIP_CHECKS=0
+UNSIGNED=0
 for a in "$@"; do
   case "$a" in
     --skip-checks) SKIP_CHECKS=1 ;;
+    --unsigned) UNSIGNED=1 ;;
     *) echo "unknown flag $a" >&2; exit 2 ;;
   esac
 done
@@ -45,7 +53,14 @@ BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
 # --- signing keystore (outside the repo, never committed) ---------------------
 SIGN_DIR="$HOME/.config/livesync-android"
 SIGN_PROPS=${LIVESYNC_SIGNING:-$SIGN_DIR/sideload.properties}
-if [[ ! -f "$SIGN_PROPS" ]]; then
+if [[ $UNSIGNED == 1 ]]; then
+  # A path that does not exist: Gradle then builds without a signing config.
+  SIGN_PROPS="$ROOT/android/build/no-signing.properties"
+  rm -f "$SIGN_PROPS"
+elif [[ ! -f "$SIGN_PROPS" && "${CI:-}" == "true" ]]; then
+  echo "no signing properties at $SIGN_PROPS (CI never creates a keystore; use --unsigned)" >&2
+  exit 1
+elif [[ ! -f "$SIGN_PROPS" ]]; then
   echo "== creating the sideload keystore in $SIGN_DIR"
   mkdir -p "$SIGN_DIR" && chmod 700 "$SIGN_DIR"
   umask 077
@@ -65,8 +80,9 @@ fi
 CRATE_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 SHA=$(git rev-parse --short=8 HEAD)
 DIRTY=$(git diff --quiet HEAD -- . ':!dist' 2>/dev/null || echo "-dirty")
-VERSION_NAME="$CRATE_VERSION-m2b+$SHA$DIRTY"
-VERSION_CODE=$(git rev-list --count HEAD)
+VERSION_NAME=${LIVESYNC_VERSION_NAME:-"$CRATE_VERSION-m2b+$SHA$DIRTY"}
+VERSION_CODE=${LIVESYNC_VERSION_CODE:-$(git rev-list --count HEAD)}
+[[ "$VERSION_CODE" =~ ^[1-9][0-9]*$ ]] || { echo "bad versionCode $VERSION_CODE" >&2; exit 1; }
 
 GEN="$ROOT/android/app/build/generated"
 echo "== Rust core: host build (bindings, JVM binding tests)"
@@ -93,11 +109,17 @@ fi
   -Plivesync.requireHostLib=true \
   "${tasks[@]}")
 
-APK=android/app/build/outputs/apk/release/app-release.apk
-[[ -f "$APK" ]] || { echo "no signed APK at $APK (is the signing file readable?)" >&2; exit 1; }
-"$BUILD_TOOLS/apksigner" verify --print-certs "$APK" | grep -E "Signer #1 certificate (DN|SHA-256)"
 mkdir -p dist
-OUT="dist/livesync-android-$VERSION_NAME.apk"
+if [[ $UNSIGNED == 1 ]]; then
+  APK=android/app/build/outputs/apk/release/app-release-unsigned.apk
+  [[ -f "$APK" ]] || { echo "no unsigned APK at $APK" >&2; exit 1; }
+  OUT="dist/livesync-android-$VERSION_NAME-unsigned.apk"
+else
+  APK=android/app/build/outputs/apk/release/app-release.apk
+  [[ -f "$APK" ]] || { echo "no signed APK at $APK (is the signing file readable?)" >&2; exit 1; }
+  "$BUILD_TOOLS/apksigner" verify --print-certs "$APK" | grep -E "Signer #1 certificate (DN|SHA-256)"
+  OUT="dist/livesync-android-$VERSION_NAME.apk"
+fi
 cp "$APK" "$OUT"
 (cd dist && sha256sum "$(basename "$OUT")" | tee "$(basename "$OUT").sha256")
 echo "APK: $ROOT/$OUT ($(du -h "$OUT" | cut -f1), versionCode $VERSION_CODE)"

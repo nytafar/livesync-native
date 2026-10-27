@@ -1,0 +1,42 @@
+# Toolchain for scripts/build-apk.sh and the Termux build: JDK 21, Android SDK
+# platform 35 + build-tools 35.0.0 + NDK r29, the aarch64-linux-android Rust
+# target and cargo-ndk. Exports ANDROID_HOME, ANDROID_NDK_HOME and
+# LIVESYNC_JAVA_HOME.
+name: Android build environment
+description: JDK, Android SDK/NDK and the Rust Android target
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-java@v6
+      with:
+        distribution: temurin
+        java-version: "21"
+    - uses: gradle/actions/setup-gradle@v6
+      with:
+        cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+    - name: Android SDK packages
+      shell: bash
+      env:
+        NDK_VERSION: 29.0.14206865
+      run: |
+        set -euo pipefail
+        sdk=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}
+        sdkmanager=$(ls "$sdk"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+        yes | "$sdkmanager" --licenses >/dev/null || true
+        "$sdkmanager" --install "platforms;android-35" "build-tools;35.0.0" "ndk;$NDK_VERSION" >/dev/null
+        {
+          echo "ANDROID_HOME=$sdk"
+          echo "ANDROID_NDK_HOME=$sdk/ndk/$NDK_VERSION"
+          echo "LIVESYNC_JAVA_HOME=$JAVA_HOME"
+        } >> "$GITHUB_ENV"
+    - name: Rust toolchain
+      shell: bash
+      run: |
+        rustup toolchain install stable --profile minimal --target aarch64-linux-android
+        rustup default stable
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: android
+    - name: cargo-ndk
+      shell: bash
+      run: command -v cargo-ndk >/dev/null || cargo install cargo-ndk --locked
