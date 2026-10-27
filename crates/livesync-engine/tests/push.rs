@@ -1737,3 +1737,103 @@ async fn a_scan_in_the_middle_of_a_mass_deletion_deletes_nothing() {
     tx.send(true).unwrap();
     task.await.unwrap().unwrap();
 }
+
+/// #10 (Codex): a full pass whose walk began inside the hold does not
+/// decide, even when it gets to the deletions after the hold ended: files
+/// that went missing after its walk are not in its picture.
+#[tokio::test]
+async fn a_scan_that_began_inside_the_hold_does_not_decide() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let env = Env::new().await;
+    for i in 0..40 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let vault = env.vault();
+    let calls = std::sync::Arc::new(AtomicU32::new(0));
+    // Asked after each walk. On the second pass the hold runs out while it
+    // works, and the rest of the burst lands after its walk.
+    let check = livesync_engine::engine::AccessCheck::new({
+        let calls = calls.clone();
+        move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                std::thread::sleep(Duration::from_millis(1200));
+                for i in 15..30 {
+                    std::fs::remove_file(vault.join(format!("f{i:02}.md"))).unwrap();
+                }
+            }
+            Ok(())
+        }
+    });
+    let engine = env.engine_with(|c| {
+        c.watch = false;
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_secs(1);
+        c.access_check = Some(check);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for i in 0..15 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    engine.rescan_now();
+    wait_until("the first pass", || calls.load(Ordering::SeqCst) >= 1).await;
+    engine.rescan_now();
+    wait_until("the second pass", || calls.load(Ordering::SeqCst) >= 2).await;
+    // And a later scan sees the rest of the burst.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    engine.rescan_now();
+    let gone = || -> Vec<String> {
+        (0..30)
+            .map(|i| format!("f{i:02}.md"))
+            .filter(|p| env.deleted(p))
+            .collect()
+    };
+    wait_until("the stop, or every deletion", || {
+        engine.status().unwrap().safety_stop.is_some() || gone().len() == 30
+    })
+    .await;
+    assert!(gone().is_empty(), "deleted remotely: {:?}", gone());
+    let st = engine.status().unwrap();
+    assert!(st.safety_stop.as_deref().unwrap().contains("30 of 40"), "{st:?}");
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// #10 (Codex): a note deleted, recreated and deleted again goes out after
+/// the hold both times, not at the next periodic rescan.
+#[tokio::test]
+async fn a_note_deleted_twice_is_sent_after_the_hold_both_times() {
+    let env = Env::new().await;
+    for i in 0..10 {
+        env.write(&format!("f{i}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::remove_file(env.vault().join("f0.md")).unwrap();
+    wait_until("the first deletion", || env.deleted("f0.md")).await;
+    env.write("f0.md", b"written again");
+    wait_until("the new version", || {
+        env.remote("f0.md").as_deref() == Some(&b"written again"[..])
+    })
+    .await;
+    std::fs::remove_file(env.vault().join("f0.md")).unwrap();
+    wait_until("the second deletion", || env.deleted("f0.md")).await;
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}

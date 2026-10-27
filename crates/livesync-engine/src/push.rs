@@ -198,8 +198,9 @@ impl RenameHints {
 /// one burst over several settle windows, and a full pass can run in the
 /// middle of it, and each part alone may stay under the mass-delete stop.
 /// So such deletions wait until no new one has turned up for `period`; then
-/// a full pass judges everything missing at that moment at once, as a single
-/// pass over the finished burst would. Partial passes never decide them.
+/// a full pass whose walk began after that judges everything missing at
+/// once, as a single pass over the finished burst would. Partial passes
+/// never decide them.
 ///
 /// Holding a deletion only keeps the remote copy longer. The hold lives in
 /// memory: if the process is killed or restarted, the rows are still
@@ -209,7 +210,8 @@ impl RenameHints {
 #[derive(Debug)]
 pub(crate) struct DeleteHold {
     period: Duration,
-    /// Documents seen missing with no known destination.
+    /// Documents seen missing with no known destination, not decided on yet
+    /// or refused by the stop: seeing them again is not a new deletion.
     seen: HashSet<String>,
     /// When the newest of them was first seen, while undecided.
     newest: Option<Instant>,
@@ -229,16 +231,19 @@ impl DeleteHold {
         self.newest.map(|t| t + self.period)
     }
 
-    /// Note a pass's deletions with no known destination. Returns true when
-    /// they must be held, false when this (full) pass decides on them now.
-    /// `now` decides at once (a confirmed mass delete).
-    fn observe(&mut self, ids: &[&str], full: bool, now: bool) -> bool {
+    /// Note a pass's deletions with no known destination. `scan` is when a
+    /// full pass's walk began (`None` for a partial pass). Returns true when
+    /// they must be held, false when this full pass decides on them now:
+    /// its walk began once the burst was over, so it saw all of it (files
+    /// that went missing after the walk are not in it). `now` decides at
+    /// once (a confirmed mass delete).
+    fn observe(&mut self, ids: &[&str], scan: Option<Instant>, now: bool) -> bool {
         let at = Instant::now();
         let mut fresh = false;
         for id in ids {
             fresh |= self.seen.insert((*id).to_string());
         }
-        if full {
+        if scan.is_some() {
             // A full pass sees every missing file: forget the ones that
             // came back or were deleted since.
             let current: HashSet<&str> = ids.iter().copied().collect();
@@ -248,16 +253,35 @@ impl DeleteHold {
             self.newest = Some(at);
         }
         if ids.is_empty() {
-            if full {
+            if scan.is_some() {
                 self.newest = None;
             }
             return false;
         }
-        if now || (full && self.due().is_none_or(|d| at >= d)) {
+        let over = match (scan, self.due()) {
+            (Some(_), None) => true,
+            (Some(walked), Some(due)) => walked >= due,
+            (None, _) => false,
+        };
+        if now || over {
             self.newest = None;
             return false;
         }
         true
+    }
+
+    /// A full pass decided on the deletions it saw. Unless the stop refused
+    /// them, they were sent (or failed, and count as new when seen again),
+    /// so the next deletion of the same document starts a new hold.
+    fn decided(&mut self, refused: bool) {
+        if !refused {
+            self.seen.clear();
+        }
+    }
+
+    /// The document's file is there: a later deletion of it is new.
+    fn forget(&mut self, doc_id: &str) {
+        self.seen.remove(doc_id);
     }
 }
 
@@ -613,6 +637,7 @@ impl Engine {
             ..Default::default()
         };
         let this = self.clone();
+        let scan_at = Instant::now();
         let walk = tokio::task::spawn_blocking(move || this.walk_visible(""))
             .await
             .map_err(EngineError::other)?;
@@ -709,7 +734,7 @@ impl Engine {
             Tally {
                 tracked,
                 visible_empty,
-                full: true,
+                scan: Some(scan_at),
             },
             &mut ctx,
             &mut rep,
@@ -807,6 +832,7 @@ impl Engine {
         for (_, f) in files {
             let row = self.row_for_local(&f.rel)?;
             if let Some(r) = &row {
+                hold.forget(&r.doc_id);
                 if r.state == State::Skipped || self.unchanged(r, &f) {
                     continue;
                 }
@@ -825,7 +851,7 @@ impl Engine {
             Tally {
                 tracked,
                 visible_empty: false,
-                full: false,
+                scan: None,
             },
             &mut ctx,
             &mut rep,
@@ -1403,8 +1429,8 @@ impl Engine {
         issues_seen: &mut HashSet<String>,
     ) -> Result<()> {
         if rows.is_empty() {
-            if let Some(h) = hold.filter(|_| tally.full) {
-                h.observe(&[], true, false);
+            if let Some(h) = hold.filter(|_| tally.scan.is_some()) {
+                h.observe(&[], tally.scan, false);
             }
             return Ok(());
         }
@@ -1446,8 +1472,8 @@ impl Engine {
             }
         }
         if gone.is_empty() {
-            if let Some(h) = hold.filter(|_| tally.full) {
-                h.observe(&[], true, false);
+            if let Some(h) = hold.filter(|_| tally.scan.is_some()) {
+                h.observe(&[], tally.scan, false);
             }
             return Ok(());
         }
@@ -1500,10 +1526,11 @@ impl Engine {
         let tracked = tally.tracked;
         // In the daemon, wait for the burst to end; a confirmed mass delete
         // is decided by the full pass that takes the confirmation.
-        let held = match hold {
+        let mut hold = hold;
+        let held = match hold.as_deref_mut() {
             Some(h) => {
                 let before = h.due();
-                let held = h.observe(&undestined_ids, tally.full, ctx.mass_delete_once);
+                let held = h.observe(&undestined_ids, tally.scan, ctx.mass_delete_once);
                 if held && h.due() != before {
                     info!(
                         "{undestined} file(s) missing with no known destination; deleting them remotely once none has gone missing for {:.0?}",
@@ -1533,6 +1560,9 @@ impl Engine {
                 rep.safety_stops += 1;
                 withhold = true;
             }
+        }
+        if let Some(h) = hold.filter(|_| !held && tally.scan.is_some()) {
+            h.decided(withhold);
         }
         for (r, fate) in fates {
             match fate {
@@ -2009,8 +2039,8 @@ struct Tally {
     tracked: u64,
     /// A full pass found no visible file at all (and nothing unreadable).
     visible_empty: bool,
-    /// A full pass (it saw every missing file).
-    full: bool,
+    /// For a full pass (which sees every missing file): when its walk began.
+    scan: Option<Instant>,
 }
 
 #[cfg(test)]
@@ -2030,30 +2060,44 @@ mod tests {
 
     #[test]
     fn the_delete_hold_decides_once_a_burst_is_over() {
+        let walk = || Some(Instant::now());
         let mut h = DeleteHold::new(Duration::from_millis(100));
         // A partial pass never decides; a new deletion starts the hold.
-        assert!(h.observe(&["a"], false, false));
+        assert!(h.observe(&["a"], None, false));
         assert!(h.due().is_some());
         // A full pass within the hold waits too, and more deletions extend it.
-        assert!(h.observe(&["a", "b"], true, false));
+        assert!(h.observe(&["a", "b"], walk(), false));
         let due = h.due().unwrap();
+        // A full pass that walked before the hold ended does not decide,
+        // even if it gets here after (its picture may miss later deletions).
+        let early = walk();
         std::thread::sleep(Duration::from_millis(120));
         assert!(Instant::now() >= due);
-        // Past the hold with nothing new: this full pass decides.
-        assert!(!h.observe(&["a", "b"], true, false));
+        assert!(h.observe(&["a", "b"], early, false));
+        // Walked past the hold with nothing new: this full pass decides.
+        assert!(!h.observe(&["a", "b"], walk(), false));
         assert!(h.due().is_none());
-        // Still missing (a stop) and nothing new: decided again at once.
-        assert!(!h.observe(&["a", "b"], true, false));
-        assert!(h.observe(&["a"], false, false), "a partial pass waits for a full one");
+        // Refused by the stop: still missing, nothing new, decided again at once.
+        h.decided(true);
+        assert!(!h.observe(&["a", "b"], walk(), false));
+        h.decided(true);
+        assert!(h.observe(&["a"], None, false), "a partial pass waits for a full one");
         assert!(h.due().is_none(), "nothing new, nothing scheduled");
+        // A refused file back and gone again is a new deletion.
+        h.forget("a");
+        assert!(h.observe(&["a"], None, false));
+        assert!(h.due().is_some());
         // One more deletion: the whole set waits again.
-        assert!(h.observe(&["a", "b", "c"], true, false));
-        // A confirmed mass delete decides at once.
-        assert!(!h.observe(&["a", "b", "c"], true, true));
-        assert!(h.due().is_none());
+        assert!(h.observe(&["a", "b", "c"], walk(), false));
+        // A confirmed mass delete decides at once; sent, they are forgotten.
+        assert!(!h.observe(&["a", "b", "c"], walk(), true));
+        h.decided(false);
+        assert!(h.due().is_none() && h.seen.is_empty());
+        // So the same document deleted again starts a new hold.
+        assert!(h.observe(&["a"], None, false));
+        assert!(h.due().is_some());
         // Nothing missing any more: nothing held.
-        assert!(h.observe(&["d"], false, false));
-        assert!(!h.observe(&[], true, false));
+        assert!(!h.observe(&[], walk(), false));
         assert!(h.due().is_none() && h.seen.is_empty());
     }
 
