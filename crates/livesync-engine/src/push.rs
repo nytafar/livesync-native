@@ -165,18 +165,30 @@ impl OrphanRecord {
     }
 }
 
-/// Renames reported by the watcher, kept for a minute so a vanished file
-/// can be matched with its destination.
+/// Renames reported by the watcher, kept for a minute (plus however long
+/// a rename may wait for its new name to be pushed) so a vanished file can
+/// be matched with its destination.
 #[derive(Debug, Default)]
 pub(crate) struct RenameHints {
     pairs: Vec<(String, String, Instant)>,
+    /// Kept beyond the minute (the daemon's `delete_hold_max`).
+    extra: Duration,
 }
 
 impl RenameHints {
+    pub(crate) fn keeping_extra(extra: Duration) -> Self {
+        RenameHints {
+            pairs: Vec::new(),
+            extra,
+        }
+    }
+
     pub(crate) fn add(&mut self, from: String, to: String) {
-        self.pairs.push((from, to, Instant::now()));
-        let cutoff = Instant::now() - Duration::from_secs(60);
-        self.pairs.retain(|p| p.2 >= cutoff);
+        let now = Instant::now();
+        self.pairs.push((from, to, now));
+        if let Some(cutoff) = now.checked_sub(Duration::from_secs(60) + self.extra) {
+            self.pairs.retain(|p| p.2 >= cutoff);
+        }
     }
 
     /// Where `path` went, following file or folder renames.
@@ -1572,6 +1584,8 @@ impl Engine {
         let mut fates: Vec<(FileRow, Fate)> = Vec::new();
         let mut unknown: Vec<FileRow> = Vec::new();
         let mut claimed: HashSet<String> = HashSet::new();
+        // Renamed documents whose new name is not pushed yet (waiting or
+        // past their wait): their wait is remembered until that resolves.
         let mut waiting: HashSet<String> = HashSet::new();
         for r in gone {
             let dest = hints.dest(&r.path);
@@ -1597,19 +1611,20 @@ impl Engine {
                             fates.push((r, Fate::Delete { dest: Some(d) }));
                             continue;
                         }
-                        Claim::Pending if hold.as_deref_mut().is_none_or(|h| h.may_wait(&r.doc_id)) => {
-                            // Renamed, and the new name is still being
-                            // written: decide once it is pushed (for at
-                            // most the maximum hold in the daemon).
-                            info!(
-                                "{}: renamed to {d}, which is not pushed yet; the old document is kept for now",
-                                r.path
-                            );
-                            ctx.dests_pending = true;
+                        Claim::Pending => {
                             waiting.insert(r.doc_id.clone());
-                            continue;
+                            if hold.as_deref_mut().is_none_or(|h| h.may_wait(&r.doc_id)) {
+                                // Renamed, and the new name is still being
+                                // written: decide once it is pushed (for at
+                                // most the maximum hold in the daemon).
+                                info!(
+                                    "{}: renamed to {d}, which is not pushed yet; the old document is kept for now",
+                                    r.path
+                                );
+                                ctx.dests_pending = true;
+                                continue;
+                            }
                         }
-                        Claim::Pending => {}
                         Claim::No => {}
                     },
                 }
@@ -1998,7 +2013,7 @@ impl Engine {
         let mut watched: HashSet<PathBuf> = HashSet::new();
         let mut started = false;
         let mut was_enabled = false;
-        let mut hints = RenameHints::default();
+        let mut hints = RenameHints::keeping_extra(self.inner.cfg.delete_hold_max);
         let mut hold = DeleteHold::new(self.inner.cfg.delete_hold, self.inner.cfg.delete_hold_max);
         let mut queue: HashMap<String, Settling> = HashMap::new();
         let mut full_due = true;
@@ -2356,9 +2371,32 @@ mod tests {
         assert!(h.may_wait("a"));
         std::thread::sleep(Duration::from_millis(120));
         assert!(!h.may_wait("a"), "waited past the maximum");
-        // Once it is no longer waiting, a later rename waits afresh.
+        // Still unresolved after a full pass: the wait does not start over.
+        h.keep_pending(&["a".to_string()].into());
+        assert!(!h.may_wait("a"), "the expired wait restarted");
+        // Once resolved, a later rename waits afresh.
         h.keep_pending(&HashSet::new());
         assert!(h.may_wait("a"));
+    }
+
+    #[test]
+    fn rename_hints_last_as_long_as_a_rename_may_wait() {
+        let mut h = RenameHints::keeping_extra(Duration::from_millis(200));
+        h.pairs.push((
+            "old.md".into(),
+            "new.md".into(),
+            Instant::now() - Duration::from_secs(60) - Duration::from_millis(100),
+        ));
+        h.add("x.md".into(), "y.md".into());
+        assert_eq!(h.dest("old.md").as_deref(), Some("new.md"), "dropped within its wait");
+        let mut h = RenameHints::default();
+        h.pairs.push((
+            "old.md".into(),
+            "new.md".into(),
+            Instant::now() - Duration::from_secs(61),
+        ));
+        h.add("x.md".into(), "y.md".into());
+        assert_eq!(h.dest("old.md"), None);
     }
 
     /// Codex (third round): files other vanished files already account for
