@@ -66,7 +66,7 @@ To rerun: `scripts/bench/snapshot.sh` once, then `scripts/bench/run.sh --contend
 
 - **It never overwrites or deletes a local edit it has not synced.** If the server changed too, your edit becomes a conflict for the desktop plugin to resolve.
 - **It fails closed.** Anything it doesn't recognise stops the sync instead of being guessed at, for example an unknown database version, encryption, or settings that changed since setup.
-- **Deletes are LiveSync's soft deletes,** and only for files that were in sync. A pass that would delete more than 20 files, when they are also more than half of what it tracks, stops and asks; so does one that finds the synced folders empty and would delete 3 or more. Smaller deletions go through without asking.
+- **Deletes are LiveSync's soft deletes,** and only for files that were in sync. A pass that would delete more than 20 files with no known destination, when they are also more than half of what it tracks, stops and asks; so does one that finds the synced folders empty and would delete 3 or more. A move into `.trash/` or a rename never counts, and smaller deletions go through without asking.
 - **It stays out of `.obsidian/` and every other dot-folder.**
 
 ## Status and limits
