@@ -259,7 +259,9 @@ mod tests {
 
     /// A lock whose file was removed (macOS cleans `/tmp`) or replaced (a
     /// sync tool renamed a copy in) no longer counts, and a fresh
-    /// acquisition locks the file the path names now.
+    /// acquisition locks the file the path names now. Unix only: elsewhere
+    /// there is no file identity and `is_current` is always true.
+    #[cfg(unix)]
     #[test]
     fn a_removed_or_replaced_lock_file_is_noticed() {
         let d = tempfile::tempdir().unwrap();
