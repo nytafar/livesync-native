@@ -14,10 +14,13 @@ object ScopePick {
         s.trim().split('/', '\\').filter { it.isNotEmpty() }.joinToString("/").lowercase(Locale.ROOT)
 
     /**
-     * Whether a tap may add [name] to the typed list: the list splits on
-     * commas and line breaks, so a name holding one would turn into others.
+     * Whether a tap may add [name] to the typed list and have it saved as
+     * that same folder: the list splits on commas and line breaks and trims
+     * each entry, and the engine reads a backslash as a separator, so a name
+     * with one of those (or spaces at either end) would become another.
      */
-    fun pickable(name: String): Boolean = name.none { it == ',' || it == '\n' || it == '\r' }
+    fun pickable(name: String): Boolean =
+        name.isNotEmpty() && name == name.trim() && name.none { it == ',' || it == '\n' || it == '\r' || it == '\\' }
 
     /** Whether [name] itself is in [folders] (any case). */
     fun ticked(folders: List<String>, name: String): Boolean = folders.any { key(it) == key(name) }

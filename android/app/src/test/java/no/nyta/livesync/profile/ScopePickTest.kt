@@ -37,7 +37,11 @@ class ScopePickTest {
     fun aNameTheFolderListCannotHoldCannotBePicked() {
         // The typed list splits on commas, so "Work, Personal" would become two folders.
         assertFalse(ScopePick.pickable("Work, Personal"))
+        // Trimmed when parsed, or split by the engine: another folder.
+        assertFalse(ScopePick.pickable(" Notes "))
+        assertFalse(ScopePick.pickable("a\\b"))
         assertTrue(ScopePick.pickable("Work & Personal"))
+        assertTrue(ScopePick.pickable("My Notes"))
         val typed = ProfileRules.parseFolders(ScopePick.toggle(emptyList(), "Work & Personal").joinToString("\n"))
         assertTrue(ScopePick.ticked(typed, "Work & Personal"))
     }

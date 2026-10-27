@@ -65,9 +65,10 @@ fun ServerFolders(
             )
             if (l.folders.isEmpty()) Text("No folders on the server.", style = MaterialTheme.typography.bodySmall)
             l.folders.forEach { f ->
-                val ticked = ScopePick.ticked(folders, f.name)
-                val nested = ScopePick.nestedIn(folders, f.name)
                 val pickable = ScopePick.pickable(f.name)
+                // A name the list cannot hold is never in it, whatever matches loosely.
+                val ticked = pickable && ScopePick.ticked(folders, f.name)
+                val nested = if (pickable) ScopePick.nestedIn(folders, f.name) else emptyList()
                 val enabled = mode != ScopeMode.ALL && pickable
                 Row(
                     Modifier.fillMaxWidth().toggleable(
@@ -88,7 +89,8 @@ fun ServerFolders(
                         Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         if (!pickable) {
                             Text(
-                                "Cannot be picked: the folder list reads a comma as two folders.",
+                                "Cannot be picked: the folder list cannot hold this name (a comma, a backslash, " +
+                                    "or spaces at either end).",
                                 style = MaterialTheme.typography.bodySmall,
                             )
                         }
