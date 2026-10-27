@@ -17,7 +17,6 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -26,7 +25,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import no.nyta.livesync.LiveSyncApp
 import no.nyta.livesync.core.ProfileStatus
@@ -36,8 +34,9 @@ import no.nyta.livesync.service.StatusSummary
 
 /**
  * The home screen: every vault with one line of status, and "Add vault". A
- * tap opens the vault's status screen. It reads the statuses every 2 s while
- * it is visible, like the status screen; nothing polls while it is not.
+ * tap opens the vault's status screen. It reads the statuses every 2 s only
+ * while the activity is started, like the status screen: with the screen
+ * off or the app in the background nothing polls.
  */
 @Composable
 fun VaultListScreen(app: LiveSyncApp, onOpen: (String) -> Unit, onAdd: () -> Unit) {
@@ -45,14 +44,11 @@ fun VaultListScreen(app: LiveSyncApp, onOpen: (String) -> Unit, onAdd: () -> Uni
     val checks = rememberDeviceChecks()
     var rows by remember { mutableStateOf<List<Pair<Profile, ProfileStatus?>>>(emptyList()) }
 
-    LaunchedEffect(Unit) {
-        while (true) {
-            rows = withContext(Dispatchers.IO) {
-                runCatching { app.profiles.all() }.getOrDefault(emptyList()).map { p ->
-                    p to runCatching { core.status(p) }.getOrNull()
-                }
+    PollWhileStarted(Unit, 2000) {
+        rows = withContext(Dispatchers.IO) {
+            runCatching { app.profiles.all() }.getOrDefault(emptyList()).map { p ->
+                p to runCatching { core.status(p) }.getOrNull()
             }
-            delay(2000)
         }
     }
 

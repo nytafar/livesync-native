@@ -36,7 +36,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import no.nyta.livesync.EngineLifecycle
@@ -76,25 +75,26 @@ fun StatusScreen(
     var busy by remember { mutableStateOf<String?>(null) }
     var showRaw by remember { mutableStateOf(false) }
 
-    LaunchedEffect(profileId) {
-        while (true) {
-            val p = withContext(Dispatchers.IO) { app.profiles.get(profileId) }
-            profile = p
-            if (p != null) {
-                status = withContext(Dispatchers.IO) { runCatching { core.status(p) }.getOrNull() }
-                logs = withContext(Dispatchers.IO) { runCatching { core.engine.recentLogLines(LOG_LINES) }.getOrDefault(logs) }
-            }
-            delay(2000)
+    // Every 2 s while the activity is started, never with the screen off.
+    PollWhileStarted(profileId, 2000) {
+        val p = withContext(Dispatchers.IO) { app.profiles.get(profileId) }
+        profile = p
+        if (p != null) {
+            status = withContext(Dispatchers.IO) { runCatching { core.status(p) }.getOrNull() }
+            logs = withContext(Dispatchers.IO) { runCatching { core.engine.recentLogLines(LOG_LINES) }.getOrDefault(logs) }
         }
     }
     val p = profile ?: return
 
+    // Changes that must finish with the service told and the app's profile
+    // list refreshed, even if the user leaves this screen meanwhile: they
+    // run in the app's scope, not the screen's.
     fun update(reason: String, change: (Profile) -> Profile) {
-        scope.launch {
+        app.scope.launch {
             profile = withContext(Dispatchers.IO) {
                 runCatching { app.profiles.update(p.id, change) }.getOrNull() ?: app.profiles.get(p.id)
             }
-            SyncService.start(ctx, reason)
+            SyncService.start(app, reason)
             onChanged()
         }
     }
@@ -316,14 +316,14 @@ fun StatusScreen(
                             val r = withContext(Dispatchers.IO) { runCatching { core.engine.fetchFromRemote(p.id) } }
                             busy = r.exceptionOrNull()?.let { "Full fetch: ${it.message}" }
                         }
-                        Confirm.Remove -> scope.launch {
+                        Confirm.Remove -> app.scope.launch {
                             busy = "Stopping the engine…"
                             val r = withContext(Dispatchers.IO) {
                                 runCatching {
                                     synchronized(EngineLifecycle.lock) { removeProfile(app, p.id) }
                                 }
                             }
-                            SyncService.start(ctx, "profile removed or paused")
+                            SyncService.start(app, "profile removed or paused")
                             r.onSuccess {
                                 busy = null
                                 onRemoved()

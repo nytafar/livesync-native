@@ -10,6 +10,9 @@ import no.nyta.livesync.core.VaultAccess
 import no.nyta.livesync.profile.ProfileStore
 import no.nyta.livesync.secret.KeystoreCipher
 import no.nyta.livesync.secret.SecretStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
@@ -25,6 +28,13 @@ class LiveSyncApp : Application() {
      * the vault list and status screens and the notification.
      */
     val startProblems: MutableMap<String, String> = ConcurrentHashMap()
+
+    /**
+     * For work a screen starts that must finish even when the screen goes
+     * (removing a vault, pausing it): its follow-up tells the service and
+     * refreshes the profile list. On the main thread; block in IO inside.
+     */
+    val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     /** The native core, or the reason it could not be loaded. */
     val core: Result<Core> by lazy {

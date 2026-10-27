@@ -147,8 +147,11 @@ private fun AppRoot(app: LiveSyncApp, openRequest: String?, onOpenHandled: () ->
                     onEdit = { screen = Screen.Setup(s.id) },
                     onChanged = { version++ },
                     onRemoved = {
+                        // May come after the user left this vault's screen:
+                        // refresh the list, and leave the screen only if it
+                        // still shows the removed vault.
                         version++
-                        screen = Screen.Vaults
+                        if (screen == Screen.Status(s.id)) screen = Screen.Vaults
                     },
                 )
             }
