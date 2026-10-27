@@ -2,15 +2,18 @@
 //!
 //! 1. Does Obsidian Android pick up files written by another process, both
 //!    while it is open and while it is in the background?
-//! 2. Does inotify see Obsidian's saves under shared storage?
+//! 2. Does the file watcher (inotify on Android) see Obsidian's saves under
+//!    shared storage?
 //!
 //! Also records filesystem facts that M2 depends on (atomic rename, setting
 //! mtime, case sensitivity, forbidden characters). Writes a Markdown report.
 
 use anyhow::{bail, Context, Result};
-use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
+use livesync_engine::platform::watcher_backend;
 use livesync_engine::vaultfs::{self, Expect};
-use std::collections::{BTreeMap, HashMap};
+use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind, RenameMode};
+use notify::{EventKind, RecursiveMode, Watcher as _};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -28,7 +31,7 @@ pub struct ProbeArgs {
     /// Seconds to wait between writing and asking (gives time to switch apps)
     #[arg(long, default_value_t = 10)]
     pub delay: u64,
-    /// Watch for this many seconds instead of waiting for Enter in the inotify step
+    /// Watch for this many seconds instead of waiting for Enter in the watcher step
     #[arg(long)]
     pub watch_secs: Option<u64>,
     /// Keep the probe notes afterwards
@@ -132,27 +135,28 @@ struct Ev {
     cookie: u32,
 }
 
-fn mask_names(m: EventMask) -> String {
-    let names = [
-        (EventMask::CREATE, "CREATE"),
-        (EventMask::MODIFY, "MODIFY"),
-        (EventMask::CLOSE_WRITE, "CLOSE_WRITE"),
-        (EventMask::MOVED_FROM, "MOVED_FROM"),
-        (EventMask::MOVED_TO, "MOVED_TO"),
-        (EventMask::DELETE, "DELETE"),
-        (EventMask::ATTRIB, "ATTRIB"),
-        (EventMask::DELETE_SELF, "DELETE_SELF"),
-        (EventMask::MOVE_SELF, "MOVE_SELF"),
-        (EventMask::ISDIR, "ISDIR"),
-        (EventMask::Q_OVERFLOW, "Q_OVERFLOW"),
-        (EventMask::IGNORED, "IGNORED"),
-    ];
-    names
-        .iter()
-        .filter(|(f, _)| m.contains(*f))
-        .map(|(_, n)| *n)
-        .collect::<Vec<_>>()
-        .join("|")
+/// inotify-style names for a `notify` event, so the report reads the same on
+/// every platform (on Linux and Android `notify` maps inotify masks one to
+/// one). `None` for events the probe does not log: reads, and the paired
+/// rename `notify` adds after `MOVED_TO`.
+fn kind_names(k: &EventKind) -> Option<&'static str> {
+    Some(match k {
+        EventKind::Create(CreateKind::Folder) => "CREATE|ISDIR",
+        EventKind::Create(_) => "CREATE",
+        EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Any) => "MODIFY",
+        EventKind::Modify(ModifyKind::Metadata(_)) => "ATTRIB",
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => "MOVED_FROM",
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => "MOVED_TO",
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => return None,
+        // FSEvents reports each end of a rename without saying which it is.
+        EventKind::Modify(ModifyKind::Name(_)) => "RENAMED",
+        EventKind::Modify(ModifyKind::Other) => "MODIFY",
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => "CLOSE_WRITE",
+        EventKind::Access(_) => return None,
+        EventKind::Remove(RemoveKind::Folder) => "DELETE|ISDIR",
+        EventKind::Remove(_) => "DELETE",
+        EventKind::Any | EventKind::Other => "OTHER",
+    })
 }
 
 struct Watcher {
@@ -163,24 +167,17 @@ struct Watcher {
     watch_errors: Vec<String>,
 }
 
-const MASK: WatchMask = WatchMask::CREATE
-    .union(WatchMask::MODIFY)
-    .union(WatchMask::CLOSE_WRITE)
-    .union(WatchMask::MOVED_FROM)
-    .union(WatchMask::MOVED_TO)
-    .union(WatchMask::DELETE)
-    .union(WatchMask::ATTRIB);
-
+/// One non-recursive watch per directory, as the daemon's watcher does; new
+/// directories are watched as they appear.
 fn start_watcher(vault: &Path) -> Result<Watcher> {
-    let mut ino = Inotify::init().context("inotify_init")?;
-    let mut wds: HashMap<WatchDescriptor, PathBuf> = HashMap::new();
+    let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    let mut w = notify::recommended_watcher(tx).with_context(|| format!("{} watcher", watcher_backend()))?;
+    let mut watched = 0;
     let mut errors = Vec::new();
     let mut stack = vec![vault.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        match ino.watches().add(&dir, MASK) {
-            Ok(wd) => {
-                wds.insert(wd, dir.clone());
-            }
+        match w.watch(&dir, RecursiveMode::NonRecursive) {
+            Ok(()) => watched += 1,
             Err(e) => errors.push(format!("{}: {e}", dir.display())),
         }
         if let Ok(rd) = std::fs::read_dir(&dir) {
@@ -191,46 +188,50 @@ fn start_watcher(vault: &Path) -> Result<Watcher> {
             }
         }
     }
-    let watched = wds.len();
     let events = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let (ev2, stop2, root) = (events.clone(), stop.clone(), vault.to_path_buf());
     let t0 = Instant::now();
     let handle = std::thread::spawn(move || {
-        let mut buf = vec![0u8; 64 * 1024];
         while !stop2.load(Ordering::Relaxed) {
-            let mut new_dirs = Vec::new();
-            match ino.read_events(&mut buf) {
-                Ok(evs) => {
-                    for e in evs {
-                        let dir = wds.get(&e.wd).cloned().unwrap_or_default();
-                        let full = match e.name {
-                            Some(n) => dir.join(n),
-                            None => dir.clone(),
-                        };
-                        if e.mask.contains(EventMask::ISDIR)
-                            && e.mask.intersects(EventMask::CREATE | EventMask::MOVED_TO)
-                        {
-                            new_dirs.push(full.clone());
-                        }
-                        let rel = full.strip_prefix(&root).unwrap_or(&full).display().to_string();
-                        ev2.lock().unwrap().push(Ev {
-                            t_ms: t0.elapsed().as_millis(),
-                            path: rel,
-                            mask: mask_names(e.mask),
-                            cookie: e.cookie,
-                        });
-                    }
+            let ev = match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(ev)) => ev,
+                Ok(Err(e)) => {
+                    ev2.lock().unwrap().push(Ev {
+                        t_ms: t0.elapsed().as_millis(),
+                        path: String::new(),
+                        mask: format!("ERROR {e}"),
+                        cookie: 0,
+                    });
+                    continue;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50));
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            let mask = if ev.need_rescan() {
+                "Q_OVERFLOW"
+            } else {
+                match kind_names(&ev.kind) {
+                    Some(m) => m,
+                    None => continue,
                 }
-                Err(_) => std::thread::sleep(Duration::from_millis(200)),
-            }
-            for d in new_dirs {
-                if let Ok(wd) = ino.watches().add(&d, MASK) {
-                    wds.insert(wd, d);
+            };
+            let cookie = ev.tracker().unwrap_or(0) as u32;
+            for full in &ev.paths {
+                if matches!(
+                    ev.kind,
+                    EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Any))
+                ) && full.is_dir()
+                {
+                    let _ = w.watch(full, RecursiveMode::NonRecursive);
                 }
+                let rel = full.strip_prefix(&root).unwrap_or(full).display().to_string();
+                ev2.lock().unwrap().push(Ev {
+                    t_ms: t0.elapsed().as_millis(),
+                    path: rel,
+                    mask: mask.to_string(),
+                    cookie,
+                });
             }
         }
     });
@@ -348,6 +349,32 @@ fn fs_checks(vault: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// The mount holding `vault`, from `statfs` (macOS has no `/proc/mounts`).
+#[cfg(target_os = "macos")]
+fn mount_info(vault: &Path) -> String {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = CString::new(vault.as_os_str().as_bytes()) else {
+        return "unknown".into();
+    };
+    // SAFETY: `c` is a valid NUL-terminated path and `st` a zeroed statfs
+    // that statfs fills; its name fields are NUL-terminated C strings.
+    unsafe {
+        let mut st: libc::statfs = std::mem::zeroed();
+        if libc::statfs(c.as_ptr(), &mut st) != 0 {
+            return "unknown".into();
+        }
+        let s = |f: &[libc::c_char]| CStr::from_ptr(f.as_ptr()).to_string_lossy().into_owned();
+        format!(
+            "{} on {} type {}",
+            s(&st.f_mntfromname),
+            s(&st.f_mntonname),
+            s(&st.f_fstypename)
+        )
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn mount_info(vault: &Path) -> String {
     let canon = std::fs::canonicalize(vault).unwrap_or_else(|_| vault.to_path_buf());
     let Ok(m) = std::fs::read_to_string("/proc/mounts") else {
@@ -512,12 +539,13 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
         .into(),
     ));
 
-    // ---- Check 2: inotify sees Obsidian's saves ----
+    // ---- Check 2: the file watcher sees Obsidian's saves ----
+    let backend = watcher_backend();
     let before = vaultfs::read_state(&vault.join(NOTE))?.map(|s| s.hash);
     let watcher = start_watcher(&vault)?;
     let (watched_dirs, watch_errors) = (watcher.watched_dirs, watcher.watch_errors.clone());
     println!(
-        "\n  inotify: watching {} directories ({} could not be watched)",
+        "\n  {backend}: watching {} directories ({} could not be watched)",
         watcher.watched_dirs,
         watcher.watch_errors.len()
     );
@@ -538,10 +566,15 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
 
     // Summarise the events.
     let probe_events: Vec<&Ev> = events.iter().filter(|e| e.path == NOTE).collect();
-    let saw_note_write = probe_events
+    let saw_note_write = probe_events.iter().any(|e| {
+        ["CLOSE_WRITE", "MOVED_TO", "RENAMED", "MODIFY"]
+            .iter()
+            .any(|k| e.mask.contains(k))
+    });
+    let save_style = if probe_events
         .iter()
-        .any(|e| e.mask.contains("CLOSE_WRITE") || e.mask.contains("MOVED_TO") || e.mask.contains("MODIFY"));
-    let save_style = if probe_events.iter().any(|e| e.mask.contains("MOVED_TO")) {
+        .any(|e| e.mask.contains("MOVED_TO") || e.mask.contains("RENAMED"))
+    {
         "temp file + rename"
     } else if probe_events.iter().any(|e| e.mask.contains("MODIFY")) {
         "in-place write"
@@ -556,18 +589,18 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
     }
     let outside_obsidian_dir = events.iter().filter(|e| !e.path.starts_with(".obsidian")).count();
     println!(
-        "  inotify: {} events ({} outside .obsidian/), {} for {NOTE}",
+        "  {backend}: {} events ({} outside .obsidian/), {} for {NOTE}",
         events.len(),
         outside_obsidian_dir,
         probe_events.len()
     );
-    println!("  note content changed on disk: {note_changed}; inotify saw the save: {saw_note_write}");
+    println!("  note content changed on disk: {note_changed}; {backend} saw the save: {saw_note_write}");
 
     // ---- Report ----
     let mut r = String::new();
     let _ = writeln!(r, "# lsync probe report\n");
     let _ = writeln!(r, "- time (unix): {}", stamp());
-    let _ = writeln!(r, "- lsync: {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(r, "- lsync: {}", crate::VERSION);
     let _ = writeln!(r, "- vault: `{}`", vault.display());
     let _ = writeln!(r, "- mount: `{}`", mount_info(&vault));
     if let Some(v) = getprop("ro.build.version.release") {
@@ -597,10 +630,10 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
         "- **result: {}**",
         if pass1 { "PASS" } else { "FAIL or inconclusive" }
     );
-    let _ = writeln!(r, "\n## Check 2: inotify sees Obsidian's saves\n");
+    let _ = writeln!(r, "\n## Check 2: {backend} sees Obsidian's saves\n");
     let _ = writeln!(
         r,
-        "- directories watched: {watched_dirs} (one inotify watch each; {} failed)",
+        "- directories watched: {watched_dirs} (one {backend} watch each; {} failed)",
         watch_errors.len()
     );
     for e in watch_errors.iter().take(20) {
@@ -616,7 +649,7 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
     let _ = writeln!(r, "- `{NOTE}` changed on disk: {note_changed}");
     let _ = writeln!(
         r,
-        "- inotify events for `{NOTE}`: {} (save style: {save_style})",
+        "- {backend} events for `{NOTE}`: {} (save style: {save_style})",
         probe_events.len()
     );
     let pass2 = note_changed && saw_note_write;
@@ -659,7 +692,7 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
         if pass1 { "PASS" } else { "FAIL/inconclusive" }
     );
     println!(
-        "check 2 (inotify sees Obsidian saves):  {}",
+        "check 2 ({backend} sees Obsidian saves):  {}",
         if pass2 { "PASS" } else { "FAIL/inconclusive" }
     );
 

@@ -13,8 +13,14 @@ use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{error, info};
 
+/// The release version (set by the release workflow from the tag), else the crate version.
+const VERSION: &str = match option_env!("LSYNC_RELEASE_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
-#[command(name = "lsync", version, about = "Self-hosted LiveSync client")]
+#[command(name = "lsync", version = VERSION, about = "Self-hosted LiveSync client")]
 struct Cli {
     /// Profile name (selects the config file and state directory)
     #[arg(long, short = 'p', env = "LSYNC_PROFILE", default_value = "default", global = true)]
@@ -81,7 +87,7 @@ enum Cmd {
         json: bool,
     },
     /// Interactive on-device check: does Obsidian see outside writes, and does
-    /// inotify see Obsidian's saves?
+    /// file watcher see Obsidian's saves?
     Probe(probe::ProbeArgs),
 }
 
@@ -119,13 +125,9 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Peak resident set size of this process in KiB (Linux and Android).
+/// Peak resident set size of this process in KiB.
 pub fn peak_rss_kib() -> Option<u64> {
-    let s = std::fs::read_to_string("/proc/self/status").ok()?;
-    s.lines()
-        .find(|l| l.starts_with("VmHWM:"))
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|v| v.parse().ok())
+    livesync_engine::platform::peak_rss_kib()
 }
 
 fn run(cli: Cli) -> Result<u8> {

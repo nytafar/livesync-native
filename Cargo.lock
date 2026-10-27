@@ -836,10 +836,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cc00ea907cab49550b7da656f80ebb97be1b997d931fbcd28d39734e17ce592"
 dependencies = [
  "bitflags",
- "futures-util",
  "inotify-sys",
  "libc",
- "tokio",
 ]
 
 [[package]]
@@ -942,6 +940,7 @@ dependencies = [
  "anyhow",
  "axum",
  "futures",
+ "libc",
  "livesync-model",
  "livesync-remote",
  "log",
@@ -1033,10 +1032,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "inotify",
+ "libc",
  "livesync-engine",
  "livesync-model",
  "livesync-remote",
+ "notify",
  "rand 0.8.8",
  "serde",
  "serde_json",

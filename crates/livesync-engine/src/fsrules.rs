@@ -134,8 +134,11 @@ mod tests {
     fn probe_on_the_test_filesystem() {
         let d = tempfile::tempdir().unwrap();
         let r = FsRules::probe(d.path()).unwrap();
-        // tmpfs/ext4/btrfs under Linux take any name.
-        assert!(!r.case_insensitive);
+        // The probe agrees with a direct look at the same filesystem.
+        fs::write(d.path().join("Fold.txt"), b"x").unwrap();
+        assert_eq!(r.case_insensitive, exists(&d.path().join("fold.txt")));
+        fs::remove_file(d.path().join("Fold.txt")).unwrap();
+        // Linux (tmpfs/ext4/btrfs) and macOS (APFS) take every probed character.
         assert!(r.forbidden.is_empty());
         assert!(r.max_name_bytes >= 255);
         assert_eq!(fs::read_dir(d.path()).unwrap().count(), 0, "scratch removed");
