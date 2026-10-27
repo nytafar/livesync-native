@@ -34,7 +34,7 @@ for a in "$@"; do
   esac
 done
 
-MIN_SDK=30
+MIN_SDK=28
 export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk}
 [[ -d "$ANDROID_HOME/platforms/android-35" ]] || { echo "no android-35 platform under $ANDROID_HOME" >&2; exit 1; }
 if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
@@ -98,6 +98,8 @@ echo "== Rust core: arm64-v8a release (API $MIN_SDK)"
 rm -rf "$GEN/jniLibs"
 cargo ndk -t arm64-v8a -P "$MIN_SDK" -o "$GEN/jniLibs" build --release -p livesync-ffi
 ls -l "$GEN/jniLibs/arm64-v8a/"
+echo "== bionic symbols at API $MIN_SDK"
+scripts/check-bionic-symbols.sh "$GEN/jniLibs/arm64-v8a/liblivesync_ffi.so" "$MIN_SDK"
 
 echo "== Gradle"
 printf 'sdk.dir=%s\n' "$ANDROID_HOME" > android/local.properties
