@@ -25,7 +25,7 @@ object LogExport {
         val text = buildString {
             appendLine("LiveSync for Android ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}), core ${runCatching { coreVersion() }.getOrDefault("?")}")
             appendLine("Exported $stamp; Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}); ${Build.MANUFACTURER} ${Build.MODEL}")
-            appendLine("All-files access: ${Perms.allFilesAccess()}; battery exempt: ${Perms.batteryExempt(ctx)}; notifications: ${Perms.notificationsAllowed(ctx)}")
+            appendLine("${Perms.storageAccess().label}: ${Perms.allFilesAccess(ctx)}; battery exempt: ${Perms.batteryExempt(ctx)}; notifications: ${Perms.notificationsAllowed(ctx)}")
             appendLine()
             val core = app.core.getOrNull()
             if (core == null) appendLine("Core failed to load: ${app.core.exceptionOrNull()}")

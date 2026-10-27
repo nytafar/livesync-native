@@ -30,8 +30,10 @@ android {
 
     defaultConfig {
         applicationId = "no.nyta.livesync"
-        // Android 11: all-files access (MANAGE_EXTERNAL_STORAGE) exists from here (spec D3).
-        minSdk = 30
+        // Android 9 (branch android9-minsdk28, for the Onyx Boox Note 2). All-files
+        // access (MANAGE_EXTERNAL_STORAGE, spec D3) exists from Android 11; below
+        // it the legacy storage permissions stand in (ui/StorageAccess.kt).
+        minSdk = 28
         targetSdk = 35
         versionCode = (findProperty("livesync.versionCode") as String?)?.toInt() ?: 1
         versionName = (findProperty("livesync.versionName") as String?) ?: "0.1.0-dev"

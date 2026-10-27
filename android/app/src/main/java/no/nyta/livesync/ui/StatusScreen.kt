@@ -109,7 +109,7 @@ fun StatusScreen(
             TextButton(onClick = onEdit) { Text("Settings") }
         }
 
-        if (!checks.essentialsOk || !checks.notifications || !checks.samsungSleepOk) {
+        if (!checks.essentialsOk || !checks.notifications || !checks.samsungSleepOk || !checks.booxOk) {
             SetupChecksCard(checks)
         }
 

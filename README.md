@@ -22,7 +22,7 @@ A foreground service keeps one or more vault folders in sync, whether or not Obs
 - Each vault can be pull-only (read-only, the safe way to start) or two-way, and can sync all folders, only some, or all but some.
 - The password is encrypted with a key in the Android Keystore.
 
-Requires Android 11 or later. Build the APK with `scripts/build-apk.sh` (see [AGENTS.md](AGENTS.md)), install it, then:
+Requires Android 11 or later on main. This branch (`android9-minsdk28`) is an exploratory build for Android 9 and 10 (an Onyx Boox Note 2): there the setup screen asks for the storage permission instead of all-files access, and on a Boox for its own freeze and background settings. Build the APK with `scripts/build-apk.sh` (see [AGENTS.md](AGENTS.md)), install it, then:
 
 1. Grant all-files access, notifications and the battery exemption on the setup screen.
 2. Pick a **new** folder under `Documents/Obsidian/`.

@@ -16,4 +16,14 @@ class DeviceChecksTest {
         assertFalse(checks(samsung = true, battery = false, ticked = false).samsungSleepOk)
         assertTrue(checks(samsung = false, battery = false, ticked = false).samsungSleepOk)
     }
+
+    @Test
+    fun booxFreezingNeedsTheUsersTickEvenWithTheBatteryExemption() {
+        // Boox's own freezer runs alongside Android's battery optimisation, and
+        // the app cannot read it: only the user's tick clears it.
+        val base = DeviceChecks(allFiles = true, notifications = true, battery = true, samsung = false, samsungNeverSleepingConfirmed = false)
+        assertTrue(base.booxOk)
+        assertFalse(base.copy(boox = true).booxOk)
+        assertTrue(base.copy(boox = true, booxConfirmed = true).booxOk)
+    }
 }

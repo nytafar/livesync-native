@@ -59,7 +59,7 @@ fun VaultListScreen(app: LiveSyncApp, onOpen: (String) -> Unit, onAdd: () -> Uni
             style = MaterialTheme.typography.bodySmall,
         )
         Spacer(Modifier.height(8.dp))
-        if (!checks.essentialsOk || !checks.notifications || !checks.samsungSleepOk) {
+        if (!checks.essentialsOk || !checks.notifications || !checks.samsungSleepOk || !checks.booxOk) {
             SetupChecksCard(checks)
         }
         rows.forEach { (p, st) ->

@@ -1,7 +1,9 @@
 package no.nyta.livesync.ui
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -18,6 +20,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalContext
+import androidx.core.app.ActivityCompat
 import androidx.core.content.edit
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
@@ -29,6 +32,8 @@ data class DeviceChecks(
     val battery: Boolean,
     val samsung: Boolean,
     val samsungNeverSleepingConfirmed: Boolean,
+    val boox: Boolean = false,
+    val booxConfirmed: Boolean = false,
 ) {
     val essentialsOk get() = allFiles && battery
 
@@ -39,18 +44,28 @@ data class DeviceChecks(
      * this checks; without it, the user's own tick that they added the app.
      */
     val samsungSleepOk get() = !samsung || battery || samsungNeverSleepingConfirmed
+
+    /**
+     * Boox's own app freezing is dealt with. It sits apart from Android's
+     * battery optimisation and the app cannot read it, so only the user's
+     * tick counts.
+     */
+    val booxOk get() = !boox || booxConfirmed
 }
 
 private const val PREFS = "ui"
 private const val KEY_NEVER_SLEEPING = "samsung_never_sleeping_confirmed"
+private const val KEY_BOOX = "boox_background_confirmed"
 
 fun readChecks(ctx: Context) = DeviceChecks(
-    allFiles = Perms.allFilesAccess(),
+    allFiles = Perms.allFilesAccess(ctx),
     notifications = Perms.notificationsAllowed(ctx),
     battery = Perms.batteryExempt(ctx),
     samsung = Perms.isSamsung(),
     samsungNeverSleepingConfirmed = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         .getBoolean(KEY_NEVER_SLEEPING, false),
+    boox = Perms.isBoox(),
+    booxConfirmed = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_BOOX, false),
 )
 
 /** Device checks that refresh on every resume (the user comes back from Settings). */
@@ -67,14 +82,32 @@ fun rememberDeviceChecks(): DeviceChecks {
 fun SetupChecksCard(checks: DeviceChecks, onChanged: () -> Unit = {}) {
     val ctx = LocalContext.current
     val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { onChanged() }
+    // Below Android 11: the storage permissions' runtime dialog. Once denied
+    // for good the dialog no longer shows, and only the app's settings can grant them.
+    val storageLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        val activity = ctx.findActivity()
+        if (it.values.any { granted -> !granted } && activity != null &&
+            StorageAccess.LEGACY_PERMISSIONS.none { p -> ActivityCompat.shouldShowRequestPermissionRationale(activity, p) }
+        ) {
+            Perms.launch(ctx, Perms.appDetailsIntent(ctx))
+        }
+        onChanged()
+    }
     var neverSleeping by remember(checks) { mutableStateOf(checks.samsungNeverSleepingConfirmed) }
+    var booxDone by remember(checks) { mutableStateOf(checks.booxConfirmed) }
     SectionCard("1. Permissions") {
         CheckRow(
-            "All-files access",
+            Perms.storageAccess().label,
             checks.allFiles,
             "Needed to read and write the vault folder directly (Obsidian does the same).",
             if (checks.allFiles) null else "Grant",
-        ) { Perms.launch(ctx, Perms.allFilesIntent(ctx), Perms.allFilesFallbackIntent()) }
+        ) {
+            if (Build.VERSION.SDK_INT >= 30) {
+                Perms.launch(ctx, Perms.allFilesIntent(ctx), Perms.allFilesFallbackIntent())
+            } else {
+                storageLauncher.launch(StorageAccess.LEGACY_PERMISSIONS)
+            }
+        }
         CheckRow(
             "Notifications",
             checks.notifications,
@@ -121,6 +154,28 @@ fun SetupChecksCard(checks: DeviceChecks, onChanged: () -> Unit = {}) {
                 Text("LiveSync is on the \"Never sleeping apps\" list", style = MaterialTheme.typography.bodySmall)
             }
         }
+        if (checks.boox) {
+            CheckRow(
+                "Boox: freezing and Wi-Fi in sleep",
+                booxDone,
+                "Boox stops apps on its own, apart from the battery exemption above (menu names vary by " +
+                    "firmware). In the app list, tap the snowflake (Freeze settings) and leave LiveSync unfrozen. " +
+                    "Long-press the LiveSync icon → Optimize → Others → turn on \"Stay active in the background\" " +
+                    "(\"Allow the app to run in the background\"). If there is an App startup (auto-start) list, " +
+                    "allow LiveSync there so it starts after a reboot. Boox also turns Wi-Fi off soon after the " +
+                    "screen sleeps: for sync while it sleeps, set Settings → Power → network timeout after sleep " +
+                    "(\"Delay disconnection after sleep\") to Never, at a cost in battery.",
+                "Open",
+            ) { Perms.launch(ctx, Perms.appDetailsIntent(ctx)) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = booxDone, onCheckedChange = {
+                    booxDone = it
+                    ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit { putBoolean(KEY_BOOX, it) }
+                    onChanged()
+                })
+                Text("LiveSync is unfrozen and allowed to stay active in the background", style = MaterialTheme.typography.bodySmall)
+            }
+        }
         if (checks.samsung) {
             TextButton(onClick = { Perms.launch(ctx, Perms.dontKillMyAppIntent()) }) {
                 Text("More on dontkillmyapp.com")
@@ -128,3 +183,7 @@ fun SetupChecksCard(checks: DeviceChecks, onChanged: () -> Unit = {}) {
         }
     }
 }
+
+/** The activity behind a Compose context, for the permission rationale check. */
+private fun Context.findActivity(): Activity? =
+    generateSequence(this) { (it as? ContextWrapper)?.baseContext }.filterIsInstance<Activity>().firstOrNull()

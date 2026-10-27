@@ -4,12 +4,12 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
-import android.os.Environment
 import no.nyta.livesync.core.LiveSync
 import no.nyta.livesync.core.VaultAccess
 import no.nyta.livesync.profile.ProfileStore
 import no.nyta.livesync.secret.KeystoreCipher
 import no.nyta.livesync.secret.SecretStore
+import no.nyta.livesync.ui.Perms
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -43,13 +43,17 @@ class LiveSyncApp : Application() {
             // lookup by name finds it already mapped.
             System.loadLibrary("livesync_ffi")
             val host = LiveSync(File(filesDir, "logs").path)
-            // Without all-files access the vault looks empty; never let that
-            // read as "everything was deleted".
+            // Without all-files access (below Android 11: the storage
+            // permissions) the vault looks empty; never let that read as
+            // "everything was deleted".
             host.setVaultAccess(object : VaultAccess {
-                override fun problem(vaultPath: String): String? = try {
-                    if (Environment.isExternalStorageManager()) null else "all-files access is not granted"
-                } catch (e: Exception) {
-                    "cannot check all-files access: ${e.message}"
+                override fun problem(vaultPath: String): String? {
+                    val what = Perms.storageAccess().phrase
+                    return try {
+                        if (Perms.allFilesAccess(this@LiveSyncApp)) null else "$what is not granted"
+                    } catch (e: Exception) {
+                        "cannot check $what: ${e.message}"
+                    }
                 }
             })
             Core(host, profiles, secrets, File(cacheDir, "connect-test"))

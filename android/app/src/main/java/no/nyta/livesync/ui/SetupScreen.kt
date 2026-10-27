@@ -203,7 +203,7 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(enabled = checks.allFiles, onClick = { picking = true }) { Text("Browse…") }
                 }
-                if (!checks.allFiles) Text("Grant all-files access first.", style = MaterialTheme.typography.bodySmall)
+                if (!checks.allFiles) Text("Grant ${Perms.storageAccess().phrase} first.", style = MaterialTheme.typography.bodySmall)
                 Text(
                     "Open the same folder in Obsidian as a device-storage vault (by default under Documents/Obsidian).",
                     style = MaterialTheme.typography.bodySmall,
@@ -396,7 +396,7 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
         }
         if (!canSave) {
             val why = when {
-                !checks.allFiles -> "Grant all-files access."
+                !checks.allFiles -> "Grant ${Perms.storageAccess().phrase}."
                 !vaultOk -> "Choose a usable vault folder."
                 urlProblem != null -> urlProblem
                 draft.database.isEmpty() -> "Enter the database name."

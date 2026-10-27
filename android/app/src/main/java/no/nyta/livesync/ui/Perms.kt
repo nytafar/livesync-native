@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
@@ -20,11 +21,29 @@ object Perms {
     fun metered(ctx: Context): Boolean =
         ctx.getSystemService(android.net.ConnectivityManager::class.java)?.isActiveNetworkMetered ?: true
 
-    fun allFilesAccess(): Boolean = Environment.isExternalStorageManager()
+    /** How this Android release grants the vault folder ([StorageAccess]). */
+    fun storageAccess(): StorageAccess = StorageAccess.forSdk(Build.VERSION.SDK_INT)
 
+    /**
+     * Whether the app can read and write all of shared storage: all-files
+     * access on Android 11+, the legacy storage permissions below it (on
+     * Android 10 only in the legacy storage model).
+     */
+    fun allFilesAccess(ctx: Context): Boolean = when {
+        Build.VERSION.SDK_INT >= StorageAccess.ALL_FILES_SDK -> Environment.isExternalStorageManager()
+        Build.VERSION.SDK_INT >= 29 -> legacyStorageGranted(ctx) && Environment.isExternalStorageLegacy()
+        else -> legacyStorageGranted(ctx)
+    }
+
+    private fun legacyStorageGranted(ctx: Context): Boolean = StorageAccess.LEGACY_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(ctx, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    @RequiresApi(30)
     fun allFilesIntent(ctx: Context): Intent =
         Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, "package:${ctx.packageName}".toUri())
 
+    @RequiresApi(30)
     fun allFilesFallbackIntent(): Intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
 
     fun batteryExempt(ctx: Context): Boolean =
@@ -44,6 +63,10 @@ object Perms {
         }
 
     fun isSamsung(): Boolean = Build.MANUFACTURER.equals("samsung", ignoreCase = true)
+
+    /** Onyx Boox e-ink devices, which freeze background apps on their own. */
+    fun isBoox(): Boolean =
+        Build.MANUFACTURER.equals("onyx", ignoreCase = true) || Build.BRAND.equals("onyx", ignoreCase = true)
 
     fun appDetailsIntent(ctx: Context): Intent =
         Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:${ctx.packageName}".toUri())
