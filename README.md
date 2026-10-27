@@ -170,3 +170,10 @@ Exit codes:
 | `scripts/` | APK and Termux builds, dev-database environment, a vault comparison script, and `interop.sh` (the M2 scenarios against the official CLI) |
 
 Build and test instructions are in [AGENTS.md](AGENTS.md).
+
+## Licence
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT licence](LICENSE-MIT), at your option. Parts ported from Self-hosted LiveSync keep its MIT notice; see [NOTICE](NOTICE).
+
+Unless you explicitly state otherwise, any contribution you submit for inclusion in this project, as defined in the Apache-2.0 licence, is dual-licensed as above, without any additional terms or conditions.
+
