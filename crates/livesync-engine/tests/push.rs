@@ -1571,7 +1571,7 @@ async fn a_mass_deletion_split_over_two_passes_still_stops() {
     assert!(st.safety_stop.as_deref().unwrap().contains("30 of 40"), "{st:?}");
 
     // The user confirms: the 30 go, once; the other 10 stay.
-    engine.allow_mass_delete_once();
+    assert!(engine.allow_mass_delete_once().unwrap());
     wait_until("the confirmed deletions", || gone().len() == 30).await;
     assert!((30..40).all(|i| !env.deleted(&format!("f{i:02}.md"))));
     wait_until("the stop to clear", || {
@@ -1837,4 +1837,161 @@ async fn a_note_deleted_twice_is_sent_after_the_hold_both_times() {
     wait_until("the second deletion", || env.deleted("f0.md")).await;
     tx.send(true).unwrap();
     task.await.unwrap().unwrap();
+}
+
+/// Review of #10: a folder renamed and then deleted within one settle
+/// window is a deletion, not a rename: the watcher's rename hint names a
+/// destination that is not there.
+#[tokio::test]
+async fn a_folder_renamed_and_then_deleted_still_stops() {
+    let env = Env::new().await;
+    for i in 0..30 {
+        env.write(&format!("d/f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    for i in 0..10 {
+        env.write(&format!("keep/g{i}.md"), format!("keep {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_secs(2);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.mv("d", "e");
+    std::fs::remove_dir_all(env.vault().join("e")).unwrap();
+    let gone = || -> Vec<String> {
+        (0..30)
+            .map(|i| format!("d/f{i:02}.md"))
+            .filter(|p| env.deleted(p))
+            .collect()
+    };
+    wait_until("the stop, or every deletion", || {
+        engine.status().unwrap().safety_stop.is_some() || gone().len() == 30
+    })
+    .await;
+    assert!(gone().is_empty(), "deleted remotely: {:?}", gone());
+    let st = engine.status().unwrap();
+    assert!(st.safety_stop.as_deref().unwrap().contains("30 of 40"), "{st:?}");
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// Review of #10: one new file accounts for one vanished file with its
+/// content, not for every vanished file with the same content (25 empty
+/// notes deleted beside one new empty note are 24 deletions).
+#[tokio::test]
+async fn one_new_file_accounts_for_one_vanished_twin_only() {
+    let env = Env::new().await;
+    for i in 0..30 {
+        env.write(&format!("empty{i:02}.md"), b"");
+    }
+    for i in 0..10 {
+        env.write(&format!("g{i}.md"), format!("keep {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    for i in 0..25 {
+        std::fs::remove_file(env.vault().join(format!("empty{i:02}.md"))).unwrap();
+    }
+    env.write("Untitled.md", b"");
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.safety_stops, 1, "{rep:?}");
+    assert_eq!(rep.push.deleted, 1, "only the one rename went out: {rep:?}");
+    let st = env.engine().status().unwrap();
+    assert!(st.safety_stop.as_deref().unwrap().contains("24 of 40"), "{st:?}");
+}
+
+/// Review of #10: the same for files found outside the synced folders: one
+/// empty file in `.trash/` accounts for one vanished empty note.
+#[tokio::test]
+async fn one_file_in_the_trash_accounts_for_one_vanished_twin_only() {
+    let env = Env::new().await;
+    for i in 0..30 {
+        env.write(&format!("empty{i:02}.md"), b"");
+        set_mtime(&env, &format!("empty{i:02}.md"), 1_700_000_000);
+    }
+    for i in 0..10 {
+        env.write(&format!("g{i}.md"), format!("keep {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    for i in 0..25 {
+        std::fs::remove_file(env.vault().join(format!("empty{i:02}.md"))).unwrap();
+    }
+    env.write(".trash/empty00.md", b"");
+    set_mtime(&env, ".trash/empty00.md", 1_700_000_000);
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.safety_stops, 1, "{rep:?}");
+    assert_eq!(rep.push.deleted, 1, "only the one move into .trash/ went out: {rep:?}");
+    let st = env.engine().status().unwrap();
+    assert!(st.safety_stop.as_deref().unwrap().contains("24 of 40"), "{st:?}");
+}
+
+/// Review of #10: a trickle of deletions that never lets the hold end is
+/// judged once the hold reaches its maximum, and the daemon says how many
+/// deletions wait meanwhile.
+#[tokio::test]
+async fn a_trickle_of_deletions_is_judged_after_the_maximum_hold() {
+    let env = Env::new().await;
+    for i in 0..40 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_secs(1);
+        c.delete_hold_max = Duration::from_secs(3);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut most_waiting = 0;
+    for i in 0..15 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        most_waiting = most_waiting.max(engine.deletes_waiting());
+    }
+    let early: Vec<usize> = (0..15).filter(|i| env.deleted(&format!("f{i:02}.md"))).collect();
+    assert!(!early.is_empty(), "nothing sent while the trickle went on");
+    assert!(most_waiting > 0, "no deletions shown as waiting");
+    wait_until("the rest", || (0..15).all(|i| env.deleted(&format!("f{i:02}.md")))).await;
+    assert!(engine.status().unwrap().safety_stop.is_none());
+    wait_until("nothing waiting", || engine.deletes_waiting() == 0).await;
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+/// Review of #10: the vault lock file is never taken for the new home of a
+/// deleted note, even one with the same content and mtime.
+#[tokio::test]
+async fn the_vault_lock_file_is_not_where_a_deleted_note_went() {
+    let env = Env::new().await;
+    env.write("other.md", b"other");
+    let engine = env.engine();
+    let lock = env.vault().join(".lsync.lock");
+    let bytes = std::fs::read(&lock).unwrap();
+    let mtime = std::fs::metadata(&lock).unwrap().modified().unwrap();
+    env.write("twin.md", &bytes);
+    std::fs::File::options()
+        .write(true)
+        .open(env.vault().join("twin.md"))
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    engine.sync_once().await.unwrap();
+    std::fs::remove_file(env.vault().join("twin.md")).unwrap();
+    let rep = engine.sync_once().await.unwrap();
+    assert_eq!(rep.push.out_of_scope, 0, "{rep:?}");
+    assert_eq!(rep.push.deleted, 1, "{rep:?}");
+    assert!(env.deleted("twin.md"));
 }

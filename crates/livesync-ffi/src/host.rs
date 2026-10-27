@@ -440,8 +440,10 @@ impl LiveSync {
     }
 
     /// The user confirmed a mass-delete safety stop: the next full push pass,
-    /// and only that one, may delete the missing files remotely
-    /// (`Engine::allow_mass_delete_once`); it is asked for at once.
+    /// and only that one, deletes the files the stop showed
+    /// (`Engine::allow_mass_delete_once`); it is asked for at once. Files
+    /// that went missing since are judged as usual. `Invalid` when no
+    /// mass-delete stop is shown.
     pub fn allow_mass_delete_once(&self, profile_id: String) -> Result<(), LiveSyncError> {
         let shared = self.slot_shared(&profile_id).ok_or_else(|| LiveSyncError::NotRunning {
             msg: format!("profile {profile_id} is not started"),
@@ -454,8 +456,12 @@ impl LiveSync {
         let engine = shared.engine().ok_or_else(|| LiveSyncError::NotRunning {
             msg: format!("no engine is running for profile {profile_id}"),
         })?;
-        warn!("profile {profile_id}: mass deletes allowed for the next full push pass (confirmed by the user)");
-        engine.allow_mass_delete_once();
+        if !engine.allow_mass_delete_once()? {
+            return Err(LiveSyncError::Invalid {
+                msg: "no mass-delete safety stop is shown; nothing to allow".into(),
+            });
+        }
+        warn!("profile {profile_id}: the deletions the safety stop showed are allowed for the next full push pass (confirmed by the user)");
         Ok(())
     }
 
@@ -555,6 +561,7 @@ impl LiveSync {
         let mut out = status::from_engine(&profile_id, state, message, pull_only, snap.as_ref(), session.as_ref());
         status::add_push(&mut out, push.as_ref());
         out.mass_delete_allowed = engine.as_ref().is_some_and(|e| e.mass_delete_allowed());
+        out.deletes_waiting = engine.as_ref().map_or(0, |e| e.deletes_waiting());
         out
     }
 

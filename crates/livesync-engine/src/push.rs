@@ -200,7 +200,8 @@ impl RenameHints {
 /// So such deletions wait until no new one has turned up for `period`; then
 /// a full pass whose walk began after that judges everything missing at
 /// once, as a single pass over the finished burst would. Partial passes
-/// never decide them.
+/// never decide them. A trickle that keeps the hold open is judged anyway
+/// once the hold has lasted `max`.
 ///
 /// Holding a deletion only keeps the remote copy longer. The hold lives in
 /// memory: if the process is killed or restarted, the rows are still
@@ -210,34 +211,52 @@ impl RenameHints {
 #[derive(Debug)]
 pub(crate) struct DeleteHold {
     period: Duration,
+    max: Duration,
     /// Documents seen missing with no known destination, not decided on yet
     /// or refused by the stop: seeing them again is not a new deletion.
     seen: HashSet<String>,
     /// When the newest of them was first seen, while undecided.
     newest: Option<Instant>,
+    /// When the undecided hold began.
+    first: Option<Instant>,
 }
 
 impl DeleteHold {
-    pub(crate) fn new(period: Duration) -> Self {
+    pub(crate) fn new(period: Duration, max: Duration) -> Self {
         DeleteHold {
             period,
+            max,
             seen: HashSet::new(),
             newest: None,
+            first: None,
         }
     }
 
     /// When a full pass must decide on the held deletions.
     pub(crate) fn due(&self) -> Option<Instant> {
-        self.newest.map(|t| t + self.period)
+        let quiet = self.newest? + self.period;
+        Some(match self.first {
+            Some(f) => quiet.min(f + self.max),
+            None => quiet,
+        })
+    }
+
+    /// Deletions waiting for a decision (for status).
+    pub(crate) fn waiting(&self) -> u64 {
+        if self.newest.is_some() {
+            self.seen.len() as u64
+        } else {
+            0
+        }
     }
 
     /// Note a pass's deletions with no known destination. `scan` is when a
     /// full pass's walk began (`None` for a partial pass). Returns true when
     /// they must be held, false when this full pass decides on them now:
     /// its walk began once the burst was over, so it saw all of it (files
-    /// that went missing after the walk are not in it). `now` decides at
-    /// once (a confirmed mass delete).
-    fn observe(&mut self, ids: &[&str], scan: Option<Instant>, now: bool) -> bool {
+    /// that went missing after the walk are not in it), or the hold has
+    /// lasted its maximum.
+    fn observe(&mut self, ids: &[&str], scan: Option<Instant>) -> bool {
         let at = Instant::now();
         let mut fresh = false;
         for id in ids {
@@ -250,11 +269,15 @@ impl DeleteHold {
             self.seen.retain(|id| current.contains(id.as_str()));
         }
         if fresh {
+            if self.newest.is_none() {
+                self.first = Some(at);
+            }
             self.newest = Some(at);
         }
         if ids.is_empty() {
             if scan.is_some() {
                 self.newest = None;
+                self.first = None;
             }
             return false;
         }
@@ -263,8 +286,9 @@ impl DeleteHold {
             (Some(walked), Some(due)) => walked >= due,
             (None, _) => false,
         };
-        if now || over {
+        if over {
             self.newest = None;
+            self.first = None;
             return false;
         }
         true
@@ -310,9 +334,10 @@ fn under(path: &str, prefix: &str) -> bool {
 /// Per-pass bookkeeping shared by the pushes and the vanished-file handling.
 #[derive(Debug, Default)]
 struct PassCtx {
-    /// Content hash -> path of files new to the index in this pass, so a
+    /// Content hash -> paths of files new to the index in this pass, so a
     /// vanished file with the same content is known to have been renamed.
-    new_files: HashMap<String, String>,
+    /// Each new file accounts for one vanished file at most.
+    new_files: HashMap<String, Vec<String>>,
     /// Per-document failures in a row.
     consecutive_failures: u32,
     /// The reconcile pass after a full fetch is pending (`meta.reconcile_pending`).
@@ -322,8 +347,10 @@ struct PassCtx {
     incomplete: bool,
     /// The file `push_local` is working on: (document path, content hash).
     attempt: Option<(String, String)>,
-    /// This pass may delete en masse (consumed `allow_mass_delete_once`).
-    mass_delete_once: bool,
+    /// Documents the user confirmed deleting after a stop (consumed
+    /// `allow_mass_delete_once`): this pass deletes them, whatever the
+    /// stop would say; any other deletion is judged as usual.
+    confirmed: Option<HashSet<String>>,
     /// Paths and content hashes whose push failed in this pass: a vanished
     /// file renamed to one of them is not deleted yet.
     failed_paths: HashSet<String>,
@@ -423,18 +450,36 @@ impl Engine {
         self.inner.push_report.lock().unwrap().clone()
     }
 
-    /// Let the next full push pass, and only that one, delete more than the
-    /// mass-delete stop allows: a front-end's answer to a safety stop the
-    /// user confirmed (the per-run `EngineConfig::allow_mass_delete` stays
-    /// for the CLI). Asks for that pass now.
-    pub fn allow_mass_delete_once(&self) {
-        self.inner.mass_delete_once.store(true, Ordering::SeqCst);
+    /// A front-end's answer to a mass-delete safety stop the user
+    /// confirmed: the next full push pass, and only that one, deletes the
+    /// files that stop refused (the ones it showed). Files that went missing
+    /// since are judged as usual. Asks for that pass now. Returns false, and
+    /// allows nothing, when no mass-delete stop is shown. (The per-run
+    /// `EngineConfig::allow_mass_delete` stays for the CLI.)
+    pub fn allow_mass_delete_once(&self) -> Result<bool> {
+        let docs = self.with_index(|ix| {
+            Ok(match ix.get_meta(meta::SAFETY_STOP)? {
+                Some(_) => ix.get_meta(meta::SAFETY_STOP_DOCS)?,
+                None => None,
+            })
+        })?;
+        let Some(docs) = docs.and_then(|d| serde_json::from_str::<HashSet<String>>(&d).ok()) else {
+            return Ok(false);
+        };
+        *self.inner.mass_delete_once.lock().unwrap() = Some(docs);
         self.rescan_now();
+        Ok(true)
     }
 
     /// Whether an `allow_mass_delete_once` is still waiting for its pass.
     pub fn mass_delete_allowed(&self) -> bool {
-        self.inner.mass_delete_once.load(Ordering::SeqCst)
+        self.inner.mass_delete_once.lock().unwrap().is_some()
+    }
+
+    /// Local deletions the running daemon holds until their burst is over
+    /// (`EngineConfig::delete_hold`).
+    pub fn deletes_waiting(&self) -> u64 {
+        self.inner.deletes_waiting.load(Ordering::SeqCst)
     }
 
     fn ids_case_insensitive(&self) -> bool {
@@ -707,7 +752,7 @@ impl Engine {
             reconcile: self.with_index(|ix| ix.get_meta(meta::RECONCILE))?.is_some(),
             incomplete: !walk.unreadable.is_empty(),
             // Taken by this full pass, so a later pass never inherits it.
-            mass_delete_once: self.inner.mass_delete_once.swap(false, Ordering::SeqCst),
+            confirmed: self.inner.mass_delete_once.lock().unwrap().take(),
             ..Default::default()
         };
         for (f, row) in work {
@@ -902,7 +947,10 @@ impl Engine {
         // A stop stays visible until a full pass completes without one; a
         // partial pass sees too little to say it is over.
         if full && rep.safety_stops == 0 {
-            self.with_index(|ix| ix.delete_meta(meta::SAFETY_STOP))?;
+            self.with_index(|ix| {
+                ix.delete_meta(meta::SAFETY_STOP)?;
+                ix.delete_meta(meta::SAFETY_STOP_DOCS)
+            })?;
         }
         Ok(())
     }
@@ -1101,7 +1149,7 @@ impl Engine {
             }
         }
         if row.is_none() {
-            ctx.new_files.insert(hash.clone(), doc_path.clone());
+            ctx.new_files.entry(hash.clone()).or_default().push(doc_path.clone());
         }
         let new_row = FileRow {
             path: doc_path.clone(),
@@ -1430,7 +1478,7 @@ impl Engine {
     ) -> Result<()> {
         if rows.is_empty() {
             if let Some(h) = hold.filter(|_| tally.scan.is_some()) {
-                h.observe(&[], tally.scan, false);
+                h.observe(&[], tally.scan);
             }
             return Ok(());
         }
@@ -1473,13 +1521,18 @@ impl Engine {
         }
         if gone.is_empty() {
             if let Some(h) = hold.filter(|_| tally.scan.is_some()) {
-                h.observe(&[], tally.scan, false);
+                h.observe(&[], tally.scan);
             }
             return Ok(());
         }
-        // Decide every fate first.
+        // Decide every fate first. A deletion counts as a rename or a move
+        // into `.trash/` only when its destination is there (and, inside the
+        // synced folders, on the server); each destination accounts for one
+        // vanished file. A rename hint alone is not enough: a folder renamed
+        // and deleted at once leaves one behind.
         let mut fates: Vec<(FileRow, Fate)> = Vec::new();
         let mut unknown: Vec<FileRow> = Vec::new();
+        let mut claimed: HashSet<String> = HashSet::new();
         for r in gone {
             let dest = hints.dest(&r.path);
             let failed_dest = dest.as_ref().is_some_and(|d| ctx.failed_paths.contains(d))
@@ -1494,21 +1547,46 @@ impl Engine {
                 continue;
             }
             if let Some(d) = dest {
-                let fate = self.fate_of(&d);
-                fates.push((r, fate));
-            } else if let Some(d) = r.disk_hash.as_ref().and_then(|h| ctx.new_files.get(h)) {
-                // The same content appeared under a new name in this pass.
-                let dest = Some(d.clone());
-                fates.push((r, Fate::Delete { dest }));
-            } else {
-                unknown.push(r);
+                match self.fate_of(&d) {
+                    Fate::OutOfScope(d) => {
+                        fates.push((r, Fate::OutOfScope(d)));
+                        continue;
+                    }
+                    Fate::Delete { .. } => {
+                        if self.claim_dest(&d, &mut claimed)? {
+                            fates.push((r, Fate::Delete { dest: Some(d) }));
+                            continue;
+                        }
+                    }
+                }
+            }
+            // The same content appeared under a new name in this pass.
+            let twin = match r.disk_hash.as_ref().and_then(|h| ctx.new_files.get_mut(h)) {
+                Some(paths) => {
+                    let mut hit = None;
+                    while let Some(d) = paths.pop() {
+                        if self.claim_dest(&d, &mut claimed)? {
+                            hit = Some(d);
+                            break;
+                        }
+                    }
+                    hit
+                }
+                None => None,
+            };
+            match twin {
+                Some(d) => fates.push((r, Fate::Delete { dest: Some(d) })),
+                None => unknown.push(r),
             }
         }
         if !unknown.is_empty() {
             let found = self.find_moved_out(&unknown).await?;
             for r in unknown {
                 let fate = match found.get(&r.doc_id) {
-                    Some(d) => self.fate_of(d),
+                    Some(d) => match self.fate_of(d) {
+                        Fate::Delete { .. } if !self.claim_dest(d, &mut claimed)? => Fate::Delete { dest: None },
+                        f => f,
+                    },
                     None => Fate::Delete { dest: None },
                 };
                 fates.push((r, fate));
@@ -1517,20 +1595,35 @@ impl Engine {
         // The mass-delete stop: deletions nobody can account for (no rename,
         // no move to `.trash/` or out of scope), against what was tracked at
         // the start of the pass.
+        // Deletions the user confirmed after a stop go now; they leave the
+        // count, as if deleted before this pass.
+        let confirmed_docs = ctx.confirmed.take();
+        let confirmed = |id: &str| confirmed_docs.as_ref().is_some_and(|c| c.contains(id));
         let undestined_ids: Vec<&str> = fates
             .iter()
-            .filter(|(_, f)| matches!(f, Fate::Delete { dest: None }))
+            .filter(|(r, f)| matches!(f, Fate::Delete { dest: None }) && !confirmed(&r.doc_id))
             .map(|(r, _)| r.doc_id.as_str())
             .collect();
         let undestined = undestined_ids.len() as u64;
-        let tracked = tally.tracked;
-        // In the daemon, wait for the burst to end; a confirmed mass delete
-        // is decided by the full pass that takes the confirmation.
+        let allowed = fates
+            .iter()
+            .filter(|(r, f)| matches!(f, Fate::Delete { dest: None }) && confirmed(&r.doc_id))
+            .count() as u64;
+        let tracked = tally.tracked.saturating_sub(allowed);
+        if confirmed_docs.is_some() {
+            // The stop is answered; anything still too much stops anew.
+            warn!("{allowed} file(s) the user confirmed deleting after a safety stop; deleting them remotely");
+            self.with_index(|ix| {
+                ix.delete_meta(meta::SAFETY_STOP)?;
+                ix.delete_meta(meta::SAFETY_STOP_DOCS)
+            })?;
+        }
+        // In the daemon, wait for the burst to end.
         let mut hold = hold;
         let held = match hold.as_deref_mut() {
             Some(h) => {
                 let before = h.due();
-                let held = h.observe(&undestined_ids, tally.scan, ctx.mass_delete_once);
+                let held = h.observe(&undestined_ids, tally.scan);
                 if held && h.due() != before {
                     info!(
                         "{undestined} file(s) missing with no known destination; deleting them remotely once none has gone missing for {:.0?}",
@@ -1551,12 +1644,16 @@ impl Engine {
             } else {
                 format!("{undestined} of {tracked} tracked files are missing from the vault")
             };
-            if self.inner.cfg.allow_mass_delete || ctx.mass_delete_once {
+            if self.inner.cfg.allow_mass_delete {
                 warn!("{msg}; deleting them remotely (mass deletes allowed)");
             } else {
                 let msg = format!("{msg}; not deleting them remotely (allow mass deletes if this is intended)");
                 warn!("{msg}");
-                self.with_index(|ix| ix.set_meta(meta::SAFETY_STOP, &format!("{} {msg}", vaultfs::now_ms())))?;
+                let docs = serde_json::to_string(&undestined_ids).unwrap_or_default();
+                self.with_index(|ix| {
+                    ix.set_meta(meta::SAFETY_STOP, &format!("{} {msg}", vaultfs::now_ms()))?;
+                    ix.set_meta(meta::SAFETY_STOP_DOCS, &docs)
+                })?;
                 rep.safety_stops += 1;
                 withhold = true;
             }
@@ -1577,7 +1674,7 @@ impl Engine {
                     self.with_index(|ix| ix.upsert(&r))?;
                     rep.out_of_scope += 1;
                 }
-                Fate::Delete { dest: None } if withhold => {}
+                Fate::Delete { dest: None } if withhold && !confirmed(&r.doc_id) => {}
                 Fate::Delete { dest } => {
                     if let Some(d) = &dest {
                         debug!("{}: moved to {d}", r.path);
@@ -1594,6 +1691,30 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Whether a deletion's destination accounts for it: not claimed by
+    /// another vanished file in this pass, a file on disk now, and inside
+    /// the synced folders also on the server (tracked with a synced
+    /// revision, as after its push in this pass). Claims it if so.
+    fn claim_dest(&self, dest: &str, claimed: &mut HashSet<String>) -> Result<bool> {
+        if claimed.contains(dest) {
+            return Ok(false);
+        }
+        let there = std::fs::symlink_metadata(self.inner.cfg.vault.join(dest)).is_ok_and(|m| m.is_file());
+        if !there {
+            return Ok(false);
+        }
+        if !in_trash(dest) {
+            let synced = self
+                .row_for_local(dest)?
+                .is_some_and(|r| r.base_rev.is_some() && is_tracked(r.state));
+            if !synced {
+                return Ok(false);
+            }
+        }
+        claimed.insert(dest.to_string());
+        Ok(true)
     }
 
     fn fate_of(&self, dest: &str) -> Fate {
@@ -1645,7 +1766,9 @@ impl Engine {
                         }
                         continue;
                     }
-                    if !ft.is_file() || this.local_visible(&rel) {
+                    // Our own vault lock file is no note's new home (an empty
+                    // note with its mtime would match it).
+                    if !ft.is_file() || this.local_visible(&rel) || rel == crate::engine::VAULT_LOCK {
                         continue;
                     }
                     let Ok(md) = e.metadata() else { continue };
@@ -1655,10 +1778,12 @@ impl Engine {
                     let Ok(Some(st)) = vaultfs::read_state(&e.path()) else {
                         continue;
                     };
-                    for c in cands {
-                        if c.disk_hash.as_deref() == Some(st.hash.as_str()) {
-                            out.entry(c.doc_id.clone()).or_insert_with(|| rel.clone());
-                        }
+                    // One file found accounts for one vanished file.
+                    if let Some(c) = cands
+                        .iter()
+                        .find(|c| c.disk_hash.as_deref() == Some(st.hash.as_str()) && !out.contains_key(&c.doc_id))
+                    {
+                        out.insert(c.doc_id.clone(), rel.clone());
                     }
                 }
             }
@@ -1780,7 +1905,7 @@ impl Engine {
         let mut started = false;
         let mut was_enabled = false;
         let mut hints = RenameHints::default();
-        let mut hold = DeleteHold::new(self.inner.cfg.delete_hold);
+        let mut hold = DeleteHold::new(self.inner.cfg.delete_hold, self.inner.cfg.delete_hold_max);
         let mut queue: HashMap<String, Settling> = HashMap::new();
         let mut full_due = true;
         let mut next_rescan = Instant::now() + self.inner.cfg.rescan_interval;
@@ -1881,6 +2006,7 @@ impl Engine {
                     backoff.reset();
                     retry_at = None;
                     total.add(&rep);
+                    self.inner.deletes_waiting.store(hold.waiting(), Ordering::SeqCst);
                     self.inner.push_report.lock().unwrap().add(&rep);
                 }
                 Err(e) => {
@@ -2061,44 +2187,73 @@ mod tests {
     #[test]
     fn the_delete_hold_decides_once_a_burst_is_over() {
         let walk = || Some(Instant::now());
-        let mut h = DeleteHold::new(Duration::from_millis(100));
+        let mut h = DeleteHold::new(Duration::from_millis(100), Duration::from_secs(60));
         // A partial pass never decides; a new deletion starts the hold.
-        assert!(h.observe(&["a"], None, false));
+        assert!(h.observe(&["a"], None));
         assert!(h.due().is_some());
+        assert_eq!(h.waiting(), 1);
         // A full pass within the hold waits too, and more deletions extend it.
-        assert!(h.observe(&["a", "b"], walk(), false));
+        assert!(h.observe(&["a", "b"], walk()));
+        assert_eq!(h.waiting(), 2);
         let due = h.due().unwrap();
         // A full pass that walked before the hold ended does not decide,
         // even if it gets here after (its picture may miss later deletions).
         let early = walk();
         std::thread::sleep(Duration::from_millis(120));
         assert!(Instant::now() >= due);
-        assert!(h.observe(&["a", "b"], early, false));
+        assert!(h.observe(&["a", "b"], early));
         // Walked past the hold with nothing new: this full pass decides.
-        assert!(!h.observe(&["a", "b"], walk(), false));
+        assert!(!h.observe(&["a", "b"], walk()));
         assert!(h.due().is_none());
+        assert_eq!(h.waiting(), 0);
         // Refused by the stop: still missing, nothing new, decided again at once.
         h.decided(true);
-        assert!(!h.observe(&["a", "b"], walk(), false));
+        assert!(!h.observe(&["a", "b"], walk()));
         h.decided(true);
-        assert!(h.observe(&["a"], None, false), "a partial pass waits for a full one");
+        assert!(h.observe(&["a"], None), "a partial pass waits for a full one");
         assert!(h.due().is_none(), "nothing new, nothing scheduled");
         // A refused file back and gone again is a new deletion.
         h.forget("a");
-        assert!(h.observe(&["a"], None, false));
+        assert!(h.observe(&["a"], None));
         assert!(h.due().is_some());
         // One more deletion: the whole set waits again.
-        assert!(h.observe(&["a", "b", "c"], walk(), false));
-        // A confirmed mass delete decides at once; sent, they are forgotten.
-        assert!(!h.observe(&["a", "b", "c"], walk(), true));
+        assert!(h.observe(&["a", "b", "c"], walk()));
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!h.observe(&["a", "b", "c"], walk()));
+        // Sent, they are forgotten, so the same document deleted again
+        // starts a new hold.
         h.decided(false);
         assert!(h.due().is_none() && h.seen.is_empty());
-        // So the same document deleted again starts a new hold.
-        assert!(h.observe(&["a"], None, false));
+        assert!(h.observe(&["a"], None));
         assert!(h.due().is_some());
         // Nothing missing any more: nothing held.
-        assert!(!h.observe(&[], walk(), false));
+        assert!(!h.observe(&[], walk()));
         assert!(h.due().is_none() && h.seen.is_empty());
+    }
+
+    #[test]
+    fn a_trickle_of_deletions_is_judged_once_the_hold_reaches_its_maximum() {
+        let walk = || Some(Instant::now());
+        let mut h = DeleteHold::new(Duration::from_millis(300), Duration::from_millis(600));
+        let started = Instant::now();
+        let ids: Vec<String> = (0..40).map(|i| format!("d{i}")).collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut n = 1;
+        // A new deletion every 60 ms keeps the 300 ms hold open...
+        loop {
+            let held = h.observe(&ids[..n], walk());
+            if !held {
+                break;
+            }
+            assert!(n < ids.len(), "never decided");
+            std::thread::sleep(Duration::from_millis(60));
+            n += 1;
+        }
+        // ...until it has lasted 600 ms; then everything so far is judged.
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(600), "{took:?}");
+        assert!(took < Duration::from_millis(2000), "{took:?}");
+        assert!(n >= 6, "{n}");
     }
 
     #[test]

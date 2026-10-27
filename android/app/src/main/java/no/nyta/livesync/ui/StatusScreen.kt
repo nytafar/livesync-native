@@ -344,7 +344,8 @@ private enum class Confirm(val title: String, val text: String, val action: Stri
     MassDelete(
         "Delete these files on the server?",
         "The files listed as missing will be soft-deleted on the server and disappear from your other devices " +
-            "(they stay recoverable there as deleted documents). This permission covers the next full sync pass only.",
+            "(they stay recoverable there as deleted documents). This permission covers the files this stop " +
+            "listed, at the next full sync pass only; files deleted after it are checked again.",
         "Delete them",
     ),
     Adopt(

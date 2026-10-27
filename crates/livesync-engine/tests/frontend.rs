@@ -71,7 +71,7 @@ async fn a_one_time_mass_delete_allowance_covers_exactly_one_full_pass() {
     assert_eq!(rep.push.safety_stops, 1);
     assert!(!env.deleted("f00.md"));
 
-    engine.allow_mass_delete_once();
+    assert!(engine.allow_mass_delete_once().unwrap());
     assert!(engine.mass_delete_allowed());
     let rep = engine.sync_once().await.unwrap();
     assert_eq!(rep.push.deleted, 31, "{:?}", rep.push);
@@ -87,6 +87,56 @@ async fn a_one_time_mass_delete_allowance_covers_exactly_one_full_pass() {
     assert_eq!(rep.push.safety_stops, 1, "{:?}", rep.push);
     assert_eq!(rep.push.deleted, 0);
     assert!(!env.deleted("f31.md"));
+}
+
+/// Review of #10: the confirmation covers the files the stop showed. Files
+/// deleted after it are judged on their own, and stop again here.
+#[tokio::test]
+async fn a_confirmation_covers_only_what_the_stop_showed() {
+    let env = Env::new().await;
+    for i in 0..60 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    let engine = env.engine_at(&env.mock.url);
+    engine.sync_once().await.unwrap();
+    for i in 0..31 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let rep = engine.sync_once().await.unwrap();
+    assert_eq!(rep.push.safety_stops, 1);
+    assert!(engine.status().unwrap().safety_stop.unwrap().contains("31 of 60"));
+    // More go missing before the user answers.
+    for i in 31..56 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    assert!(engine.allow_mass_delete_once().unwrap());
+    let rep = engine.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 31, "{:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 1, "{:?}", rep.push);
+    assert!(env.deleted("f30.md"));
+    assert!((31..56).all(|i| !env.deleted(&format!("f{i:02}.md"))));
+    let st = engine.status().unwrap();
+    assert!(st.safety_stop.as_deref().unwrap().contains("25 of 29"), "{st:?}");
+    assert!(!engine.mass_delete_allowed());
+}
+
+/// Review of #10: a confirmation with no stop shown allows nothing.
+#[tokio::test]
+async fn a_confirmation_without_a_stop_allows_nothing() {
+    let env = Env::new().await;
+    for i in 0..40 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    let engine = env.engine_at(&env.mock.url);
+    engine.sync_once().await.unwrap();
+    assert!(!engine.allow_mass_delete_once().unwrap());
+    assert!(!engine.mass_delete_allowed());
+    for i in 0..30 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let rep = engine.sync_once().await.unwrap();
+    assert_eq!(rep.push.safety_stops, 1, "{:?}", rep.push);
+    assert_eq!(rep.push.deleted, 0);
 }
 
 /// A TCP proxy that can stop forwarding (requests and responses hang, as

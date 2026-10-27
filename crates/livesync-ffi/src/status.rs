@@ -149,6 +149,10 @@ pub struct ProfileStatus {
     pub safety_stop: Option<String>,
     /// A confirmed mass delete is waiting for its (one) full push pass.
     pub mass_delete_allowed: bool,
+    /// Local deletions the running two-way engine holds until no other file
+    /// has gone missing for a while; then they are judged together by the
+    /// mass-delete stop. Zero when not running.
+    pub deletes_waiting: u64,
     /// `"<ms> <text>"`: waiting for a rebuilding device to finish uploading.
     pub rebuild_wait: Option<String>,
     /// `"<ms> <count> file(s) ...: paths"`: files the remote lacked after a
@@ -237,6 +241,7 @@ pub(crate) fn from_engine(
         resolve_owed: false,
         safety_stop: None,
         mass_delete_allowed: false,
+        deletes_waiting: 0,
         rebuild_wait: None,
         rebuild_orphans: None,
         deleted_elsewhere: 0,

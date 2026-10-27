@@ -431,6 +431,12 @@ fn a_confirmed_mass_delete_goes_through_once() {
     wait_until("registration", Duration::from_secs(20), || {
         env.status(&p).registered_ms.is_some()
     });
+    // With no stop shown there is nothing to allow.
+    assert!(matches!(
+        env.host.allow_mass_delete_once("mass".into()),
+        Err(LiveSyncError::Invalid { .. })
+    ));
+    assert!(!env.status(&p).mass_delete_allowed);
     // Spread over half a second, as a file manager or a slow filesystem
     // would: the first full pass after the registration runs in the middle
     // of it (#10; before the hold, 16 or 17 of the 22 went out every time).

@@ -79,6 +79,9 @@ pub(crate) mod meta_keys {
     pub const LAST_PUSH: &str = "last_push_ms";
     /// A safety stop that needs a human (for example a mass deletion).
     pub const SAFETY_STOP: &str = "safety_stop";
+    /// The documents a mass-delete stop refused to delete (JSON list of
+    /// IDs): what `allow_mass_delete_once` lets through, and nothing else.
+    pub const SAFETY_STOP_DOCS: &str = "safety_stop_docs";
 }
 
 /// Aborts a spawned task when dropped.
@@ -165,6 +168,9 @@ pub struct EngineConfig {
     /// burst is judged by the mass-delete stop at once (a burst the watcher
     /// spreads over several passes is still one burst).
     pub delete_hold: Duration,
+    /// The longest the daemon holds deletions while new ones keep coming
+    /// (a trickle never ends the hold above); then they are judged anyway.
+    pub delete_hold_max: Duration,
     /// Asked before any pass that could delete remote documents (a seam for
     /// the front-end, e.g. Android's "all files access" check). `None`: no
     /// check beyond the engine's own.
@@ -215,6 +221,7 @@ impl EngineConfig {
             rebuild_quiet: Duration::from_secs(30),
             allow_mass_delete: false,
             delete_hold: Duration::from_secs(10),
+            delete_hold_max: Duration::from_secs(120),
             access_check: None,
             vault_flock: true,
         }
@@ -439,8 +446,11 @@ pub(crate) struct Inner {
     report: Mutex<PullReport>,
     /// The two-way daemon's push totals for this session (`push_report`).
     pub(crate) push_report: Mutex<crate::push::PushReport>,
-    /// The next full push pass may delete en masse (`allow_mass_delete_once`).
-    pub(crate) mass_delete_once: AtomicBool,
+    /// The next full push pass may delete these documents, which a stop
+    /// refused and the user confirmed (`allow_mass_delete_once`).
+    pub(crate) mass_delete_once: Mutex<Option<std::collections::HashSet<String>>>,
+    /// Deletions the daemon holds until their burst is over (`DeleteHold`).
+    pub(crate) deletes_waiting: std::sync::atomic::AtomicU64,
     pub(crate) nudge: Notify,
     /// Wakes the push loop for a full rescan.
     pub(crate) rescan: Notify,
@@ -627,7 +637,8 @@ impl Engine {
                 mem: Semaphore::new(budget),
                 report: Mutex::new(PullReport::default()),
                 push_report: Mutex::new(crate::push::PushReport::default()),
-                mass_delete_once: AtomicBool::new(false),
+                mass_delete_once: Mutex::new(None),
+                deletes_waiting: std::sync::atomic::AtomicU64::new(0),
                 nudge: Notify::new(),
                 rescan: Notify::new(),
                 ops: tokio::sync::Mutex::new(()),
