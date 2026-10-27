@@ -48,7 +48,10 @@ JAVA_HOME=${LIVESYNC_JAVA_HOME:-$(mise where java@21 2>/dev/null || echo "${JAVA
 export JAVA_HOME
 export PATH="$JAVA_HOME/bin:$PATH"
 echo "== JDK: $("$JAVA_HOME/bin/java" -version 2>&1 | head -1)"
-BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+# Pinned: the output format of `apksigner verify --print-certs` differs between
+# build-tools releases, and CI images carry several.
+BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+[[ -x "$BUILD_TOOLS/apksigner" ]] || { echo "no build-tools 35.0.0 under $ANDROID_HOME" >&2; exit 1; }
 
 # --- signing keystore (outside the repo, never committed) ---------------------
 SIGN_DIR="$HOME/.config/livesync-android"
@@ -120,7 +123,9 @@ else
   # apksigner reports verification errors on stdout, so don't filter them away.
   certs=$("$BUILD_TOOLS/apksigner" verify --print-certs "$APK" 2>&1) || {
     echo "apksigner verify failed for $APK:" >&2; echo "$certs" >&2; exit 1; }
-  grep -E "Signer #1 certificate (DN|SHA-256)" <<<"$certs"
+  echo "$certs"
+  grep -qE "Signer #1 certificate SHA-256" <<<"$certs" || {
+    echo "apksigner printed no 'Signer #1 certificate SHA-256' line (output above)" >&2; exit 1; }
   OUT="dist/livesync-android-$VERSION_NAME.apk"
 fi
 cp "$APK" "$OUT"

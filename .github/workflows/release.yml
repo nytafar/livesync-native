@@ -209,8 +209,9 @@ jobs:
         run: |
           set -euo pipefail
           apk=$(ls dist/*.apk)
-          apksigner=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner
+          apksigner="$ANDROID_HOME/build-tools/35.0.0/apksigner"  # pinned, as in build-apk.sh
           got=$("$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          [[ -n "$got" ]] || { echo "::error::could not read the signer certificate digest from apksigner"; exit 1; }
           echo "sha256=$got" >> "$GITHUB_OUTPUT"
           echo "signer certificate SHA-256: $got"
           want=$(printf '%s' "$WANT" | tr -d ': ' | tr 'A-F' 'a-f')
