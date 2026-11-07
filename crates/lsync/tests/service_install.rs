@@ -1,9 +1,13 @@
 //! `lsync service install|status|uninstall` through the binary, into a
-//! machine of temp folders. `PATH` holds only fake `systemctl` and
-//! `loginctl` scripts that record their arguments, so no command ever
+//! machine of temp folders. `PATH` holds only fake `systemctl`, `loginctl`
+//! and `launchctl` scripts that record their arguments, so no command ever
 //! reaches this machine's service manager.
+//!
+//! The binary manages systemd units on Linux and a LaunchAgent on macOS
+//! (where `--system` is refused), so the unit tests run on Linux and the
+//! LaunchAgent tests on macOS.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 struct Machine {
@@ -24,7 +28,11 @@ impl Machine {
         )
         .unwrap();
         let log = root.join("calls.log");
-        for (prog, answer) in [("systemctl", "enabled"), ("loginctl", "no")] {
+        for (prog, answer) in [
+            ("systemctl", "enabled"),
+            ("loginctl", "no"),
+            ("launchctl", "state = running"),
+        ] {
             let p = root.join("bin").join(prog);
             std::fs::write(
                 &p,
@@ -72,6 +80,7 @@ impl Machine {
     }
 
     /// `systemctl --user show --property=UnitPath` answers `paths`.
+    #[cfg(target_os = "linux")]
     fn manager_reads(&self, paths: &str) {
         let p = self.root.join("bin/systemctl");
         std::fs::write(
@@ -84,13 +93,20 @@ impl Machine {
         .unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     fn unit(&self) -> PathBuf {
         self.root.join("config/systemd/user/lsync.service")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn plist(&self) -> PathBuf {
+        self.root.join("home/Library/LaunchAgents/no.nyta.lsync.plist")
     }
 }
 
 /// `systemd-analyze verify` on a unit file, when this machine has it.
-fn verify(path: &Path) {
+#[cfg(target_os = "linux")]
+fn verify(path: &std::path::Path) {
     let Ok(v) = Command::new("systemd-analyze").arg("--version").output() else {
         eprintln!("skipped systemd-analyze verify: not installed");
         return;
@@ -108,6 +124,8 @@ fn verify(path: &Path) {
     assert!(out.status.success() && ours.is_empty(), "{err}");
 }
 
+// systemd units: Linux only (macOS gets a LaunchAgent, tested below).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_user_unit_is_not_written_where_the_user_manager_does_not_look() {
     // The testbed's machines set XDG_CONFIG_HOME; the user's manager reads
@@ -130,6 +148,8 @@ fn a_user_unit_is_not_written_where_the_user_manager_does_not_look() {
     assert!(m.unit().exists());
 }
 
+// systemd units: Linux only (macOS gets a LaunchAgent, tested below).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_user_service_installs_into_the_config_home_and_uninstalls() {
     let m = Machine::new();
@@ -178,6 +198,8 @@ fn a_user_service_installs_into_the_config_home_and_uninstalls() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("not installed"));
 }
 
+// systemd units: Linux only (macOS gets a LaunchAgent, tested below).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_system_unit_is_printed_without_root_and_installed_only_with_it() {
     let m = Machine::new();
@@ -252,6 +274,74 @@ fn a_system_unit_is_printed_without_root_and_installed_only_with_it() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("sudo"));
         assert!(m.calls().is_empty(), "{:?}", m.calls());
     }
+}
+
+/// macOS: the LaunchAgent goes to `~/Library/LaunchAgents`, is loaded
+/// into the user's GUI domain, carries the folders this CLI uses, and is
+/// unloaded and removed again; the config stays.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_launch_agent_installs_into_the_home_and_uninstalls() {
+    let m = Machine::new();
+    let uid = unsafe { libc::getuid() };
+    let out = m.ok(&["service", "install"]);
+    assert!(out.contains("loaded no.nyta.lsync"), "{out}");
+    let plist = std::fs::read_to_string(m.plist()).unwrap();
+    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_lsync")).unwrap();
+    assert!(
+        plist.contains(&format!(
+            "<string>{}</string>\n\t\t<string>serve</string>",
+            exe.display()
+        )),
+        "{plist}"
+    );
+    for k in ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "LSYNC_RUNTIME_DIR"] {
+        assert!(plist.contains(&format!("<key>{k}</key>")), "{k}: {plist}");
+    }
+    assert!(m.root.join("home/Library/Logs/lsync").is_dir());
+    // The plist as written is one launchd reads.
+    let lint = Command::new("/usr/bin/plutil")
+        .arg("-lint")
+        .arg(m.plist())
+        .output()
+        .unwrap();
+    assert!(lint.status.success(), "{}", String::from_utf8_lossy(&lint.stdout));
+    let target = format!("gui/{uid}/no.nyta.lsync");
+    assert_eq!(
+        m.calls(),
+        [
+            format!("launchctl bootout {target}"),
+            format!("launchctl enable {target}"),
+            format!("launchctl bootstrap gui/{uid} {}", m.plist().display()),
+        ]
+    );
+
+    let st: serde_json::Value = serde_json::from_str(&m.ok(&["service", "status", "--json"])).unwrap();
+    assert_eq!(st["installed"], true);
+    assert_eq!(st["manager"], "launchd");
+    assert_eq!(st["loaded"], true);
+    assert_eq!(st["active"], "running");
+    assert_eq!(st["socket"]["answers"], false);
+
+    let out = m.ok(&["service", "uninstall"]);
+    assert!(out.contains("removed"), "{out}");
+    assert!(!m.plist().exists());
+    assert!(m.root.join("config/lsync/lsync.toml").exists());
+    let out = m.cmd(&["service", "status"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("not installed"));
+}
+
+/// macOS has no system service: `--system service install` says so, and
+/// runs nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_system_service_is_refused_on_macos() {
+    let m = Machine::new();
+    let out = m.cmd(&["--system", "service", "install", "--print"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && err.contains("not supported on macOS"), "{err}");
+    assert!(m.calls().is_empty(), "{:?}", m.calls());
 }
 
 #[test]
