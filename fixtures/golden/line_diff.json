@@ -1260,6 +1260,290 @@
    ]
   },
   {
+   "a": "# Log\n- 09:00 start\n## Notes\n",
+   "b": "# Log\n- 09:00 start\n- 10:00 call\n  with notes\n## Notes\n",
+   "diffs": [
+    [
+     0,
+     "# Log\n- 09:00 start\n"
+    ],
+    [
+     1,
+     "- 10:00 call\n  with notes\n"
+    ],
+    [
+     0,
+     "## Notes\n"
+    ]
+   ]
+  },
+  {
+   "a": "# Log\n- 09:00 start\n## Notes\n",
+   "b": "# Log\n- 09:00 start\n- 10:00 call\n  with notes\n## Notes\n",
+   "diffs": [
+    [
+     0,
+     "# Log\n- 09:00 start\n"
+    ],
+    [
+     1,
+     "- 10:00 call\n  with notes\n"
+    ],
+    [
+     0,
+     "## Notes\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\n",
+   "b": "a\nl1\nl2\nl3\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     1,
+     "l1\nl2\nl3\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\n",
+   "b": "a\nl1\nl2\nl3\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     1,
+     "l1\nl2\nl3\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\n",
+   "b": "a\nl1\nl2\nX\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     1,
+     "l1\nl2\nX\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\n",
+   "b": "a\nl1\nl2\nX\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     1,
+     "l1\nl2\nX\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\n",
+   "b": "a\nl1\nl2",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     1,
+     "l1\nl2"
+    ]
+   ]
+  },
+  {
+   "a": "a\n",
+   "b": "a\nl1\nl2",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     1,
+     "l1\nl2"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\n",
+   "b": "a\nb\n",
+   "diffs": [
+    [
+     0,
+     "a\nb\n"
+    ],
+    [
+     -1,
+     "c\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\n",
+   "b": "a\nb\n",
+   "diffs": [
+    [
+     0,
+     "a\nb\n"
+    ],
+    [
+     -1,
+     "c\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\n",
+   "b": "A\nb\n",
+   "diffs": [
+    [
+     -1,
+     "a\n"
+    ],
+    [
+     1,
+     "A\n"
+    ],
+    [
+     0,
+     "b\n"
+    ],
+    [
+     -1,
+     "c\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\n",
+   "b": "A\nb\n",
+   "diffs": [
+    [
+     -1,
+     "a\n"
+    ],
+    [
+     1,
+     "A\n"
+    ],
+    [
+     0,
+     "b\n"
+    ],
+    [
+     -1,
+     "c\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\n",
+   "b": "a\nb\n",
+   "diffs": [
+    [
+     0,
+     "a\nb\n"
+    ],
+    [
+     -1,
+     "c\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\n",
+   "b": "a\nb\n",
+   "diffs": [
+    [
+     0,
+     "a\nb\n"
+    ],
+    [
+     -1,
+     "c\n"
+    ]
+   ]
+  },
+  {
+   "a": "# Todo\n- a\n- b\n- c\n",
+   "b": "new\n# Todo\n- a\n- b\n- c\n",
+   "diffs": [
+    [
+     1,
+     "new\n"
+    ],
+    [
+     0,
+     "# Todo\n- a\n- b\n- c\n"
+    ]
+   ]
+  },
+  {
+   "a": "# Todo\n- a\n- b\n- c\n",
+   "b": "new\n# Todo\n- a\n- b\n- c\n",
+   "diffs": [
+    [
+     1,
+     "new\n"
+    ],
+    [
+     0,
+     "# Todo\n- a\n- b\n- c\n"
+    ]
+   ]
+  },
+  {
+   "a": "# Todo\n- a\n- b\n- c\n",
+   "b": "new\n# Todo\n- a\n- b\n",
+   "diffs": [
+    [
+     1,
+     "new\n"
+    ],
+    [
+     0,
+     "# Todo\n- a\n- b\n"
+    ],
+    [
+     -1,
+     "- c\n"
+    ]
+   ]
+  },
+  {
+   "a": "# Todo\n- a\n- b\n- c\n",
+   "b": "new\n# Todo\n- a\n- b\n",
+   "diffs": [
+    [
+     1,
+     "new\n"
+    ],
+    [
+     0,
+     "# Todo\n- a\n- b\n"
+    ],
+    [
+     -1,
+     "- c\n"
+    ]
+   ]
+  },
+  {
    "a": "charlie\n- [ ] task\ndelta\ngolf\n# Heading\ndelta\necho\ngolf\n> quote\n",
    "b": "charlie\n- [ ] task\ndelta\ngolf\n# Heading\ndelta\necho\ndelta 5\necho\ndelta\n> quote\n> quote 36\n",
    "diffs": [

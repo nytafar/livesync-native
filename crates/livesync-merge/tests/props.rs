@@ -1,10 +1,20 @@
 //! Property tests for D9's safety bar: no automatic merge drops a line (or a
-//! JSON value) that either side added, and a merge is symmetric up to the
-//! order the mtimes give.
+//! JSON value) that either side added, nor brings back a line a side deleted;
+//! two runs inserted at one point come out whole, the older first; and a merge
+//! is symmetric up to the order the mtimes give.
 use livesync_merge::{merge, Input, Kind, Merge, Outcome, Settings, Side, Version};
 use proptest::prelude::*;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+
+/// 1000 cases, or `PROPTEST_CASES` when set (`with_cases` would override it).
+fn config() -> ProptestConfig {
+    let mut c = ProptestConfig::default();
+    if std::env::var_os("PROPTEST_CASES").is_none() {
+        c.cases = 1000;
+    }
+    c
+}
 
 const WORDS: &[&str] = &[
     "alpha",
@@ -191,6 +201,24 @@ fn keeps_added_lines(c: &Case, out: &str) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// A base line a side deleted must not be in the result more often than on
+/// that side (D10 relies on a deletion being carried). Only meaningful where
+/// no side inserts a line the base has (which would be a move).
+fn keeps_deletions(c: &Case, out: &str) -> Result<(), TestCaseError> {
+    let (b, o, t, m) = (counts(&c.base), counts(&c.ours), counts(&c.theirs), counts(out));
+    for (line, nb) in &b {
+        let (no, nt) = (o.get(line).copied().unwrap_or(0), t.get(line).copied().unwrap_or(0));
+        if no <= *nb && nt <= *nb {
+            let got = m.get(line).copied().unwrap_or(0);
+            prop_assert!(
+                got <= no.min(nt),
+                "line {line:?} base {nb}x, ours {no}x, theirs {nt}x, merged {got}x\n{c:?}\nmerged {out:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn swapped(c: &Case) -> Case {
     Case {
         base: c.base.clone(),
@@ -212,7 +240,7 @@ fn symmetric(a: &Merge, b: &Merge) -> Result<(), TestCaseError> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1000))]
+    #![proptest_config(config())]
 
     #[test]
     fn line_merges_keep_every_added_line(c in text_case(), ours_newer in any::<bool>()) {
@@ -243,6 +271,153 @@ proptest! {
     #[test]
     fn frontmatter_merges_are_symmetric(c in markdown_case()) {
         symmetric(&run(Kind::Markdown, &c, 2000, 3000), &run(Kind::Markdown, &swapped(&c), 3000, 2000))?;
+    }
+}
+
+/// Two runs inserted at one point of a base of distinct lines, each side maybe
+/// also changing a line away from that point.
+#[derive(Clone, Debug)]
+struct Runs {
+    base: Vec<String>,
+    at: usize,
+    ours: Vec<String>,
+    theirs: Vec<String>,
+    ours_change: Option<usize>,
+    theirs_change: Option<usize>,
+    ours_newer: bool,
+}
+
+fn runs_case() -> impl Strategy<Value = Runs> {
+    (0..8usize, any::<prop::sample::Index>(), 1..5usize, 1..5usize)
+        .prop_flat_map(|(n, at, ko, kt)| {
+            let at = at.index(n + 1);
+            // A change away from the insertion point: not the line before or after it.
+            let away: Vec<usize> = (0..n).filter(|q| *q + 1 != at && *q != at).collect();
+            let change = if away.is_empty() {
+                Just(None).boxed()
+            } else {
+                prop::option::of(prop::sample::select(away)).boxed()
+            };
+            (
+                Just(n),
+                Just(at),
+                Just(ko),
+                Just(kt),
+                change.clone(),
+                change,
+                any::<bool>(),
+                prop::sample::select(&["entry", "- item", "", "  detail"][..]),
+            )
+        })
+        .prop_map(|(n, at, ko, kt, oc, tc, ours_newer, word)| Runs {
+            base: (0..n).map(|i| format!("base {i}")).collect(),
+            at,
+            ours: (0..ko).map(|i| format!("{word} ours {i}")).collect(),
+            theirs: (0..kt).map(|i| format!("{word} theirs {i}")).collect(),
+            ours_change: oc,
+            theirs_change: tc.filter(|q| Some(*q) != oc),
+            ours_newer,
+        })
+}
+
+impl Runs {
+    fn side(&self, run: &[String], change: Option<usize>, other: &[String], other_change: Option<usize>) -> String {
+        let mut v = Vec::new();
+        for (i, l) in self.base.iter().enumerate() {
+            if i == self.at {
+                v.extend(run.iter().cloned());
+                v.extend(other.iter().cloned());
+            }
+            v.push(if Some(i) == change || Some(i) == other_change {
+                format!("{l} changed")
+            } else {
+                l.clone()
+            });
+        }
+        if self.at == self.base.len() {
+            v.extend(run.iter().cloned());
+            v.extend(other.iter().cloned());
+        }
+        join(&v, "\n", true)
+    }
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Both sides insert a run at one point: the merge is clean and holds the
+    /// older side's run whole, then the newer side's.
+    #[test]
+    fn inserted_runs_stay_whole_older_first(r in runs_case()) {
+        let c = Case {
+            base: join(&r.base, "\n", true),
+            ours: r.side(&r.ours, r.ours_change, &[], None),
+            theirs: r.side(&r.theirs, r.theirs_change, &[], None),
+        };
+        let (older, newer) = if r.ours_newer { (&r.theirs, &r.ours) } else { (&r.ours, &r.theirs) };
+        let want = r.side(older, r.ours_change, newer, r.theirs_change);
+        let (mo, mt) = if r.ours_newer { (3000, 2000) } else { (2000, 3000) };
+        for kind in [Kind::Text, Kind::Markdown] {
+            match run(kind, &c, mo, mt).outcome {
+                Outcome::Write(out) => prop_assert_eq!(std::str::from_utf8(&out).unwrap(), want.as_str(), "{:?}", c),
+                other => prop_assert!(false, "{other:?}\n{c:?}"),
+            }
+        }
+    }
+}
+
+/// Distinct base lines; each side deletes, replaces or inserts lines of its
+/// own, so a base line missing on a side was deleted there, never moved.
+fn fresh_case() -> impl Strategy<Value = Case> {
+    let edits = || prop::collection::vec((0..3u8, any::<prop::sample::Index>()), 0..5);
+    (
+        0..10usize,
+        edits(),
+        edits(),
+        any::<bool>(),
+        prop::array::uniform3(prop::bool::weighted(0.8)),
+    )
+        .prop_map(|(n, eo, et, crlf, finals)| {
+            let base: Vec<String> = (0..n).map(|i| format!("base {i}")).collect();
+            let side = |who: &str, edits: &[(u8, prop::sample::Index)]| {
+                let mut v = base.clone();
+                for (k, (op, i)) in edits.iter().enumerate() {
+                    match op {
+                        0 => v.insert(i.index(v.len() + 1), format!("{who} {k}")),
+                        1 if !v.is_empty() => {
+                            v.remove(i.index(v.len()));
+                        }
+                        2 if !v.is_empty() => {
+                            let at = i.index(v.len());
+                            v[at] = format!("{} by {who} {k}", v[at]);
+                        }
+                        _ => {}
+                    }
+                }
+                v
+            };
+            let eol = if crlf { "\r\n" } else { "\n" };
+            Case {
+                ours: join(&side("ours", &eo), eol, finals[1]),
+                theirs: join(&side("theirs", &et), eol, finals[2]),
+                base: join(&base, eol, finals[0]),
+            }
+        })
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    #[test]
+    fn line_merges_carry_every_deletion(c in fresh_case(), ours_newer in any::<bool>()) {
+        let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
+        for kind in [Kind::Text, Kind::Markdown] {
+            if let Outcome::Write(out) = run(kind, &c, mo, mt).outcome {
+                let out = std::str::from_utf8(&out).unwrap();
+                keeps_added_lines(&c, out)?;
+                keeps_deletions(&c, out)?;
+            }
+        }
     }
 }
 
@@ -361,7 +536,7 @@ fn keeps_added_values(c: &Case, out: &str) -> Result<(), TestCaseError> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1000))]
+    #![proptest_config(config())]
 
     #[test]
     fn object_merges_keep_every_added_value(c in json_case(), ours_newer in any::<bool>()) {

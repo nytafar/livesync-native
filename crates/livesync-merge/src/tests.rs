@@ -75,11 +75,15 @@ fn line_diffs_match_diff_match_patch() {
 }
 
 #[test]
-fn trailing_deletion_becomes_equal_lines_as_upstream() {
-    // splitDiffPiece: a deletion with nothing after it is pushed as EQUAL.
+fn a_trailing_deletion_stays_a_deletion() {
+    // Upstream's splitDiffPiece pushes a deletion with nothing after it as EQUAL.
     assert_eq!(
-        lines::split_for_test("a\nb\nc\n", "a\nb\n"),
+        lines::split_for_test("a\nb\nc\n", "a\nb\n", false),
         vec![(0, "a\n".into()), (0, "b\n".into()), (0, "c\n".into())]
+    );
+    assert_eq!(
+        lines::split_for_test("a\nb\nc\n", "a\nb\n", true),
+        vec![(0, "a\n".into()), (0, "b\n".into()), (-1, "c\n".into())]
     );
 }
 
@@ -291,15 +295,74 @@ fn both_appending_keeps_both_older_first() {
 }
 
 #[test]
-fn two_inserted_runs_interleave_as_upstream() {
-    let m = run(
-        Kind::Text,
-        Some("# Log\n"),
-        "# Log\nours 1\nours 2\n",
-        "# Log\ntheirs 1\ntheirs 2\n",
-        false,
+fn two_inserted_runs_go_in_whole_older_first() {
+    let base = "# Log\n";
+    let ours = "# Log\nours 1\nours 2\n";
+    let theirs = "# Log\ntheirs 1\ntheirs 2\ntheirs 3\n";
+    // Upstream interleaves: ours 1, theirs 1, ours 2, theirs 2, theirs 3.
+    let m = run(Kind::Text, Some(base), ours, theirs, false);
+    assert_eq!(written(&m), "# Log\nours 1\nours 2\ntheirs 1\ntheirs 2\ntheirs 3\n");
+    assert_eq!(m.deviations, [Deviation::RunOrder]);
+    let m = run(Kind::Text, Some(base), ours, theirs, true);
+    assert_eq!(written(&m), "# Log\ntheirs 1\ntheirs 2\ntheirs 3\nours 1\nours 2\n");
+    assert_eq!(m.deviations, [Deviation::RunOrder]);
+    // Upstream's interleaving, when the fix is undone.
+    let input = Input {
+        base: Some(ver(base, 1000)),
+        ours: ver(ours, OLD),
+        theirs: ver(theirs, NEW),
+    };
+    let m = merge_undoing(Kind::Text, &input, &Settings::default(), &[Deviation::RunOrder]);
+    assert_eq!(written(&m), "# Log\nours 1\ntheirs 1\nours 2\ntheirs 2\ntheirs 3\n");
+    assert!(m.deviations.is_empty());
+}
+
+#[test]
+fn two_appends_in_the_middle_of_a_daily_note_stay_blocks() {
+    let base = "# Day\n## Log\n- 09:00 start\n## Notes\nend\n";
+    let ours = "# Day\n## Log\n- 09:00 start\n- 10:00 call\n  with notes\n## Notes\nend\n";
+    let theirs = "# Day\n## Log\n- 09:00 start\n- 11:00 review\n  - item one\n  - item two\n## Notes\nmore\nend\n";
+    let m = run(Kind::Markdown, Some(base), ours, theirs, false);
+    assert_eq!(
+        written(&m),
+        "# Day\n## Log\n- 09:00 start\n- 10:00 call\n  with notes\n- 11:00 review\n  - item one\n  - item two\n## Notes\nmore\nend\n"
     );
-    assert_eq!(written(&m), "# Log\nours 1\ntheirs 1\nours 2\ntheirs 2\n");
+    assert_eq!(m.deviations, [Deviation::RunOrder]);
+}
+
+#[test]
+fn single_lines_inserted_at_one_point_are_upstreams_order() {
+    // One line each: whole runs and upstream's pairing agree, no deviation.
+    let m = run(Kind::Text, Some("a\n"), "a\nours\n", "a\ntheirs\n", false);
+    assert_eq!(written(&m), "a\nours\ntheirs\n");
+    assert!(m.deviations.is_empty());
+    // A run against one line: upstream gives o1 t1 o2.
+    let m = run(Kind::Text, Some("a\n"), "a\no1\no2\n", "a\nt1\n", false);
+    assert_eq!(written(&m), "a\no1\no2\nt1\n");
+    assert_eq!(m.deviations, [Deviation::RunOrder]);
+}
+
+#[test]
+fn whole_runs_still_take_a_shared_line_once() {
+    // Both runs end in the same line: aligned on it, the lines before it whole.
+    let m = run(Kind::Text, Some("a\n"), "a\no1\no2\nX\n", "a\nt1\nt2\nX\n", false);
+    assert_eq!(written(&m), "a\no1\no2\nt1\nt2\nX\n");
+    assert_eq!(m.deviations, [Deviation::RunOrder]);
+    // A shared first line, then each side's own lines.
+    let m = run(Kind::Text, Some("a\n"), "a\nX\no1\no2\n", "a\nX\nt1\nt2\n", true);
+    assert_eq!(written(&m), "a\nX\nt1\nt2\no1\no2\n");
+}
+
+#[test]
+fn whole_runs_that_would_glue_stay_open() {
+    // Ours' run ends the file without a newline; going first it would be glued
+    // to theirs' line. Upstream interleaves to "o1 t1 o2" and no line is glued.
+    let m = run(Kind::Text, Some("a\n"), "a\no1\no2", "a\nt1\n", false);
+    assert!(m.outcome.is_open());
+    assert_eq!(m.deviations, [Deviation::RunOrder]);
+    // The other way round it merges.
+    let m = run(Kind::Text, Some("a\n"), "a\no1\no2", "a\nt1\n", true);
+    assert_eq!(written(&m), "a\nt1\no1\no2");
 }
 
 #[test]
@@ -376,18 +439,103 @@ fn the_closing_fence_keeps_its_line_end() {
 fn empty_files() {
     assert_eq!(written(&md("", "ours\n", "theirs\n")), "ours\ntheirs\n");
     assert_eq!(md("", "same\n", "same\n").outcome, Outcome::Identical);
-    // Emptied on one side while the other edits: upstream keeps the edit (its
-    // diff of an emptied file is one trailing deletion, carried as equal lines).
-    assert_eq!(written(&md("a\nb\n", "", "a\nB\n")), "a\nB\n");
+    // Emptied on one side while the other edits: a deletion against a change.
+    // Upstream keeps the edit (its diff of an emptied file is one trailing
+    // deletion, which it brings back as unchanged lines).
+    let m = md("a\nb\n", "", "a\nB\n");
+    assert!(m.outcome.is_open());
+    assert_eq!(m.deviations, [Deviation::TrailingDeletion]);
+    // Emptied while the other side left it alone: emptied.
+    let m = md("a\nb\n", "", "a\nb\n\nc\n");
+    assert_eq!(written(&m), "\nc\n");
     assert_eq!(written(&md("", "", "new\n")), "new\n");
 }
 
 #[test]
-fn a_trailing_deletion_is_not_carried_as_upstream() {
-    // Kept from upstream on purpose; see the crate docs.
-    assert_eq!(written(&md("a\nb\nc\n", "a\nb\n", "a\nB\nc\n")), "a\nB\nc\n");
-    // A deletion that is not the last change is carried.
-    assert_eq!(written(&md("a\nb\nc\n", "b\nc\n", "a\nb\nC\n")), "b\nC\n");
+fn a_trailing_deletion_is_carried() {
+    // Upstream gives a B c: ours' deletion of c is lost.
+    let m = md("a\nb\nc\n", "a\nb\n", "a\nB\nc\n");
+    assert_eq!(written(&m), "a\nB\n");
+    assert_eq!(m.deviations, [Deviation::TrailingDeletion]);
+    // Even against an unchanged other side, upstream brings c back.
+    let m = md("a\nb\nc\nd\n", "a\nb\n", "a\nb\nc\nd\n");
+    assert_eq!(written(&m), "a\nb\n");
+    // Theirs' trailing deletion, ours newer.
+    let m = run(Kind::Text, Some("a\nb\nc\n"), "A\nb\nc\n", "a\nb\n", true);
+    assert_eq!(written(&m), "A\nb\n");
+    assert_eq!(m.deviations, [Deviation::TrailingDeletion]);
+    // A deletion that is not the last change was always carried.
+    let m = md("a\nb\nc\n", "b\nc\n", "a\nb\nC\n");
+    assert_eq!(written(&m), "b\nC\n");
+    assert!(m.deviations.is_empty());
+    // The same trailing deletion on both sides.
+    let m = md("a\nb\nc\n", "A\nb\n", "a\nb\n");
+    assert_eq!(written(&m), "A\nb\n");
+    // A trailing deletion and an append after it: both carried.
+    let m = md("a\nb\nc\n", "a\nb\n", "a\nb\nc\nd\n");
+    assert_eq!(written(&m), "a\nb\nd\n");
+    // Without a final newline.
+    let m = md("a\nb\nc", "a\nb\n", "A\nb\nc");
+    assert_eq!(written(&m), "A\nb\n");
+}
+
+#[test]
+fn a_trailing_deletion_against_a_change_of_it_stays_open() {
+    // Upstream gives a b C, taking the change over the deletion.
+    let m = md("a\nb\nc\n", "a\nb\n", "a\nb\nC\n");
+    assert!(m.outcome.is_open());
+    assert_eq!(m.deviations, [Deviation::TrailingDeletion]);
+}
+
+/// D10: base R1, ours L (the local file), theirs R2 (what lsync wrote).
+fn guard(r1: &str, l: &str, r2: &str) -> Option<String> {
+    let input = Input {
+        base: Some(ver(r1, 1000)),
+        ours: ver(l, NEW),
+        theirs: ver(r2, OLD),
+    };
+    match merge(Kind::Markdown, &input, &Settings::default()).outcome {
+        Outcome::Write(b) => Some(String::from_utf8(b).unwrap()),
+        Outcome::Identical => Some(l.to_string()),
+        _ => None,
+    }
+}
+
+#[test]
+fn the_lost_update_guard_sees_a_lost_trailing_deletion() {
+    let r1 = "# Todo\n- a\n- b\n- c\n";
+    // R2 deleted the last item.
+    let r2 = "# Todo\n- a\n- b\n";
+    // A stale writer read R1 and added a line at the top: R2's deletion is lost.
+    let l = "new\n# Todo\n- a\n- b\n- c\n";
+    let m = guard(r1, l, r2).expect("clean");
+    assert_ne!(m, l, "the guard must see that L lost R2's change");
+    assert_eq!(m, "new\n# Todo\n- a\n- b\n");
+    // A writer that saw R2: L already holds R2.
+    let l = "new\n# Todo\n- a\n- b\n";
+    assert_eq!(guard(r1, l, r2).as_deref(), Some(l));
+    // The other way round: L deleted the last item of R1, R2 changed the top.
+    let r2 = "# Todo!\n- a\n- b\n- c\n";
+    let l = "# Todo\n- a\n- b\n";
+    assert_eq!(guard(r1, l, r2).as_deref(), Some("# Todo!\n- a\n- b\n"));
+    let l = "# Todo!\n- a\n- b\n";
+    assert_eq!(guard(r1, l, r2).as_deref(), Some(l));
+}
+
+#[test]
+fn the_lost_update_guard_sees_lost_appends_as_blocks() {
+    let r1 = "# Log\n- 09:00 start\n";
+    // R2 appended two lines; a stale writer appended two of its own.
+    let r2 = "# Log\n- 09:00 start\n- 10:00 remote\n  detail\n";
+    let l = "# Log\n- 09:00 start\n- 11:00 local\n  detail 2\n";
+    let m = guard(r1, l, r2).expect("clean");
+    assert_eq!(
+        m,
+        "# Log\n- 09:00 start\n- 10:00 remote\n  detail\n- 11:00 local\n  detail 2\n"
+    );
+    // A writer that saw R2 and appended after it: L already holds R2.
+    let l = "# Log\n- 09:00 start\n- 10:00 remote\n  detail\n- 11:00 local\n  detail 2\n";
+    assert_eq!(guard(r1, l, r2).as_deref(), Some(l));
 }
 
 #[test]

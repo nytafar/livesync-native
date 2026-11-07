@@ -776,6 +776,186 @@
    "result": "x\ny\nx\nx\nx\n"
   },
   {
+   "name": "lines/deviation-runs-log",
+   "path": "daily.md",
+   "base": "# Log\n- 09:00 start\n## Notes\n",
+   "left": "# Log\n- 09:00 start\n- 10:00 call\n  with notes\n## Notes\n",
+   "right": "# Log\n- 09:00 start\n- 11:00 review\n  - one\n  - two\n## Notes\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "# Log\n- 09:00 start\n- 10:00 call\n- 11:00 review\n  with notes\n  - one\n  - two\n## Notes\n"
+  },
+  {
+   "name": "lines/deviation-runs-log/left-newer",
+   "path": "daily.md",
+   "base": "# Log\n- 09:00 start\n## Notes\n",
+   "left": "# Log\n- 09:00 start\n- 10:00 call\n  with notes\n## Notes\n",
+   "right": "# Log\n- 09:00 start\n- 11:00 review\n  - one\n  - two\n## Notes\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "# Log\n- 09:00 start\n- 11:00 review\n- 10:00 call\n  - one\n  with notes\n  - two\n## Notes\n"
+  },
+  {
+   "name": "lines/deviation-runs-uneven",
+   "path": "note.md",
+   "base": "a\n",
+   "left": "a\nl1\nl2\nl3\n",
+   "right": "a\nr1\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "a\nl1\nr1\nl2\nl3\n"
+  },
+  {
+   "name": "lines/runs-uneven-short-first",
+   "path": "note.md",
+   "base": "a\n",
+   "left": "a\nl1\nl2\nl3\n",
+   "right": "a\nr1\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "a\nr1\nl1\nl2\nl3\n"
+  },
+  {
+   "name": "lines/deviation-runs-shared-tail",
+   "path": "note.md",
+   "base": "a\n",
+   "left": "a\nl1\nl2\nX\n",
+   "right": "a\nr1\nr2\nX\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "a\nl1\nr1\nl2\nr2\nX\n"
+  },
+  {
+   "name": "lines/deviation-runs-shared-tail/left-newer",
+   "path": "note.md",
+   "base": "a\n",
+   "left": "a\nl1\nl2\nX\n",
+   "right": "a\nr1\nr2\nX\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "a\nr1\nl1\nr2\nl2\nX\n"
+  },
+  {
+   "name": "lines/deviation-runs-unterminated",
+   "path": "note.md",
+   "base": "a\n",
+   "left": "a\nl1\nl2",
+   "right": "a\nr1\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "a\nl1\nr1\nl2"
+  },
+  {
+   "name": "lines/runs-unterminated-last",
+   "path": "note.md",
+   "base": "a\n",
+   "left": "a\nl1\nl2",
+   "right": "a\nr1\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "a\nr1\nl1\nl2"
+  },
+  {
+   "name": "lines/deviation-trailing-delete-vs-change",
+   "path": "note.md",
+   "base": "a\nb\nc\n",
+   "left": "a\nb\n",
+   "right": "a\nb\nC\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "a\nb\nC\n"
+  },
+  {
+   "name": "lines/deviation-trailing-delete-vs-change/left-newer",
+   "path": "note.md",
+   "base": "a\nb\nc\n",
+   "left": "a\nb\n",
+   "right": "a\nb\nC\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "a\nb\nC\n"
+  },
+  {
+   "name": "lines/deviation-trailing-delete-both",
+   "path": "note.md",
+   "base": "a\nb\nc\n",
+   "left": "A\nb\n",
+   "right": "a\nb\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "A\nb\nc\n"
+  },
+  {
+   "name": "lines/deviation-trailing-delete-both/left-newer",
+   "path": "note.md",
+   "base": "a\nb\nc\n",
+   "left": "A\nb\n",
+   "right": "a\nb\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "A\nb\nc\n"
+  },
+  {
+   "name": "lines/deviation-trailing-delete-and-append",
+   "path": "note.md",
+   "base": "a\nb\nc\n",
+   "left": "a\nb\n",
+   "right": "a\nb\nc\nd\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "a\nb\nc\nd\n"
+  },
+  {
+   "name": "lines/deviation-trailing-delete-and-append/left-newer",
+   "path": "note.md",
+   "base": "a\nb\nc\n",
+   "left": "a\nb\n",
+   "right": "a\nb\nc\nd\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "a\nb\nc\nd\n"
+  },
+  {
+   "name": "lines/deviation-guard-stale-writer",
+   "path": "todo.md",
+   "base": "# Todo\n- a\n- b\n- c\n",
+   "left": "new\n# Todo\n- a\n- b\n- c\n",
+   "right": "# Todo\n- a\n- b\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "new\n# Todo\n- a\n- b\n- c\n"
+  },
+  {
+   "name": "lines/deviation-guard-stale-writer/left-newer",
+   "path": "todo.md",
+   "base": "# Todo\n- a\n- b\n- c\n",
+   "left": "new\n# Todo\n- a\n- b\n- c\n",
+   "right": "# Todo\n- a\n- b\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "new\n# Todo\n- a\n- b\n- c\n"
+  },
+  {
+   "name": "lines/deviation-guard-fresh-writer",
+   "path": "todo.md",
+   "base": "# Todo\n- a\n- b\n- c\n",
+   "left": "new\n# Todo\n- a\n- b\n",
+   "right": "# Todo\n- a\n- b\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "new\n# Todo\n- a\n- b\n- c\n"
+  },
+  {
+   "name": "lines/deviation-guard-fresh-writer/left-newer",
+   "path": "todo.md",
+   "base": "# Todo\n- a\n- b\n- c\n",
+   "left": "new\n# Todo\n- a\n- b\n",
+   "right": "# Todo\n- a\n- b\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "new\n# Todo\n- a\n- b\n- c\n"
+  },
+  {
    "name": "lines/random/0",
    "path": "random.md",
    "base": "charlie\n- [ ] task\ndelta\ngolf\n# Heading\ndelta\necho\ngolf\n> quote\n",

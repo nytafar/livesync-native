@@ -38,6 +38,27 @@
 //!   `[X]` against `[Y, X]` gives `X Y X`. Here the runs are aligned on their
 //!   common lines first (`Y X`); if a shared line cannot be taken once (both
 //!   inserted `P Q` and `Q P`), it is a conflict. [`Deviation::SameInsertionOnce`].
+//! - **Two runs inserted at one point go in whole, the older side's first.**
+//!   Upstream pairs them line by line (ours `A B` and theirs `C D` after one
+//!   line give `A C B D`), which garbles two multi-line appends to a log or a
+//!   daily note, the case D9's "keeps both, the older first" exists for. Here
+//!   the older side's run goes in whole, then the newer side's (`A B C D`);
+//!   lines both runs share are still taken once, as above, with only the lines
+//!   between them placed whole. Where the whole-run order alone would join two
+//!   lines (a run whose last line has no newline going first), it is a
+//!   conflict; where upstream's interleaving joins two lines and the whole runs
+//!   do not, it merges. [`Deviation::RunOrder`].
+//! - **A trailing deletion is carried.** Upstream's `splitDiffPiece` turns a
+//!   deletion that is the last change of a side's diff into unchanged lines:
+//!   base `a b c`, ours `a b`, theirs `a B c` merges to `a B c` upstream, and
+//!   ours' deletion is lost even when theirs left `c` alone. Here it is carried
+//!   like any other deletion (`a B`), and a trailing deletion against a change
+//!   of the same lines is open, as D9's delete-against-change rule says. The
+//!   lost-update guard (D10) depends on it: with a lost trailing deletion,
+//!   "clean and M = L" would wrongly say L already holds R2. A file emptied on
+//!   one side is such a deletion: against an unchanged side it is taken, against
+//!   an edit it is open (upstream keeps the edit).
+//!   [`Deviation::TrailingDeletion`].
 //! - **No truncated merge** (the second clarification): upstream's "weird
 //!   condition" branch ends the loop with the merge marked good. Here it is a
 //!   conflict. [`Deviation::FallthroughOpen`]; no input is known to reach it.
@@ -70,15 +91,15 @@
 //!   frontmatter block the YAML parser does not understand stays open.
 //!   [`Deviation::BrokenFrontmatter`].
 //!
-//! Kept from upstream on purpose, though they surprise:
+//! [`Deviation::TrailingDeletion`] and [`Deviation::RunOrder`] are reported only
+//! where they change the result: the line merge is run again without that fix,
+//! and the deviation is listed when the two results differ (another text, or
+//! merged against open). The corpus test checks that undoing exactly the
+//! reported ones gives upstream's result.
 //!
-//! - Two runs inserted at one point interleave line by line, older first, rather
-//!   than one block after the other.
-//! - A deletion that is the last change of a side's diff is not carried (its
-//!   lines come back as unchanged): base `a b c`, ours `a b`, theirs `a B c`
-//!   merges to `a B c`. This loses no line, but it does lose that deletion.
-//! - With equal mtimes, ours goes first (upstream's `<=`), so only distinct
-//!   mtimes make the merge symmetric.
+//! Kept from upstream on purpose, though it surprises: with equal mtimes, ours
+//! goes first (upstream's `<=`), so only distinct mtimes make the merge
+//! symmetric.
 
 mod dmp;
 mod frontmatter;
@@ -309,6 +330,13 @@ pub enum Deviation {
     NumericKeyOrder,
     /// The line merge would leave frontmatter that does not parse: open.
     BrokenFrontmatter,
+    /// A deletion at the end of a side's diff is carried (upstream brings the
+    /// lines back), or is open against a change of the same lines.
+    TrailingDeletion,
+    /// Two runs inserted at one point are placed whole, the older first, where
+    /// upstream interleaves them line by line (or open, where that order would
+    /// join two lines).
+    RunOrder,
 }
 
 fn open(rule: Rule, overlaps: Vec<Overlap>) -> Merge {
@@ -326,6 +354,23 @@ fn utf8<'a>(v: &Version<'a>, w: Which) -> Result<&'a str, Reason> {
 
 /// Merge `input` as `kind`. See the crate docs for the rules.
 pub fn merge(kind: Kind, input: &Input, settings: &Settings) -> Merge {
+    merge_in(kind, input, settings, lines::Mode::FIXED)
+}
+
+/// [`merge`] with some of the line merge's fixes to upstream switched off, so a
+/// test can check that undoing exactly the reported [`Deviation::TrailingDeletion`]
+/// and [`Deviation::RunOrder`] gives upstream's result. Other deviations in
+/// `undo` are ignored. Not for production use.
+#[doc(hidden)]
+pub fn merge_undoing(kind: Kind, input: &Input, settings: &Settings, undo: &[Deviation]) -> Merge {
+    let mode = lines::Mode {
+        carry_trailing: !undo.contains(&Deviation::TrailingDeletion),
+        whole_runs: !undo.contains(&Deviation::RunOrder),
+    };
+    merge_in(kind, input, settings, mode)
+}
+
+fn merge_in(kind: Kind, input: &Input, settings: &Settings, mode: lines::Mode) -> Merge {
     let (ours, theirs) = (&input.ours, &input.theirs);
     if ours.content == theirs.content && ours.deleted == theirs.deleted {
         return Merge {
@@ -372,10 +417,10 @@ pub fn merge(kind: Kind, input: &Input, settings: &Settings) -> Merge {
     match kind {
         Kind::Object => merge_object(b, o, t, ours, theirs, ours_first),
         Kind::Markdown => {
-            if let Some(m) = merge_frontmatter(b, o, t, ours, theirs, settings) {
+            if let Some(m) = merge_frontmatter(b, o, t, ours, theirs, settings, mode) {
                 return m;
             }
-            let mut m = merge_lines(b, o, t, ours_first);
+            let mut m = merge_lines(b, o, t, ours_first, mode);
             if let Outcome::Write(out) = &m.outcome {
                 let out = std::str::from_utf8(out).expect("merged from UTF-8");
                 if let Some(d) = frontmatter::split(out) {
@@ -390,12 +435,12 @@ pub fn merge(kind: Kind, input: &Input, settings: &Settings) -> Merge {
             }
             m
         }
-        _ => merge_lines(b, o, t, ours_first),
+        _ => merge_lines(b, o, t, ours_first, mode),
     }
 }
 
-fn merge_lines(b: &str, o: &str, t: &str, ours_first: bool) -> Merge {
-    let w = lines::walk(b, o, t, ours_first);
+fn merge_lines(b: &str, o: &str, t: &str, ours_first: bool, mode: lines::Mode) -> Merge {
+    let w = lines::walk_in(b, o, t, ours_first, mode);
     let outcome = match w.text() {
         Some(text) => Outcome::Write(text.into_bytes()),
         None => Outcome::Open(w.hunks().map(|h| Overlap::Lines(h.at.clone())).collect()),
@@ -449,6 +494,7 @@ fn merge_frontmatter(
     ours: &Version,
     theirs: &Version,
     settings: &Settings,
+    mode: lines::Mode,
 ) -> Option<Merge> {
     let (db, d_o, dt) = (frontmatter::split(b)?, frontmatter::split(o)?, frontmatter::split(t)?);
     let ours_first = ours.mtime <= theirs.mtime;
@@ -467,7 +513,7 @@ fn merge_frontmatter(
                     frontmatter::Part::Conflict { key, .. } => overlaps.push(Overlap::FrontmatterKey(key.clone())),
                 }
             }
-            let w = lines::walk(db.body, d_o.body, dt.body, ours_first);
+            let w = lines::walk_in(db.body, d_o.body, dt.body, ours_first, mode);
             let (ob, oo, ot) = (db.body_line_offset(), d_o.body_line_offset(), dt.body_line_offset());
             for h in w.hunks() {
                 let shift = |r: &Range<usize>, by: usize| r.start + by..r.end + by;

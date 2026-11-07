@@ -1,6 +1,7 @@
 //! Upstream's three-way line merge (`ConflictManager.mergeSensibly`), with D9's
-//! two clarifications and one safety stop, and the same walk producing conflict
-//! hunks for `merge3`.
+//! two clarifications, two fixes for edits upstream loses or garbles (a trailing
+//! deletion, two runs inserted at one point) and one safety stop, and the same
+//! walk producing conflict hunks for `merge3`.
 
 use crate::dmp::{self, Op};
 use crate::{Deviation, LineOverlap};
@@ -34,6 +35,31 @@ pub(crate) struct Walk {
     pub deviations: Vec<Deviation>,
     /// A line was emitted right after a line without its newline.
     pub glued: bool,
+    /// A side's diff ended in a deletion, carried as a deletion.
+    pub trailing: bool,
+    /// Two insertion runs were placed whole where upstream would interleave
+    /// them (or join two lines by the order alone).
+    pub reordered: bool,
+}
+
+/// Which of this crate's fixes to upstream's line merge apply. Both are on in
+/// [`Mode::FIXED`]; switching one off gives upstream's behaviour for it, which
+/// is how [`walk`] finds out whether a fix changed the result (and so is a
+/// deviation to report).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Mode {
+    /// Carry a deletion that is the last diff ([`Deviation::TrailingDeletion`]).
+    pub carry_trailing: bool,
+    /// Two runs inserted at one point go in whole, the older first
+    /// ([`Deviation::RunOrder`]).
+    pub whole_runs: bool,
+}
+
+impl Mode {
+    pub const FIXED: Mode = Mode {
+        carry_trailing: true,
+        whole_runs: true,
+    };
 }
 
 impl Walk {
@@ -91,9 +117,12 @@ fn pieces(text: &str) -> impl Iterator<Item = &str> {
 }
 
 /// `splitDiffPiece`: one item per line, a deletion's lines paired with the
-/// insertion that follows it. As upstream, a deletion that is the last diff
-/// becomes EQUAL lines (so a deletion at the end of a file is not carried).
-fn split_diff(src: Vec<(Op, String)>) -> Vec<Item> {
+/// insertion that follows it. Upstream turns a deletion that is the last diff
+/// into EQUAL lines, so a deletion at the end of a file is not carried; with
+/// `carry` it stays a deletion ([`Deviation::TrailingDeletion`]). The flag
+/// says whether there was such a deletion.
+fn split_diff(src: Vec<(Op, String)>, carry: bool) -> (Vec<Item>, bool) {
+    let mut trailing = false;
     let mut ret = Vec::new();
     let mut src = src.into_iter();
     while let Some((op, text)) = src.next() {
@@ -136,13 +165,17 @@ fn split_diff(src: Vec<(Op, String)>) -> Vec<Item> {
                     }));
                 }
             }
-            None => ret.extend(ps.iter().map(|p| Item {
-                op: Op::Equal,
-                text: p.to_string(),
-            })),
+            None => {
+                trailing = true;
+                let op = if carry { Op::Delete } else { Op::Equal };
+                ret.extend(ps.iter().map(|p| Item {
+                    op,
+                    text: p.to_string(),
+                }))
+            }
         }
     }
-    ret
+    (ret, trailing)
 }
 
 /// Positions along one side's items.
@@ -212,8 +245,9 @@ impl Track {
 }
 
 /// Upstream's merge of `ours` (left, the winning revision) and `theirs` (right)
-/// against `base`. `ours_first` is upstream's `leftLeaf.mtime <= rightLeaf.mtime`:
-/// where both sides insert at one point, that side's lines go first.
+/// against `base`, with every fix of [`Mode::FIXED`]. `ours_first` is upstream's
+/// `leftLeaf.mtime <= rightLeaf.mtime`: where both sides insert at one point,
+/// that side's lines go first.
 ///
 /// Where upstream stops at the first conflict, the walk records the conflicting
 /// region, resynchronises on the next base line both sides kept, and goes on, so
@@ -221,10 +255,51 @@ impl Track {
 /// the walk is upstream's, so "clean" here is "merged" there, apart from the
 /// recorded deviations.
 pub(crate) fn walk(base: &str, ours: &str, theirs: &str, ours_first: bool) -> Walk {
+    walk_in(base, ours, theirs, ours_first, Mode::FIXED)
+}
+
+/// [`walk`] with only the fixes `mode` names. A fix is reported as a deviation
+/// when switching it off changes the result: another text, or merged against
+/// open.
+pub(crate) fn walk_in(base: &str, ours: &str, theirs: &str, ours_first: bool, mode: Mode) -> Walk {
+    let mut w = walk_raw(base, ours, theirs, ours_first, mode);
+    let fixes = [
+        (
+            w.trailing && mode.carry_trailing,
+            Deviation::TrailingDeletion,
+            Mode {
+                carry_trailing: false,
+                ..mode
+            },
+        ),
+        (
+            w.reordered && mode.whole_runs,
+            Deviation::RunOrder,
+            Mode {
+                whole_runs: false,
+                ..mode
+            },
+        ),
+    ];
+    let text = w.text();
+    for (applied, d, without) in fixes {
+        if applied && walk_raw(base, ours, theirs, ours_first, without).text() != text {
+            w.note(d);
+        }
+    }
+    w
+}
+
+fn walk_raw(base: &str, ours: &str, theirs: &str, ours_first: bool, mode: Mode) -> Walk {
     let base_lines: Vec<&str> = pieces(base).collect();
-    let l = Track::new(split_diff(dmp::line_diff(base, ours)), base_lines.len());
-    let r = Track::new(split_diff(dmp::line_diff(base, theirs)), base_lines.len());
-    let mut w = Walk::default();
+    let (li, lt) = split_diff(dmp::line_diff(base, ours), mode.carry_trailing);
+    let (ri, rt) = split_diff(dmp::line_diff(base, theirs), mode.carry_trailing);
+    let l = Track::new(li, base_lines.len());
+    let r = Track::new(ri, base_lines.len());
+    let mut w = Walk {
+        trailing: lt || rt,
+        ..Walk::default()
+    };
     let (mut li, mut ri) = (0usize, 0usize);
     'walk: loop {
         if li >= l.len() && ri >= r.len() {
@@ -255,7 +330,15 @@ pub(crate) fn walk(base: &str, ours: &str, theirs: &str, ours_first: bool) -> Wa
                 let rend = run_end(&r, ri0);
                 let lrun: Vec<&str> = l.items[li0..lend].iter().map(|i| i.text.as_str()).collect();
                 let rrun: Vec<&str> = r.items[ri0..rend].iter().map(|i| i.text.as_str()).collect();
-                match merge_runs(&lrun, &rrun, ours_first, lend == l.len() && rend == r.len()) {
+                let runs = merge_runs(
+                    &lrun,
+                    &rrun,
+                    ours_first,
+                    lend == l.len() && rend == r.len(),
+                    mode.whole_runs,
+                );
+                w.reordered |= runs.reordered;
+                match runs.result {
                     Ok((text, dev)) => {
                         if let Some(d) = dev {
                             w.note(d);
@@ -377,71 +460,137 @@ fn record_conflict(
     (lend, rend)
 }
 
-/// Both sides insert at the same point. Upstream pairs the two runs line by
-/// line (equal lines once, otherwise the older side's line first) and appends
-/// the longer run's tail. D9's first clarification: the same insertion made on
-/// both sides is taken once. Where upstream's pairing would take a line both
-/// sides inserted twice, the runs are aligned on their common lines instead and
-/// only the lines between them are paired; if a shared line still cannot be
-/// taken once (the sides inserted it in a different order), it is a conflict.
+/// What [`merge_runs`] made of two runs inserted at one point.
+struct Runs {
+    /// The merged lines and the deviation they carry, or a conflict (with the
+    /// deviation that made it one, if upstream would have merged).
+    result: Result<(String, Option<Deviation>), Option<Deviation>>,
+    /// The whole-run order gave another result than upstream's interleaving.
+    pub reordered: bool,
+}
+
+/// Both sides insert at the same point.
 ///
-/// `Err(Some(_))` is a conflict upstream would have merged.
-fn merge_runs(
-    l: &[&str],
-    r: &[&str],
-    ours_first: bool,
+/// Upstream pairs the two runs line by line (equal lines once, otherwise the
+/// older side's line first) and appends the longer run's tail, so two
+/// multi-line appends come out interleaved. D9 keeps both "the older first" so
+/// that two appends to a log both survive intact: with `whole`, the older
+/// side's run goes in whole, then the newer side's ([`Deviation::RunOrder`]).
+///
+/// D9's first clarification: the same insertion made on both sides is taken
+/// once. The runs are aligned on their common lines and only the lines between
+/// them are placed (whole, or paired as upstream); if a shared line still
+/// cannot be taken once (the sides inserted it in a different order), it is a
+/// conflict. Upstream's own pairing (without `whole`) is used as it is unless
+/// it would take a line both sides inserted twice
+/// ([`Deviation::SameInsertionOnce`]).
+fn merge_runs(l: &[&str], r: &[&str], ours_first: bool, at_end: bool, whole: bool) -> Runs {
+    let (first, second) = if ours_first { (l, r) } else { (r, l) };
+    let upstream = interleaved(first, second, at_end);
+    if !whole {
+        return Runs {
+            result: upstream,
+            reordered: false,
+        };
+    }
+    let (mut uf, mut us) = (Vec::new(), Vec::new());
+    zip(first, second, &mut Vec::new(), &mut uf, &mut us);
+    let once = shares(&uf, &us).then_some(Deviation::SameInsertionOnce);
+    let (out, uf, us) = aligned(first, second, true);
+    let result = if shares(&uf, &us) {
+        Err(once)
+    } else if glues(&out, at_end) {
+        Err(match upstream {
+            Err(Some(Deviation::GluedLines)) => Some(Deviation::GluedLines),
+            _ => once,
+        })
+    } else {
+        Ok((out.concat(), once))
+    };
+    let text = |r: &Result<(String, Option<Deviation>), Option<Deviation>>| r.as_ref().ok().map(|x| x.0.clone());
+    Runs {
+        reordered: text(&result) != text(&upstream),
+        result,
+    }
+}
+
+/// Upstream's pairing, aligned on common lines where it would take a shared
+/// line twice. `Err(Some(_))` is a conflict upstream would have merged.
+fn interleaved(
+    first: &[&str],
+    second: &[&str],
     at_end: bool,
 ) -> Result<(String, Option<Deviation>), Option<Deviation>> {
-    let (first, second) = if ours_first { (l, r) } else { (r, l) };
     let mut out: Vec<&str> = Vec::new();
     let (mut un_first, mut un_second) = (Vec::new(), Vec::new());
     zip(first, second, &mut out, &mut un_first, &mut un_second);
     let mut dev = None;
     if shares(&un_first, &un_second) {
         dev = Some(Deviation::SameInsertionOnce);
-        out.clear();
-        un_first.clear();
-        un_second.clear();
-        let joined_first: String = first.concat();
-        let joined_second: String = second.concat();
-        let diffs = dmp::line_diff(&joined_first, &joined_second);
-        let (mut fseg, mut sseg): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
-        let (mut fi, mut si) = (0usize, 0usize);
-        for (op, text) in &diffs {
-            let n = pieces(text).count();
-            match op {
-                Op::Delete => {
-                    fseg.extend(&first[fi..fi + n]);
-                    fi += n;
-                }
-                Op::Insert => {
-                    sseg.extend(&second[si..si + n]);
-                    si += n;
-                }
-                Op::Equal => {
-                    zip(&fseg, &sseg, &mut out, &mut un_first, &mut un_second);
-                    fseg.clear();
-                    sseg.clear();
-                    out.extend(&first[fi..fi + n]);
-                    fi += n;
-                    si += n;
-                }
-            }
-        }
-        zip(&fseg, &sseg, &mut out, &mut un_first, &mut un_second);
-        if shares(&un_first, &un_second) {
+        let (o, uf, us) = aligned(first, second, false);
+        if shares(&uf, &us) {
             return Err(dev);
         }
+        out = o;
     }
-    let last = out.len().saturating_sub(1);
-    if out
-        .iter()
-        .enumerate()
-        .any(|(i, p)| !p.ends_with('\n') && (i < last || !at_end))
-    {
+    if glues(&out, at_end) {
         return Err(Some(Deviation::GluedLines));
     }
     Ok((out.concat(), dev))
+}
+
+/// The two runs aligned on their common lines (taken once); the lines between
+/// two common lines placed whole (`whole`: the first run's, then the second's)
+/// or paired as upstream does. Also returns the placed lines of each run that
+/// were not taken once.
+#[allow(clippy::type_complexity)]
+fn aligned<'a>(first: &[&'a str], second: &[&'a str], whole: bool) -> (Vec<&'a str>, Vec<&'a str>, Vec<&'a str>) {
+    let (mut out, mut un_first, mut un_second) = (Vec::new(), Vec::new(), Vec::new());
+    let mut gap = |f: &[&'a str], s: &[&'a str], out: &mut Vec<&'a str>| {
+        if whole {
+            out.extend(f);
+            out.extend(s);
+            un_first.extend(f);
+            un_second.extend(s);
+        } else {
+            zip(f, s, out, &mut un_first, &mut un_second);
+        }
+    };
+    let joined_first: String = first.concat();
+    let joined_second: String = second.concat();
+    let (mut fseg, mut sseg): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    let (mut fi, mut si) = (0usize, 0usize);
+    for (op, text) in &dmp::line_diff(&joined_first, &joined_second) {
+        let n = pieces(text).count();
+        match op {
+            Op::Delete => {
+                fseg.extend(&first[fi..fi + n]);
+                fi += n;
+            }
+            Op::Insert => {
+                sseg.extend(&second[si..si + n]);
+                si += n;
+            }
+            Op::Equal => {
+                gap(&fseg, &sseg, &mut out);
+                fseg.clear();
+                sseg.clear();
+                out.extend(&first[fi..fi + n]);
+                fi += n;
+                si += n;
+            }
+        }
+    }
+    gap(&fseg, &sseg, &mut out);
+    (out, un_first, un_second)
+}
+
+/// A line without its newline that is not the file's last line.
+fn glues(out: &[&str], at_end: bool) -> bool {
+    let last = out.len().saturating_sub(1);
+    out.iter()
+        .enumerate()
+        .any(|(i, p)| !p.ends_with('\n') && (i < last || !at_end))
 }
 
 fn zip<'a>(
@@ -589,8 +738,9 @@ pub(crate) fn eol_of(texts: &[&str]) -> &'static str {
 }
 
 #[cfg(test)]
-pub(crate) fn split_for_test(a: &str, b: &str) -> Vec<(i8, String)> {
-    split_diff(dmp::line_diff(a, b))
+pub(crate) fn split_for_test(a: &str, b: &str, carry: bool) -> Vec<(i8, String)> {
+    split_diff(dmp::line_diff(a, b), carry)
+        .0
         .into_iter()
         .map(|i| (i.op as i8, i.text))
         .collect()

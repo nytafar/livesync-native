@@ -419,6 +419,19 @@ await mergeBoth("lines/replace-block", "note.md", L("a", "b", "c", "d", "e"), L(
 await mergeBoth("lines/replace-block-longer", "note.md", L("a", "b", "c"), L("a", "x", "y", "z", "c"), L("A", "b", "c"));
 await mergeCase("lines/equal-mtime", "note.md", L("a"), L("a", "left"), L("a", "right"), 2000, 2000);
 await mergeBoth("lines/repeated-lines", "note.md", L("x", "x", "x"), L("x", "x", "x", "x"), L("x", "y", "x", "x"));
+// Where this crate deviates on purpose: whole insertion runs, carried trailing deletions.
+await mergeBoth("lines/deviation-runs-log", "daily.md", L("# Log", "- 09:00 start", "## Notes"), L("# Log", "- 09:00 start", "- 10:00 call", "  with notes", "## Notes"), L("# Log", "- 09:00 start", "- 11:00 review", "  - one", "  - two", "## Notes"));
+// The one-line run first: whole runs and upstream's pairing agree.
+await mergeCase("lines/deviation-runs-uneven", "note.md", L("a"), L("a", "l1", "l2", "l3"), L("a", "r1"));
+await mergeCase("lines/runs-uneven-short-first", "note.md", L("a"), L("a", "l1", "l2", "l3"), L("a", "r1"), 3000, 2000);
+await mergeBoth("lines/deviation-runs-shared-tail", "note.md", L("a"), L("a", "l1", "l2", "X"), L("a", "r1", "r2", "X"));
+await mergeCase("lines/deviation-runs-unterminated", "note.md", L("a"), "a\nl1\nl2", L("a", "r1"));
+await mergeCase("lines/runs-unterminated-last", "note.md", L("a"), "a\nl1\nl2", L("a", "r1"), 3000, 2000);
+await mergeBoth("lines/deviation-trailing-delete-vs-change", "note.md", L("a", "b", "c"), L("a", "b"), L("a", "b", "C"));
+await mergeBoth("lines/deviation-trailing-delete-both", "note.md", L("a", "b", "c"), L("A", "b"), L("a", "b"));
+await mergeBoth("lines/deviation-trailing-delete-and-append", "note.md", L("a", "b", "c"), L("a", "b"), L("a", "b", "c", "d"));
+await mergeBoth("lines/deviation-guard-stale-writer", "todo.md", L("# Todo", "- a", "- b", "- c"), L("new", "# Todo", "- a", "- b", "- c"), L("# Todo", "- a", "- b"));
+await mergeBoth("lines/deviation-guard-fresh-writer", "todo.md", L("# Todo", "- a", "- b", "- c"), L("new", "# Todo", "- a", "- b"), L("# Todo", "- a", "- b"));
 
 // --- line merge, generated: small vocabulary so lines repeat and alignment matters ---
 const WORDS = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "- [ ] task", "- [x] done", "", "# Heading", "> quote", "golf"];

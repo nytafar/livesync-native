@@ -1,8 +1,11 @@
 //! The merge corpus from `tools/golden` (upstream commonlib 0.2.1's own
 //! `ConflictManager`): where this crate reports no deviation, its result must be
 //! upstream's, byte for byte for text and token for token for JSON (upstream
-//! writes JSON unindented, this crate in the file's style).
-use livesync_merge::{merge, Deviation, Input, Kind, Outcome, Rule, Settings, Version};
+//! writes JSON unindented, this crate in the file's style). Where it reports a
+//! deviation, the difference must be the one the deviation names; for the line
+//! merge's own fixes (a trailing deletion carried, whole insertion runs),
+//! undoing exactly the reported fixes must give upstream's result byte for byte.
+use livesync_merge::{merge_undoing, Deviation, Input, Kind, Outcome, Rule, Settings, Version};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -83,6 +86,10 @@ struct Run {
 }
 
 fn run(c: &Value, kind: Kind) -> Run {
+    run_undoing(c, kind, &[])
+}
+
+fn run_undoing(c: &Value, kind: Kind, undo: &[Deviation]) -> Run {
     let s = |k: &str| c[k].as_str().unwrap().as_bytes();
     let n = |k: &str| c[k].as_i64().unwrap();
     let input = Input {
@@ -102,7 +109,7 @@ fn run(c: &Value, kind: Kind) -> Run {
             deleted: false,
         },
     };
-    let m = merge(kind, &input, &Settings::default());
+    let m = merge_undoing(kind, &input, &Settings::default(), undo);
     let ours = match m.outcome {
         Outcome::Write(b) => Some(String::from_utf8(b).unwrap()),
         // Upstream's merge of identical sides is that content.
@@ -122,7 +129,9 @@ fn merges_match_upstream() {
     let cases = fixture("merge.json");
     assert!(cases.len() >= 600, "corpus too small: {}", cases.len());
     let mut agreed = 0;
+    let mut undone = 0;
     let mut deviated: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_deviation: BTreeMap<String, usize> = BTreeMap::new();
     for c in &cases {
         let name = c["name"].as_str().unwrap();
         let upstream = c["result"].as_str().map(str::to_string);
@@ -154,7 +163,32 @@ fn merges_match_upstream() {
                 );
             }
             for d in &r.deviations {
-                justify(name, *d, c, &r.ours, &upstream);
+                justify(name, *d, &r.deviations, c, &r.ours, &upstream);
+                *per_deviation.entry(format!("{d:?}")).or_default() += 1;
+            }
+            if r.deviations.iter().all(|d| LINE_FIXES.contains(d)) {
+                let u = run_undoing(c, kind, &r.deviations);
+                if u.deviations == [Deviation::GluedLines] {
+                    // Upstream's interleaving glues two lines (open here);
+                    // the whole runs did not.
+                    justify(name, Deviation::GluedLines, &u.deviations, c, &u.ours, &upstream);
+                } else {
+                    assert!(u.deviations.is_empty(), "{name}: undone, still {:?}", u.deviations);
+                }
+                assert!(u.ours.is_none() || u.deviations.is_empty());
+                assert!(
+                    !u.deviations.is_empty() || u.ours == upstream,
+                    "{name}: undoing {:?} is not upstream's result\nbase {:?}\nleft {:?}\nright {:?}",
+                    r.deviations,
+                    c["base"],
+                    c["left"],
+                    c["right"]
+                );
+                for d in &r.deviations {
+                    let one = run_undoing(c, kind, &[*d]);
+                    assert_ne!(one.ours, r.ours, "{name}: undoing {d:?} alone changes nothing");
+                }
+                undone += 1;
             }
             *deviated.entry(format!("{:?}", r.deviations)).or_default() += 1;
             continue;
@@ -177,14 +211,49 @@ fn merges_match_upstream() {
         agreed += 1;
     }
     eprintln!(
-        "merge corpus: {} cases, {agreed} agree with upstream, deviations: {deviated:?}",
+        "merge corpus: {} cases, {agreed} agree with upstream; per deviation: {per_deviation:?}; \
+         by set: {deviated:?}; {undone} line-fix cases are upstream's once undone",
         cases.len()
     );
-    assert!(agreed >= 500, "too few cases agree: {agreed}, deviations: {deviated:?}");
+    assert!(agreed >= 450, "too few cases agree: {agreed}, deviations: {deviated:?}");
+    assert!(
+        agreed + undone >= 550,
+        "too few cases are upstream's, as they are or once the line fixes are undone: {agreed} + {undone}"
+    );
+}
+
+/// The line merge's fixes to upstream, which `merge_undoing` can switch off.
+const LINE_FIXES: [Deviation; 2] = [Deviation::TrailingDeletion, Deviation::RunOrder];
+
+/// Lines without their line end, in order.
+fn lines_of(s: &str) -> Vec<String> {
+    s.split_inclusive('\n')
+        .map(|l| l.trim_end_matches(['\n', '\r']).to_string())
+        .collect()
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// What is left of `of` after taking `sub` out as an ordered subsequence, or
+/// `None` if `sub` is not one.
+fn minus_subsequence(of: &[String], sub: &[String]) -> Option<Vec<String>> {
+    let mut rest = Vec::new();
+    let mut it = sub.iter().peekable();
+    for l in of {
+        if it.peek() == Some(&l) {
+            it.next();
+        } else {
+            rest.push(l.clone());
+        }
+    }
+    it.peek().is_none().then_some(rest)
 }
 
 /// A reported deviation must be the kind of difference it names.
-fn justify(name: &str, d: Deviation, c: &Value, ours: &Option<String>, upstream: &Option<String>) {
+fn justify(name: &str, d: Deviation, all: &[Deviation], c: &Value, ours: &Option<String>, upstream: &Option<String>) {
     let lines = |s: &str| {
         s.split_inclusive('\n')
             .map(|l| l.trim_end_matches(['\n', '\r']).to_string())
@@ -227,6 +296,67 @@ fn justify(name: &str, d: Deviation, c: &Value, ours: &Option<String>, upstream:
                 t
             };
             assert_eq!(sorted(o), sorted(up), "{name}: more than key order differs");
+        }
+        Deviation::TrailingDeletion => {
+            // Upstream keeps lines a side deleted at its end: ours has them
+            // removed (lines of the base, in order), or is open where the other
+            // side changed them.
+            let up = upstream
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: upstream did not merge"));
+            if let Some(o) = ours {
+                let (o, up) = (lines_of(o), lines_of(up));
+                let removed = if all.contains(&Deviation::RunOrder) {
+                    // Placed differently too: compare as multisets.
+                    let mut rest = sorted(up.clone());
+                    for l in &o {
+                        let i = rest
+                            .iter()
+                            .position(|x| x == l)
+                            .unwrap_or_else(|| panic!("{name}: {l:?} not in upstream's {up:?}"));
+                        rest.remove(i);
+                    }
+                    rest
+                } else {
+                    minus_subsequence(&up, &o)
+                        .unwrap_or_else(|| panic!("{name}: {o:?} is not upstream's {up:?} minus lines"))
+                };
+                assert!(!removed.is_empty(), "{name}: no line removed");
+                let base = lines_of(c["base"].as_str().unwrap());
+                assert!(
+                    minus_subsequence(&base, &removed).is_some() || all.contains(&Deviation::RunOrder),
+                    "{name}: removed {removed:?} are not base lines in order"
+                );
+                for l in &removed {
+                    assert!(base.contains(l), "{name}: removed {l:?} is not a base line");
+                }
+            }
+        }
+        Deviation::RunOrder => {
+            // The same lines as upstream's interleaving, placed as whole runs;
+            // or open, where that order would glue two lines.
+            let up = upstream
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: upstream did not merge"));
+            match ours {
+                Some(o) if !all.contains(&Deviation::TrailingDeletion) => {
+                    assert_ne!(o, up, "{name}: same as upstream");
+                    // Or upstream's interleaving glued two lines, which whole
+                    // runs do not.
+                    let glued = lines_of(up).iter().any(|l| !inputs.contains(l));
+                    assert!(
+                        glued || sorted(lines_of(o)) == sorted(lines_of(up)),
+                        "{name}: more than the order differs: {o:?} against {up:?}"
+                    );
+                }
+                Some(_) => {}
+                None => assert!(
+                    [c["left"].as_str().unwrap(), c["right"].as_str().unwrap()]
+                        .iter()
+                        .any(|s| !s.is_empty() && !s.ends_with('\n')),
+                    "{name}: open, but no run without a final newline"
+                ),
+            }
         }
         other => panic!("{name}: unexpected deviation {other:?} in the corpus"),
     }
