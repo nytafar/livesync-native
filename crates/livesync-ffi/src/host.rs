@@ -164,6 +164,7 @@ impl LiveSync {
         );
         status::add_push(&mut out, st.push.as_ref());
         out.mass_delete_allowed = st.mass_delete_allowed;
+        out.mass_delete_waits = st.mass_delete_waits;
         out.deletes_waiting = st.deletes_waiting;
         out
     }

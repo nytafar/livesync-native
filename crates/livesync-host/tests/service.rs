@@ -807,3 +807,114 @@ fn an_engine_error_is_an_event() {
     f.mock.state.lock().unwrap().fail_changes = 0;
     f.rt.block_on(svc.shutdown());
 }
+
+/// #11 and spec D7: a mass-delete stop in one vault of the service holds
+/// only that vault's deletions. The other vault keeps pushing, the stop
+/// shows in the stopped vault's status (and only there) and as its event,
+/// and a client confirms it over the socket with the stop it read: the
+/// listed files go, and the stop clears.
+#[test]
+fn a_safety_stop_holds_one_vault_and_is_confirmed_over_the_socket() {
+    let f = Fixture::new();
+    for i in 0..30 {
+        f.mock.put_text(&format!("Notes/f{i:02}.md"), &[&format!("note {i}")]);
+    }
+    f.mock.put_text("Work/w.md", &["work"]);
+    f.write_config(&format!(
+        "{}{}",
+        vault("notes", "dev", "notes", "include = [\"Notes\"]"),
+        vault("work", "other", "work", "include = [\"Work\"]")
+    ));
+    let svc = f.service();
+    f.reload(&svc);
+    let (path, stop_socket) = f.serve(&svc, Policy::own_user());
+    wait_until("both vaults pulled and running", || {
+        f.home("notes/Notes/f29.md").exists()
+            && f.home("work/Work/w.md").exists()
+            && state_of(&svc, "notes") == "running"
+            && state_of(&svc, "work") == "running"
+    });
+    std::thread::sleep(livesync_host::service::ACTIVITY_POLL * 3);
+    let seen = subscribe(&path);
+    let live = |p: &str| f.mock.live_paths().iter().any(|l| l == p);
+    let stop_of = |name: &str| -> Option<String> {
+        svc.status(Some(name)).unwrap().vaults[0]
+            .status
+            .as_ref()
+            .and_then(|s| s.safety_stop.clone())
+    };
+
+    for i in 0..25 {
+        std::fs::remove_file(f.home(&format!("notes/Notes/f{i:02}.md"))).unwrap();
+    }
+    // While notes holds its deletions (and then stops), work pushes.
+    std::fs::write(f.home("work/Work/during.md"), "pushed while notes holds").unwrap();
+    wait_until("work's save on the server", || live("Work/during.md"));
+    let end = Instant::now() + Duration::from_secs(60);
+    while stop_of("notes").is_none() {
+        assert!(Instant::now() < end, "timed out waiting for the safety stop");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let stop = stop_of("notes").unwrap();
+    assert!(stop.contains("25 of 30"), "{stop}");
+    assert!(
+        (0..25).all(|i| live(&format!("Notes/f{i:02}.md"))),
+        "deleted despite the stop"
+    );
+    assert!(stop_of("work").is_none());
+    std::fs::write(f.home("work/Work/after.md"), "pushed beside the stop").unwrap();
+    wait_until("work's save after the stop", || live("Work/after.md"));
+    wait_until("the safety-stop event", || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.event == "safety-stop" && e.vault.as_deref() == Some("notes") && e.data["stop"] == json!(stop))
+    });
+    assert!(!seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.event == "safety-stop" && e.vault.as_deref() == Some("work")));
+
+    let mut c = Client::connect(&path).unwrap().expect("a service listens");
+    let hello = c.call(method::HELLO, Value::Null).unwrap();
+    assert!(hello["methods"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(method::ALLOW_DELETES)));
+    let e = c
+        .call(method::ALLOW_DELETES, json!({"vault": "work", "stop": stop}))
+        .unwrap_err();
+    assert_eq!(e.code(), Some(code::NO_STOP));
+    let e = c
+        .call(
+            method::ALLOW_DELETES,
+            json!({"vault": "notes", "stop": "1 an older stop"}),
+        )
+        .unwrap_err();
+    assert_eq!(e.code(), Some(code::STOP_CHANGED));
+    assert!(e.to_string().contains("25 of 30"), "{e}");
+    let e = c.call(method::ALLOW_DELETES, json!({"vault": "notes"})).unwrap_err();
+    assert_eq!(e.code(), Some(code::BAD_REQUEST));
+    assert!(
+        (0..25).all(|i| live(&format!("Notes/f{i:02}.md"))),
+        "a refused answer deleted"
+    );
+    let r = c
+        .call(method::ALLOW_DELETES, json!({"vault": "notes", "stop": stop}))
+        .unwrap();
+    assert_eq!(r["vaults"], json!(["notes"]));
+    wait_until("the confirmed deletions", || {
+        (0..25).all(|i| !live(&format!("Notes/f{i:02}.md")))
+    });
+    wait_until("the stop to clear", || stop_of("notes").is_none());
+    assert!((25..30).all(|i| live(&format!("Notes/f{i:02}.md"))));
+    wait_until("the cleared event", || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.event == "safety-stop" && e.vault.as_deref() == Some("notes") && e.data["stop"].is_null())
+    });
+    let _ = stop_socket.send(true);
+    f.rt.block_on(svc.shutdown());
+}

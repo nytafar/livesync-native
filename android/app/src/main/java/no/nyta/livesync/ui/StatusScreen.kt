@@ -160,7 +160,17 @@ fun StatusScreen(
                     Tone.INFO,
                 )
             }
-            if (st?.massDeleteAllowed == true) Banner("Deleting the missing files at the next full sync pass…", Tone.WARN)
+            if (st?.massDeleteAllowed == true) {
+                if (st.massDeleteWaits) {
+                    Banner(
+                        "Allowed, but waiting: some of the stop's files cannot be read right now (see Needs attention). " +
+                            "Nothing is deleted until they can be checked again.",
+                        Tone.WARN,
+                    )
+                } else {
+                    Banner("Deleting the missing files at the next full sync pass…", Tone.WARN)
+                }
+            }
             st?.rebuildWait?.let { Banner("Waiting for a rebuild elsewhere to finish: ${fmtStamped(it)}", Tone.INFO) }
             st?.rebuildOrphans?.let {
                 Banner("Pushed back after a rebuild (check them): ${it.substringAfter(' ')}", Tone.WARN)

@@ -102,6 +102,8 @@ This is an independent client, not affiliated with the Self-hosted LiveSync proj
 - Watches the vault (one watch per folder, never `.obsidian/` nor a folder an ignore file ignores as a whole), waits until a file has been stable for 2 s, and rescans every 15 minutes in case an event was missed.
 - **Notices a dead connection quickly.** The longpoll asks CouchDB for a heartbeat every 10 s and reconnects after 25 s without one, so a link that died in sleep or a Wi-Fi switch is noticed within 25 s. When the wall clock jumps 10 s or more past the monotonic clock, the machine slept: it drops its connections, reconnects and rescans the vault at once. The Android app keeps a 30 s heartbeat (each heartbeat wakes the radio) with a 75 s timeout, and relies on the system's network callbacks instead of the clock check; a network change also drops the pooled connections. Both timeouts stay below the HTTP read timeout (90 s), so a dead longpoll is noticed by its own check. Each reconnect runs the gates again. All three are per-vault settings (below).
 - **The daemon judges a burst of deletes as one:** a delete with no known destination goes out only once no other file has gone missing for 10 s (or after 2 minutes of steady deleting), so a burst the watcher spreads over several passes still meets the mass-delete stop. Steady deleting that goes on past the 2 minutes stays one burst until a 10 s pause: the deletes already sent count with the ones still missing, so a slow wipe stops before more than half of the files are gone. Allowing a stopped deletion covers the files that stop listed, and only if the stop is still the one shown when you allow it; files deleted after it are checked again.
+- **The stop fails closed when files cannot be checked.** Files under a folder that cannot be read (or that an unreadable ignore file leaves undecided) are never deleted, and when the stop or a burst depends on them they count as still missing: the stop stands and lists them, and an allowed stop waits until it can check them all (`lsync status` and the app say so). The deletes the daemon holds and the burst's count are kept in the index, so a restart or an `lsync sync` in between neither forgets them nor ends the burst; a one-shot `lsync sync` adds what it deletes to an open burst, which ends at a pass that finds nothing missing 10 s after its last delete. A stop saved by v0.2.1 (without its list of files) counts every file that cannot be checked as missing, and is shown anew with its list.
+- **Allowing a stop:** `lsync allow-deletes` shows the stop and asks; `lsync allow-deletes --stop TEXT` (the `safety_stop` from `lsync status --json`) is for scripts and agents. It deletes exactly the listed files, in the service when it runs the vault, else with a sync here. `lsync sync --allow-mass-delete` still lets one pass delete whatever is missing.
 - **Folder scope:** all folders by default, or only some (`--include`), or all but some (`--exclude`), matched case-insensitively. Files outside the scope are invisible in both directions. Widening fetches the newly visible documents; narrowing stops tracking without touching the remote.
 - Registers itself in the milestone (`node_info`, `tweak_values`, `node_chunk_info`) after a complete fetch, and marks itself resolved after a fresh start or a rebuild elsewhere, so a rebuilt and locked database is recovered from automatically.
 - Reassembles `plain` (text) and `newnote` (binary) files. It decompresses chunks when needed, reads legacy eden chunks, and writes each file through a hidden temp file plus rename.
@@ -225,6 +227,7 @@ lsync events [--json]         # follow what the service does (Ctrl-C to stop)
 lsync pause                   # stop every vault's engine (or --vault NAME); resume starts them again
 lsync resume
 lsync sync-now                # reconnect and rescan now (every vault, or --vault NAME)
+lsync --vault notes allow-deletes   # confirm notes' mass-delete stop (shows it and asks)
 lsync reload                  # reread lsync.toml; only the vaults that changed restart
 ```
 
@@ -238,6 +241,7 @@ lsync reload                  # reread lsync.toml; only the vaults that changed 
 |---|---|
 | `status` | Read from the service (the running engine's status). |
 | `sync`, `fetch`, `pull`, `connect` | The service stops the vault's engine, runs the command on an engine of its own with the vault's settings (and the command's `--allow-mass-delete`, `--remove-out-of-scope-copies`, `--adopt-tweaks`), and starts the vault's engine again, unless it was paused. Settings given only to this command (flags, `LSYNC_*`, a profile file that says otherwise) would not apply, so such a command is refused with what differs and what to do; for a paused vault it runs here instead, with its settings. The password is not compared: the service uses its own. |
+| `allow-deletes` | The service confirms the stop it shows (with the stop text the CLI read), and the vault's next full pass deletes the listed files. A stop holds only its own vault: the others keep syncing. |
 | `daemon` | Refused: the service already runs the vault. |
 | `folders`, `probe`, `account`, `vault`, `configure` | Run here (they don't open the vault's engine); the edits tell the service to reload. |
 | `serve` | Refused while another service holds the control socket's folder. |
@@ -268,17 +272,18 @@ lsync reload                  # reread lsync.toml; only the vaults that changed 
 | Method | Params | Result |
 |---|---|---|
 | `hello` | | `protocol`, `version`, `pid`, `methods`, `config` (the file the service reads) |
-| `status` | `vault`? | `vaults`: per vault `name`, `state`, `message`, `paused`, `enabled`, `account`, `command`, `settings` (URL without credentials, user, database, folders, scope, mode, what syncs: ignore files, regexes, dot-paths, trash; never the password), `status` (as `lsync status --json`), `session` and `push` (this engine's counters), `deletes_waiting`, `mass_delete_allowed`, `fingerprint` (names `settings`; changes when they do) |
+| `status` | `vault`? | `vaults`: per vault `name`, `state`, `message`, `paused`, `enabled`, `account`, `command`, `settings` (URL without credentials, user, database, folders, scope, mode, what syncs: ignore files, regexes, dot-paths, trash; never the password), `status` (as `lsync status --json`), `session` and `push` (this engine's counters), `deletes_waiting`, `mass_delete_allowed`, `mass_delete_waits` (allowed, but some of its files cannot be checked now), `fingerprint` (names `settings`; changes when they do) |
 | `events` | `vault`? | `subscribed`, then events |
 | `sync-now`, `pause`, `resume` | `vault`? (else every vault) | `vaults`: the names acted on |
 | `reload` | `wait`? (`false`: return at once with `scheduled`) | `started`, `stopped`, `restarted`, `unchanged`, `failed` (`vault`, `message`) |
+| `allow-deletes` | `vault`, `stop` (the vault's `status.safety_stop`, whole) | `vaults`: the vault. The next full pass deletes the files that stop listed. `no_stop` when it shows none; `stop_changed` when it shows another (the message quotes it); nothing is allowed then |
 | `sync`, `fetch`, `pull`, `connect` | `vault`, and `allow_mass_delete`, `remove_out_of_scope_copies`, `adopt_tweaks`, `fingerprint` (from the `status` whose settings the client compared: when the vault's settings changed since, nothing runs and the error is `changed`) | `report` (as the command's `--json` prints it), `wall_ms`, `peak_rss_kib` (the service's) |
 
 A vault's `state` is `starting`, `running`, `failed` (retrying), `stopped`, `paused`, `busy` (running a command for a client), `disabled` or `invalid` (its settings cannot be used, for example a missing password; `message` says why).
 
 Events: `state` (`state`, `message`), `paused` (`paused`), `pulled` (`written`, `deleted`, `adopted`, `dirty`, `conflicted`, `restored_edits`, `bytes_written`), `pushed` (`pushed`, `created`, `deleted`, `conflicts`, `chunks_uploaded`, `chunk_bytes`), `conflict` (`pulled`, `pushed`), `safety-stop` (`stop`: the text, or `null` once cleared), `upstream-stop` (`stop`: what changed upstream, or `null` once the remote is compatible again), `remote-locked` (`lock`: who holds a lock that came without a rebuild, or `null` once it no longer refuses this device; both are states, sent when one starts, ends or its reason changes, not at every recheck), `error` (`message`), `command` (`command`, `phase`: `started` or `finished`, `ok`, `message`), `reload` (the reload's result) and `lagged` (`missed`: events a slow reader lost). Counts are what happened since the vault's previous event of that kind, read from the engines about twice a second; `status` is the source of truth.
 
-Error codes: `bad_request`, `unsupported_version`, `unknown_method`, `unknown_vault`, `not_running`, `paused`, `busy`, `refused` (a gate refused; the message is the refusal), `invalid_config`, `failed`, `forbidden`, `shutting_down`, `changed`.
+Error codes: `bad_request`, `unsupported_version`, `unknown_method`, `unknown_vault`, `not_running`, `paused`, `busy`, `refused` (a gate refused; the message is the refusal), `invalid_config`, `failed`, `forbidden`, `shutting_down`, `changed`, `no_stop`, `stop_changed`.
 
 From a shell: `printf '%s\n' '{"v":1,"id":1,"method":"status"}' | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/lsync/control.sock"`.
 
@@ -391,6 +396,7 @@ Exit codes:
 - 0: OK (`check-ignore`: some path is not synced).
 - 1: error (`check-ignore`: every path syncs).
 - 2: refused by a gate.
+- 1 from `allow-deletes`: no safety stop is shown; 2: the stop shown is not the one given (nothing was allowed).
 - 3: pull or sync finished, but something needs attention (dirty or pending files, local files that cannot sync, a safety stop); for `reload`, a vault that cannot run.
 - 4: probe failed or was inconclusive.
 

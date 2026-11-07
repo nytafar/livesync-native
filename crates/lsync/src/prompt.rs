@@ -71,3 +71,19 @@ fn ask(prompt: &str) -> Result<Secret> {
 fn ask(_prompt: &str) -> Result<Secret> {
     bail!("give the password with --password-stdin")
 }
+
+/// Ask a yes/no question on the terminal (`/dev/tty`); only "y" or "yes"
+/// is a yes. An error when there is no terminal: `hint` says what to do.
+pub fn confirm(question: &str, hint: &str) -> Result<bool> {
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .with_context(|| format!("no terminal to ask on; {hint}"))?;
+    let mut out = &tty;
+    out.write_all(format!("{question} [y/N] ").as_bytes())?;
+    out.flush()?;
+    let mut line = String::new();
+    std::io::BufReader::new(&tty).read_line(&mut line)?;
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}

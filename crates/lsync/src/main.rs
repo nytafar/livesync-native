@@ -12,11 +12,12 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use config::{FileConfig, Origin, Overrides, Selected, Selector, Setup};
 use livesync_engine::{
-    engine::status_from_index, Engine, EngineConfig, EngineError, GateReport, Index, PullReport, SyncReport,
+    engine::status_from_index, Confirmation, Engine, EngineConfig, EngineError, GateReport, Index, PullReport,
+    SyncReport,
 };
 use livesync_host::config::{Dirs, Mode};
 use livesync_host::control::Client;
-use livesync_host::protocol::{method, CommandResult};
+use livesync_host::protocol::{code, method, CommandResult};
 use livesync_remote::Couch;
 use route::Route;
 use serde_json::json;
@@ -91,6 +92,19 @@ enum Cmd {
         json: bool,
         #[command(flatten)]
         push: PushOpts,
+    },
+    /// Confirm the vault's mass-delete safety stop: the files it listed, and
+    /// only those, are deleted remotely (files that went missing since are
+    /// checked again). Shows the stop and asks first, unless --stop gives
+    /// it. Done by the service when it runs the vault, else by a sync here
+    AllowDeletes {
+        /// The stop as `lsync status --json` shows it (`safety_stop`, whole);
+        /// nothing is allowed if the stop shown now is another one
+        #[arg(long, value_name = "TEXT")]
+        stop: Option<String>,
+        /// Print JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Run every enabled vault in lsync.toml in this process (or one, with
     /// --vault), with the control socket other lsync commands use. SIGHUP
@@ -334,9 +348,14 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         Cmd::Status { json, .. } => {
             let r = config::resolve(&sel, &cfg, &ctx.dirs, false)?;
             let index_path = r.state_dir.join("index.sqlite");
+            // A confirmed stop the service has not applied yet: (allowed, waits).
+            let mut confirmed = (false, false);
             let st = match route::route(&r, "status", false)? {
                 Route::Service { mut client, vault, .. } => {
                     let view = route::status_of(&mut client, Some(&vault))?.vaults.into_iter().next();
+                    if let Some(v) = &view {
+                        confirmed = (v.mass_delete_allowed, v.mass_delete_waits);
+                    }
                     let Some(mut st) = view.and_then(|v| v.status) else {
                         bail!("no index at {} yet; run `lsync pull` first", index_path.display());
                     };
@@ -357,6 +376,13 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
                 println!("{}", serde_json::to_string_pretty(&st)?);
             } else {
                 print_status(&st);
+                match confirmed {
+                    (true, true) => println!(
+                        "ALLOWED         waiting: some of the stop's files cannot be checked now (see the local issues); nothing is deleted until they can be"
+                    ),
+                    (true, false) => println!("ALLOWED         the stop's files are deleted at the next full pass"),
+                    _ => {}
+                }
             }
             Ok(0)
         }
@@ -460,6 +486,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             run_sync(&engine, json, true).await
         }),
+        Cmd::AllowDeletes { stop, json } => rt()?.block_on(allow_deletes(&sel, &cfg, &ctx.dirs, stop, json)),
         Cmd::Daemon { pull_only, push } => {
             let pull_only = pull_only || sel.mode == Mode::PullOnly;
             if let Some((client, vault, _)) = routed(&sel, &cfg, &ctx.dirs, "daemon")? {
@@ -742,6 +769,84 @@ fn run_config_for(
             ..sel.tuning.clone()
         },
     })
+}
+
+/// The stop to confirm: the one given, or the one shown after a yes on the
+/// terminal. `None` when no stop is shown (and none given).
+fn stop_to_confirm(shown: Option<String>, given: Option<String>) -> Result<Option<String>> {
+    if given.is_some() {
+        return Ok(given);
+    }
+    let Some(stop) = shown else { return Ok(None) };
+    let text = stop.split_once(' ').map_or(stop.as_str(), |(_, t)| t);
+    println!("Safety stop: {text}");
+    let yes = prompt::confirm(
+        "Delete exactly the files this stop listed on the server, and so on every device?",
+        "pass the stop with --stop (`safety_stop` in `lsync status --json`), so that only the stop you read is confirmed",
+    )?;
+    if !yes {
+        bail!("nothing was allowed");
+    }
+    Ok(Some(stop))
+}
+
+/// `lsync allow-deletes`: confirm the vault's mass-delete stop, in the
+/// service when it runs the vault (its next full pass deletes the files),
+/// else here, with a sync that deletes them. Exit 1 when no stop is shown,
+/// 2 when the stop changed since it was read.
+async fn allow_deletes(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, given: Option<String>, json: bool) -> Result<u8> {
+    two_way_allowed(sel, "allow-deletes")?;
+    let r = config::resolve(sel, cfg, dirs, false)?;
+    let none = || {
+        eprintln!("no mass-delete safety stop is shown; nothing was allowed");
+        Ok(1)
+    };
+    match route::route(&r, "allow-deletes", false)? {
+        Route::Service { mut client, vault, .. } => {
+            let shown = route::status_of(&mut client, Some(&vault))?
+                .vaults
+                .into_iter()
+                .next()
+                .and_then(|v| v.status)
+                .and_then(|s| s.safety_stop);
+            let Some(stop) = stop_to_confirm(shown, given)? else {
+                return none();
+            };
+            client.set_timeout(None);
+            match client.call(method::ALLOW_DELETES, json!({"vault": vault, "stop": stop})) {
+                Ok(v) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&v)?);
+                    } else {
+                        println!("allowed: the lsync service deletes the files the stop listed at the next full pass of {vault}, which starts now");
+                    }
+                    Ok(0)
+                }
+                Err(e) if e.code() == Some(code::NO_STOP) => none(),
+                Err(e) if e.code() == Some(code::STOP_CHANGED) => {
+                    eprintln!("{e}");
+                    Ok(2)
+                }
+                Err(e) => Err(anyhow::anyhow!("{e}")),
+            }
+        }
+        Route::Local => {
+            let engine = engine_for(sel, cfg, dirs, &PushOpts::default())?;
+            let shown = engine.status()?.safety_stop;
+            let Some(stop) = stop_to_confirm(shown, given)? else {
+                return none();
+            };
+            match engine.allow_mass_delete_once(&stop)? {
+                Confirmation::Allowed => run_sync(&engine, json, false).await,
+                Confirmation::NoStop => none(),
+                Confirmation::Changed(now) => {
+                    let now = now.split_once(' ').map_or(now.as_str(), |(_, t)| t);
+                    eprintln!("the safety stop changed after it was read, so nothing was allowed; it now says: {now}");
+                    Ok(2)
+                }
+            }
+        }
+    }
 }
 
 /// A pull-only vault is never written to the remote from here either.
@@ -1194,7 +1299,7 @@ fn print_status(s: &livesync_engine::Status) {
         println!("pushed back     {o}");
     }
     if let Some(stop) = &s.safety_stop {
-        println!("SAFETY STOP     {stop} (lsync sync --allow-mass-delete)");
+        println!("SAFETY STOP     {stop} (restore the files, or `lsync allow-deletes` to delete exactly these)");
     }
     if let Some(stop) = &s.upstream_stop {
         println!("UPSTREAM STOP   {stop}");

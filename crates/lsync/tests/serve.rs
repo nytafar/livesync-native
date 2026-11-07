@@ -684,3 +684,77 @@ impl Drop for Events {
         let _ = self.child.wait();
     }
 }
+
+/// #11 and spec D7: `lsync allow-deletes --stop TEXT` confirms the stop
+/// that was read, here (with a sync) or in the service that runs the vault;
+/// another stop's text or no stop allows nothing.
+#[test]
+fn allow_deletes_confirms_the_stop_that_was_read_here_or_in_the_service() {
+    let rt = runtime();
+    let mock = rt.block_on(Mock::start());
+    for i in 0..30 {
+        mock.put_text(&format!("Notes/f{i:02}.md"), &[&format!("note {i}")]);
+    }
+    let m = Machine::with_vault(&mock);
+    let live = |p: &str| mock.live_paths().iter().any(|l| l == p);
+    let stop_of = || {
+        m.json(&["--vault", "notes", "status", "--json"])["safety_stop"]
+            .as_str()
+            .map(str::to_string)
+    };
+    m.ok(&["--vault", "notes", "sync"]);
+    for i in 0..25 {
+        std::fs::remove_file(m.folder(&format!("notes/Notes/f{i:02}.md"))).unwrap();
+    }
+    assert_eq!(m.run(&["--vault", "notes", "sync"]).status.code(), Some(3));
+    let stop = stop_of().expect("a stop");
+    assert!(m.ok(&["--vault", "notes", "status"]).contains("lsync allow-deletes"));
+    // Another stop's text: nothing allowed, exit 2.
+    let out = m.run(&["--vault", "notes", "allow-deletes", "--stop", "1 an older stop"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("25 of 30"));
+    assert!((0..25).all(|i| live(&format!("Notes/f{i:02}.md"))));
+    // The stop read: deleted here, by a sync.
+    let rep = m.json(&["--vault", "notes", "allow-deletes", "--stop", &stop, "--json"]);
+    assert_eq!(rep["push"]["deleted"], 25, "{rep}");
+    assert!(stop_of().is_none());
+    assert_eq!(
+        m.run(&["--vault", "notes", "allow-deletes", "--stop", &stop])
+            .status
+            .code(),
+        Some(1),
+        "no stop"
+    );
+
+    // In the service.
+    for i in 30..60 {
+        mock.put_text(&format!("Notes/f{i:02}.md"), &[&format!("note {i}")]);
+    }
+    let svc = m.spawn(&["serve"], "serve.log");
+    wait_until("the new notes pulled by the service", || {
+        m.served_state("notes").as_deref() == Some("running") && m.folder("notes/Notes/f59.md").exists()
+    });
+    for i in 30..55 {
+        std::fs::remove_file(m.folder(&format!("notes/Notes/f{i:02}.md"))).unwrap();
+    }
+    let end = Instant::now() + Duration::from_secs(60);
+    let stop = loop {
+        if let Some(s) = stop_of() {
+            break s;
+        }
+        assert!(Instant::now() < end, "no stop in the service:\n{}", svc.log());
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(stop.contains("25 of 35"), "{stop}");
+    let out = m.run(&["--vault", "notes", "allow-deletes", "--stop", "1 an older stop"]);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    let r = m.json(&["--vault", "notes", "allow-deletes", "--stop", &stop, "--json"]);
+    assert_eq!(r["vaults"], serde_json::json!(["notes"]));
+    wait_until("the service's confirmed deletions", || {
+        (30..55).all(|i| !live(&format!("Notes/f{i:02}.md")))
+    });
+    wait_until("the stop to clear", || stop_of().is_none());
+    assert!((55..60).all(|i| live(&format!("Notes/f{i:02}.md"))));
+    assert!(svc.log().contains("confirmed by a client"), "{}", svc.log());
+    assert_eq!(svc.stop(), Some(0));
+}

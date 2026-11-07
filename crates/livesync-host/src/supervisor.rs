@@ -131,6 +131,9 @@ pub struct VaultStatus {
     /// This engine session's push totals (running only).
     pub push: Option<PushReport>,
     pub mass_delete_allowed: bool,
+    /// That confirmation waits because some of the files it covers cannot
+    /// be checked now (a folder or an ignore file that cannot be read).
+    pub mass_delete_waits: bool,
     pub deletes_waiting: u64,
 }
 
@@ -722,6 +725,7 @@ impl Host {
             session,
             push,
             mass_delete_allowed: engine.as_ref().is_some_and(|e| e.mass_delete_allowed()),
+            mass_delete_waits: engine.as_ref().is_some_and(|e| e.mass_delete_waits()),
             deletes_waiting: engine.as_ref().map_or(0, |e| e.deletes_waiting()),
         }
     }

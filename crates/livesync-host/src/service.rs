@@ -36,7 +36,7 @@ use crate::protocol::{
 use crate::secret::SecretStores;
 use crate::supervisor::{wait_released, RELEASE_TIMEOUT, STOP_TIMEOUT};
 use crate::{Host, HostError, RunConfig, RunState, StateListener};
-use livesync_engine::{EngineError, PullReport, PushReport};
+use livesync_engine::{Confirmation, EngineError, PullReport, PushReport};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -720,6 +720,55 @@ impl Service {
         Ok(done)
     }
 
+    /// Confirm a vault's mass-delete safety stop (spec D7): `shown` is the
+    /// stop as the client's `status` showed it. The vault's next full pass,
+    /// asked for now, deletes the files that stop listed and no others;
+    /// files that went missing since are judged as usual. Only that vault's
+    /// engine is touched. Reads the index: call it from a blocking thread.
+    pub fn allow_deletes(&self, vault: &str, shown: &str) -> Result<(), CtlError> {
+        self.check_running()?;
+        let entry = self.entry(vault)?;
+        let v = entry.view();
+        if v.removed {
+            return Err(self.unknown(vault));
+        }
+        if v.paused {
+            return Err(CtlError::new(
+                code::PAUSED,
+                format!("vault {vault} is paused; `lsync --vault {vault} resume` first"),
+            ));
+        }
+        if let Some(c) = v.command {
+            return Err(CtlError::new(
+                code::BUSY,
+                format!("vault {vault} is running `{}` for a client", c.name()),
+            ));
+        }
+        if v.planned.runnable().is_some_and(|c| c.pull_only) {
+            return Err(CtlError::new(
+                code::FAILED,
+                format!("vault {vault} is pull-only and never deletes anything remotely"),
+            ));
+        }
+        let engine = self.host.engine(vault).ok_or_else(|| self.not_running(vault, &v))?;
+        match engine.allow_mass_delete_once(shown).map_err(engine_error)? {
+            Confirmation::Allowed => {
+                warn!("vault {vault}: the deletions the safety stop listed are allowed for its next full push pass (confirmed by a client)");
+                Ok(())
+            }
+            Confirmation::NoStop => Err(CtlError::new(
+                code::NO_STOP,
+                format!("vault {vault} shows no mass-delete safety stop; nothing was allowed"),
+            )),
+            Confirmation::Changed(now) => Err(CtlError::new(
+                code::STOP_CHANGED,
+                format!(
+                    "vault {vault}'s safety stop changed after it was read, so nothing was allowed; it now says: {now}"
+                ),
+            )),
+        }
+    }
+
     fn not_running(&self, name: &str, v: &View) -> CtlError {
         let why = if !v.planned.enabled {
             format!("vault {name} is disabled (`lsync vault enable {name}`)")
@@ -775,6 +824,7 @@ impl Service {
                 push: st.push,
                 deletes_waiting: st.deletes_waiting,
                 mass_delete_allowed: st.mass_delete_allowed,
+                mass_delete_waits: st.mass_delete_waits,
             });
         }
         Ok(StatusResult { vaults: out })

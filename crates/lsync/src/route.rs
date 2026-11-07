@@ -236,6 +236,7 @@ pub fn route(r: &Resolved, what: &str, settings: bool) -> Result<Route> {
         "pull" => Some(method::PULL),
         "fetch" => Some(method::FETCH),
         "connect" => Some(method::CONNECT),
+        "allow-deletes" => Some(method::ALLOW_DELETES),
         _ => None,
     };
     let needs: Vec<&str> = std::iter::once(method::STATUS).chain(runs).collect();

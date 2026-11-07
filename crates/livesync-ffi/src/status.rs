@@ -152,6 +152,11 @@ pub struct ProfileStatus {
     pub safety_stop: Option<String>,
     /// A confirmed mass delete is waiting for its (one) full push pass.
     pub mass_delete_allowed: bool,
+    /// ... and the last full pass could not apply it, because some of the
+    /// files it covers cannot be checked now (a folder or an ignore file
+    /// that cannot be read; see the local issues). Nothing is deleted until
+    /// they can be.
+    pub mass_delete_waits: bool,
     /// Local deletions the running two-way engine holds until no other file
     /// has gone missing for a while; then they are judged together by the
     /// mass-delete stop. Zero when not running.
@@ -245,6 +250,7 @@ pub(crate) fn from_engine(
         resolve_owed: false,
         safety_stop: None,
         mass_delete_allowed: false,
+        mass_delete_waits: false,
         deletes_waiting: 0,
         rebuild_wait: None,
         rebuild_orphans: None,

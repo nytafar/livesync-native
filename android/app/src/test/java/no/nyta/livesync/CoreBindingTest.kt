@@ -162,6 +162,7 @@ class CoreBindingTest {
             // expected
         }
         assertFalse(st.massDeleteAllowed)
+        assertFalse(st.massDeleteWaits)
         assertEquals(0L, st.pushed)
 
         host.stop("p1")

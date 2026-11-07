@@ -31,8 +31,8 @@
 //! engine's own locks still keep it off a vault a service holds).
 
 use crate::protocol::{
-    check_hello, code, event, method, CommandParams, CtlError, Event, Hello, Incoming, ReloadParams, Request, Response,
-    VaultParam, MAX_LINE, PROTOCOL,
+    check_hello, code, event, method, AllowDeletesParams, CommandParams, CtlError, Event, Hello, Incoming,
+    ReloadParams, Request, Response, VaultParam, MAX_LINE, PROTOCOL,
 };
 use crate::service::{Command, Service};
 use livesync_engine::platform::{read_holder, Holder, LockError, LockFile};
@@ -679,6 +679,21 @@ async fn handle(svc: &Arc<Service>, req: Request) -> Result<Value, CtlError> {
         method::PULL => Ok(to_value(&cmd(Command::Pull).await?)),
         method::FETCH => Ok(to_value(&cmd(Command::Fetch).await?)),
         method::CONNECT => Ok(to_value(&cmd(Command::Connect).await?)),
+        method::ALLOW_DELETES => {
+            let p: AllowDeletesParams = params(&req.params)?;
+            if p.vault.is_empty() || p.stop.is_empty() {
+                return Err(CtlError::new(
+                    code::BAD_REQUEST,
+                    "parameters: vault and stop are required",
+                ));
+            }
+            let s = svc.clone();
+            let vault = p.vault.clone();
+            tokio::task::spawn_blocking(move || s.allow_deletes(&p.vault, &p.stop))
+                .await
+                .map_err(|e| CtlError::new(code::FAILED, e.to_string()))??;
+            Ok(json!({"vaults": [vault]}))
+        }
         other => Err(CtlError::new(
             code::UNKNOWN_METHOD,
             format!(

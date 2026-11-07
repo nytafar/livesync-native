@@ -57,9 +57,24 @@ pub mod method {
     pub const PULL: &str = "pull";
     pub const FETCH: &str = "fetch";
     pub const CONNECT: &str = "connect";
+    /// Confirm a vault's mass-delete safety stop (`AllowDeletesParams`):
+    /// its next full pass deletes the files that stop listed, and only
+    /// those. `stop` is the stop as `status` showed it.
+    pub const ALLOW_DELETES: &str = "allow-deletes";
 
     pub const ALL: &[&str] = &[
-        HELLO, STATUS, EVENTS, SYNC_NOW, PAUSE, RESUME, RELOAD, SYNC, PULL, FETCH, CONNECT,
+        HELLO,
+        STATUS,
+        EVENTS,
+        SYNC_NOW,
+        PAUSE,
+        RESUME,
+        RELOAD,
+        SYNC,
+        PULL,
+        FETCH,
+        CONNECT,
+        ALLOW_DELETES,
     ];
 }
 
@@ -92,6 +107,12 @@ pub mod code {
     /// A command's `fingerprint` is not the vault's: its settings changed
     /// (a reload) since the client compared them. Nothing was run.
     pub const CHANGED: &str = "changed";
+    /// `allow-deletes`: the vault shows no mass-delete safety stop.
+    pub const NO_STOP: &str = "no_stop";
+    /// `allow-deletes`: the stop shown now is not the one given (it changed
+    /// since the client read it); nothing was allowed. The message quotes
+    /// the stop shown now.
+    pub const STOP_CHANGED: &str = "stop_changed";
 
     /// Every code above, for clients mapping a code to a constant.
     pub const ALL: &[&str] = &[
@@ -108,6 +129,8 @@ pub mod code {
         FORBIDDEN,
         SHUTTING_DOWN,
         CHANGED,
+        NO_STOP,
+        STOP_CHANGED,
     ];
 }
 
@@ -307,6 +330,14 @@ pub struct CommandResult {
     pub peak_rss_kib: Option<u64>,
 }
 
+/// The parameters of `allow-deletes`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AllowDeletesParams {
+    pub vault: String,
+    /// The stop the user saw: the vault's `status.safety_stop`, whole.
+    pub stop: String,
+}
+
 /// `{"wait": false}` returns at once with `{"scheduled": true}`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReloadParams {
@@ -408,7 +439,12 @@ pub struct VaultView {
     pub session: Option<PullReport>,
     pub push: Option<PushReport>,
     pub deletes_waiting: u64,
+    /// A confirmed safety stop waits for its full pass.
     pub mass_delete_allowed: bool,
+    /// ... and that pass could not apply it, because some of its files
+    /// cannot be checked now (see the status's local issues): nothing is
+    /// deleted until they can be.
+    pub mass_delete_waits: bool,
     /// Names the settings the service runs the vault with (opaque; changes
     /// whenever `settings` does). A client that compared `settings` sends it
     /// back with a command (see [`CommandParams::fingerprint`]).
