@@ -73,6 +73,30 @@ gh run watch "$(gh run list -w Release -L1 --json databaseId -q '.[0].databaseId
 - `source scripts/dev-env.sh` maps the dev credentials to `LSYNC_*` variables and refuses anything on port 8410.
 - Credentials never go into the repo, test fixtures or commit messages.
 - `lsync pull` and `lsync daemon --pull-only` (`Engine::pull_once`, `Engine::daemon_pull_only`) never write to the remote: no document writes and no milestone registration. The mock-server tests assert it. Writes happen only in `sync`, `fetch` and the two-way `daemon`.
+- **The real database and the live desktop vault are used only through the testbed's snapshot** (below). A field check against the real database, when a phase's exit calls for one, is a deliberate step: run the nightly backup first (`systemctl --user start livesync-backup.service`) and check that it verified, then use a scoped vault folder of its own. Never point a test at the live desktop vault itself.
+
+## Desktop testbed
+
+The desktop and server work is built and checked here, on this machine (`scripts/testbed/testbed.sh`):
+
+```sh
+scripts/testbed/testbed.sh up                                   # start the dev container (it survives reboots)
+scripts/testbed/testbed.sh new t1 --machines a,b                # tb-t1, initialised by the official CLI
+scripts/testbed/testbed.sh new big --from snapshot --adopt a    # a clone of the real database (about 70 s for 440k docs);
+                                                                # machine a starts from the matching folder
+scripts/testbed/testbed.sh run t1 a sync                        # target/release/lsync as machine a
+eval "$(scripts/testbed/testbed.sh env t1 b)"                   # this shell as machine b
+scripts/testbed/testbed.sh cli t1 ls                            # the official CLI as another node of t1
+scripts/testbed/testbed.sh status
+scripts/testbed/testbed.sh drop t1
+```
+
+- **Machines.** Each has its own vault, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `LSYNC_RUNTIME_DIR` under `~/scratch/lsync-testbed/<name>/<machine>/`, and no `LSYNC_*` variable leaks in. Two machines, and later two `lsync serve`, run side by side without touching any real config or service. `lsync serve` and the control socket must honour `LSYNC_RUNTIME_DIR`.
+- **The snapshot.** `real-snap` is a read-only copy of the real database; `~/scratch/lsync-testbed/real-copy` is the matching vault folder (minus the LiveSync plugin's folder, which holds credentials).
+  - Clone it with `new … --from snapshot`; never write to `real-snap` itself.
+  - `snapshot --force` re-takes both. It is the one command that reads the real server and the desktop vault, and only reads them. Run the nightly backup first.
+  - Which folder and database: `~/.config/livesync-android/testbed.env` (`TESTBED_SOURCE_VAULT`, optionally `REAL_DB`), outside the repo.
+- **Limits.** Writes go only to `tb-*` databases on the dev container and only under `~/scratch/lsync-testbed`. Keep vault folders there, never in `/tmp`, which is tmpfs.
 
 ## Interop check against the official CLI
 
