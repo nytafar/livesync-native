@@ -439,16 +439,66 @@ fn the_closing_fence_keeps_its_line_end() {
 fn empty_files() {
     assert_eq!(written(&md("", "ours\n", "theirs\n")), "ours\ntheirs\n");
     assert_eq!(md("", "same\n", "same\n").outcome, Outcome::Identical);
-    // Emptied on one side while the other edits: a deletion against a change.
-    // Upstream keeps the edit (its diff of an emptied file is one trailing
-    // deletion, which it brings back as unchanged lines).
-    let m = md("a\nb\n", "", "a\nB\n");
-    assert!(m.outcome.is_open());
-    assert_eq!(m.deviations, [Deviation::TrailingDeletion]);
-    // Emptied while the other side left it alone: emptied.
-    let m = md("a\nb\n", "", "a\nb\n\nc\n");
-    assert_eq!(written(&m), "\nc\n");
     assert_eq!(written(&md("", "", "new\n")), "new\n");
+    // Whitespace only in the base is no content to lose.
+    assert_eq!(written(&md("\n", "", "\nnew\n")), "new\n");
+}
+
+fn emptied(m: &Merge) -> Which {
+    assert_eq!(m.rule, Rule::Emptied, "{m:?}");
+    match overlaps(m) {
+        [Overlap::Whole(Reason::Emptied(w))] => *w,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn an_emptied_side_never_merges() {
+    let base = "a\nb\n";
+    for ours_newer in [false, true] {
+        for empty in ["", "\n", " \r\n\t\n"] {
+            // Against an unchanged side, an edit, an append: open, either side.
+            for other in [base, "a\nB\n", "a\nb\nc\n"] {
+                for kind in [Kind::Markdown, Kind::Text] {
+                    let m = run(kind, Some(base), empty, other, ours_newer);
+                    assert_eq!(emptied(&m), Which::Ours);
+                    assert_eq!(m.deviations, [Deviation::EmptiedOpen]);
+                    let m = run(kind, Some(base), other, empty, ours_newer);
+                    assert_eq!(emptied(&m), Which::Theirs);
+                }
+            }
+        }
+    }
+    // JSON too; other kinds stay open as ever, with no deviation from upstream.
+    let m = run(Kind::Object, Some("{\"a\": 1}\n"), "{\"a\": 1, \"b\": 2}\n", "", false);
+    assert_eq!(emptied(&m), Which::Theirs);
+    let m = run(Kind::Other, Some("x"), "", "x", true);
+    assert_eq!(emptied(&m), Which::Ours);
+    assert!(m.deviations.is_empty());
+    // Both emptied differently: open, naming ours.
+    assert_eq!(emptied(&md(base, "", "\n")), Which::Ours);
+    // Both emptied alike is rule 1.
+    assert_eq!(md(base, "", "").outcome, Outcome::Identical);
+    assert_eq!(md(base, "\n", "\n").rule, Rule::Identical);
+}
+
+#[test]
+fn a_deleted_leaf_is_not_emptied() {
+    let input = Input {
+        base: Some(ver("a\n", 1000)),
+        ours: gone(OLD),
+        theirs: ver("a\nb\n", NEW),
+    };
+    let m = merge(Kind::Markdown, &input, &Settings::default());
+    assert_eq!(m.rule, Rule::EditBeatsDelete);
+    // A deleted leaf against an emptied live one: the live (empty) side is kept.
+    let input = Input {
+        base: Some(ver("a\n", 1000)),
+        ours: ver("", NEW),
+        theirs: gone(OLD),
+    };
+    let m = merge(Kind::Markdown, &input, &Settings::default());
+    assert_eq!(m.outcome, Outcome::Keep(Side::Ours));
 }
 
 #[test]
@@ -551,6 +601,7 @@ fn names_are_stable() {
             "both_deleted",
             "no_base",
             "base_deleted",
+            "emptied",
             "lines",
             "frontmatter",
             "object",
@@ -570,7 +621,8 @@ fn names_are_stable() {
             "numeric_key_order",
             "broken_frontmatter",
             "trailing_deletion",
-            "run_order"
+            "run_order",
+            "emptied_open"
         ]
     );
     for r in Rule::ALL {
@@ -597,6 +649,7 @@ fn names_are_stable() {
         (Reason::InvalidFrontmatter(Which::Ours), "invalid_frontmatter"),
         (Reason::MergedFrontmatterInvalid, "merged_frontmatter_invalid"),
         (Reason::GluedLines, "glued_lines"),
+        (Reason::Emptied(Which::Theirs), "emptied"),
     ];
     for (r, s) in reasons {
         assert_eq!(r.as_str(), s);
@@ -604,6 +657,7 @@ fn names_are_stable() {
     assert_eq!(Reason::InvalidJson(Which::Ours).to_string(), "invalid_json(ours)");
     assert_eq!(Reason::InvalidJson(Which::Ours).which(), Some(Which::Ours));
     assert_eq!(Reason::JsonShape.to_string(), "json_shape");
+    assert_eq!(Reason::Emptied(Which::Ours).to_string(), "emptied(ours)");
     let overlaps = [
         (
             Overlap::Lines(LineOverlap {

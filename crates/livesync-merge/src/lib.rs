@@ -13,14 +13,16 @@
 //!    [`Outcome::Keep`], with or without a base. Two deleted sides with
 //!    different data stay open.
 //! 3. **No base** (or a deleted base): open.
-//! 4. **Markdown and text** ([`Kind::Markdown`], [`Kind::Text`]): upstream's
+//! 4. **Emptied**: a side with no content (or only whitespace) against a base
+//!    with content: open (see below).
+//! 5. **Markdown and text** ([`Kind::Markdown`], [`Kind::Text`]): upstream's
 //!    three-way line merge (commonlib `ConflictManager.mergeSensibly`).
-//! 5. **Frontmatter** ([`Kind::Markdown`] only), when both sides changed the
+//! 6. **Frontmatter** ([`Kind::Markdown`] only), when both sides changed the
 //!    YAML block, each differently: key by key, with [`Settings::newest_keys`];
-//!    the body as in 4. When only one side changed it, 4 applies to the file.
-//! 6. **`.json`/`.canvas`** ([`Kind::Object`]): upstream's object merge
+//!    the body as in 5. When only one side changed it, 5 applies to the file.
+//! 7. **`.json`/`.canvas`** ([`Kind::Object`]): upstream's object merge
 //!    (`ConflictManager.mergeObject`, `utils.patch.ts`).
-//! 7. **Anything else** ([`Kind::Other`]): open.
+//! 8. **Anything else** ([`Kind::Other`]): open.
 //!
 //! Which paths are which kind is a setting ([`Settings::kind_of`]), as is the
 //! list of timestamp keys. Nothing is built in beyond D9's defaults.
@@ -55,10 +57,18 @@
 //!   like any other deletion (`a B`), and a trailing deletion against a change
 //!   of the same lines is open, as D9's delete-against-change rule says. The
 //!   lost-update guard (D10) depends on it: with a lost trailing deletion,
-//!   "clean and M = L" would wrongly say L already holds R2. A file emptied on
-//!   one side is such a deletion: against an unchanged side it is taken, against
-//!   an edit it is open (upstream keeps the edit).
+//!   "clean and M = L" would wrongly say L already holds R2.
 //!   [`Deviation::TrailingDeletion`].
+//! - **An emptied side never merges.** Where the base has content and a side
+//!   is empty (no bytes, or only spaces, tabs and line ends), the merge is open
+//!   whatever the other side did, an unchanged side included
+//!   ([`Rule::Emptied`], [`Reason::Emptied`]). Upstream takes the emptying (or,
+//!   against an edit, keeps the edit). An accidental truncation (an editor
+//!   crash, a stray `> file`, a partial write) is the most destructive
+//!   one-sided change and the commonest glitch, so a person or an agent
+//!   confirms it. Both sides emptied alike is rule 1; a deleted leaf is not
+//!   emptied (rule 2 applies). [`Deviation::EmptiedOpen`], reported for the
+//!   kinds upstream merges.
 //! - **No truncated merge** (the second clarification): upstream's "weird
 //!   condition" branch ends the loop with the merge marked good. Here it is a
 //!   conflict. [`Deviation::FallthroughOpen`]; no input is known to reach it.
@@ -219,6 +229,8 @@ pub enum Rule {
     NoBase,
     /// The ancestor is a deleted leaf: open.
     BaseDeleted,
+    /// A side was emptied (the base has content): open.
+    Emptied,
     /// The three-way line merge.
     Lines,
     /// Frontmatter key by key, body by lines.
@@ -316,6 +328,9 @@ pub enum Reason {
     MergedFrontmatterInvalid,
     /// The merge would join two lines into one (see [`Deviation::GluedLines`]).
     GluedLines,
+    /// This side is empty, or only whitespace, where the base has content.
+    /// Both sides emptied (differently) names ours.
+    Emptied(Which),
 }
 
 /// A place where this crate's result differs from upstream's by design (see
@@ -346,6 +361,8 @@ pub enum Deviation {
     /// upstream interleaves them line by line (or open, where that order would
     /// join two lines).
     RunOrder,
+    /// A side was emptied: open, where upstream would merge.
+    EmptiedOpen,
 }
 
 fn open(rule: Rule, overlaps: Vec<Overlap>) -> Merge {
@@ -406,6 +423,15 @@ fn merge_in(kind: Kind, input: &Input, settings: &Settings, mode: lines::Mode) -
         Some(b) if b.deleted => return open(Rule::BaseDeleted, vec![Overlap::Whole(Reason::BaseDeleted)]),
         Some(b) => b,
     };
+    let blank = |v: &Version| v.content.iter().all(u8::is_ascii_whitespace);
+    if !blank(&base) && (blank(ours) || blank(theirs)) {
+        let which = if blank(ours) { Which::Ours } else { Which::Theirs };
+        let mut m = open(Rule::Emptied, vec![Overlap::Whole(Reason::Emptied(which))]);
+        if kind != Kind::Other {
+            m.deviations.push(Deviation::EmptiedOpen);
+        }
+        return m;
+    }
     let rule = match kind {
         Kind::Markdown | Kind::Text => Rule::Lines,
         Kind::Object => Rule::Object,
@@ -689,6 +715,7 @@ names!(Rule {
     BothDeleted => "both_deleted",
     NoBase => "no_base",
     BaseDeleted => "base_deleted",
+    Emptied => "emptied",
     Lines => "lines",
     Frontmatter => "frontmatter",
     Object => "object",
@@ -706,6 +733,7 @@ names!(Deviation {
     BrokenFrontmatter => "broken_frontmatter",
     TrailingDeletion => "trailing_deletion",
     RunOrder => "run_order",
+    EmptiedOpen => "emptied_open",
 });
 
 names!(Which {
@@ -735,6 +763,7 @@ impl Reason {
             Reason::InvalidFrontmatter(_) => "invalid_frontmatter",
             Reason::MergedFrontmatterInvalid => "merged_frontmatter_invalid",
             Reason::GluedLines => "glued_lines",
+            Reason::Emptied(_) => "emptied",
         }
     }
     /// The version the reason is about, where it names one.
@@ -743,7 +772,8 @@ impl Reason {
             Reason::NotUtf8(w)
             | Reason::InvalidJson(w)
             | Reason::UnsupportedJson(w)
-            | Reason::InvalidFrontmatter(w) => Some(w),
+            | Reason::InvalidFrontmatter(w)
+            | Reason::Emptied(w) => Some(w),
             _ => None,
         }
     }

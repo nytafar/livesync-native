@@ -358,6 +358,14 @@ fn justify(name: &str, d: Deviation, all: &[Deviation], c: &Value, ours: &Option
                 ),
             }
         }
+        Deviation::EmptiedOpen => {
+            assert!(ours.is_none(), "{name}: an emptied side must stay open");
+            let blank = |k: &str| c[k].as_str().unwrap().trim().is_empty();
+            assert!(
+                !blank("base") && (blank("left") || blank("right")),
+                "{name}: no side emptied"
+            );
+        }
         other => panic!("{name}: unexpected deviation {other:?} in the corpus"),
     }
 }

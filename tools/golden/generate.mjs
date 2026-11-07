@@ -411,6 +411,7 @@ await mergeBoth("lines/empty-base-same", "note.md", "", L("same"), L("same"));
 await mergeBoth("lines/emptied-vs-edit", "note.md", L("a", "b"), "", L("a", "B"));
 await mergeBoth("lines/emptied-vs-unchanged", "note.md", L("a", "b"), "", L("a", "b", "c"));
 await mergeBoth("lines/both-emptied", "note.md", L("a", "b"), "", "");
+await mergeBoth("lines/deviation-whitespace-emptied", "note.md", L("a", "b"), "\n\n", L("a", "b", "c"));
 await mergeBoth("lines/blank-lines", "note.md", L("a", "", "b"), L("a", "", "", "b", "left"), L("right", "a", "", "b"));
 await mergeBoth("lines/unicode", "note.md", L("æøå", "日本語", "😀"), L("ÆØÅ", "日本語", "😀"), L("æøå", "日本語", "🎉"));
 await mergeBoth("lines/frontmatter-as-text", "note.md", L("---", "title: Note", "tags: a", "---", "body"), L("---", "title: Note", "tags: b", "---", "body"), L("---", "title: Note", "tags: a", "---", "body", "more"));

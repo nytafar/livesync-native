@@ -626,6 +626,26 @@
    "result": "a\nb\n"
   },
   {
+   "name": "lines/deviation-whitespace-emptied",
+   "path": "note.md",
+   "base": "a\nb\n",
+   "left": "\n\n",
+   "right": "a\nb\nc\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "\n\nc\n"
+  },
+  {
+   "name": "lines/deviation-whitespace-emptied/left-newer",
+   "path": "note.md",
+   "base": "a\nb\n",
+   "left": "\n\n",
+   "right": "a\nb\nc\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "\nc\n\n"
+  },
+  {
    "name": "lines/blank-lines",
    "path": "note.md",
    "base": "a\n\nb\n",

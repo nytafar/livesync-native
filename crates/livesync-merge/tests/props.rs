@@ -2,7 +2,7 @@
 //! JSON value) that either side added, nor brings back a line a side deleted;
 //! two runs inserted at one point come out whole, the older first; and a merge
 //! is symmetric up to the order the mtimes give.
-use livesync_merge::{merge, Input, Kind, Merge, Outcome, Settings, Side, Version};
+use livesync_merge::{merge, Input, Kind, Merge, Outcome, Overlap, Reason, Rule, Settings, Side, Version};
 use proptest::prelude::*;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -96,14 +96,23 @@ fn text_case() -> impl Strategy<Value = Case> {
         prop::collection::vec(edit(), 0..5),
         any::<bool>(),
         prop::array::uniform3(prop::bool::weighted(0.8)),
+        0..16u8,
     )
-        .prop_map(|(base, eo, et, crlf, finals)| {
+        .prop_map(|(base, eo, et, crlf, finals, blank)| {
             let eol = if crlf { "\r\n" } else { "\n" };
-            Case {
+            let mut c = Case {
                 ours: join(&apply(&base, &eo), eol, finals[1]),
                 theirs: join(&apply(&base, &et), eol, finals[2]),
                 base: join(&base, eol, finals[0]),
+            };
+            // Now and then a side emptied, or left with only whitespace.
+            match blank {
+                0 => c.ours = String::new(),
+                1 => c.theirs = eol.repeat(2),
+                2 => c.ours = " \t".into(),
+                _ => {}
             }
+            c
         })
 }
 
@@ -219,6 +228,22 @@ fn keeps_deletions(c: &Case, out: &str) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// A side emptied (blank) against a base with content never merges, unless
+/// both sides are the same.
+fn emptied_stays_open(c: &Case, m: &Merge) -> Result<(), TestCaseError> {
+    let blank = |s: &str| s.bytes().all(|b| b.is_ascii_whitespace());
+    if !blank(&c.base) && (blank(&c.ours) || blank(&c.theirs)) && c.ours != c.theirs {
+        prop_assert_eq!(m.rule, Rule::Emptied, "{:?}\n{:?}", c, m);
+        prop_assert!(
+            matches!(&m.outcome, Outcome::Open(o) if matches!(o.as_slice(), [Overlap::Whole(Reason::Emptied(_))])),
+            "{:?}\n{:?}",
+            c,
+            m
+        );
+    }
+    Ok(())
+}
+
 fn swapped(c: &Case) -> Case {
     Case {
         base: c.base.clone(),
@@ -247,7 +272,9 @@ proptest! {
         let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
         // As Markdown too: `---` lines make frontmatter blocks out of plain text.
         for kind in [Kind::Text, Kind::Markdown] {
-            if let Outcome::Write(out) = run(kind, &c, mo, mt).outcome {
+            let m = run(kind, &c, mo, mt);
+            emptied_stays_open(&c, &m)?;
+            if let Outcome::Write(out) = m.outcome {
                 keeps_added_lines(&c, std::str::from_utf8(&out).unwrap())?;
             }
         }
@@ -412,7 +439,9 @@ proptest! {
     fn line_merges_carry_every_deletion(c in fresh_case(), ours_newer in any::<bool>()) {
         let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
         for kind in [Kind::Text, Kind::Markdown] {
-            if let Outcome::Write(out) = run(kind, &c, mo, mt).outcome {
+            let m = run(kind, &c, mo, mt);
+            emptied_stays_open(&c, &m)?;
+            if let Outcome::Write(out) = m.outcome {
                 let out = std::str::from_utf8(&out).unwrap();
                 keeps_added_lines(&c, out)?;
                 keeps_deletions(&c, out)?;
