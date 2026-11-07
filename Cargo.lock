@@ -1052,6 +1052,7 @@ name = "lsync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "libc",
  "livesync-engine",

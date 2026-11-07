@@ -40,11 +40,12 @@ The same engine as a single binary for Linux (and Termux on Android): one-shot p
 lsync account add home --url https://couch.example.net --user me   # asks for the password
 lsync vault add notes --db vault --folder ~/Notes
 lsync connect            # check that the database is compatible
-lsync daemon             # two-way, continuously
+lsync serve              # every vault, two-way, continuously, in one process
+lsync daemon             # one vault, two-way, continuously
 lsync daemon --pull-only # follow the server, never write to it
 ```
 
-With more than one vault, name the one to act on: `lsync --vault notes sync`.
+With more than one vault, name the one to act on: `lsync --vault notes sync`. While `lsync serve` runs, the other commands go through it (below), so `lsync sync`, `lsync status` and the rest work the same with or without the service.
 
 Full usage is under [Reference](#reference).
 
@@ -192,13 +193,84 @@ An account without `--user` is a server without authentication: it has no passwo
 </details>
 
 <details>
+<summary>The service, its control socket and routing</summary>
+
+`lsync serve` runs every enabled vault in `lsync.toml` in one process: one runtime, one log, one control socket, and one HTTP connection pool per server, shared by the vaults on it. Each vault has its own engine, index, locks, node ID and status, and a failing vault is retried (from 15 s to 15 minutes) without stopping the others. `lsync serve --vault NAME` runs one vault, for a container or a unit per vault.
+
+```sh
+lsync serve                   # every enabled vault; logs to stderr
+lsync status --all [--json]   # every vault of the service: state, mode, last pull
+lsync events [--json]         # follow what the service does (Ctrl-C to stop)
+lsync pause                   # stop every vault's engine (or --vault NAME); resume starts them again
+lsync resume
+lsync sync-now                # reconnect and rescan now (every vault, or --vault NAME)
+lsync reload                  # reread lsync.toml; only the vaults that changed restart
+```
+
+- **Reload.** `kill -HUP`, `lsync reload`, and every `lsync account ...`, `lsync vault ...` or `lsync configure` that changes the file make the service reread it. Only the vaults whose settings changed (an account's URL, user or password included) are started, stopped or restarted; the others keep running. A file that cannot be read changes nothing. `kill -USR1` is "sync now" for every vault; SIGTERM and SIGINT stop the service.
+- **Pause** stops a vault's engine and lets go of its folders until `resume`. A paused vault takes changes from a reload and starts with them at `resume`. Pausing is not kept across a restart of the service.
+- **`lsync daemon`** runs one vault, from `lsync.toml`, a profile file or flags and `LSYNC_*` alone, as before (`lsync --profile bench daemon` included). It fails at once when the vault cannot start; after that it is supervised like the service's vaults (retried instead of exiting). It takes the control socket when no other service holds it, and runs without one otherwise.
+
+**Routing.** A command for a vault the service runs is run by the service, which holds the vault's locks; otherwise the CLI opens the engine itself, one-shot, as before. Either way the output and the exit code are the same. A vault is the service's when the service runs one with the same state folder or the same vault folder.
+
+| Command | While the service runs the vault |
+|---|---|
+| `status` | Read from the service (the running engine's status). |
+| `sync`, `fetch`, `pull`, `connect` | The service stops the vault's engine, runs the command on an engine of its own with the vault's settings (and the command's `--allow-mass-delete`, `--remove-out-of-scope-copies`, `--adopt-tweaks`), and starts the vault's engine again, unless it was paused. Settings given only to this command (flags, `LSYNC_*`, a profile file that says otherwise) would not apply, so such a command is refused with what differs and what to do; for a paused vault it runs here instead, with its settings. The password is not compared: the service uses its own. |
+| `daemon` | Refused: the service already runs the vault. |
+| `folders`, `probe`, `account`, `vault`, `configure` | Run here (they don't open the vault's engine); the edits tell the service to reload. |
+| `serve` | Refused while another service holds the control socket's folder. |
+
+`pause`, `resume`, `sync-now`, `reload`, `events` and `status --all` need a running service; they name a vault with `--vault` (or `--profile`) on the command line, never from `LSYNC_PROFILE`, and act on every vault without one.
+
+**Where the socket is.** `$LSYNC_RUNTIME_DIR/control.sock` when that is set; else `$XDG_RUNTIME_DIR/lsync/control.sock` (Linux) or `~/Library/Application Support/lsync/control.sock` (macOS) for a user's service, and `$RUNTIME_DIRECTORY` or `/run/lsync/control.sock` for `lsync serve --system`. Clients look at `$LSYNC_RUNTIME_DIR` alone when it is set, else at the user's socket and then the system's. It is a Unix socket and never listens on the network; a remote client goes through SSH (`ssh server lsync status --all --json`).
+
+**Who may connect.** Before anything is bound, the socket's folder must be a real folder (not a link) owned by the service's user; it is made 0700, and a wider folder is tightened only when it holds nothing but the socket and its lock. The socket is 0600. Every connection's peer is checked (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and must be the service's own user; `lsync serve --system --socket-group GROUP` also lets in that group's members (folder 0750 and socket 0660, owned by the group). Anyone else gets one `forbidden` line and is disconnected. The service holds an flock on `control.lock` beside the socket while it runs: a second service is refused and told which process holds it, and a socket left by a crashed service is replaced. A client uses a socket only in a folder no one but its owner can write to, and only when the process behind it runs as that owner.
+
+**Protocol.** Newline-delimited JSON over the socket, one object per line, version 1. The shapes below are stable within a major version: methods, parameters, result fields, event kinds and error codes are only added, never renamed or removed. Clients ignore what they don't know.
+
+```json
+{"v":1,"id":1,"method":"status","params":{"vault":"notes"}}
+{"v":1,"id":1,"result":{"vaults":[{"name":"notes","state":"running", ...}]}}
+{"v":1,"id":2,"method":"pause","params":{"vault":"nope"}}
+{"v":1,"id":2,"error":{"code":"unknown_vault","message":"the service runs no vault named \"nope\" (it has: notes)"}}
+{"v":1,"id":3,"method":"events"}
+{"v":1,"id":3,"result":{"subscribed":true}}
+{"v":1,"event":"pulled","vault":"notes","ts":1730000000000,"data":{"written":1,"deleted":0, ...}}
+```
+
+- A request has `v` (the major version; 1 when left out), an `id` of the client's choosing (echoed in the response), a `method` and optional `params`. Requests on one connection run concurrently, so match responses by `id`. A request for another major version gets `unsupported_version`.
+- A response has `result` or `error` (`code` and `message`).
+- After `events`, the connection also carries event lines: they have `event` instead of `id`, the `vault` (or `null` for the service as a whole), `ts` (milliseconds since the epoch) and `data`.
+
+| Method | Params | Result |
+|---|---|---|
+| `hello` | | `protocol`, `version`, `pid`, `methods`, `config` (the file the service reads) |
+| `status` | `vault`? | `vaults`: per vault `name`, `state`, `message`, `paused`, `enabled`, `account`, `command`, `settings` (URL without credentials, user, database, folders, scope, mode; never the password), `status` (as `lsync status --json`), `session` and `push` (this engine's counters), `deletes_waiting`, `mass_delete_allowed` |
+| `events` | `vault`? | `subscribed`, then events |
+| `sync-now`, `pause`, `resume` | `vault`? (else every vault) | `vaults`: the names acted on |
+| `reload` | `wait`? (`false`: return at once with `scheduled`) | `started`, `stopped`, `restarted`, `unchanged`, `failed` (`vault`, `message`) |
+| `sync`, `fetch`, `pull`, `connect` | `vault`, and `allow_mass_delete`, `remove_out_of_scope_copies`, `adopt_tweaks` | `report` (as the command's `--json` prints it), `wall_ms`, `peak_rss_kib` (the service's) |
+
+A vault's `state` is `starting`, `running`, `failed` (retrying), `stopped`, `paused`, `busy` (running a command for a client), `disabled` or `invalid` (its settings cannot be used, for example a missing password; `message` says why).
+
+Events: `state` (`state`, `message`), `paused` (`paused`), `pulled` (`written`, `deleted`, `adopted`, `dirty`, `conflicted`, `restored_edits`, `bytes_written`), `pushed` (`pushed`, `created`, `deleted`, `conflicts`, `chunks_uploaded`, `chunk_bytes`), `conflict` (`pulled`, `pushed`), `safety-stop` (`stop`: the text, or `null` once cleared), `error` (`message`), `command` (`command`, `phase`: `started` or `finished`, `ok`, `message`), `reload` (the reload's result) and `lagged` (`missed`: events a slow reader lost). Counts are what happened since the vault's previous event of that kind, read from the engines about twice a second; `status` is the source of truth.
+
+Error codes: `bad_request`, `unsupported_version`, `unknown_method`, `unknown_vault`, `not_running`, `paused`, `busy`, `refused` (a gate refused; the message is the refusal), `invalid_config`, `failed`, `forbidden`, `shutting_down`.
+
+From a shell: `printf '%s\n' '{"v":1,"id":1,"method":"status"}' | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/lsync/control.sock"`.
+
+</details>
+
+<details>
 <summary>Full <code>lsync</code> usage, environment and exit codes</summary>
 
 ```sh
 lsync connect               # run the compatibility gate and print what it found
 lsync pull                  # one-shot pull into the vault folder (read-only)
 lsync sync                  # one-shot two-way sync: pull, register, push local changes
-lsync daemon                # two-way, continuously (watcher + longpoll); kill -USR1 = "sync now"
+lsync serve                 # every enabled vault in one process, with the control socket (above)
+lsync daemon                # one vault, two-way, continuously (watcher + longpoll); kill -USR1 = "sync now"
 lsync daemon --pull-only    # follow changes, read-only
 lsync fetch                 # start over from the remote (upstream's "Fetch"), clears a lock
 lsync status                # index summary, last gate result, files needing attention
@@ -219,7 +291,7 @@ Exit codes:
 - 0: OK.
 - 1: error.
 - 2: refused by a gate.
-- 3: pull or sync finished, but something needs attention (dirty or pending files, local files that cannot sync, a safety stop).
+- 3: pull or sync finished, but something needs attention (dirty or pending files, local files that cannot sync, a safety stop); for `reload`, a vault that cannot run.
 - 4: probe failed or was inconclusive.
 
 </details>
@@ -231,8 +303,8 @@ Exit codes:
 | `crates/livesync-model` | Pure model: doc types, path→ID, chunk IDs, the splitter, decompression codec, gate evaluation, milestone registration, folder scope |
 | `crates/livesync-remote` | CouchDB over HTTP (reqwest + rustls with bundled webpki roots): `_changes`, `_all_docs`, `_local` docs, backoff |
 | `crates/livesync-engine` | Pull and push loops, daemons, SQLite index, vault file operations; platform seams (`Watcher`, `FsRules`) |
-| `crates/livesync-host` | Hosting vaults for every front-end: one supervisor per vault (retries from 15 s to 15 min), accounts and vaults (`lsync.toml`), the secret stores, migration from profile files |
-| `crates/lsync` | The CLI, including `probe` and the account and vault commands |
+| `crates/livesync-host` | Hosting vaults for every front-end: one supervisor per vault (retries from 15 s to 15 min), accounts and vaults (`lsync.toml`), the secret stores, migration from profile files, the service (reload, pause, commands, events) and the control socket with its protocol and client |
+| `crates/lsync` | The CLI, including `serve`, the routing through the control socket, `probe` and the account and vault commands |
 | `crates/livesync-ffi` | UniFFI surface for the app over `livesync-host`: one engine per profile, connect test, status, logs |
 | `crates/uniffi-bindgen` | UniFFI's Kotlin binding generator, pinned to the same version |
 | `android/` | The Android app (Kotlin, Compose): foreground service, onboarding, vault list, status screens |

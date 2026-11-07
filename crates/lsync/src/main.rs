@@ -4,17 +4,25 @@ mod config;
 mod manage;
 mod probe;
 mod prompt;
+mod route;
+mod serve;
 mod service;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use config::{FileConfig, Origin, Overrides, Selected, Selector, Setup};
-use livesync_engine::{engine::status_from_index, Engine, EngineConfig, EngineError, Index, SyncReport};
+use livesync_engine::{
+    engine::status_from_index, Engine, EngineConfig, EngineError, GateReport, Index, PullReport, SyncReport,
+};
 use livesync_host::config::{Dirs, Mode};
+use livesync_host::control::Client;
+use livesync_host::protocol::{method, CommandResult};
 use livesync_remote::Couch;
+use route::Route;
+use serde_json::json;
 use std::path::PathBuf;
-use std::time::Instant;
-use tracing::{error, info};
+use std::time::{Duration, Instant};
+use tracing::error;
 
 /// The release version (set by the release workflow from the tag), else the crate version.
 const VERSION: &str = match option_env!("LSYNC_RELEASE_VERSION") {
@@ -84,7 +92,15 @@ enum Cmd {
         #[command(flatten)]
         push: PushOpts,
     },
+    /// Run every enabled vault in lsync.toml in this process (or one, with
+    /// --vault), with the control socket other lsync commands use. SIGHUP
+    /// rereads the config, SIGUSR1 syncs now
+    Serve {
+        #[command(flatten)]
+        opts: serve::ServeOpts,
+    },
     /// Follow the remote continuously and push local changes as they happen
+    /// (one vault, from any settings; refused for a vault `lsync serve` runs)
     Daemon {
         /// Only pull; never write to the remote
         #[arg(long)]
@@ -102,6 +118,39 @@ enum Cmd {
     },
     /// Show index state, last gate result and files needing attention
     Status {
+        #[arg(long)]
+        json: bool,
+        /// Every vault of the running service: its state, mode and last sync
+        #[arg(long)]
+        all: bool,
+    },
+    /// Pause the service's vaults (or the one named with --vault): their
+    /// engines stop and let go of the folders until `lsync resume`
+    Pause {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume the service's paused vaults (or the one named with --vault)
+    Resume {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the service to reconnect and rescan now (every vault, or the one
+    /// named with --vault)
+    SyncNow {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make the service reread lsync.toml; only the vaults that changed
+    /// start, stop or restart
+    Reload {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Follow the service's events (every vault, or the one named with
+    /// --vault) until interrupted
+    Events {
+        /// Print the protocol's JSON lines as they come
         #[arg(long)]
         json: bool,
     },
@@ -187,6 +236,8 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             bail!("the account and vault commands take the name as an argument, not --vault or --profile");
         }
     }
+    // Checked only by the verbs that take a vault name of the service.
+    let named = cli_vault(&cli, matches);
     let cmd = match cli.cmd {
         Cmd::Account { cmd } => {
             let given = manage::Given {
@@ -203,6 +254,16 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             return manage::vault(&ctx, cmd, &given);
         }
         Cmd::Probe(args) => return probe::run(args),
+        Cmd::Pause { json } => return service_verb(named?, method::PAUSE, "paused", json),
+        Cmd::Resume { json } => return service_verb(named?, method::RESUME, "resumed", json),
+        Cmd::SyncNow { json } => return service_verb(named?, method::SYNC_NOW, "syncing now", json),
+        Cmd::Reload { json } => return reload(json),
+        Cmd::Events { json } => return events(named?, json),
+        Cmd::Status { json, all: true } => return status_all(json),
+        Cmd::Serve { opts } => {
+            let only = named?;
+            return serve::serve(&ctx, only, &opts, VERSION);
+        }
         other => other,
     };
     let mut selector = Selector {
@@ -245,20 +306,33 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             if let Some(v) = &new.vault {
                 new.vault = Some(absolute(v)?);
             }
-            livesync_host::legacy::save(cfg_path, &new)
-                .with_context(|| format!("writing {}", cfg_path.display()))?;
+            livesync_host::legacy::save(cfg_path, &new).with_context(|| format!("writing {}", cfg_path.display()))?;
             println!("saved {}", cfg_path.display());
             print_config(&new);
             Ok(0)
         }
-        Cmd::Status { json } => {
+        Cmd::Status { json, .. } => {
             let r = config::resolve(&sel, &cfg, &ctx.dirs, false)?;
             let index_path = r.state_dir.join("index.sqlite");
-            if !index_path.exists() {
-                bail!("no index at {} yet; run `lsync pull` first", index_path.display());
-            }
-            let ix = Index::open(&index_path)?;
-            let st = status_from_index(&ix, &r.vault, &index_path)?;
+            let st = match route::route(&r, "status", false)? {
+                Route::Service { mut client, vault } => {
+                    let view = route::status_of(&mut client, Some(&vault))?.vaults.into_iter().next();
+                    let Some(mut st) = view.and_then(|v| v.status) else {
+                        bail!("no index at {} yet; run `lsync pull` first", index_path.display());
+                    };
+                    // As this command names them, like the one-shot status.
+                    st.vault = r.vault.display().to_string();
+                    st.index = index_path.display().to_string();
+                    st
+                }
+                Route::Local => {
+                    if !index_path.exists() {
+                        bail!("no index at {} yet; run `lsync pull` first", index_path.display());
+                    }
+                    let ix = Index::open(&index_path)?;
+                    status_from_index(&ix, &r.vault, &index_path)?
+                }
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&st)?);
             } else {
@@ -268,8 +342,24 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         }
         Cmd::Folders { json } => rt()?.block_on(folders(&sel, &cfg, &ctx.dirs, json)),
         Cmd::Connect { adopt_tweaks, json } => rt()?.block_on(async {
-            let engine = engine_for(&sel, &cfg, &ctx.dirs, &PushOpts::default())?;
-            match engine.connect_gate(adopt_tweaks).await {
+            let gate = match routed(&sel, &cfg, &ctx.dirs, "connect")? {
+                Some((mut client, vault)) => {
+                    let p = json!({"vault": vault, "adopt_tweaks": adopt_tweaks});
+                    match command(&mut client, method::CONNECT, p)? {
+                        Ok(r) => Ok(serde_json::from_value::<GateReport>(r.report)?),
+                        Err(refusal) => Err(refusal),
+                    }
+                }
+                None => {
+                    let engine = engine_for(&sel, &cfg, &ctx.dirs, &PushOpts::default())?;
+                    match engine.connect_gate(adopt_tweaks).await {
+                        Ok(g) => Ok(g),
+                        Err(EngineError::Refused(r)) => Err(r.to_string()),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            };
+            match gate {
                 Ok(g) => {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&g)?);
@@ -295,14 +385,27 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
                     }
                     Ok(0)
                 }
-                Err(EngineError::Refused(r)) => {
+                Err(r) => {
                     eprintln!("gate: REFUSED\n  {r}");
                     Ok(2)
                 }
-                Err(e) => Err(e.into()),
             }
         }),
         Cmd::Pull { json } => rt()?.block_on(async {
+            if let Some((mut client, vault)) = routed(&sel, &cfg, &ctx.dirs, "pull")? {
+                return match command(&mut client, method::PULL, json!({ "vault": vault }))? {
+                    Ok(r) => print_pull(
+                        &serde_json::from_value(r.report)?,
+                        Duration::from_millis(r.wall_ms),
+                        r.peak_rss_kib,
+                        json,
+                    ),
+                    Err(refusal) => {
+                        eprintln!("pull refused: {refusal}");
+                        Ok(2)
+                    }
+                };
+            }
             let engine = engine_for(&sel, &cfg, &ctx.dirs, &PushOpts::default())?;
             let t0 = Instant::now();
             let rep = match engine.pull_once().await {
@@ -313,85 +416,271 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
                 }
                 Err(e) => return Err(e.into()),
             };
-            let wall = t0.elapsed();
-            let rss = peak_rss_kib();
-            if json {
-                let mut v = serde_json::to_value(&rep)?;
-                v["wall_ms"] = (wall.as_millis() as u64).into();
-                v["peak_rss_kib"] = rss.into();
-                println!("{}", serde_json::to_string_pretty(&v)?);
-            } else {
-                println!("pull complete in {:.1}s", wall.as_secs_f64());
-                println!("  changes seen     {}", rep.changes);
-                println!(
-                    "  files written    {} ({:.1} MB)",
-                    rep.written,
-                    rep.bytes_written as f64 / 1e6
-                );
-                println!("  already on disk  {}", rep.adopted);
-                println!("  unchanged        {}", rep.unchanged);
-                println!("  deleted          {}", rep.deleted);
-                println!("  dirty (kept)     {}", rep.dirty);
-                println!("  conflicted       {}", rep.conflicted);
-                println!("  pending (retry)  {}", rep.pending);
-                println!("  skipped          {:?}", rep.skipped);
-                println!("  other docs       {}", rep.ignored_docs);
-                println!(
-                    "  chunks fetched   {} ({:.1} MB)",
-                    rep.chunks_fetched,
-                    rep.chunk_bytes as f64 / 1e6
-                );
-                println!("  size mismatches  {}", rep.size_mismatches);
-                println!("  chunk-id misses  {}", rep.chunk_id_mismatches);
-                if let Some(k) = rss {
-                    println!("  peak RSS         {:.1} MB", k as f64 / 1024.0);
-                }
-            }
-            Ok(if rep.dirty > 0 || rep.pending > 0 { 3 } else { 0 })
+            print_pull(&rep, t0.elapsed(), peak_rss_kib(), json)
         }),
         Cmd::Sync { json, push } => rt()?.block_on(async {
             two_way_allowed(&sel, "sync")?;
+            if let Some((mut client, vault)) = routed(&sel, &cfg, &ctx.dirs, "sync")? {
+                return run_routed(&mut client, method::SYNC, &vault, &push, json);
+            }
             let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             run_sync(&engine, json, false).await
         }),
         Cmd::Fetch { json, push } => rt()?.block_on(async {
             two_way_allowed(&sel, "fetch")?;
+            if let Some((mut client, vault)) = routed(&sel, &cfg, &ctx.dirs, "fetch")? {
+                return run_routed(&mut client, method::FETCH, &vault, &push, json);
+            }
             let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             run_sync(&engine, json, true).await
         }),
-        Cmd::Daemon { pull_only, push } => rt()?.block_on(async {
+        Cmd::Daemon { pull_only, push } => {
             let pull_only = pull_only || sel.mode == Mode::PullOnly;
-            let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
-            let (tx, rx) = tokio::sync::watch::channel(false);
-            let nudger = engine.clone();
-            tokio::spawn(async move {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut term = signal(SignalKind::terminate()).ok();
-                let mut usr1 = signal(SignalKind::user_defined1()).ok();
-                loop {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => break,
-                        _ = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending::<()>().await } } => break,
-                        // `kill -USR1`: reconnect now and rescan the vault ("sync now").
-                        _ = async { match usr1.as_mut() { Some(u) => { u.recv().await; } None => std::future::pending::<()>().await } } => {
-                            info!("SIGUSR1: reconnecting and rescanning");
-                            nudger.network_changed(true);
-                            continue;
-                        }
-                    }
-                }
-                info!("shutting down");
-                let _ = tx.send(true);
-            });
-            if pull_only {
-                engine.daemon_pull_only(rx).await.context("daemon")?;
-            } else {
-                engine.run(rx).await.context("daemon")?;
+            if let Some((client, vault)) = routed(&sel, &cfg, &ctx.dirs, "daemon")? {
+                bail!(
+                    "vault {vault} is already run by the lsync service (socket {}); follow it with `lsync --vault {vault} events`, sync it now with `lsync --vault {vault} sync-now`, or stop the service to run it here",
+                    client.path().display()
+                );
             }
-            Ok(0)
-        }),
-        Cmd::Probe(_) | Cmd::Account { .. } | Cmd::Vault { .. } => unreachable!("dispatched above"),
+            let run = run_config_for(&sel, &cfg, &ctx.dirs, &push, pull_only)?;
+            serve::daemon(serve::planned(run), VERSION)
+        }
+        Cmd::Probe(_)
+        | Cmd::Account { .. }
+        | Cmd::Vault { .. }
+        | Cmd::Serve { .. }
+        | Cmd::Pause { .. }
+        | Cmd::Resume { .. }
+        | Cmd::SyncNow { .. }
+        | Cmd::Reload { .. }
+        | Cmd::Events { .. } => unreachable!("dispatched above"),
     }
+}
+
+/// The vault a service verb names: `--vault` or `--profile` on the command
+/// line, never `LSYNC_PROFILE`; without one the verb is for every vault.
+fn cli_vault(cli: &Cli, m: &clap::ArgMatches) -> Result<Option<String>> {
+    let v = cli
+        .vault
+        .clone()
+        .or_else(|| cli.profile.clone().filter(|_| on_command_line(m, "profile")));
+    if let Some(n) = &v {
+        if config::looks_like_path(n) {
+            bail!("--vault takes a vault's name here, not a folder: {n}");
+        }
+    }
+    Ok(v)
+}
+
+fn vault_names(v: &serde_json::Value) -> String {
+    let names: Vec<&str> = v["vaults"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|n| n.as_str()).collect())
+        .unwrap_or_default();
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// `pause`, `resume`, `sync-now`: one request to the service.
+fn service_verb(vault: Option<String>, m: &str, done: &str, json: bool) -> Result<u8> {
+    let mut c = route::require()?;
+    let v = c
+        .call(m, json!({ "vault": vault }))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("{done}: {}", vault_names(&v));
+    }
+    Ok(0)
+}
+
+fn reload(json: bool) -> Result<u8> {
+    let mut c = route::require()?;
+    let v = c.call(method::RELOAD, json!({})).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let r: livesync_host::protocol::ReloadReport = serde_json::from_value(v.clone())?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        let show = |l: &[String]| if l.is_empty() { "-".to_string() } else { l.join(", ") };
+        println!("started    {}", show(&r.started));
+        println!("stopped    {}", show(&r.stopped));
+        println!("restarted  {}", show(&r.restarted));
+        println!("unchanged  {}", show(&r.unchanged));
+        for f in &r.failed {
+            println!("NOT RUNNING {}: {}", f.vault, f.message);
+        }
+    }
+    Ok(if r.failed.is_empty() { 0 } else { 3 })
+}
+
+/// Local wall-clock time of a timestamp, `HH:MM:SS`.
+fn clock(ms: i64) -> String {
+    let secs = (ms / 1000) as libc::time_t;
+    // SAFETY: zeroed tm is a valid out-parameter for localtime_r.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return ms.to_string();
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+/// An event's data as `key=value`, leaving out zeros and nulls.
+fn event_summary(data: &serde_json::Value) -> String {
+    let Some(m) = data.as_object() else {
+        return String::new();
+    };
+    m.iter()
+        .filter(|(_, v)| !(v.is_null() || v.as_u64() == Some(0) || v.as_array().is_some_and(|a| a.is_empty())))
+        .map(|(k, v)| match v {
+            serde_json::Value::String(s) => format!("{k}={s}"),
+            other => format!("{k}={other}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn events(vault: Option<String>, json: bool) -> Result<u8> {
+    use std::io::Write;
+    let mut c = route::require()?;
+    let mut out = std::io::stdout();
+    c.subscribe(vault.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    loop {
+        let e = c.next_event().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let line = if json {
+            serde_json::to_string(&e).unwrap_or_default()
+        } else {
+            format!(
+                "{} {:<12} {:<11} {}",
+                clock(e.ts),
+                e.vault.as_deref().unwrap_or("-"),
+                e.event,
+                event_summary(&e.data)
+            )
+        };
+        if writeln!(out, "{line}").and_then(|_| out.flush()).is_err() {
+            // The reader went away (a closed pipe).
+            return Ok(0);
+        }
+    }
+}
+
+/// `lsync status --all`: the service's view of every vault.
+fn status_all(json: bool) -> Result<u8> {
+    let mut c = route::require()?;
+    let st = route::status_of(&mut c, None)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&st)?);
+        return Ok(0);
+    }
+    println!(
+        "{:<16} {:<9} {:<10} {:<22} message",
+        "vault", "state", "mode", "last pull"
+    );
+    for v in &st.vaults {
+        let mode = v
+            .settings
+            .as_ref()
+            .map_or("-", |s| livesync_host::service::mode_name(s.pull_only));
+        let last = v.status.as_ref().and_then(|s| s.last_pull_ms);
+        let ago = last.map_or("-".to_string(), |ms| {
+            format!("{}s ago", (livesync_engine::vaultfs::now_ms() - ms) / 1000)
+        });
+        let message = v
+            .status
+            .as_ref()
+            .and_then(|s| s.safety_stop.as_ref().map(|t| format!("SAFETY STOP {t}")))
+            // A running engine's message is its mode, shown already.
+            .or_else(|| v.message.clone().filter(|m| m != mode))
+            .unwrap_or_default();
+        println!("{:<16} {:<9} {:<10} {:<22} {message}", v.name, v.state, mode, ago);
+    }
+    println!("(service at {})", c.path().display());
+    Ok(0)
+}
+
+/// The service and the vault name, when the service holds this command's
+/// vault (see `route`).
+fn routed(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, what: &str) -> Result<Option<(Client, String)>> {
+    let r = config::resolve(sel, cfg, dirs, true)?;
+    Ok(match route::route(&r, what, true)? {
+        Route::Local => None,
+        Route::Service { client, vault } => Some((client, vault)),
+    })
+}
+
+/// Run a command in the service. `Ok(Err(refusal))` when a gate refused.
+fn command(c: &mut Client, m: &str, p: serde_json::Value) -> Result<std::result::Result<CommandResult, String>> {
+    c.set_timeout(None);
+    match c.call(m, p) {
+        Ok(v) => Ok(Ok(serde_json::from_value(v)?)),
+        Err(e) if e.code() == Some(livesync_host::protocol::code::REFUSED) => Ok(Err(e.to_string())),
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
+/// `sync` or `fetch` in the service, printed as the one-shot prints it.
+fn run_routed(c: &mut Client, m: &str, vault: &str, push: &PushOpts, json: bool) -> Result<u8> {
+    let p = json!({
+        "vault": vault,
+        "allow_mass_delete": push.allow_mass_delete,
+        "remove_out_of_scope_copies": push.remove_out_of_scope_copies,
+    });
+    match command(c, m, p)? {
+        Ok(r) => print_sync(
+            &serde_json::from_value(r.report)?,
+            Duration::from_millis(r.wall_ms),
+            r.peak_rss_kib,
+            json,
+        ),
+        Err(refusal) => {
+            eprintln!("sync refused: {refusal}");
+            Ok(2)
+        }
+    }
+}
+
+/// What `lsync daemon` runs: this command's vault, as `engine_for` would
+/// open it.
+fn run_config_for(
+    sel: &Selected,
+    cfg: &FileConfig,
+    dirs: &Dirs,
+    push: &PushOpts,
+    pull_only: bool,
+) -> Result<livesync_host::RunConfig> {
+    let quiet = std::env::var("LSYNC_REBUILD_QUIET_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let r = config::resolve(sel, cfg, dirs, true)?;
+    let vault = absolute(&r.vault)?;
+    let state = absolute(&r.state_dir)?;
+    let index = state.join("index.sqlite");
+    if index.starts_with(&vault) && !index.strip_prefix(&vault)?.to_string_lossy().starts_with('.') {
+        bail!("the state directory must not be a visible folder inside the vault");
+    }
+    Ok(livesync_host::RunConfig {
+        id: sel.name.clone(),
+        vault_path: vault.display().to_string(),
+        state_dir: state.display().to_string(),
+        url: r.remote.url,
+        database: r.remote.database,
+        username: r.remote.username.unwrap_or_default(),
+        password: r.remote.password.unwrap_or_default(),
+        scope_mode: r.scope.mode,
+        scope_folders: r.scope.prefixes,
+        pull_only,
+        device_name: r.device_name.unwrap_or_default(),
+        ignore_regex: r.ignore_regex.unwrap_or_default(),
+        concurrency: r.concurrency,
+        max_size_mb: r.max_size_mb,
+        allow_mass_delete: push.allow_mass_delete,
+        remove_out_of_scope_copies: push.remove_out_of_scope_copies,
+        rebuild_quiet: quiet.map(Duration::from_secs),
+    })
 }
 
 /// A pull-only vault is never written to the remote from here either.
@@ -419,11 +708,14 @@ async fn run_sync(engine: &Engine, json: bool, fetch: bool) -> Result<u8> {
         }
         Err(e) => return Err(e.into()),
     };
-    let wall = t0.elapsed();
+    print_sync(&rep, t0.elapsed(), peak_rss_kib(), json)
+}
+
+fn print_sync(rep: &SyncReport, wall: Duration, rss: Option<u64>, json: bool) -> Result<u8> {
     if json {
-        let mut v = serde_json::to_value(&rep)?;
+        let mut v = serde_json::to_value(rep)?;
         v["wall_ms"] = (wall.as_millis() as u64).into();
-        v["peak_rss_kib"] = peak_rss_kib().into();
+        v["peak_rss_kib"] = rss.into();
         println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
         let (p, u) = (&rep.pull, &rep.push);
@@ -480,6 +772,42 @@ async fn run_sync(engine: &Engine, json: bool, fetch: bool) -> Result<u8> {
         || rep.push.failed > 0
         || rep.push.orphans_pushed > 0;
     Ok(if attention { 3 } else { 0 })
+}
+
+fn print_pull(rep: &PullReport, wall: Duration, rss: Option<u64>, json: bool) -> Result<u8> {
+    if json {
+        let mut v = serde_json::to_value(rep)?;
+        v["wall_ms"] = (wall.as_millis() as u64).into();
+        v["peak_rss_kib"] = rss.into();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("pull complete in {:.1}s", wall.as_secs_f64());
+        println!("  changes seen     {}", rep.changes);
+        println!(
+            "  files written    {} ({:.1} MB)",
+            rep.written,
+            rep.bytes_written as f64 / 1e6
+        );
+        println!("  already on disk  {}", rep.adopted);
+        println!("  unchanged        {}", rep.unchanged);
+        println!("  deleted          {}", rep.deleted);
+        println!("  dirty (kept)     {}", rep.dirty);
+        println!("  conflicted       {}", rep.conflicted);
+        println!("  pending (retry)  {}", rep.pending);
+        println!("  skipped          {:?}", rep.skipped);
+        println!("  other docs       {}", rep.ignored_docs);
+        println!(
+            "  chunks fetched   {} ({:.1} MB)",
+            rep.chunks_fetched,
+            rep.chunk_bytes as f64 / 1e6
+        );
+        println!("  size mismatches  {}", rep.size_mismatches);
+        println!("  chunk-id misses  {}", rep.chunk_id_mismatches);
+        if let Some(k) = rss {
+            println!("  peak RSS         {:.1} MB", k as f64 / 1024.0);
+        }
+    }
+    Ok(if rep.dirty > 0 || rep.pending > 0 { 3 } else { 0 })
 }
 
 async fn folders(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, json: bool) -> Result<u8> {

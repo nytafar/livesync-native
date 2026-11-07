@@ -43,6 +43,9 @@ BIN=$REPO/target/release/lsync
 RUN="$(date +%s)-$RANDOM"
 DB="lsync-it-$RUN"
 W=$(mktemp -d /tmp/lsync-it.XXXXXX)
+# The daemons' control socket stays in the work folder, never the user's
+# runtime folder (where a real `lsync serve` may listen).
+export LSYNC_RUNTIME_DIR="$W/run"
 RESULTS="$W/results.txt"
 PASS=0
 FAIL=0
