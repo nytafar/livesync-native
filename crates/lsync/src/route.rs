@@ -18,7 +18,7 @@ use crate::config::Resolved;
 use anyhow::{anyhow, bail, Result};
 use livesync_host::control::{client_sockets, current_uid, Client, ClientError};
 use livesync_host::paths::comparable;
-use livesync_host::protocol::{code, method, Settings, StatusResult, VaultView};
+use livesync_host::protocol::{check_hello, code, method, Hello, Settings, StatusResult, VaultView};
 use livesync_host::service::same_server;
 use std::path::Path;
 use std::time::Duration;
@@ -39,12 +39,12 @@ pub enum Route {
 }
 
 /// Check that the service lets this user in and can do `needs` (methods).
-fn handshake(client: &mut Client, needs: &[&str]) -> Result<()> {
+fn handshake(client: &mut Client, needs: &[&str]) -> Result<Hello> {
     client.set_timeout(Some(STATUS_TIMEOUT));
     let r = client.hello(needs);
     client.set_timeout(None);
     match r {
-        Ok(_) => Ok(()),
+        Ok(h) => Ok(h),
         Err(e) if e.code() == Some(code::FORBIDDEN) => bail!(
             "the lsync service at {} does not let this user (uid {}) use it: {e}. Run lsync as the service's user, or join the service's socket group; or set LSYNC_RUNTIME_DIR to a folder of your own to run commands without it",
             client.path().display(),
@@ -239,12 +239,17 @@ pub fn route(r: &Resolved, what: &str, settings: bool) -> Result<Route> {
         "allow-deletes" => Some(method::ALLOW_DELETES),
         _ => None,
     };
-    let needs: Vec<&str> = std::iter::once(method::STATUS).chain(runs).collect();
-    handshake(&mut client, &needs)?;
+    // The method only matters when the service holds the vault: a service
+    // older than this lsync still lets it run the others here.
+    let hello = handshake(&mut client, &[method::STATUS])?;
     let st = status_of(&mut client, None)?;
     let Some(v) = find(&st, r) else {
         return Ok(Route::Local);
     };
+    let needs: Vec<&str> = runs.into_iter().collect();
+    if let Err(e) = check_hello(&hello, &needs) {
+        bail!("vault {} is run by the lsync service, but {e}", v.name);
+    }
     let diff = if settings {
         differences(r, v.settings.as_ref().expect("found by its settings"))
     } else {

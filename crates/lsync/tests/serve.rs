@@ -709,9 +709,12 @@ fn allow_deletes_confirms_the_stop_that_was_read_here_or_in_the_service() {
     assert_eq!(m.run(&["--vault", "notes", "sync"]).status.code(), Some(3));
     let stop = stop_of().expect("a stop");
     assert!(m.ok(&["--vault", "notes", "status"]).contains("lsync allow-deletes"));
-    // Another stop's text: nothing allowed, exit 2.
+    let st = m.json(&["--vault", "notes", "status", "--json"]);
+    assert_eq!(st["mass_delete_allowed"], false, "{st}");
+    assert_eq!(st["mass_delete_waits"], false, "{st}");
+    // Another stop's text: nothing allowed, exit 5 (2 is a gate's refusal).
     let out = m.run(&["--vault", "notes", "allow-deletes", "--stop", "1 an older stop"]);
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(5));
     assert!(String::from_utf8_lossy(&out.stderr).contains("25 of 30"));
     assert!((0..25).all(|i| live(&format!("Notes/f{i:02}.md"))));
     // The stop read: deleted here, by a sync.
@@ -747,7 +750,7 @@ fn allow_deletes_confirms_the_stop_that_was_read_here_or_in_the_service() {
     };
     assert!(stop.contains("25 of 35"), "{stop}");
     let out = m.run(&["--vault", "notes", "allow-deletes", "--stop", "1 an older stop"]);
-    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(5), "{}", String::from_utf8_lossy(&out.stderr));
     let r = m.json(&["--vault", "notes", "allow-deletes", "--stop", &stop, "--json"]);
     assert_eq!(r["vaults"], serde_json::json!(["notes"]));
     wait_until("the service's confirmed deletions", || {
@@ -757,4 +760,68 @@ fn allow_deletes_confirms_the_stop_that_was_read_here_or_in_the_service() {
     assert!((55..60).all(|i| live(&format!("Notes/f{i:02}.md"))));
     assert!(svc.log().contains("confirmed by a client"), "{}", svc.log());
     assert_eq!(svc.stop(), Some(0));
+}
+
+/// #11 review, finding 6: a service older than this lsync, without the
+/// method a command needs, does not stop the command for a vault it does
+/// not run: that runs here. For a vault it runs, the command says why not.
+#[test]
+fn an_older_service_without_a_method_still_lets_other_vaults_run_here() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    let rt = runtime();
+    let mock = rt.block_on(Mock::start());
+    mock.put_text("Notes/a.md", &["note a"]);
+    let m = Machine::with_vault(&mock);
+    m.ok(&["--vault", "notes", "sync"]);
+    let run = m.root.join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(m.socket()).unwrap();
+    // The vaults it runs: none, then `notes`.
+    let serves = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let folder = m.folder("notes").display().to_string();
+    {
+        let serves = serves.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { return };
+                let mut out = conn.try_clone().unwrap();
+                for line in BufReader::new(conn).lines() {
+                    let Ok(line) = line else { break };
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    let result = match req["method"].as_str().unwrap() {
+                        "hello" => serde_json::json!({
+                            "protocol": livesync_host::protocol::PROTOCOL,
+                            "version": "0.0.1-old",
+                            "pid": 1,
+                            "methods": ["hello", "status", "sync", "pull", "fetch", "connect"],
+                            "config": "",
+                        }),
+                        "status" if serves.load(std::sync::atomic::Ordering::SeqCst) => serde_json::json!({
+                            "vaults": [{"name": "notes", "state": "running", "enabled": true,
+                                        "settings": {"folder": folder}}]
+                        }),
+                        "status" => serde_json::json!({"vaults": []}),
+                        _ => Value::Null,
+                    };
+                    let resp = serde_json::json!({"v": 1, "id": req["id"], "result": result});
+                    use std::io::Write;
+                    if writeln!(out, "{resp}").is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    let out = m.run(&["--vault", "notes", "allow-deletes", "--stop", "1 a stop"]);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("no mass-delete safety stop is shown"), "{err}");
+    serves.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = m.fails(&["--vault", "notes", "allow-deletes", "--stop", "1 a stop"]);
+    assert!(
+        err.contains("run by the lsync service") && err.contains("allow-deletes"),
+        "{err}"
+    );
 }

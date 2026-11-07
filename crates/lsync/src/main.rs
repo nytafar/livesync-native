@@ -348,20 +348,22 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         Cmd::Status { json, .. } => {
             let r = config::resolve(&sel, &cfg, &ctx.dirs, false)?;
             let index_path = r.state_dir.join("index.sqlite");
-            // A confirmed stop the service has not applied yet: (allowed, waits).
-            let mut confirmed = (false, false);
             let st = match route::route(&r, "status", false)? {
                 Route::Service { mut client, vault, .. } => {
                     let view = route::status_of(&mut client, Some(&vault))?.vaults.into_iter().next();
-                    if let Some(v) = &view {
-                        confirmed = (v.mass_delete_allowed, v.mass_delete_waits);
-                    }
+                    // A service older than these fields in the status has
+                    // them in its vault view.
+                    let confirmed = view
+                        .as_ref()
+                        .map_or((false, false), |v| (v.mass_delete_allowed, v.mass_delete_waits));
                     let Some(mut st) = view.and_then(|v| v.status) else {
                         bail!("no index at {} yet; run `lsync pull` first", index_path.display());
                     };
                     // As this command names them, like the one-shot status.
                     st.vault = r.vault.display().to_string();
                     st.index = index_path.display().to_string();
+                    st.mass_delete_allowed |= confirmed.0;
+                    st.mass_delete_waits |= confirmed.1;
                     st
                 }
                 Route::Local => {
@@ -376,13 +378,6 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
                 println!("{}", serde_json::to_string_pretty(&st)?);
             } else {
                 print_status(&st);
-                match confirmed {
-                    (true, true) => println!(
-                        "ALLOWED         waiting: some of the stop's files cannot be checked now (see the local issues); nothing is deleted until they can be"
-                    ),
-                    (true, false) => println!("ALLOWED         the stop's files are deleted at the next full pass"),
-                    _ => {}
-                }
             }
             Ok(0)
         }
@@ -771,6 +766,9 @@ fn run_config_for(
     })
 }
 
+/// `allow-deletes`: the stop shown is not the one given; nothing was allowed.
+const EXIT_STOP_CHANGED: u8 = 5;
+
 /// The stop to confirm: the one given, or the one shown after a yes on the
 /// terminal. `None` when no stop is shown (and none given).
 fn stop_to_confirm(shown: Option<String>, given: Option<String>) -> Result<Option<String>> {
@@ -792,8 +790,10 @@ fn stop_to_confirm(shown: Option<String>, given: Option<String>) -> Result<Optio
 
 /// `lsync allow-deletes`: confirm the vault's mass-delete stop, in the
 /// service when it runs the vault (its next full pass deletes the files),
-/// else here, with a sync that deletes them. Exit 1 when no stop is shown,
-/// 2 when the stop changed since it was read.
+/// else here, with a sync that deletes them. The confirmation is kept in the
+/// index until a pass applies it. Exit 1 when no stop is shown,
+/// [`EXIT_STOP_CHANGED`] when the stop changed since it was read (2 stays a
+/// gate's refusal of the sync).
 async fn allow_deletes(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, given: Option<String>, json: bool) -> Result<u8> {
     two_way_allowed(sel, "allow-deletes")?;
     let r = config::resolve(sel, cfg, dirs, false)?;
@@ -818,14 +818,14 @@ async fn allow_deletes(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, given: Opt
                     if json {
                         println!("{}", serde_json::to_string_pretty(&v)?);
                     } else {
-                        println!("allowed: the lsync service deletes the files the stop listed at the next full pass of {vault}, which starts now");
+                        println!("allowed: the lsync service deletes the files the stop listed at the next full pass of {vault}, which starts now. If some of them cannot be checked then (a folder that cannot be read), it waits until they can, and `lsync status` says so");
                     }
                     Ok(0)
                 }
                 Err(e) if e.code() == Some(code::NO_STOP) => none(),
                 Err(e) if e.code() == Some(code::STOP_CHANGED) => {
                     eprintln!("{e}");
-                    Ok(2)
+                    Ok(EXIT_STOP_CHANGED)
                 }
                 Err(e) => Err(anyhow::anyhow!("{e}")),
             }
@@ -837,12 +837,22 @@ async fn allow_deletes(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, given: Opt
                 return none();
             };
             match engine.allow_mass_delete_once(&stop)? {
-                Confirmation::Allowed => run_sync(&engine, json, false).await,
+                Confirmation::Allowed => {
+                    let code = run_sync(&engine, json, false)
+                        .await
+                        .context("allowed, and the confirmation is kept for the next sync; but this sync failed")?;
+                    if engine.mass_delete_waits() {
+                        eprintln!("allowed, but waiting: some of the files the stop listed cannot be checked now (see `lsync status`), so none was deleted on it. The confirmation is kept: the next sync (or the service) that can check them all deletes them");
+                    } else if engine.mass_delete_allowed() {
+                        eprintln!("allowed, but not applied yet: this sync did not get to the deletions. The confirmation is kept for the next sync that does");
+                    }
+                    Ok(code)
+                }
                 Confirmation::NoStop => none(),
                 Confirmation::Changed(now) => {
                     let now = now.split_once(' ').map_or(now.as_str(), |(_, t)| t);
                     eprintln!("the safety stop changed after it was read, so nothing was allowed; it now says: {now}");
-                    Ok(2)
+                    Ok(EXIT_STOP_CHANGED)
                 }
             }
         }
@@ -1300,6 +1310,13 @@ fn print_status(s: &livesync_engine::Status) {
     }
     if let Some(stop) = &s.safety_stop {
         println!("SAFETY STOP     {stop} (restore the files, or `lsync allow-deletes` to delete exactly these)");
+    }
+    match (s.mass_delete_allowed, s.mass_delete_waits) {
+        (true, true) => println!(
+            "ALLOWED         waiting: some of the stop's files cannot be checked now (see the local issues); nothing is deleted until they can be"
+        ),
+        (true, false) => println!("ALLOWED         the stop's files are deleted at the next full pass"),
+        _ => {}
     }
     if let Some(stop) = &s.upstream_stop {
         println!("UPSTREAM STOP   {stop}");
