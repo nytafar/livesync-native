@@ -29,9 +29,10 @@
 //! Chunks always go before metadata.
 
 use crate::engine::{meta_keys as meta, Engine, EngineError};
-use crate::index::{FileRow, State};
+use crate::index::{FileRow, Origin, RevisionRow, State};
 use crate::vaultfs::{self, DiskState, RemoveOutcome};
 use crate::watcher::{NoWatcher, WatchEvent, Watcher};
+use livesync_model::doc::{classify_doc, Classified};
 use livesync_model::path::{classify_path, path_to_id};
 use livesync_model::splitter::chunk_file;
 use livesync_model::FileKind;
@@ -1309,13 +1310,18 @@ impl Engine {
         rep.chunks_uploaded += n;
         rep.chunk_bytes += b;
         let children: Vec<String> = chunked.chunks.iter().map(|(id, _)| id.clone()).collect();
+        let kind = match chunked.kind {
+            FileKind::Plain => "plain",
+            FileKind::Binary => "newnote",
+        };
+        let ctime = ctime_ms(&md);
         let doc = json!({
             "_id": doc_id,
             "path": doc_path,
-            "ctime": ctime_ms(&md),
+            "ctime": ctime,
             "mtime": disk.mtime_ms,
             "size": chunked.size,
-            "type": match chunked.kind { FileKind::Plain => "plain", FileKind::Binary => "newnote" },
+            "type": kind,
             "children": children,
             "eden": {},
         });
@@ -1349,7 +1355,7 @@ impl Engine {
                 written.rev
             );
         }
-        if written.adopted {
+        if written.adopted.is_some() {
             rep.adopted += 1;
         } else {
             rep.pushed += 1;
@@ -1371,6 +1377,32 @@ impl Engine {
         if row.is_none() {
             ctx.new_files.entry(hash.clone()).or_default().push(doc_path.clone());
         }
+        let now = vaultfs::now_ms();
+        let revision = match written.adopted.as_ref().map(classify_doc) {
+            // A version the remote already had (same chunks and type): its
+            // own fields, and not known to be ours.
+            Some(Classified::File(cur)) => RevisionRow::of_doc(&cur, Some(hash.clone()), Origin::Remote, true, now),
+            _ => RevisionRow {
+                doc_id: doc_id.clone(),
+                rev: written.rev.clone(),
+                path: doc_path.clone(),
+                kind: Some(kind.into()),
+                children: children.clone(),
+                eden: Default::default(),
+                mtime: disk.mtime_ms,
+                ctime: Some(ctime),
+                size: chunked.size,
+                deleted: false,
+                hash: Some(hash.clone()),
+                origin: if written.adopted.is_some() {
+                    Origin::Remote
+                } else {
+                    Origin::Local
+                },
+                applied: true,
+                seen_ms: now,
+            },
+        };
         let new_row = FileRow {
             path: doc_path.clone(),
             doc_id: doc_id.clone(),
@@ -1385,13 +1417,16 @@ impl Engine {
                 .then(|| "local edit saved as a conflicting revision; resolve with an official client".into()),
         };
         self.with_index(|ix| {
-            if let Some(r) = &row {
-                if r.doc_id != doc_id {
-                    ix.delete_doc(&r.doc_id)?;
+            ix.atomically(|ix| {
+                if let Some(r) = &row {
+                    if r.doc_id != doc_id {
+                        ix.delete_doc(&r.doc_id)?;
+                    }
                 }
-            }
-            ix.upsert(&new_row)?;
-            ix.remove_pending(&doc_id)
+                ix.upsert(&new_row)?;
+                ix.record_revision(&revision)?;
+                ix.remove_pending(&doc_id)
+            })
         })?;
         debug!("pushed {doc_path} as {}", written.rev);
         Ok(issue)
@@ -1542,7 +1577,7 @@ impl Engine {
                                 return Ok(MetaWrite::Written(Written {
                                     rev: cur["_rev"].as_str().unwrap_or_default().to_string(),
                                     branched: has_conflicts(&cur),
-                                    adopted: true,
+                                    adopted: Some(cur.clone()),
                                     created: false,
                                 }));
                             }
@@ -1568,7 +1603,7 @@ impl Engine {
         Ok(Written {
             rev,
             branched: true,
-            adopted: false,
+            adopted: None,
             created: false,
         })
     }
@@ -1600,7 +1635,7 @@ impl Engine {
         Ok(Written {
             rev,
             branched: true,
-            adopted: false,
+            adopted: None,
             created: false,
         })
     }
@@ -1656,7 +1691,7 @@ impl Engine {
                         return Ok(MetaWrite::Written(Written {
                             rev,
                             branched: has_conflicts(&cur),
-                            adopted: true,
+                            adopted: Some(cur.clone()),
                             created: false,
                         }));
                     }
@@ -2347,9 +2382,22 @@ impl Engine {
         match self.inner.couch.put_doc(&d).await? {
             PutOutcome::Saved { rev } => {
                 debug!("deleted {} remotely ({rev})", r.path);
+                // The soft deletion keeps the body it was made from.
+                d["_rev"] = json!(rev);
+                let now = vaultfs::now_ms();
+                let revision = match classify_doc(&d) {
+                    Classified::File(f) => RevisionRow::of_doc(&f, None, Origin::Local, true, now),
+                    _ => RevisionRow {
+                        origin: Origin::Local,
+                        ..RevisionRow::tombstone(&r.doc_id, &rev, &r.path, true, now)
+                    },
+                };
                 self.with_index(|ix| {
-                    ix.delete_doc(&r.doc_id)?;
-                    ix.remove_pending(&r.doc_id)
+                    ix.atomically(|ix| {
+                        ix.delete_doc(&r.doc_id)?;
+                        ix.record_revision(&revision)?;
+                        ix.remove_pending(&r.doc_id)
+                    })
                 })?;
                 rep.deleted += 1;
                 Ok(())
@@ -2646,8 +2694,8 @@ struct Written {
     rev: String,
     /// Stored as a branch beside the remote's version.
     branched: bool,
-    /// The remote already had exactly this content.
-    adopted: bool,
+    /// The remote already had exactly this content: its document.
+    adopted: Option<Value>,
     /// No live document existed: created (or a deletion replaced).
     created: bool,
 }
@@ -2657,7 +2705,7 @@ impl Written {
         Written {
             rev,
             branched: false,
-            adopted: false,
+            adopted: None,
             created: false,
         }
     }

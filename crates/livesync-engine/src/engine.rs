@@ -2,7 +2,7 @@
 //! milestone registration. The push side lives in `push.rs`.
 
 use crate::fsrules::{FsRules, PROBED_CHARS};
-use crate::index::{FileRow, Index, LocalIssue, PendingRow, State};
+use crate::index::{FileRow, Index, LocalIssue, Origin, PendingRow, RevisionRow, State};
 use crate::platform::{self, Holder, VaultLock, VaultLockError};
 use crate::vaultfs::{self, DiskState, Expect, LockError, LockFile, RemoveOutcome, WriteError};
 use futures::stream::{self, StreamExt};
@@ -1127,7 +1127,8 @@ impl Engine {
         }
 
         let mut writes: Vec<FileDoc> = Vec::new();
-        let mut deletes: Vec<(String, Option<String>)> = Vec::new();
+        // With the document when it is a soft deletion (it keeps its body).
+        let mut deletes: Vec<(String, Option<String>, Option<FileDoc>)> = Vec::new();
         // Deleted winners that still have live conflicting revisions.
         let mut conflicted_deletes: Vec<FileDoc> = Vec::new();
         let mut skips: Vec<(FileDoc, Skip)> = Vec::new();
@@ -1146,7 +1147,7 @@ impl Engine {
                         ignored += 1;
                     } else {
                         let rev = doc.get("_rev").and_then(Value::as_str).map(str::to_string);
-                        deletes.push((id, rev));
+                        deletes.push((id, rev, None));
                     }
                 }
                 Classified::LegacyNote { id, path } => {
@@ -1192,7 +1193,7 @@ impl Engine {
                     } else if f.deleted && !f.conflicts.is_empty() {
                         conflicted_deletes.push(f);
                     } else if f.deleted {
-                        deletes.push((f.id, Some(f.rev)));
+                        deletes.push((f.id.clone(), Some(f.rev.clone()), Some(f)));
                     } else if let Some(s) = self.skip_reason(&f) {
                         skips.push((f, s));
                     } else {
@@ -1206,8 +1207,8 @@ impl Engine {
         // Deletions and skips are quick, local-only work.
         let this = self.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            for (id, rev) in deletes {
-                this.apply_delete(&id, rev.as_deref())?;
+            for (id, rev, doc) in deletes {
+                this.apply_delete(&id, rev.as_deref(), doc.as_ref())?;
             }
             for f in conflicted_deletes {
                 this.apply_conflicted_delete(&f)?;
@@ -1292,41 +1293,80 @@ impl Engine {
             }
             other => other.label().to_string(),
         };
+        // Seen, not applied. A legacy note's body is not read, so there is
+        // nothing to rebuild it from.
+        let seen = (!matches!(s, Skip::Legacy))
+            .then(|| RevisionRow::of_doc(f, None, Origin::Remote, false, vaultfs::now_ms()));
         self.with_index(|ix| {
-            let row = match ix.by_doc(&f.id)? {
-                // Keep what we know about the file on disk; just stop syncing it.
-                Some(mut b) if b.path == f.path => {
-                    b.state = State::Skipped;
-                    b.note = Some(note);
-                    b
+            ix.atomically(|ix| {
+                let row = match ix.by_doc(&f.id)? {
+                    // Keep what we know about the file on disk; just stop syncing it.
+                    Some(mut b) if b.path == f.path => {
+                        b.state = State::Skipped;
+                        b.note = Some(note);
+                        b
+                    }
+                    _ => FileRow {
+                        path: f.path.clone(),
+                        doc_id: f.id.clone(),
+                        base_rev: None,
+                        base_children: vec![],
+                        disk_mtime: None,
+                        disk_size: None,
+                        disk_hash: None,
+                        state: State::Skipped,
+                        note: Some(note),
+                    },
+                };
+                ix.upsert(&row)?;
+                if let Some(r) = &seen {
+                    ix.record_revision(r)?;
                 }
-                _ => FileRow {
-                    path: f.path.clone(),
-                    doc_id: f.id.clone(),
-                    base_rev: None,
-                    base_children: vec![],
-                    disk_mtime: None,
-                    disk_size: None,
-                    disk_hash: None,
-                    state: State::Skipped,
-                    note: Some(note),
-                },
-            };
-            ix.upsert(&row)?;
-            ix.remove_pending(&f.id)
+                ix.remove_pending(&f.id)
+            })
         })
     }
 
-    fn apply_delete(&self, id: &str, rev: Option<&str>) -> Result<()> {
+    fn apply_delete(&self, id: &str, rev: Option<&str>, doc: Option<&FileDoc>) -> Result<()> {
         let base = self.with_index(|ix| ix.by_doc(id))?;
         let Some(mut b) = base else {
             return self.with_index(|ix| ix.remove_pending(id));
         };
+        // The deletion's revision for the history. A tombstone has no body:
+        // it is filed under the path the index knows the document by.
+        let known_path = b.path.clone();
+        let deletion = move |applied: bool| -> Option<RevisionRow> {
+            let now = vaultfs::now_ms();
+            match (doc, rev) {
+                (Some(d), _) => Some(RevisionRow::of_doc(d, None, Origin::Remote, applied, now)),
+                (None, Some(r)) => Some(RevisionRow::tombstone(id, r, &known_path, applied, now)),
+                (None, None) => None,
+            }
+        };
+        let record = |ix: &Index, r: Option<RevisionRow>| match r {
+            Some(r) => ix.record_revision(&r),
+            None => Ok(()),
+        };
+        // The local file survives the deletion: seen, not applied.
+        let keep_file = |b: &FileRow| -> Result<()> {
+            let seen = deletion(false);
+            self.with_index(|ix| {
+                ix.atomically(|ix| {
+                    ix.upsert(b)?;
+                    record(ix, seen)?;
+                    ix.remove_pending(id)
+                })
+            })
+        };
         if matches!(b.state, State::Skipped | State::OutOfScope) {
             // No file of ours at this path (or the user moved it away).
+            let seen = deletion(true);
             return self.with_index(|ix| {
-                ix.delete_doc(id)?;
-                ix.remove_pending(id)
+                ix.atomically(|ix| {
+                    ix.delete_doc(id)?;
+                    record(ix, seen)?;
+                    ix.remove_pending(id)
+                })
             });
         }
         if b.state == State::Conflicted {
@@ -1347,10 +1387,7 @@ impl Engine {
             // No hash to match any more: a replayed deletion (a full fetch,
             // a rebuild) or a remote change sees a diverged file and keeps it.
             b.disk_hash = None;
-            return self.with_index(|ix| {
-                ix.upsert(&b)?;
-                ix.remove_pending(id)
-            });
+            return keep_file(&b);
         }
         let target = self.inner.cfg.vault.join(&b.path);
         let outcome = match &b.disk_hash {
@@ -1369,9 +1406,13 @@ impl Engine {
             RemoveOutcome::Removed | RemoveOutcome::AlreadyGone => {
                 self.inner.report.lock().unwrap().deleted += 1;
                 debug!("deleted {}", b.path);
+                let applied = deletion(true);
                 self.with_index(|ix| {
-                    ix.delete_doc(id)?;
-                    ix.remove_pending(id)
+                    ix.atomically(|ix| {
+                        ix.delete_doc(id)?;
+                        record(ix, applied)?;
+                        ix.remove_pending(id)
+                    })
                 })?;
                 self.requeue_collisions(&b.path)
             }
@@ -1382,10 +1423,7 @@ impl Engine {
                 self.put_back(&b.path, displaced, None);
                 b.state = State::Dirty;
                 b.note = Some("deleted remotely; a local edit made meanwhile was kept".into());
-                self.with_index(|ix| {
-                    ix.upsert(&b)?;
-                    ix.remove_pending(id)
-                })
+                keep_file(&b)
             }
             RemoveOutcome::Diverged { .. } => {
                 warn!(
@@ -1395,10 +1433,7 @@ impl Engine {
                 self.inner.report.lock().unwrap().dirty += 1;
                 b.state = State::Dirty;
                 b.note = Some("deleted remotely; local changes kept".into());
-                self.with_index(|ix| {
-                    ix.upsert(&b)?;
-                    ix.remove_pending(id)
-                })
+                keep_file(&b)
             }
         }
     }
@@ -1414,10 +1449,14 @@ impl Engine {
         };
         match b.state {
             State::Skipped | State::OutOfScope => {
+                let gone = RevisionRow::of_doc(f, None, Origin::Remote, true, vaultfs::now_ms());
                 return self.with_index(|ix| {
-                    ix.delete_doc(&f.id)?;
-                    ix.remove_pending(&f.id)
-                })
+                    ix.atomically(|ix| {
+                        ix.delete_doc(&f.id)?;
+                        ix.record_revision(&gone)?;
+                        ix.remove_pending(&f.id)
+                    })
+                });
             }
             // An unpushed local edit: the push side writes it as a branch.
             State::Dirty => return self.with_index(|ix| ix.remove_pending(&f.id)),
@@ -1441,9 +1480,13 @@ impl Engine {
         self.inner.report.lock().unwrap().conflicted += 1;
         b.state = State::Conflicted;
         b.note = Some(note);
+        let seen = RevisionRow::of_doc(f, None, Origin::Remote, false, vaultfs::now_ms());
         self.with_index(|ix| {
-            ix.upsert(&b)?;
-            ix.remove_pending(&f.id)
+            ix.atomically(|ix| {
+                ix.upsert(&b)?;
+                ix.record_revision(&seen)?;
+                ix.remove_pending(&f.id)
+            })
         })
     }
 
@@ -1603,9 +1646,17 @@ impl Engine {
                     let mut b = b.clone();
                     b.state = State::Conflicted;
                     b.note = Some(conflict_note(&doc));
+                    // The winner, when it is another leaf: seen, not applied.
+                    let seen = (b.base_rev.as_deref() != Some(doc.rev.as_str()))
+                        .then(|| RevisionRow::of_doc(&doc, None, Origin::Remote, false, vaultfs::now_ms()));
                     self.with_index(|ix| {
-                        ix.upsert(&b)?;
-                        ix.remove_pending(&doc.id)
+                        ix.atomically(|ix| {
+                            ix.upsert(&b)?;
+                            if let Some(r) = &seen {
+                                ix.record_revision(r)?;
+                            }
+                            ix.remove_pending(&doc.id)
+                        })
                     })?;
                     let mut r = self.inner.report.lock().unwrap();
                     r.conflicted += 1;
@@ -1775,6 +1826,27 @@ impl Engine {
             state,
             note: note.clone(),
         };
+        // The revision for the history: applied, or only seen when a local
+        // edit keeps it off the disk.
+        let revision = |applied: bool| {
+            RevisionRow::of_doc(
+                &doc,
+                Some(remote_hash.clone()),
+                Origin::Remote,
+                applied,
+                vaultfs::now_ms(),
+            )
+        };
+        let commit = |row: &FileRow, applied: bool| -> Result<()> {
+            let r = revision(applied);
+            self.with_index(|ix| {
+                ix.atomically(|ix| {
+                    ix.upsert(row)?;
+                    ix.record_revision(&r)?;
+                    ix.remove_pending(&doc.id)
+                })
+            })
+        };
         let count = |f: fn(&mut PullReport)| f(&mut self.inner.report.lock().unwrap());
         // Case-collision guard: on a filesystem that folds names, never let
         // a second document land on the file of another.
@@ -1795,10 +1867,7 @@ impl Engine {
         // Already identical on disk: adopt without touching the file.
         if let Some(l) = &local {
             if l.hash == remote_hash {
-                self.with_index(|ix| {
-                    ix.upsert(&row_for(l))?;
-                    ix.remove_pending(&doc.id)
-                })?;
+                commit(&row_for(l), true)?;
                 self.cleanup_old_path(base.as_ref(), &doc.path, l);
                 count(|r| r.adopted += 1);
                 return Ok(());
@@ -1815,6 +1884,7 @@ impl Engine {
                 &doc,
                 base,
                 "local file differs from the last synced version; remote change not applied",
+                &remote_hash,
             );
         }
         let expect = match &local {
@@ -1850,17 +1920,11 @@ impl Engine {
                         note: Some("local edit during a remote update".into()),
                     },
                 };
-                self.with_index(|ix| {
-                    ix.upsert(&row)?;
-                    ix.remove_pending(&doc.id)
-                })
+                commit(&row, false)
             }
             Ok(w) => {
                 let disk = w.state;
-                self.with_index(|ix| {
-                    ix.upsert(&row_for(&disk))?;
-                    ix.remove_pending(&doc.id)
-                })?;
+                commit(&row_for(&disk), true)?;
                 self.cleanup_old_path(base.as_ref(), &doc.path, &disk);
                 let mut r = self.inner.report.lock().unwrap();
                 r.written += 1;
@@ -1872,6 +1936,7 @@ impl Engine {
                 &doc,
                 base,
                 "local file changed during the write; remote change not applied",
+                &remote_hash,
             ),
             Err(WriteError::Io { source, .. }) => self.io_failure(&doc, &source),
         }
@@ -1967,7 +2032,16 @@ impl Engine {
         })
     }
 
-    fn mark_dirty(&self, doc: &FileDoc, base: Option<FileRow>, why: &str) -> Result<()> {
+    /// The local file holds an edit: the remote revision (whose content
+    /// hashes to `remote_hash`) is recorded as seen, not applied.
+    fn mark_dirty(&self, doc: &FileDoc, base: Option<FileRow>, why: &str, remote_hash: &str) -> Result<()> {
+        let seen = RevisionRow::of_doc(
+            doc,
+            Some(remote_hash.to_string()),
+            Origin::Remote,
+            false,
+            vaultfs::now_ms(),
+        );
         warn!("{}: {why}", doc.path);
         self.inner.report.lock().unwrap().dirty += 1;
         let note = format!("{why} (remote {})", doc.rev);
@@ -1990,8 +2064,11 @@ impl Engine {
             },
         };
         self.with_index(|ix| {
-            ix.upsert(&row)?;
-            ix.remove_pending(&doc.id)
+            ix.atomically(|ix| {
+                ix.upsert(&row)?;
+                ix.record_revision(&seen)?;
+                ix.remove_pending(&doc.id)
+            })
         })
     }
 
