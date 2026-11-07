@@ -1935,6 +1935,40 @@ async fn a_few_deletions_now_and_then_go_through_after_the_hold() {
 }
 
 /// #10: deletions that came from the server are not this device's: 30 of
+/// Files the daemon pulled are watched as any other: one deleted and one
+/// edited here go out without waiting for a rescan. On macOS FSEvents
+/// reports nothing for a file that was ever a hard link, so a pulled file
+/// must not be linked into place.
+#[tokio::test]
+async fn a_pulled_file_deleted_or_edited_here_is_seen_by_the_watcher() {
+    let env = Env::new().await;
+    env.mock.put_text("pulled.md", &["from the server"]);
+    env.mock.put_text("edited.md", &["v1"]);
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    wait_until("both pulled", || {
+        env.read("pulled.md").is_some() && env.read("edited.md").is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::remove_file(env.vault().join("pulled.md")).unwrap();
+    env.write("edited.md", b"edited here");
+    wait_until("the deletion and the edit pushed", || {
+        env.deleted("pulled.md") && env.remote("edited.md").as_deref() == Some(&b"edited here"[..])
+    })
+    .await;
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}
+
 /// 40 deleted remotely, beside 5 deleted here, do not trip the stop, and
 /// the local ones go out.
 #[tokio::test]

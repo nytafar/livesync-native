@@ -168,9 +168,10 @@ fn open_expected(target: &Path, expect: &Expect) -> Result<Option<File>, WriteEr
 /// The old file is held open across the swap and hashed again afterwards,
 /// so an edit that lands between the check and the rename is caught and
 /// returned in [`Written::displaced`] instead of being lost. A new file is
-/// linked into place without replacing anything where the filesystem
-/// supports hard links; elsewhere (Android's FUSE) the absence check runs
-/// right before the rename.
+/// moved into place by a rename that never replaces anything (see
+/// [`rename_noreplace`]); where the kernel or filesystem cannot do that, it
+/// is linked into place, and where there are no hard links either
+/// (Android's FUSE) the absence check runs right before the rename.
 pub fn atomic_write(target: &Path, bytes: &[u8], mtime_ms: i64, expect: &Expect) -> Result<Written, WriteError> {
     let dir = target.parent().ok_or_else(|| WriteError::Io {
         path: target.to_path_buf(),
@@ -193,22 +194,31 @@ pub fn atomic_write(target: &Path, bytes: &[u8], mtime_ms: i64, expect: &Expect)
         f.sync_all().map_err(io_err(&tmp))?;
         drop(f);
         let old = open_expected(target, expect)?;
+        let diverged = || WriteError::Diverged {
+            expected: expect.clone(),
+            found: read_state(target).ok().flatten().map(|s| s.hash),
+        };
         match old {
-            None => match fs::hard_link(&tmp, target) {
-                Ok(()) => {
-                    let _ = fs::remove_file(&tmp);
-                    Ok(None)
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(WriteError::Diverged {
-                    expected: expect.clone(),
-                    found: read_state(target).ok().flatten().map(|s| s.hash),
-                }),
-                Err(_) => {
-                    // No hard links here: check once more, then rename.
-                    open_expected(target, expect)?;
-                    fs::rename(&tmp, target).map_err(io_err(target))?;
-                    Ok(None)
-                }
+            // An exclusive rename first: a file that was ever a hard link
+            // is invisible to FSEvents on macOS (no event when it is
+            // edited or deleted later), so linking is only the fallback.
+            None => match rename_noreplace(&tmp, target) {
+                Some(Ok(())) => Ok(None),
+                Some(Err(e)) if e.kind() == io::ErrorKind::AlreadyExists => Err(diverged()),
+                Some(Err(e)) => Err(io_err(target)(e)),
+                None => match fs::hard_link(&tmp, target) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&tmp);
+                        Ok(None)
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(diverged()),
+                    Err(_) => {
+                        // No hard links here: check once more, then rename.
+                        open_expected(target, expect)?;
+                        fs::rename(&tmp, target).map_err(io_err(target))?;
+                        Ok(None)
+                    }
+                },
             },
             Some(mut old) => {
                 fs::rename(&tmp, target).map_err(io_err(target))?;
