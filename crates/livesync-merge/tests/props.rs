@@ -286,6 +286,9 @@ fn passes_oracle(c: &Case, ours_mtime: i64, theirs_mtime: i64) -> Result<(), Tes
     if let Err(e) = oracle::check(&c.base, &c.ours, &c.theirs, ours_first, &t) {
         prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, written);
     }
+    if let Err(e) = oracle::counts(&c.base, &c.ours, &c.theirs, &t) {
+        prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, written);
+    }
     Ok(())
 }
 
@@ -980,22 +983,146 @@ proptest! {
     #![proptest_config(config())]
 
     /// The lost-update guard's contract: where L already holds R2, the merge
-    /// of base R1, ours L and theirs R2 is L (or open). The one exception is
-    /// by design: L and R2 inserted runs at one point that share lines but
-    /// neither holds the other as a whole prefix or suffix (the writer put
-    /// lines between R2's), which go in whole.
+    /// of base R1, ours L and theirs R2 is L, or open. (Where L and R2
+    /// inserted runs at one point and the writer put lines between R2's, L's
+    /// run holds R2's with lines between: open, not both whole.)
     #[test]
     fn a_writer_that_saw_the_remote_change_already_holds_it((c, l_newer) in guard_case()) {
         let (mo, mt) = if l_newer { (3000, 2000) } else { (2000, 3000) };
         passes_oracle(&c, mo, mt)?;
         for kind in [Kind::Text, Kind::Markdown] {
             match run(kind, &c, mo, mt).outcome {
-                Outcome::Write(out) if out != c.ours.as_bytes() => {
-                    let t = line_merge_trace(&c.base, &c.ours, &c.theirs, mo <= mt).unwrap();
-                    prop_assert!(
-                        oracle::shares_lines_in_whole_runs(&c.base, &c.ours, &c.theirs, &t),
-                        "{:?}\nmerged {:?}", c, String::from_utf8(out)
-                    );
+                Outcome::Write(out) => {
+                    prop_assert_eq!(String::from_utf8(out).unwrap(), c.ours.clone(), "{:?}", c);
+                }
+                Outcome::Keep(_) => prop_assert!(false),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A lost-update guard's case where lines repeat: blank lines, `---`, a
+/// list item, copies of lines already there, edited blank lines (` r`). R2
+/// is R1 with a remote's inserts (copies too), deletes of R1's lines and
+/// edits; L is R2 with a writer's inserts (copies too), and deletes and edits
+/// of R1's lines that are blank or that R2 has once. L already holds R2.
+/// (Where the writer deletes or edits one of two copies R2 has, no merge can
+/// tell which: base `X`, L `X`, R2 `X X` is a side that changed nothing
+/// against one that added a copy.)
+fn guard_repeats_case() -> impl Strategy<Value = (Case, bool)> {
+    const POOL: &[&str] = &["", "", "", "---", "- x", "u", "u", "u", "u", "u"];
+    type Edits = Vec<(u8, prop::sample::Index, &'static str, prop::sample::Index)>;
+    let edits = || {
+        prop::collection::vec(
+            (
+                0..4u8,
+                any::<prop::sample::Index>(),
+                prop::sample::select(POOL),
+                any::<prop::sample::Index>(),
+            ),
+            0..5,
+        )
+    };
+    (
+        prop::collection::vec(prop::sample::select(POOL), 0..12),
+        edits(),
+        edits(),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(|(r1, remote, writer, l_newer, fin)| {
+            let mut fresh = 0;
+            let mut word = |w: &str| {
+                if w == "u" {
+                    fresh += 1;
+                    format!("line {fresh}")
+                } else {
+                    w.to_string()
+                }
+            };
+            // Each line with whether it is R1's, untouched.
+            let r1: Vec<(String, bool)> = r1.iter().map(|w| (word(w), true)).collect();
+            let mut edit =
+                |v: &mut Vec<(String, bool)>, edits: &Edits, mark: &str, may: &dyn Fn(&(String, bool)) -> bool| {
+                    for (op, i, w, j) in edits {
+                        match op {
+                            0 => {
+                                let at = i.index(v.len() + 1);
+                                v.insert(at, (word(w), false));
+                            }
+                            3 if !v.is_empty() => {
+                                let copy = v[j.index(v.len())].0.clone();
+                                v.insert(i.index(v.len() + 1), (copy, false));
+                            }
+                            1 if !v.is_empty() => {
+                                let at = i.index(v.len());
+                                if may(&v[at]) {
+                                    v.remove(at);
+                                }
+                            }
+                            2 if !v.is_empty() => {
+                                let at = i.index(v.len());
+                                if may(&v[at]) {
+                                    v[at] = (format!("{} {mark}", v[at].0), false);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                };
+            let mut r2 = r1.clone();
+            edit(&mut r2, &remote, "r", &|l| l.1);
+            let once: Vec<String> = r2
+                .iter()
+                .filter(|l| r2.iter().filter(|m| m.0 == l.0).count() == 1)
+                .map(|l| l.0.clone())
+                .collect();
+            let mut l = r2.clone();
+            edit(&mut l, &writer, "w", &|x| {
+                x.1 && (x.0.trim().is_empty() || once.contains(&x.0))
+            });
+            let text =
+                |v: &[(String, bool)], f: bool| join(&v.iter().map(|x| x.0.clone()).collect::<Vec<_>>(), "\n", f);
+            let c = Case {
+                base: text(&r1, fin),
+                ours: text(&l, true),
+                theirs: text(&r2, true),
+            };
+            (c, l_newer)
+        })
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// The lost-update guard where lines repeat, checked by counts alone (no
+    /// alignment): a clean merge of base R1, ours L and theirs R2 never has a
+    /// line that is not blank more often than L, so it never takes a line
+    /// twice nor brings back one the writer deleted or changed.
+    #[test]
+    fn a_guard_merge_never_has_a_line_more_often_than_the_writer((c, l_newer) in guard_repeats_case()) {
+        let (mo, mt) = if l_newer { (3000, 2000) } else { (2000, 3000) };
+        passes_oracle(&c, mo, mt)?;
+        let solid = |s: &str| -> HashMap<String, usize> {
+            let mut n = HashMap::new();
+            for l in s.lines().filter(|l| !l.trim().is_empty()) {
+                *n.entry(l.to_string()).or_default() += 1;
+            }
+            n
+        };
+        for kind in [Kind::Text, Kind::Markdown] {
+            match run(kind, &c, mo, mt).outcome {
+                Outcome::Write(out) => {
+                    let (m, l) = (solid(std::str::from_utf8(&out).unwrap()), solid(&c.ours));
+                    for (line, n) in &m {
+                        let want = l.get(line).copied().unwrap_or(0);
+                        prop_assert!(
+                            *n <= want,
+                            "{line:?} {n}x, L has it {want}x\n{c:?}\nmerged {:?}",
+                            String::from_utf8_lossy(&out)
+                        );
+                    }
                 }
                 Outcome::Keep(_) => prop_assert!(false),
                 _ => {}
@@ -1225,6 +1352,63 @@ fn the_oracle_rejects_wrong_merges() {
     .is_some());
 }
 
+/// The count oracle needs no alignment: it rejects the wrong merges an
+/// earlier version made where the two diffs aligned repeated lines
+/// differently (each with the merge's own alignments, which the placement
+/// rules of `oracle::check` take on trust), and the merge now leaves each
+/// open.
+#[test]
+fn the_count_oracle_rejects_what_alignments_hide() {
+    // base, ours, theirs, the wrong merge.
+    let cases = [
+        // A line both inserted, put at two points across blank lines.
+        (
+            "# Day\n- a\n- b\n\n\n",
+            "# Day\n- a done\n\n- c\n- d\n",
+            "# Day\n- a done\n\n- c\n\n",
+            "# Day\n- a done\n- c\n\n- c\n- d\n",
+        ),
+        (
+            "line 1\n\nline 2\n\nline 3\n",
+            "line 1\n\n\nline 4\n\n\nline 3 r\n",
+            "line 1\n\nline 4\nline 2\n\nline 3 r\n",
+            "line 1\n\nline 4\n\nline 4\n\n\nline 3 r\n",
+        ),
+        // A line ours changed, back as theirs' "moved" copy.
+        (
+            "\n\nline 1\nline 2",
+            "line 1 w\n\n",
+            "line 1\n\nline 2\n",
+            "line 1\nline 1 w\n",
+        ),
+        (
+            "\nline 1\nline 2",
+            "line 2\nline 3\nline 4\n\n",
+            "line 2\nline 3\n",
+            "line 2\nline 3\nline 4\nline 3\n",
+        ),
+        // A copy both inserted beside a line it copies, at either end of it.
+        (
+            "A\n- x\nB\n",
+            "A'\n- x\n- x\nB\n",
+            "A\n- x\n- x\nB\n",
+            "A'\n- x\n- x\n- x\nB\n",
+        ),
+        ("B\nC\nB\n", "B\nC r\nB\nC\n", "B\nC r\nB\n", "B\nC r\nB\nC r\n"),
+    ];
+    for (b, o, t, wrong) in cases {
+        for ours_first in [true, false] {
+            let mut tr = line_merge_trace(b, o, t, ours_first).unwrap();
+            assert_eq!(tr.merged, None, "open now: {b:?} {o:?} {t:?}");
+            tr.text = Some(wrong.to_string());
+            assert!(
+                oracle::counts(b, o, t, &tr).is_err(),
+                "{wrong:?} passes the count oracle"
+            );
+        }
+    }
+}
+
 /// The generators reach real merges, not just opens: a share of each one's
 /// cases is written.
 #[test]
@@ -1255,4 +1439,11 @@ fn generators_reach_merges() {
         0.15,
     );
     share("json", json_case().boxed(), Kind::Object, Rule::Object, 0.3);
+    share(
+        "guard with repeated lines",
+        guard_repeats_case().prop_map(|(c, _)| c).boxed(),
+        Kind::Text,
+        Rule::Lines,
+        0.3,
+    );
 }

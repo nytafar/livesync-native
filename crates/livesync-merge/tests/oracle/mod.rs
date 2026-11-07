@@ -17,6 +17,12 @@
 //!   runs inserted at one point that are not the same, nor one a whole prefix
 //!   or suffix of the other: those go in whole, the older side's first;
 //! - no line follows a line without its newline.
+//!
+//! Those rules take each side's alignment from the merge, so a merge that
+//! went wrong because a diff aligned repeated lines badly (a line both sides
+//! inserted, put at two points; a line a side deleted, kept as another copy)
+//! can pass them. [`counts`] checks what does not depend on any alignment:
+//! how often each line that is not blank is in each file.
 #![allow(dead_code)]
 
 use livesync_merge::{LineTrace, Src};
@@ -294,6 +300,75 @@ pub fn check(base: &str, ours: &str, theirs: &str, ours_first: bool, t: &LineTra
         }
     }
     Ok(())
+}
+
+/// The checks that know nothing of any alignment, by how often each line
+/// that is not blank (by content) is in the base `B`, ours `O`, theirs `T`
+/// and the merge `M`:
+///
+/// - `M <= max(O, T)`: more is a line both sides added taken twice. Shared
+///   lines of two runs at one point that go in whole are the exception.
+/// - where neither side has a line more often than the base, `M <= min(O,
+///   T)`: more is a deleted line come back.
+pub fn counts(base: &str, ours: &str, theirs: &str, t: &LineTrace) -> Result<(), String> {
+    let Some(text) = &t.text else {
+        return Ok(());
+    };
+    let tally = |s: &str| {
+        let mut n: HashMap<String, usize> = HashMap::new();
+        for l in s.split_inclusive('\n').map(content).filter(|l| !l.trim().is_empty()) {
+            *n.entry(l.to_string()).or_default() += 1;
+        }
+        n
+    };
+    let (b, o, th, m) = (tally(base), tally(ours), tally(theirs), tally(text));
+    let twice = whole_runs_shared(base, ours, theirs, t);
+    let get = |h: &HashMap<String, usize>, l: &str| h.get(l).copied().unwrap_or(0);
+    for l in m.keys().chain(b.keys()) {
+        let (nb, no, nt, nm) = (get(&b, l), get(&o, l), get(&th, l), get(&m, l));
+        if nm > no.max(nt) + get(&twice, l) {
+            return Err(format!("{l:?} is there {nm}x, ours has it {no}x, theirs {nt}x"));
+        }
+        if no <= nb && nt <= nb && nm > no.min(nt) {
+            return Err(format!(
+                "{l:?} is there {nm}x, base {nb}x, ours {no}x, theirs {nt}x: a deleted copy came back"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The lines (by content) the two sides' runs at one base point that go in
+/// whole share, and how often: those are there twice by design.
+fn whole_runs_shared(base: &str, ours: &str, theirs: &str, t: &LineTrace) -> HashMap<String, usize> {
+    let mut twice: HashMap<String, usize> = HashMap::new();
+    let b: Vec<&str> = base.split_inclusive('\n').collect();
+    let (Ok(o), Ok(th)) = (side("ours", &b, ours, &t.ours), side("theirs", &b, theirs, &t.theirs)) else {
+        return twice;
+    };
+    for co in o.changes.iter().filter(|c| c.inserts()) {
+        for ct in th
+            .changes
+            .iter()
+            .filter(|c| c.inserts() && c.base.start == co.base.start)
+        {
+            let (ro, rt) = (&o.lines[co.side.clone()], &th.lines[ct.side.clone()]);
+            if holds(ro, rt) || holds(rt, ro) {
+                continue;
+            }
+            let mut n: HashMap<&str, (usize, usize)> = HashMap::new();
+            for l in ro.iter().map(|l| content(l)) {
+                n.entry(l).or_default().0 += 1;
+            }
+            for l in rt.iter().map(|l| content(l)) {
+                n.entry(l).or_default().1 += 1;
+            }
+            for (l, (x, y)) in n {
+                *twice.entry(l.to_string()).or_default() += x.min(y);
+            }
+        }
+    }
+    twice
 }
 
 /// Whether the two sides inserted runs at one base point that share a line

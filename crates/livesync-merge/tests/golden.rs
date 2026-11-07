@@ -215,7 +215,7 @@ fn merges_match_upstream() {
             let (b, l, rt) = (str_of(c, "base"), str_of(c, "left"), str_of(c, "right"));
             let t = line_merge_trace(b, l, rt, ours_first(c)).expect("within the budget");
             assert_eq!(t.text, r.ours, "{name}: the trace is not the merge");
-            if let Err(e) = oracle::check(b, l, rt, ours_first(c), &t) {
+            if let Err(e) = oracle::check(b, l, rt, ours_first(c), &t).and_then(|_| oracle::counts(b, l, rt, &t)) {
                 panic!(
                     "{name}: {e} ({:?})\nbase {b:?}\nleft {l:?}\nright {rt:?}\nmerged {:?}\nupstream {upstream:?}",
                     r.deviations, r.ours

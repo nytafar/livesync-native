@@ -18,3 +18,5 @@ cc 1a57690d2a112727d81ee35ccdee5a03da825a20dcea5ce6480866853bfefd23 # shrinks to
 cc 6dabf82d243f1f59d495ebcb38f10b6951685be89dc6bccda4c19c42c862808d # shrinks to c = Case { base: "charlie\n---\n", ours: "---\ncharlie\n---\nbravo", theirs: "bravo\n---" }, ours_newer = false
 cc 59afdb465360abc47d2fc5d3de0c5a511da7294e2ad35dd6b0fd953c6437ac19 # shrinks to g = Truth { n: 2, lines: [(0, 1), (2, 1)], gaps: [(4, 1), (0, 1), (0, 1)], ours_newer: true, fin: [false, false, false] }
 cc d9dc48004e655918f2bf15a5676901f48ae7d5f1972123b3ba81473a95bc66db # shrinks to r = Runs { base: [], at: 0, ours: ["", "- item"], theirs: ["- item", "entry theirs 1"], ours_change: None, theirs_change: None, ours_newer: false }
+cc a9f957f717aede11dc8dba1c89262773c38763403bf20891c77457c76b4d7055 # shrinks to (c, l_newer) = (Case { base: "\n\n", ours: "\n---\n---\n\n- x\n---\n", theirs: "\n\n---\n\n- x\n" }, false)
+cc c6871c2d385feaf48cccc5681a006f2b4f7e6ff5a09eeb3818c4adb84eee1e75 # shrinks to (c, l_newer) = (Case { base: "---\n- x\n", ours: "- x\n\n---\n- x\n- x r\n---\n", theirs: "- x\n\n---\n- x r\n" }, false)
