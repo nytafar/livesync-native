@@ -37,6 +37,10 @@ const KNOWN_GOOD: &str = concat!(
     " is the newest version known to work with lsync, as long as it does not turn on what is named here (see COMPATIBILITY.md)"
 );
 
+/// What `pathNormalizationVersion` 1 and the feature `nfc-path-identity-v1`
+/// mean, for their refusals.
+const NFC_PATH_IDENTITY: &str = "NFC path identity, new in Self-hosted LiveSync 1.0.46 for new databases: each path is normalised to NFC and that becomes part of its document ID, which lsync does not implement yet; a database whose first device set pathNormalizationVersion to 0 before its first sync works";
+
 /// Every key a PREFERRED tweak set may hold that this client knows about:
 /// the compared ones ([`TWEAK_RULES`]), the rest of upstream's
 /// `TweakValuesTemplate` (`tweak.definition.ts`), and keys older plugin
@@ -296,7 +300,14 @@ pub fn assess_version_doc(doc: Option<&Value>, db_has_docs: bool) -> Result<i64,
     // All known features imply settings this client cannot handle yet
     // (encryption, keyed IDs or NFC path identity).
     if !names.is_empty() {
-        return Err(Refusal::UnsupportedFeatures(names.join(", ")));
+        let named: Vec<String> = names
+            .iter()
+            .map(|n| match n.as_str() {
+                "nfc-path-identity-v1" => format!("{n} ({NFC_PATH_IDENTITY})"),
+                _ => n.clone(),
+            })
+            .collect();
+        return Err(Refusal::UnsupportedFeatures(named.join(", ")));
     }
     Ok(13)
 }
@@ -598,7 +609,7 @@ pub fn unsupported_tweaks(p: &Map<String, Value>) -> Vec<Refusal> {
     match p.get("pathNormalizationVersion") {
         None | Some(Value::Null) => {}
         Some(v) if v.as_i64() == Some(0) => {}
-        Some(v) => unsupported(format!("pathNormalizationVersion={v}")),
+        Some(v) => unsupported(format!("pathNormalizationVersion={v} ({NFC_PATH_IDENTITY})")),
     }
     match p.get("idDerivationVersion") {
         None | Some(Value::Null) => {}
@@ -647,10 +658,21 @@ mod tests {
             vd(json!({"type":"versioninfo","version":13,"used_features":["warp-drive"]})),
             Err(Refusal::UnknownFeatures(_))
         ));
-        assert!(matches!(
-            vd(json!({"type":"versioninfo","version":13,"used_features":["nfc-path-identity-v1"]})),
-            Err(Refusal::UnsupportedFeatures(_))
-        ));
+        // NFC path identity (1.0.46) is refused, with what it is, both as a
+        // feature and as the setting.
+        let nfc = vd(json!({"type":"versioninfo","version":13,"used_features":["nfc-path-identity-v1"]}));
+        let Err(r @ Refusal::UnsupportedFeatures(_)) = nfc else {
+            panic!("{nfc:?}")
+        };
+        let msg = r.to_string();
+        assert!(
+            msg.contains("nfc-path-identity-v1 (NFC path identity, new in Self-hosted LiveSync 1.0.46"),
+            "{msg}"
+        );
+        let setting = unsupported_tweaks(json!({"pathNormalizationVersion":1}).as_object().unwrap());
+        let msg = setting[0].to_string();
+        assert!(msg.contains("pathNormalizationVersion=1 (NFC path identity"), "{msg}");
+        assert!(msg.contains("set pathNormalizationVersion to 0"), "{msg}");
         assert!(matches!(
             vd(json!({"type":"versioninfo","version":13})),
             Err(Refusal::InvalidVersionDoc(_))
