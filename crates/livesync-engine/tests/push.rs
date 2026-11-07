@@ -1381,10 +1381,8 @@ async fn a_one_shot_sync_counts_a_burst_the_daemon_left_open() {
     }
     env.engine().sync_once().await.unwrap();
     let sent: Vec<String> = (0..45).map(|i| format!("sent{i:02}.md")).collect();
-    Index::open(&env.index_path())
-        .unwrap()
-        .set_meta("delete_burst_sent", &serde_json::to_string(&sent).unwrap())
-        .unwrap();
+    // Its last deletion just now: a daemon stopped in the middle of it.
+    seed_burst(&env, &sent, now_ms());
     for i in 0..27 {
         std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
     }
@@ -2649,10 +2647,7 @@ async fn a_one_shot_sync_does_not_end_an_open_burst() {
     }
     env.engine().sync_once().await.unwrap();
     let sent: Vec<String> = (0..45).map(|i| format!("sent{i:02}.md")).collect();
-    Index::open(&env.index_path())
-        .unwrap()
-        .set_meta("delete_burst_sent", &serde_json::to_string(&sent).unwrap())
-        .unwrap();
+    seed_burst(&env, &sent, now_ms());
     for i in 0..4 {
         std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
     }
@@ -2715,4 +2710,272 @@ async fn a_wipe_beside_newly_ignored_files_still_stops() {
     let stop = env.meta("safety_stop").unwrap();
     assert!(stop.contains("25 of 40"), "{stop}");
     assert!((0..60).all(|i| !env.deleted(&format!("big/b{i:02}.md"))));
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// As a daemon leaves a burst: its sent deletions, and when the last one
+/// joined it (ms since the epoch).
+fn seed_burst(env: &Env, sent: &[String], at: i64) {
+    let ix = Index::open(&env.index_path()).unwrap();
+    ix.set_meta("delete_burst_sent", &serde_json::to_string(sent).unwrap())
+        .unwrap();
+    ix.set_meta("delete_burst_at", &at.to_string()).unwrap();
+}
+
+fn burst_len(env: &Env) -> usize {
+    env.meta("delete_burst_sent")
+        .map_or(0, |b| serde_json::from_str::<Vec<String>>(&b).unwrap().len())
+}
+
+/// #11 review, finding 1: a tool deletes one note a second. The daemon
+/// holds the first 45 (no burst sent yet) when `lsync sync` runs, which
+/// stops the daemon and runs a one-shot pass: "45 of 100" is not a stop, so
+/// they go; but they start the burst. The wipe goes on, and the next pass
+/// stops at "72 of 100" instead of letting "27 of 55" through.
+#[tokio::test]
+async fn a_one_shot_sync_during_a_daemon_hold_starts_the_burst_with_what_was_held() {
+    let env = Env::new().await;
+    for i in 0..100 {
+        env.write(&format!("f{i:03}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_secs(30);
+        c.delete_hold_max = Duration::from_secs(60);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for i in 0..45 {
+        std::fs::remove_file(env.vault().join(format!("f{i:03}.md"))).unwrap();
+    }
+    wait_until("45 deletes held", || engine.deletes_waiting() == 45).await;
+    wait_until("the held deletes saved", || {
+        env.meta("delete_held")
+            .is_some_and(|h| serde_json::from_str::<Vec<String>>(&h).unwrap().len() == 45)
+    })
+    .await;
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    drop(engine);
+    assert!(env.meta("delete_burst_sent").is_none(), "nothing was sent yet");
+
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 45, "{:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 0);
+    assert_eq!(burst_len(&env), 45, "the held deletions started no burst");
+    assert!(env.meta("delete_held").is_none());
+    for i in 45..72 {
+        std::fs::remove_file(env.vault().join(format!("f{i:03}.md"))).unwrap();
+    }
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0, "{:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 1);
+    let stop = env.meta("safety_stop").unwrap();
+    assert!(stop.contains("72 of 100") && stop.contains("in one burst"), "{stop}");
+}
+
+/// #11 review, finding 2: a burst a previous run left ends after a quiet
+/// period, also for one-shot passes. A pass long after its last deletion
+/// still counts it (it cannot tell when its own deletions went missing),
+/// but what it sends does not join it, and the burst ends: syncs from cron
+/// that delete a note or two each do not grow one burst for weeks.
+#[tokio::test]
+async fn a_one_shot_pass_ends_a_burst_after_a_quiet_period() {
+    let env = Env::new().await;
+    for i in 0..55 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let sent: Vec<String> = (0..45).map(|i| format!("sent{i:02}.md")).collect();
+    seed_burst(&env, &sent, now_ms() - 3_600_000);
+    for i in 0..2 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 2, "{:?}", rep.push);
+    assert!(env.meta("delete_burst_sent").is_none(), "the burst grew");
+    assert!(env.meta("delete_burst_at").is_none());
+    for i in 2..4 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 2, "{:?}", rep.push);
+    assert!(env.meta("delete_burst_sent").is_none());
+
+    // Counted all the same: a pass after the quiet period that would make
+    // the burst more than half of the files stops.
+    seed_burst(&env, &sent, now_ms() - 3_600_000);
+    for i in 4..10 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0, "{:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 1);
+}
+
+/// #11 review, finding 2: a burst kept because a daemon held some of its
+/// files under a folder that cannot be read now is kept for as long as
+/// they cannot be checked, and counted; but after a quiet period only what
+/// the daemon held in it joins it, not every later deletion.
+#[tokio::test]
+async fn a_burst_kept_for_files_that_cannot_be_checked_takes_in_no_later_deletions() {
+    let env = Env::new().await;
+    for i in 0..5 {
+        env.write(&format!("sub/s{i}.md"), format!("sub {i}").as_bytes());
+    }
+    env.write("z.md", b"z");
+    for i in 0..40 {
+        env.write(&format!("g{i:02}.md"), format!("g {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    for i in 0..5 {
+        std::fs::remove_file(env.vault().join(format!("sub/s{i}.md"))).unwrap();
+    }
+    std::fs::remove_file(env.vault().join("z.md")).unwrap();
+    // A daemon sent 10 of the burst and held these 6, a while ago.
+    let sent: Vec<String> = (0..10).map(|i| format!("sent{i:02}.md")).collect();
+    let long_ago = now_ms() - 3_600_000;
+    seed_burst(&env, &sent, long_ago);
+    let mut held: Vec<String> = (0..5).map(|i| format!("sub/s{i}.md")).collect();
+    held.push("z.md".into());
+    Index::open(&env.index_path())
+        .unwrap()
+        .set_meta("delete_held", &serde_json::to_string(&held).unwrap())
+        .unwrap();
+    let locked = Unreadable::new(env.vault().join("sub"));
+    let mut runs = vec![];
+    for (n, pair) in [[0, 1], [2, 3], [4, 5]].iter().enumerate() {
+        for i in pair {
+            std::fs::remove_file(env.vault().join(format!("g{i:02}.md"))).unwrap();
+        }
+        let rep = env.engine().sync_once().await;
+        runs.push((
+            n,
+            rep,
+            burst_len(&env),
+            env.meta("delete_burst_at"),
+            env.meta("delete_held"),
+        ));
+    }
+    drop(locked);
+    for (n, rep, burst, at, held) in runs {
+        let rep = rep.unwrap();
+        // The first pass also sends z.md, which the daemon held in it.
+        assert_eq!(rep.push.deleted, if n == 0 { 3 } else { 2 }, "pass {n}: {:?}", rep.push);
+        assert_eq!(rep.push.safety_stops, 0, "pass {n}");
+        assert_eq!(burst, 11, "pass {n}: the burst took in later deletions");
+        assert_eq!(at, Some(long_ago.to_string()), "pass {n}");
+        let held: Vec<String> = serde_json::from_str(&held.expect("the held files forgotten")).unwrap();
+        assert_eq!(held.len(), 5, "pass {n}");
+    }
+    // Readable again: the 5 are judged with the burst, which then ends.
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 5, "{:?}", rep.push);
+    assert!(env.meta("delete_burst_sent").is_none());
+    assert!(env.meta("delete_held").is_none());
+}
+
+/// #11 review, finding 3: the daemon keeps the deletions it holds in the
+/// index before its pass sends anything, so a pass that dies on the server
+/// (here: a move into `.trash/` whose remote delete fails) still leaves
+/// them for a restart.
+#[tokio::test]
+async fn held_deletions_are_kept_before_the_pass_sends_anything() {
+    let env = Env::new().await;
+    env.write("a.md", b"to the trash");
+    for i in 0..3 {
+        env.write(&format!("f{i}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_secs(30);
+        c.delete_hold_max = Duration::from_secs(60);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    env.mock.state.lock().unwrap().fail_writes = 1_000_000;
+    env.mv("a.md", ".trash/a.md");
+    std::fs::remove_file(env.vault().join("f0.md")).unwrap();
+    wait_until("the held deletion saved", || {
+        env.meta("delete_held").is_some_and(|h| h.contains("f0.md"))
+    })
+    .await;
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    env.mock.state.lock().unwrap().fail_writes = 0;
+    assert!(!env.deleted("a.md") && !env.deleted("f0.md"));
+}
+
+/// #11 review, finding 5: a confirmed stop is kept in the index until a
+/// pass applies it, so another engine of the vault (a restart, a reload, a
+/// command the service runs) applies it too; while it waits for files that
+/// cannot be checked, the status says so, also read straight from the index.
+#[tokio::test]
+async fn a_confirmation_survives_a_restart_and_says_when_it_waits() {
+    let env = Env::new().await;
+    for i in 0..5 {
+        env.write(&format!("sub/s{i}.md"), format!("sub {i}").as_bytes());
+    }
+    for i in 0..30 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    for i in 0..5 {
+        std::fs::remove_file(env.vault().join(format!("sub/s{i}.md"))).unwrap();
+    }
+    for i in 0..25 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.safety_stops, 1);
+    let stop = env.meta("safety_stop").unwrap();
+    let locked = Unreadable::new(env.vault().join("sub"));
+    {
+        let e = env.engine();
+        assert_eq!(
+            e.allow_mass_delete_once(&stop).unwrap(),
+            livesync_engine::Confirmation::Allowed
+        );
+        let st = e.status().unwrap();
+        assert!(st.mass_delete_allowed && !st.mass_delete_waits);
+    }
+    let e = env.engine();
+    assert!(e.mass_delete_allowed(), "the confirmation was lost with its engine");
+    let rep = e.sync_once().await;
+    let st = e.status();
+    drop(e);
+    let reopened = env.engine();
+    let waits = (reopened.mass_delete_allowed(), reopened.mass_delete_waits());
+    drop(reopened);
+    drop(locked);
+    assert_eq!(rep.unwrap().push.deleted, 0);
+    let st = st.unwrap();
+    assert!(st.mass_delete_allowed && st.mass_delete_waits, "{st:?}");
+    assert_eq!(waits, (true, true));
+    let e = env.engine();
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 30, "{:?}", rep.push);
+    let st = e.status().unwrap();
+    assert!(!st.mass_delete_allowed && !st.mass_delete_waits && st.safety_stop.is_none());
+    assert!(env.meta("safety_stop_allowed").is_none());
 }

@@ -30,7 +30,7 @@
 
 use crate::engine::{meta_keys as meta, Engine, EngineError};
 use crate::filters::{IgnoreState, Verdict};
-use crate::index::{FileRow, Origin, RevisionRow, State};
+use crate::index::{FileRow, Index, Origin, RevisionRow, State};
 use crate::vaultfs::{self, DiskState, RemoveOutcome};
 use crate::watcher::{NoWatcher, WatchEvent, Watcher};
 use livesync_model::doc::{classify_doc, Classified};
@@ -230,7 +230,9 @@ impl RenameHints {
 /// A full pass that cannot check some of the files the burst or its stop
 /// depends on (their folder became unreadable, say) neither ends the burst
 /// nor clears the stop. Files it cannot check that belong to neither do not
-/// matter to them.
+/// matter to them. After a quiet period such a burst is closed: kept, and
+/// counted, for as long as its files cannot be checked, but deletions after
+/// it no longer join it.
 ///
 /// Holding a deletion only keeps the remote copy longer. If the process is
 /// killed or restarted, the rows are still tracked and the files still
@@ -262,9 +264,14 @@ pub(crate) struct DeleteHold {
     last_new: Option<Instant>,
     /// The last decision was a stop, not answered yet: the burst stays.
     refused: bool,
-    /// The decision being made was forced by the maximum, or its pass could
-    /// not check some of the burst's files: the burst goes on.
+    /// The decision being made was forced by the maximum: the burst goes on.
     cut: bool,
+    /// A decision after a quiet period kept the burst only because some of
+    /// its files could not be checked: it is over, and kept for them. Later
+    /// deletions are judged with it, but do not join it (unless a trickle
+    /// makes the maximum cut them again), so an unreadable folder does not
+    /// make one burst of everything deleted while it lasts.
+    closed: bool,
     /// The burst's or its stop's documents the last full pass could not
     /// check (`Some(empty)`: a stop saved without its list, so which ones is
     /// not known). They stay seen and the burst cannot end, but no look of
@@ -288,6 +295,7 @@ impl DeleteHold {
             last_new: None,
             refused: false,
             cut: false,
+            closed: false,
             unchecked: None,
             persisted: HashSet::new(),
         }
@@ -310,6 +318,9 @@ impl DeleteHold {
         self.seen = held.clone();
         self.persisted = held;
         self.refused = stopped;
+        // Not known after a restart: the next quiet decision may add to it
+        // once more (counting more, never less).
+        self.closed = false;
     }
 
     /// When the undecided hold is over (quiet, or at its maximum).
@@ -378,7 +389,7 @@ impl DeleteHold {
         if !over {
             return None;
         }
-        self.cut = !self.quiet(walked) || self.unchecked.is_some();
+        self.cut = !self.quiet(walked);
         self.newest = None;
         self.first = None;
         Some(self.burst.len() as u64)
@@ -388,7 +399,10 @@ impl DeleteHold {
     /// them, `sent` were sent (or failed, and count as new when seen
     /// again), so the next deletion of the same document starts a new hold.
     /// They join the burst if the maximum cut it; after a quiet period the
-    /// burst is over. A stop keeps the burst as it is.
+    /// burst is over. A stop keeps the burst as it is. So does a pass that
+    /// could not check some of the burst's files: what the first such
+    /// decision after a quiet period sends went missing in the burst and
+    /// joins it; then the burst is closed (see `closed`).
     fn decided(&mut self, refused: bool, sent: &[&str]) {
         self.refused = refused;
         if refused {
@@ -400,8 +414,15 @@ impl DeleteHold {
         }
         if self.cut {
             self.burst.extend(sent.iter().map(|id| id.to_string()));
+            self.closed = false;
+        } else if self.unchecked.is_some() {
+            if !self.closed {
+                self.burst.extend(sent.iter().map(|id| id.to_string()));
+            }
+            self.closed = true;
         } else {
             self.burst.clear();
+            self.closed = false;
         }
     }
 
@@ -422,6 +443,7 @@ impl DeleteHold {
     fn answered(&mut self) {
         self.burst.clear();
         self.refused = false;
+        self.closed = false;
     }
 
     /// Whether a renamed document may keep waiting for its new name to be
@@ -482,6 +504,42 @@ pub enum Confirmation {
     Changed(String),
 }
 
+/// A confirmation as the index keeps it (`meta::SAFETY_STOP_ALLOWED`).
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedConfirmation {
+    stop: String,
+    /// `ConfirmedDocs::Exactly`, sorted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    docs: Option<Vec<String>>,
+    /// `ConfirmedDocs::UpTo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    up_to: Option<u64>,
+    /// The last full pass could not apply it (`Engine::mass_delete_waits`).
+    #[serde(default)]
+    waits: bool,
+}
+
+/// The confirmation the index keeps, if it answers the stop shown now, and
+/// whether it waits for files that cannot be checked. One kept for another
+/// stop counts for nothing.
+pub(crate) fn saved_confirmation(ix: &Index) -> rusqlite::Result<Option<(Confirmed, bool)>> {
+    let Some(saved) = ix
+        .get_meta(meta::SAFETY_STOP_ALLOWED)?
+        .and_then(|s| serde_json::from_str::<SavedConfirmation>(&s).ok())
+    else {
+        return Ok(None);
+    };
+    if ix.get_meta(meta::SAFETY_STOP)?.as_deref() != Some(saved.stop.as_str()) {
+        return Ok(None);
+    }
+    let docs = match (saved.docs, saved.up_to) {
+        (Some(d), _) => ConfirmedDocs::Exactly(d.into_iter().collect()),
+        (None, Some(n)) => ConfirmedDocs::UpTo(n),
+        (None, None) => return Ok(None),
+    };
+    Ok(Some((Confirmed { stop: saved.stop, docs }, saved.waits)))
+}
+
 /// How many files a mass-delete stop said were missing (`<ms> <n> of <m>
 /// tracked files ...`, the form every version wrote), for a stop saved
 /// without its list of documents.
@@ -493,6 +551,17 @@ fn stop_count(stop: &str) -> Option<u64> {
         return None;
     }
     words.next()?.parse().ok()
+}
+
+/// Keep the deletions the daemon holds (`meta::DELETE_HELD`).
+fn write_held(ix: &Index, held: &HashSet<String>) -> rusqlite::Result<()> {
+    if held.is_empty() {
+        ix.delete_meta(meta::DELETE_HELD)
+    } else {
+        let mut ids: Vec<&String> = held.iter().collect();
+        ids.sort();
+        ix.set_meta(meta::DELETE_HELD, &serde_json::to_string(&ids).unwrap_or_default())
+    }
 }
 
 /// What a pass that could not check some files makes of them
@@ -690,6 +759,10 @@ impl Engine {
     /// confirmation covers what is missing when it is applied, as long as
     /// that is no more files than the stop showed; otherwise nothing goes
     /// and the stop is shown anew.
+    ///
+    /// The confirmation is kept in the index until a pass applies it or the
+    /// stop changes, so a restart, a reload or a command that runs on
+    /// another engine of the vault applies it too.
     pub fn allow_mass_delete_once(&self, shown: &str) -> Result<Confirmation> {
         let (stop, docs) =
             self.with_index(|ix| Ok((ix.get_meta(meta::SAFETY_STOP)?, ix.get_meta(meta::SAFETY_STOP_DOCS)?)))?;
@@ -714,10 +787,44 @@ impl Engine {
                     .into(),
             ));
         };
-        *self.inner.mass_delete_once.lock().unwrap() = Some(Confirmed { stop, docs });
-        self.inner.mass_delete_waits.store(false, Ordering::SeqCst);
+        {
+            let mut once = self.inner.mass_delete_once.lock().unwrap();
+            *once = Some(Confirmed { stop, docs });
+            self.inner.mass_delete_waits.store(false, Ordering::SeqCst);
+            self.keep_confirmation(&once)?;
+        }
         self.rescan_now();
         Ok(Confirmation::Allowed)
+    }
+
+    /// Keep the confirmation as it stands now in the index
+    /// (`meta::SAFETY_STOP_ALLOWED`), with `mass_delete_waits`. Called with
+    /// `mass_delete_once` locked (`once`), so the index never says other
+    /// than memory.
+    fn keep_confirmation(&self, once: &Option<Confirmed>) -> Result<()> {
+        let saved = once.as_ref().map(|c| {
+            let (docs, up_to) = match &c.docs {
+                ConfirmedDocs::Exactly(d) => {
+                    let mut d: Vec<String> = d.iter().cloned().collect();
+                    d.sort();
+                    (Some(d), None)
+                }
+                ConfirmedDocs::UpTo(n) => (None, Some(*n)),
+            };
+            SavedConfirmation {
+                stop: c.stop.clone(),
+                docs,
+                up_to,
+                waits: self.inner.mass_delete_waits.load(Ordering::SeqCst),
+            }
+        });
+        self.with_index(|ix| match saved {
+            Some(s) => ix.set_meta(
+                meta::SAFETY_STOP_ALLOWED,
+                &serde_json::to_string(&s).unwrap_or_default(),
+            ),
+            None => ix.delete_meta(meta::SAFETY_STOP_ALLOWED),
+        })
     }
 
     /// Whether an `allow_mass_delete_once` is still waiting for its pass.
@@ -1101,6 +1208,8 @@ impl Engine {
             // Unless the user confirmed another stop meanwhile.
             if once.as_ref().is_some_and(|c| c.stop == *stop) {
                 *once = None;
+                self.inner.mass_delete_waits.store(false, Ordering::SeqCst);
+                self.keep_confirmation(&once)?;
             }
         }
         if deferred.is_empty() {
@@ -1116,7 +1225,6 @@ impl Engine {
         // A waiting confirmation whose stop is no longer shown (this pass
         // recorded another, or cleared it) is dropped: the user is asked
         // again rather than told it is about to be applied.
-        let mut waits = false;
         if let Some(stop) = confirming.filter(|_| unapplied) {
             let shown = self.with_index(|ix| ix.get_meta(meta::SAFETY_STOP))?;
             let stale = shown.as_deref() != Some(stop.as_str());
@@ -1126,9 +1234,11 @@ impl Engine {
                 info!("the safety stop that was confirmed is no longer shown; that confirmation is dropped");
                 *once = None;
             }
-            waits = ours && !stale;
+            if ours {
+                self.inner.mass_delete_waits.store(!stale, Ordering::SeqCst);
+                self.keep_confirmation(&once)?;
+            }
         }
-        self.inner.mass_delete_waits.store(waits, Ordering::SeqCst);
         Ok(Some((rep, deferred)))
     }
 
@@ -1282,8 +1392,10 @@ impl Engine {
         // partial pass sees too little to say it is over.
         if full && rep.safety_stops == 0 {
             self.with_index(|ix| {
-                ix.delete_meta(meta::SAFETY_STOP)?;
-                ix.delete_meta(meta::SAFETY_STOP_DOCS)
+                ix.atomically(|ix| {
+                    ix.delete_meta(meta::SAFETY_STOP)?;
+                    ix.delete_meta(meta::SAFETY_STOP_DOCS)
+                })
             })?;
         }
         Ok(())
@@ -2159,6 +2271,7 @@ impl Engine {
                             stop,
                             docs: ConfirmedDocs::Exactly(missing.clone()),
                         });
+                        self.keep_confirmation(&once)?;
                     }
                     Some(missing)
                 } else {
@@ -2188,10 +2301,12 @@ impl Engine {
             // anything still too much stops anew.
             warn!("{allowed} file(s) the user confirmed deleting after a safety stop; deleting them remotely");
             self.with_index(|ix| {
-                ix.delete_meta(meta::SAFETY_STOP)?;
-                ix.delete_meta(meta::SAFETY_STOP_DOCS)?;
-                ix.delete_meta(meta::DELETE_BURST)?;
-                ix.delete_meta(meta::DELETE_BURST_AT)
+                ix.atomically(|ix| {
+                    ix.delete_meta(meta::SAFETY_STOP)?;
+                    ix.delete_meta(meta::SAFETY_STOP_DOCS)?;
+                    ix.delete_meta(meta::DELETE_BURST)?;
+                    ix.delete_meta(meta::DELETE_BURST_AT)
+                })
             })?;
             if let Some(h) = hold.as_deref_mut() {
                 h.answered();
@@ -2212,6 +2327,9 @@ impl Engine {
                 }
                 let before = h.hold_due();
                 let decision = h.observe(&undestined_ids, tally.scan);
+                // Kept before anything is sent or looked up on the server:
+                // killed in the middle, a restart still knows them.
+                self.save_held(h)?;
                 if decision.is_none() && h.hold_due() != before {
                     info!(
                         "{undestined} file(s) missing with no known destination; deleting them remotely once none has gone missing for {:.0?}",
@@ -2288,21 +2406,23 @@ impl Engine {
                     .chain(hidden.iter().cloned())
                     .collect();
                 self.with_index(|ix| {
-                    // The same files refused again: the same stop, so a
-                    // confirmation of it still matches.
-                    let same = ix.get_meta(meta::SAFETY_STOP)?.is_some()
-                        && ix
-                            .get_meta(meta::SAFETY_STOP_DOCS)?
-                            .and_then(|d| serde_json::from_str::<HashSet<String>>(&d).ok())
-                            .is_some_and(|d| d == refused);
-                    if !same {
-                        let mut docs: Vec<&String> = refused.iter().collect();
-                        docs.sort();
-                        let docs = serde_json::to_string(&docs).unwrap_or_default();
-                        ix.set_meta(meta::SAFETY_STOP, &format!("{} {msg}", vaultfs::now_ms()))?;
-                        ix.set_meta(meta::SAFETY_STOP_DOCS, &docs)?;
-                    }
-                    Ok(())
+                    ix.atomically(|ix| {
+                        // The same files refused again: the same stop, so a
+                        // confirmation of it still matches.
+                        let same = ix.get_meta(meta::SAFETY_STOP)?.is_some()
+                            && ix
+                                .get_meta(meta::SAFETY_STOP_DOCS)?
+                                .and_then(|d| serde_json::from_str::<HashSet<String>>(&d).ok())
+                                .is_some_and(|d| d == refused);
+                        if !same {
+                            let mut docs: Vec<&String> = refused.iter().collect();
+                            docs.sort();
+                            let docs = serde_json::to_string(&docs).unwrap_or_default();
+                            ix.set_meta(meta::SAFETY_STOP, &format!("{} {msg}", vaultfs::now_ms()))?;
+                            ix.set_meta(meta::SAFETY_STOP_DOCS, &docs)?;
+                        }
+                        Ok(())
+                    })
                 })?;
                 rep.safety_stops += 1;
                 withhold = true;
@@ -2313,19 +2433,37 @@ impl Engine {
             match hold.as_deref_mut() {
                 Some(h) => {
                     h.decided(withhold, sent);
-                    self.save_burst(&burst_before, &h.burst)?;
+                    self.save_burst(&burst_before, &h.burst, !h.closed)?;
                 }
-                // A one-shot pass has no hold and cannot tell that a burst
-                // is over by what it sees. A burst a previous run left open
-                // goes on: what this pass sends joins it, and it ends only
-                // at a pass that finds nothing new to send, a quiet period
-                // after its last deletion. So a wipe that goes on after
-                // `lsync sync` is still counted from the burst's start.
-                // The same when it could not check the burst's files.
+                // A one-shot pass has no hold of its own. A burst a previous
+                // run left open (deletions it sent, or ones a daemon held
+                // that are still missing) goes on while its last deletion
+                // is less than a quiet period ago: what this pass sends
+                // joins it, so a wipe that goes on after `lsync sync` is
+                // still counted from the burst's start. After a quiet
+                // period the burst is over, as in the daemon: this pass
+                // counted it (it cannot tell when its own deletions went
+                // missing), and then it ends. Unless this pass could not
+                // check the burst's files: then it is kept for them, and
+                // of what this pass sends only what a daemon held in it
+                // joins it.
                 None if !withhold => {
-                    if unchecked || (!saved.is_empty() && (!sent.is_empty() || !self.burst_quiet()?)) {
+                    let held_before = self.saved_held()?;
+                    let open = !saved.is_empty()
+                        || held_before
+                            .iter()
+                            .any(|id| undestined_ids.contains(&id.as_str()) || hidden.contains(id));
+                    let quiet = self.burst_quiet()?;
+                    if open && !quiet {
                         saved.extend(sent.iter().map(|id| id.to_string()));
-                        self.save_burst(&burst_before, &saved)?;
+                        self.save_burst(&burst_before, &saved, true)?;
+                    } else if unchecked {
+                        saved.extend(
+                            sent.iter()
+                                .filter(|id| held_before.contains(**id))
+                                .map(|id| id.to_string()),
+                        );
+                        self.save_burst(&burst_before, &saved, false)?;
                     } else {
                         self.end_burst()?;
                     }
@@ -2385,7 +2523,7 @@ impl Engine {
                 }
                 h.decided(false, &[]);
                 h.keep_pending(&HashSet::new());
-                self.save_burst(&before, &h.burst)
+                self.save_burst(&before, &h.burst, true)
             }
             None if unchecked => Ok(()),
             // Nothing missing: a burst a previous run left open ends once a
@@ -2413,8 +2551,10 @@ impl Engine {
 
     fn end_burst(&self) -> Result<()> {
         self.with_index(|ix| {
-            ix.delete_meta(meta::DELETE_BURST)?;
-            ix.delete_meta(meta::DELETE_BURST_AT)
+            ix.atomically(|ix| {
+                ix.delete_meta(meta::DELETE_BURST)?;
+                ix.delete_meta(meta::DELETE_BURST_AT)
+            })
         })
     }
 
@@ -2430,7 +2570,7 @@ impl Engine {
         if now == before {
             return Ok(());
         }
-        self.write_held(&now)
+        self.with_index(|ix| write_held(ix, &now))
     }
 
     /// Keep the daemon's held deletions in the index when they changed, and
@@ -2440,24 +2580,17 @@ impl Engine {
             return Ok(());
         }
         let fresh = h.seen.iter().any(|id| !h.persisted.contains(id));
-        self.write_held(&h.seen)?;
-        if fresh {
-            self.with_index(|ix| ix.set_meta(meta::DELETE_BURST_AT, &vaultfs::now_ms().to_string()))?;
-        }
+        self.with_index(|ix| {
+            ix.atomically(|ix| {
+                write_held(ix, &h.seen)?;
+                if fresh {
+                    ix.set_meta(meta::DELETE_BURST_AT, &vaultfs::now_ms().to_string())?;
+                }
+                Ok(())
+            })
+        })?;
         h.persisted = h.seen.clone();
         Ok(())
-    }
-
-    fn write_held(&self, held: &HashSet<String>) -> Result<()> {
-        self.with_index(|ix| {
-            if held.is_empty() {
-                ix.delete_meta(meta::DELETE_HELD)
-            } else {
-                let mut ids: Vec<&String> = held.iter().collect();
-                ids.sort();
-                ix.set_meta(meta::DELETE_HELD, &serde_json::to_string(&ids).unwrap_or_default())
-            }
-        })
     }
 
     /// The deletions a daemon held when it last saved them (`meta::DELETE_HELD`).
@@ -2510,21 +2643,25 @@ impl Engine {
     }
 
     /// Keep a burst's deletions across restarts (`meta::DELETE_BURST`), and
-    /// when the burst last grew (`meta::DELETE_BURST_AT`).
-    fn save_burst(&self, before: &HashSet<String>, now: &HashSet<String>) -> Result<()> {
+    /// when the burst last grew (`meta::DELETE_BURST_AT`), unless `touch` is
+    /// false: deletions that went missing in it earlier joined it late (a
+    /// burst kept after a quiet period for files that cannot be checked).
+    fn save_burst(&self, before: &HashSet<String>, now: &HashSet<String>, touch: bool) -> Result<()> {
         if before == now {
             return Ok(());
         }
         if now.is_empty() {
             return self.end_burst();
         }
-        let grew = now.iter().any(|id| !before.contains(id));
+        let grew = touch && now.iter().any(|id| !before.contains(id));
         self.with_index(|ix| {
-            ix.set_meta(meta::DELETE_BURST, &serde_json::to_string(now).unwrap_or_default())?;
-            if grew {
-                ix.set_meta(meta::DELETE_BURST_AT, &vaultfs::now_ms().to_string())?;
-            }
-            Ok(())
+            ix.atomically(|ix| {
+                ix.set_meta(meta::DELETE_BURST, &serde_json::to_string(now).unwrap_or_default())?;
+                if grew {
+                    ix.set_meta(meta::DELETE_BURST_AT, &vaultfs::now_ms().to_string())?;
+                }
+                Ok(())
+            })
         })
     }
 
@@ -3318,6 +3455,17 @@ mod tests {
         assert_eq!(h.burst.len(), 5, "an incomplete look ended the burst");
         assert!(h.seen.contains("y") && !h.seen.contains("z"));
         assert!(h.due().is_none(), "an incomplete look scheduled another");
+        // #11 review: the burst is kept for "y", but closed. A deletion after
+        // a quiet period is judged with it, and does not join it, however
+        // long "y" cannot be checked.
+        for w in ["w1", "w2"] {
+            assert!(holds(h.observe(&[w], walk())));
+            std::thread::sleep(Duration::from_millis(120));
+            h.checked(Some(HashSet::from(["y".to_string()])));
+            assert_eq!(h.observe(&[w], walk()), Some(5));
+            h.decided(false, &[w]);
+            assert_eq!(h.burst.len(), 5, "{w} joined a closed burst");
+        }
         // Checked again and still gone: not a new deletion, judged at once
         // with the burst; after a quiet period that ends it.
         h.checked(None);
@@ -3540,12 +3688,12 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        engine.save_burst(&HashSet::new(), &burst).unwrap();
+        engine.save_burst(&HashSet::new(), &burst, true).unwrap();
         assert_eq!(engine.saved_burst().unwrap(), burst);
         engine.prune_burst(&mut burst).unwrap();
         let left: HashSet<String> = ["gone.md", "moved.md"].iter().map(|s| s.to_string()).collect();
         assert_eq!(burst, left);
-        engine.save_burst(&left, &HashSet::new()).unwrap();
+        engine.save_burst(&left, &HashSet::new(), true).unwrap();
         assert!(engine.saved_burst().unwrap().is_empty());
         assert!(engine
             .with_index(|ix| ix.get_meta(meta::DELETE_BURST))

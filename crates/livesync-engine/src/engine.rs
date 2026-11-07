@@ -83,14 +83,20 @@ pub(crate) mod meta_keys {
     /// IDs): what `allow_mass_delete_once` lets through, and nothing else.
     /// Older versions did not record it.
     pub const SAFETY_STOP_DOCS: &str = "safety_stop_docs";
+    /// The user's confirmation of the stop shown (JSON: the stop, the
+    /// documents it lets through, whether it waits for files that cannot be
+    /// checked), kept until a full pass applies it, so a restart, a reload
+    /// or a command run on another engine does not lose it. It counts only
+    /// while that stop is the one shown.
+    pub const SAFETY_STOP_ALLOWED: &str = "safety_stop_allowed";
     /// How many deletions of a burst the daemon's maximum hold cut into
     /// parts were already sent: while the burst goes on, or a stop it led
     /// to stands, later parts are judged together with them (`DeleteHold`).
     /// Kept here so a restart does not forget them.
     pub const DELETE_BURST: &str = "delete_burst_sent";
     /// When a deletion last joined the burst or the daemon's hold (ms since
-    /// the epoch): a one-shot pass ends a burst a previous run left open
-    /// only once that is at least `delete_hold` ago.
+    /// the epoch): a one-shot pass decides after that whether the burst is
+    /// still going on (less than `delete_hold` ago) or over.
     pub const DELETE_BURST_AT: &str = "delete_burst_at";
     /// The deletions the daemon holds (seen missing with no known
     /// destination, not decided yet, or refused by the stop; JSON list of
@@ -594,6 +600,13 @@ pub struct Status {
     /// holds the lock and the ways out, `<ms> <message>`. Never unlocked
     /// automatically; cleared by the next gate that passes.
     pub remote_locked: Option<String>,
+    /// The user confirmed that stop; the next full pass that can check all
+    /// of its files deletes them.
+    pub mass_delete_allowed: bool,
+    /// ... and the last full pass could not apply it, because some of its
+    /// files cannot be checked now (see `local_issues`): nothing is deleted
+    /// until they can be.
+    pub mass_delete_waits: bool,
     /// After a rebuild: the refetch is waiting (or owes a wait) for the
     /// remote to stop changing. `<ms> <description>`.
     pub rebuild_wait: Option<String>,
@@ -811,6 +824,11 @@ impl Engine {
         let trash = Trash::for_vault(cfg.trash, &canon)
             .map_err(|e| EngineError::Other(format!("trash = \"{}\": {e}", cfg.trash.as_str())))?;
         let budget = cfg.memory_budget_mb.max(16);
+        // A confirmed stop a previous run (or another engine) did not apply.
+        let (once, waits) = match crate::push::saved_confirmation(&index)? {
+            Some((c, waits)) => (Some(c), waits),
+            None => (None, false),
+        };
         Ok(Engine {
             inner: Arc::new(Inner {
                 couch,
@@ -831,8 +849,8 @@ impl Engine {
                 mem: Semaphore::new(budget),
                 report: Mutex::new(PullReport::default()),
                 push_report: Mutex::new(crate::push::PushReport::default()),
-                mass_delete_once: Mutex::new(None),
-                mass_delete_waits: std::sync::atomic::AtomicBool::new(false),
+                mass_delete_once: Mutex::new(once),
+                mass_delete_waits: std::sync::atomic::AtomicBool::new(waits),
                 deletes_waiting: std::sync::atomic::AtomicU64::new(0),
                 nudge: Notify::new(),
                 rescan: Notify::new(),
@@ -3261,6 +3279,7 @@ impl SleepWatch {
 /// Status straight from an index file (no network).
 pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<Status> {
     let num = |k: &str| -> Result<Option<i64>> { Ok(ix.get_meta(k)?.and_then(|s| s.parse().ok())) };
+    let confirmed = crate::push::saved_confirmation(ix)?;
     Ok(Status {
         remote: ix.get_meta(meta::REMOTE)?,
         vault: vault.display().to_string(),
@@ -3297,6 +3316,8 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
         safety_stop: ix.get_meta(meta::SAFETY_STOP)?,
         upstream_stop: ix.get_meta(meta::UPSTREAM_STOP)?,
         remote_locked: ix.get_meta(meta::REMOTE_LOCKED)?,
+        mass_delete_allowed: confirmed.is_some(),
+        mass_delete_waits: confirmed.is_some_and(|(_, waits)| waits),
         rebuild_wait: ix.get_meta(meta::REBUILD_WAIT)?,
         rebuild_orphans: ix
             .get_meta(meta::ORPHANS)?
