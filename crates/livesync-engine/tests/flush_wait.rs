@@ -458,6 +458,17 @@ async fn a_revision_on_a_losing_branch_is_never_reported_as_arrived() {
             other => panic!("{old}: {other:?}"),
         }
     }
+    // A history cut at `_revs_limit` (here: the last two) does not reach
+    // back to 1-…: blocked, and said so, not "on another branch".
+    mock.state.lock().unwrap().revs_limit = Some(2);
+    match b.engine.wait_for(&applied("h.md", &first), soon()).await.unwrap() {
+        WaitOutcome::Blocked(why) => {
+            assert!(why.contains("does not reach that far back"), "{why}");
+            assert!(!why.contains("another branch"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+    mock.state.lock().unwrap().revs_limit = None;
     // Without the server's history there is no telling: blocked, never success.
     mock.state.lock().unwrap().forget_rev_bodies = true;
     match b.engine.wait_for(&applied("h.md", &kept), soon()).await.unwrap() {
@@ -562,6 +573,28 @@ async fn a_wait_ends_at_a_gate_refusal_and_for_a_path_this_vault_does_not_sync()
         }
     }
     assert!(t0.elapsed() < Duration::from_secs(2));
+    a.stop().await;
+}
+
+#[tokio::test]
+async fn a_server_that_briefly_is_not_couchdb_is_retried_not_refused() {
+    let mock = Mock::start().await;
+    let a = Node::start(&mock, false, |_| {}).await;
+    // A restarting proxy answers the root with something else.
+    mock.state.lock().unwrap().root = serde_json::json!({"not": "couchdb"});
+    a.engine.network_changed(true);
+    a.until("the gate failed", |n| n.engine.activity().pull == PullPhase::Retrying)
+        .await;
+    assert!(a.engine.activity().refused.is_none(), "it clears by itself");
+    match a
+        .engine
+        .wait_for(&WaitFor::Idle, Instant::now() + Duration::from_millis(500))
+        .await
+        .unwrap()
+    {
+        WaitOutcome::TimedOut(_) => {}
+        other => panic!("a wait rides it out: {other:?}"),
+    }
     a.stop().await;
 }
 

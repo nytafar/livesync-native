@@ -103,6 +103,8 @@ pub struct MockState {
     /// Answer `GET /{db}/{id}?rev=…&revs=true` with a 404 `missing`, as
     /// CouchDB does for a revision compaction removed.
     pub forget_rev_bodies: bool,
+    /// Cut `_revisions` to this many entries, as CouchDB's `_revs_limit`.
+    pub revs_limit: Option<usize>,
     /// IDs whose bodies a ranged `GET _all_docs?include_docs=true` returned.
     pub served_bodies: Vec<String>,
     /// After the next full page of a ranged `_all_docs` read, drop the last
@@ -610,6 +612,9 @@ async fn get_doc(State((st, _)): S, Path(id): Path<String>, Query(q): Query<Hash
             while let Some(r) = at {
                 ids.push(rev_key(&r).1);
                 at = tree.revs.get(&r).and_then(|n| n.parent.clone());
+            }
+            if let Some(n) = s.revs_limit {
+                ids.truncate(n);
             }
             body["_revisions"] = json!({"start": rev_key(rev).0, "ids": ids});
         }

@@ -3013,6 +3013,10 @@ impl Engine {
                             | Refusal::LockedWithoutRebuild { .. }
                             | Refusal::MissingVersionDoc,
                         ) => Duration::from_secs(30),
+                        // A decode error or a 404/405 from a restarting
+                        // proxy reads as "not CouchDB" too, and clears by
+                        // itself: retried like a remote failure.
+                        EngineError::Refused(Refusal::NotCouchDb) => backoff.next_delay(),
                         EngineError::Refused(_) => {
                             // Only a person clears this one: `wait` says so
                             // instead of waiting it out.
