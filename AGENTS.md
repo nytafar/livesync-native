@@ -53,6 +53,8 @@ The binary links only `libc`, `libm` and `libdl`. TLS is rustls with bundled web
 
 `.github/workflows/ci.yml` runs the gate on Linux and macOS and the Android gate (`scripts/build-apk.sh --unsigned`) on every push and PR.
 
+`.github/workflows/upstream-interop.yml` runs `scripts/interop.sh` weekly (and by hand: `gh workflow run upstream-interop.yml [-f tag=1.0.46]`) against the official CLI built from the latest upstream release (`scripts/ci/upstream-cli.sh`), on a throwaway CouchDB service container published on 127.0.0.1:8411 and set up by `scripts/ci/couchdb-init.sh`. It publishes nothing. When it fails, or a new upstream release is tested, update `COMPATIBILITY.md` and `TESTED_PLUGIN_VERSION` (`crates/livesync-model/src/gate.rs`) together. To try a release locally: `scripts/ci/upstream-cli.sh ~/scratch/upstream-cli [TAG]`, then `LSYNC_CLI_JS=<the cli_js it prints> scripts/interop.sh`.
+
 A release is a pushed tag; `.github/workflows/release.yml` does the rest:
 
 ```sh

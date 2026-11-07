@@ -1,0 +1,103 @@
+# The interop scenarios (scripts/interop.sh) against the latest upstream
+# release of the official Self-hosted LiveSync CLI, weekly and by hand, so a
+# breaking release is known before any device updates (COMPATIBILITY.md).
+#
+# CouchDB runs as a throwaway service container published on port 8411
+# (interop.sh accepts only 127.0.0.1:8411); its credentials exist
+# only for this job. The official CLI is built from the release tag with
+# scripts/ci/upstream-cli.sh. Nothing is published: no release, no
+# artefact, nothing pushed.
+name: Upstream interop
+
+on:
+  schedule:
+    - cron: "23 5 * * 1" # Mondays 05:23 UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release tag to test (empty: the latest release)"
+        required: false
+        default: ""
+
+concurrency:
+  group: upstream-interop
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Throwaway: the CouchDB below lives only as long as this job.
+  CI_COUCHDB_USER: ci
+  CI_COUCHDB_PASSWORD: ci-throwaway-password
+
+jobs:
+  interop:
+    name: interop against the latest official CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      couchdb:
+        image: couchdb:3.5
+        env:
+          COUCHDB_USER: ci
+          COUCHDB_PASSWORD: ci-throwaway-password
+          COUCHDB_SINGLE_NODE: "y"
+        ports:
+          - 8411:5984
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24.x"
+      - name: Build the official CLI from the upstream release
+        id: cli
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: scripts/ci/upstream-cli.sh "$RUNNER_TEMP/upstream" "$TAG" | tee -a "$GITHUB_OUTPUT"
+      - name: Configure CouchDB
+        env:
+          COUCHDB_URL: http://127.0.0.1:8411
+          COUCHDB_USER: ${{ env.CI_COUCHDB_USER }}
+          COUCHDB_PASSWORD: ${{ env.CI_COUCHDB_PASSWORD }}
+        run: scripts/ci/couchdb-init.sh
+      - name: Interop scenarios
+        env:
+          LSYNC_CLI_JS: ${{ steps.cli.outputs.cli_js }}
+          LSYNC_DEV_ENV: ${{ runner.temp }}/dev.env
+        run: |
+          umask 077
+          {
+            echo "LSYNC_DEV_URL=http://127.0.0.1:8411"
+            echo "LSYNC_DEV_DB=unused"
+            echo "LSYNC_DEV_USER=$CI_COUCHDB_USER"
+            echo "LSYNC_DEV_PASSWORD=$CI_COUCHDB_PASSWORD"
+          } > "$LSYNC_DEV_ENV"
+          echo "### Upstream interop: official CLI ${{ steps.cli.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          set -o pipefail
+          KEEP=1 scripts/interop.sh 2>&1 | tee "$RUNNER_TEMP/interop.txt"
+      - name: Summary
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/interop.txt" ]]; then
+            { echo '```'; grep -E '^(==|S[0-9]|  (PASS|FAIL)|passed )' "$RUNNER_TEMP/interop.txt" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Logs of a failed run
+        if: failure()
+        run: |
+          for w in /tmp/lsync-it.*; do
+            [[ -d "$w" ]] || continue
+            for f in "$w"/*.log; do
+              echo "::group::$(basename "$f")"
+              tail -n 200 "$f"
+              echo "::endgroup::"
+            done
+          done
