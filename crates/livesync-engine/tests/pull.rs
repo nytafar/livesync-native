@@ -480,6 +480,37 @@ async fn daemon_follows_changes_and_survives_outages() {
     assert!(st.daemon_heartbeat_ms.is_some());
 }
 
+// The mock's longpoll once answered a wait woken by a chunk (which the
+// selector filters out) with a `last_seq` past a document that landed during
+// its second wait, so the daemon skipped that document for good.
+#[tokio::test]
+async fn a_document_landing_while_the_longpoll_waits_after_its_chunks_is_not_skipped() {
+    let env = Env::new().await;
+    let m = env.mock.clone();
+    m.put_text("first.md", &["1"]);
+    let engine = env.engine_with(|c| c.regate_interval = Duration::from_secs(600));
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let e2 = engine.clone();
+    let h = tokio::spawn(async move { e2.daemon_pull_only(rx).await });
+    wait_for(&env.vault().join("first.md"), b"1").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The chunk wakes the open longpoll, which finds nothing it selects and
+    // waits again; the document arrives during that wait.
+    let children = m.put_chunks(&["late"]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    m.put(serde_json::json!({
+        "_id": "late.md", "path": "late.md", "type": "plain", "children": children,
+        "ctime": 1_700_000_000_000i64, "mtime": 1_700_000_100_000i64, "size": 4, "eden": {}
+    }));
+    wait_for(&env.vault().join("late.md"), b"late").await;
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), h)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
 async fn wait_for(path: &Path, content: &[u8]) {
     for _ in 0..200 {
         if std::fs::read(path).ok().as_deref() == Some(content) {

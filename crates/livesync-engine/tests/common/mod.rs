@@ -684,7 +684,11 @@ async fn changes(State((st, notify)): S, Query(q): Query<HashMap<String, String>
     let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(usize::MAX);
     let longpoll = q.get("feed").map(String::as_str) == Some("longpoll");
     let conflicts = q.get("conflicts").map(String::as_str) == Some("true");
-    for _ in 0..2 {
+    // Answer from one snapshot of the log: results, and a `last_seq` that
+    // covers only what that snapshot held. A wait woken by a change the
+    // selector drops (a chunk) looks again, until the longpoll times out.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
         let notified = notify.notified();
         let (results, last, pending) = {
             let s = st.lock().unwrap();
@@ -714,14 +718,12 @@ async fn changes(State((st, notify)): S, Query(q): Query<HashMap<String, String>
                 .collect();
             (results, last, (total - page.len()) as u64)
         };
-        if !results.is_empty() || !longpoll {
+        if !results.is_empty() || !longpoll || tokio::time::Instant::now() >= deadline {
             return Json(json!({"results": results, "last_seq": format!("{last}-x"), "pending": pending}))
                 .into_response();
         }
-        let _ = tokio::time::timeout(Duration::from_secs(20), notified).await;
+        let _ = tokio::time::timeout_at(deadline, notified).await;
     }
-    let s = st.lock().unwrap();
-    Json(json!({"results": [], "last_seq": format!("{}-x", s.seq), "pending": 0})).into_response()
 }
 
 async fn all_docs(State((st, _)): S, Query(q): Query<HashMap<String, String>>, Json(body): Json<Value>) -> Json<Value> {
