@@ -301,6 +301,8 @@ pub struct Service {
     events: broadcast::Sender<Event>,
     stopping: AtomicBool,
     version: String,
+    /// What the activity poll last saw of each running engine.
+    activity: Mutex<HashMap<String, Seen>>,
 }
 
 impl Service {
@@ -317,6 +319,7 @@ impl Service {
             events,
             stopping: AtomicBool::new(false),
             version: version.to_string(),
+            activity: Mutex::new(HashMap::new()),
         })
     }
 
@@ -386,10 +389,18 @@ impl Service {
         self.host.state(name).is_some()
     }
 
-    async fn stop_engine(&self, name: &str) -> bool {
-        let host = self.host.clone();
+    /// Stop a vault's engine, after reporting what it did since the last
+    /// activity poll (its counters go with it).
+    async fn stop_engine(self: &Arc<Self>, name: &str) -> bool {
+        let svc = self.clone();
         let id = name.to_string();
-        blocking(move || host.stop(&id)).await
+        blocking(move || {
+            svc.poll_vault(&id);
+            let released = svc.host.stop(&id);
+            lock(&svc.activity).remove(&id);
+            released
+        })
+        .await
     }
 
     async fn start_engine(&self, cfg: RunConfig) -> Result<(), String> {
@@ -551,7 +562,7 @@ impl Service {
 
     /// Pause one vault, or every vault: its engine stops and lets go of its
     /// folders. Pausing a paused vault does nothing.
-    pub async fn pause(&self, vault: Option<&str>) -> Result<Vec<String>, CtlError> {
+    pub async fn pause(self: &Arc<Self>, vault: Option<&str>) -> Result<Vec<String>, CtlError> {
         self.check_running()?;
         let mut done = Vec::new();
         for (name, entry) in self.targets(vault)? {
@@ -577,7 +588,7 @@ impl Service {
     }
 
     /// Resume one vault, or every paused vault, with its current settings.
-    pub async fn resume(&self, vault: Option<&str>) -> Result<Vec<String>, CtlError> {
+    pub async fn resume(self: &Arc<Self>, vault: Option<&str>) -> Result<Vec<String>, CtlError> {
         self.check_running()?;
         let mut done = Vec::new();
         for (name, entry) in self.targets(vault)? {
@@ -701,7 +712,7 @@ impl Service {
     /// Run a command for a client on a vault the service holds (see the
     /// module docs). The vault's engine is back as it was afterwards,
     /// whatever the command's outcome.
-    pub async fn command(&self, cmd: Command, p: CommandParams) -> Result<CommandResult, CtlError> {
+    pub async fn command(self: &Arc<Self>, cmd: Command, p: CommandParams) -> Result<CommandResult, CtlError> {
         self.check_running()?;
         let name = p.vault.clone();
         let entry = self.entry(&name)?;
@@ -802,7 +813,7 @@ impl Service {
     /// For `lsync daemon`: wait until a vault's first start is decided.
     /// `Err` with the reason when it did not start (it is then stopped, so
     /// the caller can exit as a one-shot `lsync daemon` always did).
-    pub async fn wait_started(&self, name: &str) -> Result<(), String> {
+    pub async fn wait_started(self: &Arc<Self>, name: &str) -> Result<(), String> {
         let entry = self.entry(name).map_err(|e| e.message)?;
         loop {
             let v = entry.view();
@@ -828,7 +839,7 @@ impl Service {
 
     /// Stop every engine: refuse new requests, let running commands finish
     /// (up to the host's stop timeout each), then stop the vaults.
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(self: &Arc<Self>) {
         self.stopping.store(true, Ordering::SeqCst);
         let entries: Vec<(String, Arc<Entry>)> =
             lock(&self.vaults).iter().map(|(n, e)| (n.clone(), e.clone())).collect();
@@ -839,8 +850,14 @@ impl Service {
                 Err(_) => warn!("vault {name}: a command is still running; stopping anyway"),
             }
         }
-        let host = self.host.clone();
-        blocking(move || host.stop_all()).await;
+        let svc = self.clone();
+        blocking(move || {
+            for name in svc.names() {
+                svc.poll_vault(&name);
+            }
+            svc.host.stop_all();
+        })
+        .await;
         drop(guards);
     }
 
@@ -849,7 +866,6 @@ impl Service {
     pub fn spawn_activity(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let weak: Weak<Service> = Arc::downgrade(self);
         tokio::spawn(async move {
-            let mut seen: HashMap<String, Seen> = HashMap::new();
             let mut tick = tokio::time::interval(ACTIVITY_POLL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -858,35 +874,34 @@ impl Service {
                 if svc.stopping.load(Ordering::SeqCst) {
                     return;
                 }
-                let mut state = std::mem::take(&mut seen);
-                state = blocking(move || {
-                    svc.poll_activity(&mut state);
-                    state
+                blocking(move || {
+                    let names = svc.names();
+                    lock(&svc.activity).retain(|n, _| names.contains(n));
+                    for name in names {
+                        svc.poll_vault(&name);
+                    }
                 })
                 .await;
-                seen = state;
             }
         })
     }
 
-    fn poll_activity(&self, seen: &mut HashMap<String, Seen>) {
-        let names = self.names();
-        seen.retain(|n, _| names.contains(n));
-        for name in names {
-            let Some(engine) = self.host.engine(&name) else {
-                // The next engine starts its counters at zero.
-                seen.remove(&name);
-                continue;
-            };
-            let s = seen.entry(name.clone()).or_default();
-            let (pull, push) = (engine.report(), engine.push_report());
-            let moved = s.counters(self, &name, &pull, &push);
-            if moved || s.status_at.is_none_or(|t| t.elapsed() >= STATUS_POLL) {
-                if let Ok(st) = engine.status() {
-                    s.status(self, &name, st.safety_stop, st.last_error);
-                }
-                s.status_at = Some(Instant::now());
+    /// One activity poll of one vault. Blocks (an index read now and then).
+    fn poll_vault(&self, name: &str) {
+        let mut seen = lock(&self.activity);
+        let Some(engine) = self.host.engine(name) else {
+            // The next engine starts its counters at zero.
+            seen.remove(name);
+            return;
+        };
+        let s = seen.entry(name.to_string()).or_default();
+        let (pull, push) = (engine.report(), engine.push_report());
+        let moved = s.counters(self, name, &pull, &push);
+        if moved || s.status_at.is_none_or(|t| t.elapsed() >= STATUS_POLL) {
+            if let Ok(st) = engine.status() {
+                s.status(self, name, st.safety_stop, st.last_error);
             }
+            s.status_at = Some(Instant::now());
         }
     }
 }

@@ -499,3 +499,25 @@ fn pause_resume_and_commands_leave_every_vault_in_a_defined_state() {
     // After shutdown, nothing more is taken.
     assert_eq!(f.rt.block_on(svc.resume(None)).unwrap_err().code, code::SHUTTING_DOWN);
 }
+
+#[test]
+fn a_change_just_before_a_pause_is_still_reported() {
+    let f = Fixture::new();
+    f.write_config(&vault("notes", "dev", "notes", "mode = \"pull-only\""));
+    let svc = f.service();
+    f.reload(&svc);
+    wait_until("running", || state_of(&svc, "notes") == "running");
+    std::thread::sleep(livesync_host::service::ACTIVITY_POLL * 3);
+    let mut rx = svc.subscribe();
+    f.mock.put_text("late.md", &["late"]);
+    // Paused as soon as the file is there, before the next poll: what the
+    // engine did is read before it stops.
+    wait_until("the file", || f.home("notes/late.md").exists());
+    f.rt.block_on(svc.pause(None)).unwrap();
+    let mut pulled = false;
+    while let Ok(e) = rx.try_recv() {
+        pulled |= e.event == "pulled" && e.data["written"].as_u64() >= Some(1);
+    }
+    assert!(pulled, "the pull before the pause was reported");
+    f.rt.block_on(svc.shutdown());
+}
