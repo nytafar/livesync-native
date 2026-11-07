@@ -157,6 +157,44 @@ fn an_upstream_change_stops_only_the_vault_on_that_database() {
 }
 
 #[test]
+fn an_engine_refused_before_it_ran_is_marked_ended() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mock = rt.block_on(Mock::start());
+    let d = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        home: Some(d.path().join("home")),
+        config: d.path().join("config/lsync"),
+        state: d.path().join("state/lsync"),
+    };
+    // The plugin is on in the folder: `run` refuses before it marks itself
+    // running.
+    let obsidian = d.path().join("home/a/.obsidian");
+    std::fs::create_dir_all(obsidian.join("plugins/obsidian-livesync")).unwrap();
+    std::fs::write(obsidian.join("community-plugins.json"), r#"["obsidian-livesync"]"#).unwrap();
+    let text = format!(
+        "[account.dev]\nurl = \"{}\"\nusername = \"u\"\n\n[vault.a]\naccount = \"dev\"\ndatabase = \"{DB}\"\nfolder = \"~/a\"\n",
+        mock.url
+    );
+    let cfg = Config::parse(&text, &dirs).unwrap();
+    let host = Host::new().unwrap();
+    let engines = Arc::new(Mutex::new(Vec::new()));
+    let seen = engines.clone();
+    host.set_engine_hook(Arc::new(move |_, e| seen.lock().unwrap().push(e.clone())));
+    let v = &cfg.vault["a"];
+    host.start(v.run_config("a", &cfg.account[&v.account], Some("p"), &dirs).unwrap())
+        .unwrap();
+    wait_until("the refusal", || host.status("a", "", "").state == RunState::Failed);
+    let first = engines.lock().unwrap()[0].clone();
+    // A wait or flush that picked it up sees it end at once.
+    assert!(first.activity().ended, "{:?}", first.activity());
+    host.stop_all();
+}
+
+#[test]
 fn the_guard_settings_are_checked_with_the_config() {
     let d = tempfile::tempdir().unwrap();
     let dirs = Dirs {

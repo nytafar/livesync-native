@@ -272,6 +272,7 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
                 let started = Instant::now();
                 let rx = stop.clone();
                 let pull_only = shared.cfg.pull_only;
+                let ran = engine.clone();
                 // A separate task, so a panic in the engine is reported here
                 // instead of taking the supervisor down with it. Aborting it
                 // cancels the engine's push side too (`Engine::run`).
@@ -287,6 +288,9 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
                 );
                 *lock(&shared.run_abort) = Some(run.abort_handle());
                 let result = run.await;
+                // `run` can return before it marked itself running (the
+                // plugin guard); a wait or flush on it must still see it end.
+                ran.mark_ended();
                 *lock(&shared.run_abort) = None;
                 *lock(&shared.engine) = None;
                 if *stop.borrow() {

@@ -281,6 +281,21 @@ impl Engine {
         self.inner.activity.subscribe()
     }
 
+    /// Marks this engine's daemon as ended, for a caller whose `run` (or
+    /// `daemon_pull_only`) returned, including before it marked itself
+    /// running (a refusal at the start): waits and flushes on it then end at
+    /// once instead of running out their time.
+    pub fn mark_ended(&self) {
+        self.set_activity(|a| {
+            a.running = false;
+            a.ended = true;
+            a.pull = PullPhase::Stopped;
+            a.settling = 0;
+            a.pushing = false;
+            a.push_due = false;
+        });
+    }
+
     pub(crate) fn set_activity(&self, f: impl FnOnce(&mut Activity)) {
         self.inner.activity.send_if_modified(|a| {
             let before = a.clone();
@@ -526,6 +541,15 @@ impl Engine {
                 deleted: false,
                 superseded: true,
             }),
+            // `_revisions` is cut at the server's `_revs_limit`: a revision
+            // older than the oldest one listed may be an ancestor still.
+            Ok(Some(history))
+                if parse_rev(want).is_some_and(|w| history.iter().filter_map(|r| parse_rev(r)).min().is_some_and(|m| w < m)) =>
+            {
+                unknown(format!(
+                    "the server's history of {current} does not reach that far back (it keeps only the latest revisions, `_revs_limit`)"
+                ))
+            }
             Ok(Some(_)) => Check::Blocked(format!(
                 "revision {want} of {path} is not in the history of {current}, the revision here: it is on another branch (the losing side of a conflict?) and will not arrive"
             )),
@@ -655,14 +679,7 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.0.set_activity(|a| {
-            a.running = false;
-            a.ended = true;
-            a.pull = PullPhase::Stopped;
-            a.settling = 0;
-            a.pushing = false;
-            a.push_due = false;
-        });
+        self.0.mark_ended();
     }
 }
 
