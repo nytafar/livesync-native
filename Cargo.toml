@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/livesync-model",
+    "crates/livesync-merge",
     "crates/livesync-remote",
     "crates/livesync-engine",
     "crates/livesync-host",

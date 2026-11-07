@@ -1,0 +1,13 @@
+[package]
+name = "livesync-merge"
+description = "D9's conflict merge rules (line, frontmatter, JSON) as a pure library"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+yaml-rust2 = { version = "0.13.0", default-features = false }
+
+[dev-dependencies]
+proptest = "1.11.0"
+serde_json = "1.0.154"
