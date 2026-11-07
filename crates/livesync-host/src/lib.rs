@@ -3,14 +3,23 @@
 //!
 //! - [`supervisor`]: one Tokio runtime, one supervisor task per vault, with
 //!   retries and stop and release timeouts ([`Host`]).
-//! - [`run`]: what one supervised engine needs, and its checks.
+//! - [`config`]: accounts and vaults (`lsync.toml`), and the folder rules
+//!   between vaults.
+//! - [`edit`]: changing `lsync.toml` with its comments and layout kept.
+//! - [`secret`]: the `SecretStore` seam and its backends.
+//! - [`migrate`]: from `<profile>.toml` files to `lsync.toml`.
 //!
 //! Nothing here is platform-specific: the front-end owns the service, the
 //! UI, the network callback and the platform's secret store.
 
 pub mod cancel;
+pub mod config;
+pub mod edit;
+pub mod legacy;
+pub mod migrate;
 pub mod paths;
 pub mod run;
+pub mod secret;
 pub mod supervisor;
 
 pub use cancel::Cancel;
@@ -56,6 +65,27 @@ impl From<EngineError> for HostError {
             EngineError::Index(_) | EngineError::Other(_) => HostError::Other { msg },
         }
     }
+}
+
+/// A TOML error as "line L, column C: message", without the source line
+/// the parser's own rendering quotes: a config or profile file may hold a
+/// password on that line.
+pub fn toml_error(text: &str, message: &str, span: Option<std::ops::Range<usize>>) -> String {
+    let message = message.trim();
+    match span {
+        Some(r) => {
+            let before = &text[..r.start.min(text.len())];
+            let line = before.matches('\n').count() + 1;
+            let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+            format!("line {line}, column {column}: {message}")
+        }
+        None => message.to_string(),
+    }
+}
+
+/// [`toml_error`] for `toml::from_str`.
+pub fn toml_de_error(text: &str, e: &toml::de::Error) -> String {
+    toml_error(text, e.message(), e.span())
 }
 
 /// A sentence for the user about a remote error, without the request

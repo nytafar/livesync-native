@@ -37,12 +37,14 @@ The home screen lists every vault with one line of status; "Add vault" sets up a
 The same engine as a single binary for Linux (and Termux on Android): one-shot pulls and syncs, or a long-running daemon for a server or a desktop without Obsidian.
 
 ```sh
-printf '%s' "$PASSWORD" | lsync --url https://couch.example.net --db vault --user me \
-    --vault ~/Notes configure --password-stdin
+lsync account add home --url https://couch.example.net --user me   # asks for the password
+lsync vault add notes --db vault --folder ~/Notes
 lsync connect            # check that the database is compatible
 lsync daemon             # two-way, continuously
 lsync daemon --pull-only # follow the server, never write to it
 ```
+
+With more than one vault, name the one to act on: `lsync --vault notes sync`.
 
 Full usage is under [Reference](#reference).
 
@@ -125,13 +127,72 @@ This is an independent client, not affiliated with the Self-hosted LiveSync proj
 </details>
 
 <details>
+<summary>Accounts, vaults and passwords (<code>lsync.toml</code>)</summary>
+
+One file, `$XDG_CONFIG_HOME/lsync/lsync.toml` (`~/.config/lsync/lsync.toml`), holds every account and vault of the machine. An **account** is a server, a user and where its password is kept; a **vault** is an account, a database, a folder and its options. Several vaults may use one account (the password is entered once), and two vaults may sync one database with different folder scopes: each is its own device to the other LiveSync clients.
+
+```toml
+[account.home]
+url = "https://couch.example.net"
+username = "me"
+secret = "file:home"            # where the password is (below); never the password itself
+
+[vault.notes]
+account = "home"
+database = "vault"
+folder = "~/Notes"
+exclude = ["Archive"]           # or include = [...]; neither: every folder
+
+[vault.archive]                 # nested in notes: another database, excluded by notes' scope
+account = "home"
+database = "archive"
+folder = "~/Notes/Archive"
+mode = "pull-only"              # default two-way
+```
+
+A vault also takes `state_dir` (default `$XDG_STATE_HOME/lsync/<vault>`), `device_name`, `ignore_regex` (upstream `syncIgnoreRegEx`), `enabled` (default true; `false` keeps it configured but out of the service), `max_size_mb` and `concurrency`. Anything else, including a password, is refused with a message rather than ignored.
+
+```sh
+lsync account add home --url https://couch.example.net --user me   # asks for the password
+printf '%s' "$PASSWORD" | lsync account add home --url ... --user me --password-stdin
+lsync account add ci --url ... --user me --secret env:LSYNC_CI_PASSWORD   # read from the environment
+lsync account ls [--json]       # every account, where its password is kept, whether it is set
+lsync account passwd home       # asks; or --password-stdin
+lsync account rm home           # only when no vault uses it
+
+lsync vault add notes --account home --db vault --folder ~/Notes [--exclude Archive] [--mode pull-only]
+lsync vault ls [--json]
+lsync vault edit notes --include Notes,Projects --device-name desk   # --unset KEY clears a setting
+lsync vault disable notes       # and enable
+lsync vault rm notes            # the folder and the index are kept
+
+lsync --vault notes sync        # --profile is the same; with one vault there is nothing to name
+```
+
+These commands edit the file in place and keep its comments and layout; a change that would make the file invalid is refused and nothing is written. They take their settings from the command line only, never from `LSYNC_*` variables, and never a password from the command line.
+
+**Folder rules.** No two vaults share a folder or a state folder. A vault folder inside another one is allowed only when it syncs a database of its own and the outer vault's scope excludes it; the refusal says what to add to which `exclude`.
+
+**Passwords** never go in `lsync.toml`, in logs or in error messages. An account's `secret` names its store:
+
+| `secret` | Where the password is |
+|---|---|
+| `file:KEY` (the default, `file:<account>`) | `secrets.toml` beside `lsync.toml`, mode 0600, `"KEY" = "password"` per line; refused while others can read it |
+| `credential:NAME` | a systemd credential: the file `NAME` in `$CREDENTIALS_DIRECTORY` (`LoadCredential=` or `LoadCredentialEncrypted=` in the unit) |
+| `env:VAR` | the environment variable `VAR` |
+
+`--password` and `LSYNC_PASSWORD` still override the store for one run. The macOS Keychain and the Linux Secret Service come later as more stores.
+
+**Selecting a vault.** `--vault NAME` (or `--profile NAME`, or `LSYNC_PROFILE`) picks a vault. Without one, a vault named `default` is used, or else the only vault; with several, the command asks for `--vault`. When a run gives its own folder (`--folder` or `LSYNC_VAULT`) without naming a vault, it uses only flags and the environment, never another vault's index; a vault named `default` stands in for the old default profile and is still merged with them. `--vault` used to name the folder: a value that is clearly a path (with a `/`, or starting with `~` or `.`) is still read as `--folder`, with a warning.
+
+**From profile files.** Before `lsync.toml`, each profile was its own `~/.config/lsync/<profile>.toml` with the password inside. On the first run without an `lsync.toml`, they are migrated: one account per server, user and password, one vault per profile with the profile's name, and the passwords into `secrets.toml`. A vault keeps its profile's state folder (the default one has the same path), so its index and node ID stay and nothing is fetched again. The profile files are left as they were, so an older `lsync` still runs from them, but they still hold their passwords: delete them once you no longer need them. A profile that cannot become a vault (incomplete, or overlapping another one) is left, reported, and still read with `--profile NAME`. `--config FILE` reads a profile file as before, and never migrates it. `lsync configure` still works: on a vault in `lsync.toml` it changes that vault (and its account, and the password in the account's store); on a profile file, that file.
+
+</details>
+
+<details>
 <summary>Full <code>lsync</code> usage, environment and exit codes</summary>
 
 ```sh
-# Save a profile (config at ~/.config/lsync/<profile>.toml, mode 0600)
-printf '%s' "$PASSWORD" | lsync --url https://couch.example.net --db vault --user me \
-    --vault ~/Documents/Obsidian/Vault configure --password-stdin
-
 lsync connect               # run the compatibility gate and print what it found
 lsync pull                  # one-shot pull into the vault folder (read-only)
 lsync sync                  # one-shot two-way sync: pull, register, push local changes
@@ -142,14 +203,14 @@ lsync status                # index summary, last gate result, files needing att
 
 lsync folders               # the server's top-level folders (files, size) against the folder scope;
                             # reads file metadata only, never chunks, and never writes
-lsync --include Notes,Projects configure   # sync only these folders (saved in the profile)
-lsync --exclude Private configure          # sync everything except these
-lsync --all-folders configure              # back to everything
+lsync vault edit notes --include Notes,Projects   # sync only these folders
+lsync vault edit notes --exclude Private          # sync everything except these
+lsync vault edit notes --all-folders              # back to everything
 lsync probe <vault>         # on-phone check: Obsidian vs outside writes, inotify vs Obsidian saves
                             # (refuses vaults where the LiveSync plugin is enabled)
 ```
 
-Every setting can also come from flags or `LSYNC_*` environment variables, for example `LSYNC_URL`, `LSYNC_DB`, `LSYNC_USER`, `LSYNC_PASSWORD`, `LSYNC_VAULT`, `LSYNC_STATE_DIR`, `LSYNC_IGNORE_REGEX`, `LSYNC_INCLUDE`, `LSYNC_EXCLUDE` and `LSYNC_DEVICE_NAME`. Flags win over the environment, and the environment wins over the config file. The index lives in `$XDG_STATE_HOME/lsync/<profile>/index.sqlite` unless `--state-dir` says otherwise.
+Every setting can also come from flags or `LSYNC_*` environment variables, for example `LSYNC_URL`, `LSYNC_DB`, `LSYNC_USER`, `LSYNC_PASSWORD`, `LSYNC_VAULT` (the vault folder, `--folder`), `LSYNC_STATE_DIR`, `LSYNC_IGNORE_REGEX`, `LSYNC_INCLUDE`, `LSYNC_EXCLUDE` and `LSYNC_DEVICE_NAME`. Flags win over the environment, and the environment wins over the config file, so `lsync` also runs with no config file at all. The index lives in `$XDG_STATE_HOME/lsync/<vault>/index.sqlite` unless `--state-dir` says otherwise.
 
 Exit codes:
 
@@ -168,8 +229,9 @@ Exit codes:
 | `crates/livesync-model` | Pure model: doc types, path→ID, chunk IDs, the splitter, decompression codec, gate evaluation, milestone registration, folder scope |
 | `crates/livesync-remote` | CouchDB over HTTP (reqwest + rustls with bundled webpki roots): `_changes`, `_all_docs`, `_local` docs, backoff |
 | `crates/livesync-engine` | Pull and push loops, daemons, SQLite index, vault file operations; platform seams (`Watcher`, `FsRules`) |
-| `crates/lsync` | The CLI, including `probe` |
-| `crates/livesync-ffi` | UniFFI surface for the app: one host, one engine per profile, connect test, status, logs |
+| `crates/livesync-host` | Hosting vaults for every front-end: one supervisor per vault (retries from 15 s to 15 min), accounts and vaults (`lsync.toml`), the secret stores, migration from profile files |
+| `crates/lsync` | The CLI, including `probe` and the account and vault commands |
+| `crates/livesync-ffi` | UniFFI surface for the app over `livesync-host`: one engine per profile, connect test, status, logs |
 | `crates/uniffi-bindgen` | UniFFI's Kotlin binding generator, pinned to the same version |
 | `android/` | The Android app (Kotlin, Compose): foreground service, onboarding, vault list, status screens |
 | `tools/golden` | Node program pinned to `@vrtmrz/livesync-commonlib` 0.2.1; it emits the fixtures in `fixtures/golden` |

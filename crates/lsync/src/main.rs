@@ -1,14 +1,17 @@
 //! `lsync`: Linux/Termux CLI over the LiveSync engine.
 
 mod config;
+mod manage;
 mod probe;
+mod prompt;
+mod service;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
-use config::{FileConfig, Overrides};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use config::{FileConfig, Origin, Overrides, Selected, Selector, Setup};
 use livesync_engine::{engine::status_from_index, Engine, EngineConfig, EngineError, Index, SyncReport};
+use livesync_host::config::{Dirs, Mode};
 use livesync_remote::Couch;
-use std::io::Read;
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{error, info};
@@ -22,10 +25,16 @@ const VERSION: &str = match option_env!("LSYNC_RELEASE_VERSION") {
 #[derive(Parser)]
 #[command(name = "lsync", version = VERSION, about = "Self-hosted LiveSync client")]
 struct Cli {
-    /// Profile name (selects the config file and state directory)
-    #[arg(long, short = 'p', env = "LSYNC_PROFILE", default_value = "default", global = true)]
-    profile: String,
-    /// Config file (default: $XDG_CONFIG_HOME/lsync/<profile>.toml)
+    /// The vault to act on, by name (see `lsync vault ls`); not needed with
+    /// one vault. A folder given here is read as --folder, with a warning
+    #[arg(long, global = true, value_name = "NAME")]
+    vault: Option<String>,
+    /// Another name for --vault; also names a profile file (<NAME>.toml)
+    /// that was not migrated
+    #[arg(long, short = 'p', env = "LSYNC_PROFILE", global = true, value_name = "NAME")]
+    profile: Option<String>,
+    /// Config file (default: $XDG_CONFIG_HOME/lsync/lsync.toml); a profile
+    /// file in the format before lsync.toml is read as such
     #[arg(long, env = "LSYNC_CONFIG", global = true)]
     config: Option<PathBuf>,
     #[command(flatten)]
@@ -36,7 +45,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Save remote and vault settings to the profile's config file (mode 0600)
+    /// Save the given settings (and the password, from --password,
+    /// LSYNC_PASSWORD or --password-stdin) to the vault in lsync.toml and
+    /// its account, or to a profile file that was not migrated
     Configure {
         /// Read the password from stdin instead of --password/LSYNC_PASSWORD
         #[arg(long)]
@@ -97,6 +108,16 @@ enum Cmd {
     /// Interactive on-device check: does Obsidian see outside writes, and does
     /// file watcher see Obsidian's saves?
     Probe(probe::ProbeArgs),
+    /// Accounts in lsync.toml: a server, a user, and where the password is
+    Account {
+        #[command(subcommand)]
+        cmd: manage::AccountCmd,
+    },
+    /// Vaults in lsync.toml: an account, a database, a folder, and options
+    Vault {
+        #[command(subcommand)]
+        cmd: manage::VaultCmd,
+    },
 }
 
 #[derive(clap::Args, Debug, Clone, Default)]
@@ -126,8 +147,12 @@ fn init_logging() {
 
 fn main() -> std::process::ExitCode {
     init_logging();
-    let cli = Cli::parse();
-    match run(cli) {
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(c) => c,
+        Err(e) => e.exit(),
+    };
+    match run(cli, &matches) {
         Ok(code) => std::process::ExitCode::from(code),
         Err(e) => {
             error!("{e:#}");
@@ -136,37 +161,98 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Whether an argument was given on the command line (not the environment
+/// or a default), at the top or in any subcommand.
+fn on_command_line(m: &clap::ArgMatches, id: &str) -> bool {
+    let here = m
+        .try_contains_id(id)
+        .ok()
+        .filter(|&has| has)
+        .and_then(|_| m.value_source(id))
+        .is_some_and(|s| s == clap::parser::ValueSource::CommandLine);
+    here || m.subcommand().is_some_and(|(_, sub)| on_command_line(sub, id))
+}
+
 /// Peak resident set size of this process in KiB.
 pub fn peak_rss_kib() -> Option<u64> {
     livesync_engine::platform::peak_rss_kib()
 }
 
-fn run(cli: Cli) -> Result<u8> {
-    let cfg_path = cli
-        .config
-        .clone()
-        .unwrap_or_else(|| config::default_config_path(&cli.profile));
-    let file_cfg = config::load(&cfg_path)?;
-    let cfg = file_cfg.clone().merged(&cli.overrides);
+fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
+    let mut overrides = cli.overrides.clone();
+    let ctx = Setup::new(cli.config.clone());
+    ctx.migrate_if_needed();
+    if let Cmd::Account { .. } | Cmd::Vault { .. } = &cli.cmd {
+        if cli.vault.is_some() || cli.profile.is_some() {
+            bail!("the account and vault commands take the name as an argument, not --vault or --profile");
+        }
+    }
+    let cmd = match cli.cmd {
+        Cmd::Account { cmd } => {
+            let given = manage::Given {
+                o: &overrides,
+                on_command_line: &|id| on_command_line(matches, id),
+            };
+            return manage::account(&ctx, cmd, &given);
+        }
+        Cmd::Vault { cmd } => {
+            let given = manage::Given {
+                o: &overrides,
+                on_command_line: &|id| on_command_line(matches, id),
+            };
+            return manage::vault(&ctx, cmd, &given);
+        }
+        Cmd::Probe(args) => return probe::run(args),
+        other => other,
+    };
+    let mut selector = Selector {
+        vault: cli.vault.clone(),
+        // A flag wins over the environment: `--vault NAME` over `LSYNC_PROFILE`.
+        profile: cli.profile.clone().filter(|_| {
+            cli.vault.as_deref().is_none_or(config::looks_like_path) || on_command_line(matches, "profile")
+        }),
+    };
+    let name = selector.name(&mut overrides)?;
+    let sel = ctx.select(name, &overrides)?;
+    let cfg = config::merged(sel.file.clone(), &overrides);
 
-    match cli.cmd {
+    match cmd {
         Cmd::Configure { password_stdin } => {
+            let password = if password_stdin {
+                Some(prompt::from_stdin()?)
+            } else {
+                overrides.password.clone().map(livesync_host::secret::Secret::new)
+            };
+            let to_accounts = match &sel.origin {
+                Origin::Vault { .. } => true,
+                // A new name beside an lsync.toml becomes a vault there.
+                Origin::Profile { path } => ctx.explicit.is_none() && ctx.config_file.exists() && !path.exists(),
+            };
+            if to_accounts {
+                let path = manage::configure(&ctx, &sel, &overrides, password)?;
+                println!("saved {}", path.display());
+                let again = ctx.select(Some(sel.name.clone()), &Overrides::default())?;
+                print_config(&again.file);
+                return Ok(0);
+            }
+            let Origin::Profile { path: cfg_path } = &sel.origin else {
+                unreachable!("handled above")
+            };
             let mut new = cfg;
-            if password_stdin {
-                let mut s = String::new();
-                std::io::stdin().read_to_string(&mut s)?;
-                new.password = Some(s.trim_end_matches(['\n', '\r']).to_string());
+            if let Some(pw) = password {
+                new.password = Some(pw.expose().to_string());
             }
             if let Some(v) = &new.vault {
                 new.vault = Some(absolute(v)?);
             }
-            config::save(&cfg_path, &new)?;
+            livesync_host::legacy::save(cfg_path, &new)
+                .with_context(|| format!("writing {}", cfg_path.display()))?;
             println!("saved {}", cfg_path.display());
             print_config(&new);
             Ok(0)
         }
         Cmd::Status { json } => {
-            let r = config::resolve(&cfg, &cli.profile, false)?;
+            let r = config::resolve(&sel, &cfg, &ctx.dirs, false)?;
             let index_path = r.state_dir.join("index.sqlite");
             if !index_path.exists() {
                 bail!("no index at {} yet; run `lsync pull` first", index_path.display());
@@ -180,10 +266,9 @@ fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
-        Cmd::Probe(args) => probe::run(args),
-        Cmd::Folders { json } => rt()?.block_on(folders(&cfg, json)),
+        Cmd::Folders { json } => rt()?.block_on(folders(&sel, &cfg, &ctx.dirs, json)),
         Cmd::Connect { adopt_tweaks, json } => rt()?.block_on(async {
-            let engine = engine_for(&cfg, &cli.profile, &PushOpts::default())?;
+            let engine = engine_for(&sel, &cfg, &ctx.dirs, &PushOpts::default())?;
             match engine.connect_gate(adopt_tweaks).await {
                 Ok(g) => {
                     if json {
@@ -218,7 +303,7 @@ fn run(cli: Cli) -> Result<u8> {
             }
         }),
         Cmd::Pull { json } => rt()?.block_on(async {
-            let engine = engine_for(&cfg, &cli.profile, &PushOpts::default())?;
+            let engine = engine_for(&sel, &cfg, &ctx.dirs, &PushOpts::default())?;
             let t0 = Instant::now();
             let rep = match engine.pull_once().await {
                 Ok(r) => r,
@@ -265,15 +350,18 @@ fn run(cli: Cli) -> Result<u8> {
             Ok(if rep.dirty > 0 || rep.pending > 0 { 3 } else { 0 })
         }),
         Cmd::Sync { json, push } => rt()?.block_on(async {
-            let engine = engine_for(&cfg, &cli.profile, &push)?;
+            two_way_allowed(&sel, "sync")?;
+            let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             run_sync(&engine, json, false).await
         }),
         Cmd::Fetch { json, push } => rt()?.block_on(async {
-            let engine = engine_for(&cfg, &cli.profile, &push)?;
+            two_way_allowed(&sel, "fetch")?;
+            let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             run_sync(&engine, json, true).await
         }),
         Cmd::Daemon { pull_only, push } => rt()?.block_on(async {
-            let engine = engine_for(&cfg, &cli.profile, &push)?;
+            let pull_only = pull_only || sel.mode == Mode::PullOnly;
+            let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             let (tx, rx) = tokio::sync::watch::channel(false);
             let nudger = engine.clone();
             tokio::spawn(async move {
@@ -302,7 +390,20 @@ fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }),
+        Cmd::Probe(_) | Cmd::Account { .. } | Cmd::Vault { .. } => unreachable!("dispatched above"),
     }
+}
+
+/// A pull-only vault is never written to the remote from here either.
+fn two_way_allowed(sel: &Selected, what: &str) -> Result<()> {
+    if sel.mode == Mode::PullOnly {
+        bail!(
+            "vault {} is pull-only (mode = \"pull-only\"), and `{what}` writes to the remote; use `lsync pull`, or `lsync vault edit {} --mode two-way`",
+            sel.name,
+            sel.name
+        );
+    }
+    Ok(())
 }
 
 async fn run_sync(engine: &Engine, json: bool, fetch: bool) -> Result<u8> {
@@ -381,20 +482,14 @@ async fn run_sync(engine: &Engine, json: bool, fetch: bool) -> Result<u8> {
     Ok(if attention { 3 } else { 0 })
 }
 
-async fn folders(cfg: &FileConfig, json: bool) -> Result<u8> {
+async fn folders(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, json: bool) -> Result<u8> {
     use livesync_model::scope::Coverage;
-    let url = cfg.url.clone().unwrap_or_default();
-    let database = cfg.database.clone().unwrap_or_default();
-    if url.is_empty() || database.is_empty() {
-        bail!("no remote configured (use --url/--db, LSYNC_URL/LSYNC_DB or `lsync configure`)");
-    }
-    let scope = cfg.scope()?;
-    let couch = Couch::new(&livesync_remote::RemoteConfig {
-        url,
-        database,
-        username: cfg.username.clone(),
-        password: cfg.password.clone(),
-    })?;
+    let mut probe = cfg.clone();
+    // The folder is optional here: only its top-level folders are merged in.
+    probe.vault = Some(cfg.vault.clone().unwrap_or_default());
+    let r = config::resolve(sel, &probe, dirs, true)?;
+    let scope = r.scope;
+    let couch = Couch::new(&r.remote)?;
     let mut l = match livesync_engine::list_remote_folders(&couch).await {
         Ok(l) => l,
         Err(EngineError::Refused(r)) => {
@@ -476,13 +571,13 @@ fn absolute(p: &std::path::Path) -> Result<PathBuf> {
     })
 }
 
-fn engine_for(cfg: &FileConfig, profile: &str, push: &PushOpts) -> Result<Engine> {
+fn engine_for(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, push: &PushOpts) -> Result<Engine> {
     // After a rebuild elsewhere, how long the remote must stay unchanged
     // before the refetch counts as complete (default 30 s; tests shorten it).
     let quiet = std::env::var("LSYNC_REBUILD_QUIET_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
-    let r = config::resolve(cfg, profile, true)?;
+    let r = config::resolve(sel, cfg, dirs, true)?;
     let couch = Couch::new(&r.remote)?;
     let mut ec = EngineConfig::new(absolute(&r.vault)?, r.state_dir.join("index.sqlite"));
     ec.ignore_regex = r.ignore_regex;
