@@ -30,13 +30,16 @@
 
 use crate::config::{server_key, Config, Dirs, Mode};
 use crate::protocol::{
-    code, event, CommandParams, CommandResult, CtlError, Event, Hello, ReloadReport, Settings, StatusResult,
-    VaultError, VaultView, PROTOCOL,
+    code, event, CommandParams, CommandResult, CtlError, Event, FlushParams, Hello, ReloadReport, Settings,
+    StatusResult, VaultError, VaultView, WaitParams, WaitResult, PROTOCOL,
 };
 use crate::secret::SecretStores;
 use crate::supervisor::{wait_released, RELEASE_TIMEOUT, STOP_TIMEOUT};
 use crate::{Host, HostError, RunConfig, RunState, StateListener};
-use livesync_engine::{Confirmation, EngineError, PullReport, PushReport};
+use livesync_engine::{
+    Confirmation, Engine, EngineError, EngineEvent, FlushOutcome, FlushReport, PullPhase, PullReport, PushReport,
+    Target, WaitFor, WaitOutcome,
+};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -44,7 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// How often the engines' counters are looked at for events.
 pub const ACTIVITY_POLL: Duration = Duration::from_millis(500);
@@ -359,6 +362,30 @@ impl Service {
     pub fn new(host: Arc<Host>, source: Box<dyn Source>, version: &str) -> Arc<Service> {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         host.set_listener(Arc::new(Forward(events.clone())));
+        // Every engine's stored and applied revisions, from its first one.
+        let (tx, handle) = (events.clone(), host.handle().clone());
+        host.set_engine_hook(Arc::new(move |id: &str, engine: &Engine| {
+            let mut rx = engine.subscribe();
+            let (tx, id) = (tx.clone(), id.to_string());
+            handle.spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(ev) => {
+                            let kind = match &ev {
+                                EngineEvent::Stored(_) => event::STORED,
+                                EngineEvent::Applied(_) => event::APPLIED,
+                            };
+                            let data = serde_json::to_value(ev.revision()).unwrap_or_default();
+                            let _ = tx.send(make_event(kind, Some(id.clone()), data));
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            debug!("vault {id}: {n} revision events missed")
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            });
+        }));
         Arc::new(Service {
             host,
             source,
@@ -825,6 +852,7 @@ impl Service {
                 deletes_waiting: st.deletes_waiting,
                 mass_delete_allowed: st.mass_delete_allowed,
                 mass_delete_waits: st.mass_delete_waits,
+                activity: self.host.engine(&name).map(|e| e.activity()),
             });
         }
         Ok(StatusResult { vaults: out })
@@ -943,6 +971,176 @@ impl Service {
             }),
         );
         outcome
+    }
+
+    /// The running engine of a vault for `flush` or `wait`, waiting (until
+    /// `deadline`) while it starts, retries or runs a command for a client.
+    /// A vault that will not run without a person (paused, disabled,
+    /// unusable settings) is an error at once.
+    async fn engine_now(&self, name: &str, deadline: Option<Instant>) -> Result<Engine, CtlError> {
+        loop {
+            self.check_running()?;
+            let entry = self.entry(name)?;
+            let v = entry.view();
+            if v.removed {
+                return Err(self.unknown(name));
+            }
+            if v.paused {
+                return Err(CtlError::new(
+                    code::PAUSED,
+                    format!("vault {name} is paused; `lsync --vault {name} resume` first"),
+                ));
+            }
+            if v.planned.runnable().is_none() || (v.start_error.is_some() && !self.has_slot(name)) {
+                return Err(self.not_running(name, &v));
+            }
+            if let Some(e) = self.host.engine(name) {
+                return Ok(e);
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                let why = match (self.host.state(name), v.command) {
+                    (_, Some(c)) => format!("it is running `{}` for a client", c.name()),
+                    (Some((s, m)), _) => format!(
+                        "it is {}{}",
+                        state_name(s),
+                        m.map(|m| format!(": {m}")).unwrap_or_default()
+                    ),
+                    (None, _) => "it is not running".into(),
+                };
+                return Err(CtlError::new(
+                    code::TIMEOUT,
+                    format!("vault {name} did not get going in time ({why})"),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// `flush`: push the vault's local changes now (the paths given, or
+    /// every pending one) and answer once they are stored on the server
+    /// (see `livesync_engine::flush`). Waits while the vault starts or its
+    /// engine restarts, up to the timeout.
+    pub async fn flush(self: &Arc<Self>, p: FlushParams) -> Result<FlushReport, CtlError> {
+        self.check_running()?;
+        let name = p.vault.clone();
+        let paths = if p.paths.is_empty() {
+            None
+        } else {
+            Some(p.paths.iter().map(|x| relative(x)).collect::<Result<Vec<_>, _>>()?)
+        };
+        let limit = p.timeout_ms.filter(|t| *t > 0).map(Duration::from_millis);
+        let deadline = limit.map(|t| Instant::now() + t);
+        let v = self.entry(&name)?.view();
+        if v.planned.runnable().is_some_and(|c| c.pull_only) {
+            return Err(CtlError::new(
+                code::FAILED,
+                format!("vault {name} is pull-only and never writes to the server; there is nothing to flush"),
+            ));
+        }
+        loop {
+            let engine = self.engine_now(&name, deadline).await?;
+            let flushed = engine.flush(paths.clone());
+            let r = match deadline {
+                Some(d) => match tokio::time::timeout_at(d.into(), flushed).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let busy = engine.idle().map(|i| i.busy.join("; ")).unwrap_or_default();
+                        return Err(CtlError::new(
+                            code::TIMEOUT,
+                            format!(
+                                "vault {name}: not everything was stored on the server within {}s{}",
+                                limit.unwrap_or_default().as_secs_f64(),
+                                if busy.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" ({busy})")
+                                }
+                            ),
+                        ));
+                    }
+                },
+                None => flushed.await,
+            };
+            match r.map_err(engine_error)? {
+                FlushOutcome::Done(rep) => return Ok(rep),
+                FlushOutcome::Blocked(why) => return Err(CtlError::new(code::BLOCKED, format!("vault {name}: {why}"))),
+                // Its engine restarted (a reload, a command): the next one.
+                FlushOutcome::Stopped => continue,
+            }
+        }
+    }
+
+    /// `wait`: answer once the vault is idle, or a revision of a file is in
+    /// the local file (see `Engine::wait_for`). Without a revision, the one
+    /// the server has when the wait begins. Waits while the vault starts or
+    /// its engine restarts, up to the timeout.
+    pub async fn wait(self: &Arc<Self>, p: WaitParams) -> Result<WaitResult, CtlError> {
+        self.check_running()?;
+        let name = p.vault.clone();
+        let path = match (&p.path, p.idle) {
+            (Some(x), false) => Some(relative(x)?),
+            (None, true) => None,
+            _ => return Err(CtlError::new(code::BAD_REQUEST, "parameters: give either idle or path")),
+        };
+        let t0 = Instant::now();
+        let limit = p.timeout_ms.filter(|t| *t > 0).map(Duration::from_millis);
+        let deadline = limit.map(|t| t0 + t);
+        let until = deadline.unwrap_or_else(|| t0 + Duration::from_secs(10 * 365 * 86_400));
+        let timed_out = |why: String| {
+            CtlError::new(
+                code::TIMEOUT,
+                format!(
+                    "vault {name}: not within {}s: {why}",
+                    limit.unwrap_or_default().as_secs_f64()
+                ),
+            )
+        };
+        let mut target = p.rev.clone().map(Target::Rev);
+        loop {
+            let engine = self.engine_now(&name, deadline).await?;
+            let cond = match &path {
+                None => WaitFor::Idle,
+                Some(path) => {
+                    if target.is_none() {
+                        // The gate first: it settles how paths name documents.
+                        let mut activity = engine.watch_activity();
+                        let _ =
+                            tokio::time::timeout_at(until.into(), activity.wait_for(|a| a.pull.connected() || a.ended))
+                                .await;
+                        match engine.target_of(path, None).await {
+                            Ok(t) => target = Some(t),
+                            Err(e) if Instant::now() + Duration::from_secs(1) >= until => {
+                                return Err(timed_out(format!(
+                                    "the server's revision of {path} could not be read: {e}"
+                                )))
+                            }
+                            Err(e) => {
+                                debug!("vault {name}: reading the server's revision of {path}: {e}; again");
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue;
+                            }
+                        }
+                    }
+                    WaitFor::Applied {
+                        path: path.clone(),
+                        target: target.clone().expect("read above"),
+                    }
+                }
+            };
+            match engine.wait_for(&cond, until).await.map_err(engine_error)? {
+                WaitOutcome::Reached(reached) => {
+                    return Ok(WaitResult {
+                        vault: name,
+                        condition: if path.is_some() { "applied" } else { "idle" }.into(),
+                        reached,
+                        waited_ms: t0.elapsed().as_millis() as u64,
+                    })
+                }
+                WaitOutcome::Blocked(why) => return Err(CtlError::new(code::BLOCKED, format!("vault {name}: {why}"))),
+                WaitOutcome::Stopped => continue,
+                WaitOutcome::TimedOut(why) => return Err(timed_out(why)),
+            }
+        }
     }
 
     async fn run_command(
@@ -1090,7 +1288,10 @@ impl Service {
         };
         let s = seen.entry(name.to_string()).or_default();
         let (pull, push) = (engine.report(), engine.push_report());
-        let moved = s.counters(self, name, &pull, &push);
+        let moved = s.counters(self, name, &pull, &push, || {
+            engine.open_conflicts(100).unwrap_or_default()
+        });
+        s.activity(self, name, &engine);
         if moved || final_read || s.status_at.is_none_or(|t| t.elapsed() >= STATUS_POLL) {
             if let Ok(a) = engine.alerts() {
                 s.status(self, name, a);
@@ -1112,6 +1313,8 @@ struct Seen {
     /// The guards' stops: their messages, without the time.
     upstream: Option<Option<String>>,
     locked: Option<Option<String>>,
+    /// The activity last reported: idle, connected, the pull side's phase.
+    active: Option<(bool, bool, PullPhase)>,
 }
 
 /// `cur - prev`, where a smaller `cur` means the counters were reset (the
@@ -1126,7 +1329,14 @@ fn delta(cur: u64, prev: u64) -> u64 {
 
 impl Seen {
     /// Emit what the counters say happened; true if any moved.
-    fn counters(&mut self, svc: &Service, name: &str, pull: &PullReport, push: &PushReport) -> bool {
+    fn counters(
+        &mut self,
+        svc: &Service,
+        name: &str,
+        pull: &PullReport,
+        push: &PushReport,
+        open: impl FnOnce() -> Vec<String>,
+    ) -> bool {
         let (p0, u0) = (&self.pull, &self.push);
         let pd = |c: fn(&PullReport) -> u64| delta(c(pull), c(p0));
         let ud = |c: fn(&PushReport) -> u64| delta(c(push), c(u0));
@@ -1166,12 +1376,32 @@ impl Seen {
             svc.emit(
                 event::CONFLICT,
                 Some(name),
-                json!({"pulled": conflicts_in, "pushed": conflicts_out}),
+                json!({"pulled": conflicts_in, "pushed": conflicts_out, "open": open()}),
             );
         }
         self.pull = pull.clone();
         self.push = push.clone();
         moved
+    }
+
+    /// Report what the engine does when that changed (coarsely: idle or not,
+    /// connected or not, the pull side's phase).
+    fn activity(&mut self, svc: &Service, name: &str, engine: &Engine) {
+        let a = engine.activity();
+        if !a.running {
+            return;
+        }
+        let pushes_idle =
+            !a.two_way || (a.pushes && a.settling == 0 && !a.pushing && !a.push_due && a.deletes_waiting == 0);
+        let now = (a.pull == PullPhase::Live && pushes_idle, a.pull.connected(), a.pull);
+        if self.active != Some(now) {
+            self.active = Some(now);
+            svc.emit(
+                event::ACTIVITY,
+                Some(name),
+                json!({"idle": now.0, "connected": now.1, "pull": now.2.as_str()}),
+            );
+        }
     }
 
     fn status(&mut self, svc: &Service, name: &str, a: livesync_engine::Alerts) {
@@ -1212,6 +1442,19 @@ impl Seen {
     }
 }
 
+/// A vault-relative path from a client: no absolute path, no `.` or `..`.
+fn relative(p: &str) -> Result<String, CtlError> {
+    let p = p.replace('\\', "/");
+    let trimmed = p.trim_matches('/');
+    if p.starts_with('/') || trimmed.is_empty() || trimmed.split('/').any(|s| s == ".." || s == ".") {
+        return Err(CtlError::new(
+            code::BAD_REQUEST,
+            format!("parameters: {p:?} is not a path inside the vault (vault-relative, without . or ..)"),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Whether two server URLs name the same server, as accounts compare them.
 pub fn same_server(a: &str, b: &str) -> bool {
     server_key(&redact_url(a)) == server_key(&redact_url(b))
@@ -1242,6 +1485,16 @@ mod tests {
             "https://couch.example.net/a@b"
         );
         assert!(same_server("https://Couch.example.net/", "https://u@couch.example.net"));
+    }
+
+    #[test]
+    fn client_paths_stay_inside_the_vault() {
+        assert_eq!(relative("a/b.md").unwrap(), "a/b.md");
+        assert_eq!(relative("a/b/").unwrap(), "a/b");
+        assert_eq!(relative("a\\b.md").unwrap(), "a/b.md");
+        for bad in ["/etc/passwd", "../x.md", "a/../../x", "", "/", "./a"] {
+            assert_eq!(relative(bad).unwrap_err().code, code::BAD_REQUEST, "{bad}");
+        }
     }
 
     #[test]

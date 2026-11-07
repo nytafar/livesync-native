@@ -39,8 +39,9 @@ pub struct FlushedPath {
     /// `stored`, `deleted`, `conflict` (stored as a conflicting branch),
     /// `not-synced` (the filters or the folder scope leave it out),
     /// `failed` (a local issue: too large, unreadable, a failed push),
-    /// `held` (a deletion the safety stop holds) or `missing` (no such file,
-    /// and none known).
+    /// `held` (a deletion the safety stop holds), `missing` (no such file,
+    /// and none known) or, from a one-shot flush, `pending` (written to
+    /// while it ran).
     pub outcome: String,
     /// This flush wrote it (else it was on the server already).
     pub pushed: bool,
@@ -116,7 +117,9 @@ pub(crate) struct Flushes {
 }
 
 impl Flushes {
-    pub(crate) fn len(&self) -> usize {
+    /// The flushes still waiting; one whose caller gave up is dropped.
+    pub(crate) fn len(&mut self) -> usize {
+        self.waiting.retain(|t| !t.w.reply.is_closed());
         self.waiting.len()
     }
 
@@ -325,6 +328,43 @@ impl Engine {
         )?))
     }
 
+    /// A flush without a daemon (no service runs the vault): one two-way
+    /// sync (gate, pull, push everything, as `sync_once`), then what became
+    /// of the paths given (or every revision it stored). A path still on
+    /// its way after the sync (written to while it ran) is `pending`.
+    pub async fn flush_once(&self, paths: Option<Vec<String>>) -> Result<FlushReport> {
+        let paths = match paths {
+            Some(p) => Some(self.flush_paths(&p)?),
+            None => None,
+        };
+        let mut events = self.subscribe();
+        self.sync_once().await?;
+        let mut stored: BTreeMap<String, crate::activity::RevisionEvent> = BTreeMap::new();
+        loop {
+            match events.try_recv() {
+                Ok(crate::activity::EngineEvent::Stored(e)) => {
+                    stored.insert(e.path.clone(), e);
+                }
+                Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        let mut done = Vec::new();
+        for p in paths.iter().flatten() {
+            done.push(match self.flushed_path(p)? {
+                Some(f) => f,
+                None => FlushedPath {
+                    path: p.clone(),
+                    doc_id: self.doc_id_for(p),
+                    outcome: "pending".into(),
+                    note: Some("changed while the sync ran; flush again".into()),
+                    ..Default::default()
+                },
+            });
+        }
+        self.flush_report(paths.is_none(), &mut done, stored)
+    }
+
     /// The report of a flush (`done`: the paths given, as answered), with
     /// what it `stored`.
     pub(crate) fn flush_report(
@@ -394,22 +434,23 @@ impl Engine {
                 if !self.local_visible(rel) {
                     return Ok(out("not-synced", None, Some(self.explain(rel).detail)));
                 }
-                if let Some(i) = issue {
-                    return Ok(out("failed", None, Some(i.note)));
-                }
                 let found = Found {
                     rel: rel.to_string(),
                     size: md.len(),
                     mtime_ms: crate::push::mtime_ms(&md),
                 };
+                // Stored as it is here (an issue is then only a note, as a
+                // file stored with replacement characters has); else an
+                // issue is why it was not.
+                let note = issue.as_ref().map(|i| i.note.clone());
                 Ok(match row {
                     Some(r) if self.unchanged(&r, &found) => match r.state {
-                        State::Clean => out("stored", r.base_rev, None),
-                        State::Conflicted => out("conflict", r.base_rev, r.note),
+                        State::Clean => out("stored", r.base_rev, note),
+                        State::Conflicted => out("conflict", r.base_rev, r.note.or(note)),
                         State::Skipped | State::OutOfScope => out("not-synced", None, r.note),
-                        State::Dirty => None,
+                        State::Dirty => note.and_then(|n| out("failed", None, Some(n))),
                     },
-                    _ => None,
+                    _ => note.and_then(|n| out("failed", None, Some(n))),
                 })
             }
             Ok(_) => Ok(out("failed", None, Some("not a file".into()))),

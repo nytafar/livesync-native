@@ -1,7 +1,9 @@
 //! `lsync`: Linux/Termux CLI over the LiveSync engine.
 
 mod adopt;
+mod bar;
 mod config;
+mod handoff;
 mod import;
 mod manage;
 mod probe;
@@ -132,14 +134,35 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Show index state, last gate result and files needing attention
+    /// Show index state, last gate result and files needing attention.
+    /// With --follow, --waybar or --format: one line for a status bar, from
+    /// the running service (every vault, or the one named with --vault)
     Status {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "format")]
         json: bool,
         /// Every vault of the running service: its state, mode and last sync
         #[arg(long)]
         all: bool,
+        /// Print a new line whenever the status changes, until interrupted
+        #[arg(long)]
+        follow: bool,
+        /// Waybar's JSON (text, alt, class, tooltip); --format=waybar
+        #[arg(long, conflicts_with = "format")]
+        waybar: bool,
+        /// A status bar line: text, json, waybar or swiftbar
+        #[arg(long, value_enum, value_name = "FORMAT")]
+        format: Option<bar::Format>,
     },
+    /// Push local changes now and return once they are stored on the
+    /// server, with their revisions: the files or folders given, or every
+    /// pending change. Exit 0 when all is stored, 2 when blocked (a stop
+    /// or a refusal), 3 when some could not be stored, 124 on timeout
+    Flush(handoff::FlushArgs),
+    /// Block until a file's revision is in the local file (--applied
+    /// PATH[@REV], as `lsync flush` printed it elsewhere) or the vault is
+    /// idle. Exit 0 when it holds, 2 when it cannot without a person (a
+    /// stop, a local edit holding the revision back), 124 on timeout
+    Wait(handoff::WaitArgs),
     /// Pause the service's vaults (or the one named with --vault): their
     /// engines stop and let go of the folders until `lsync resume`
     Pause {
@@ -331,7 +354,21 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         Cmd::SyncNow { json } => return service_verb(named?, method::SYNC_NOW, "syncing now", json),
         Cmd::Reload { json } => return reload(json),
         Cmd::Events { json } => return events(named?, json),
-        Cmd::Status { json, all: true } => return status_all(json),
+        Cmd::Status { json, all: true, .. } => return status_all(json),
+        Cmd::Status {
+            follow,
+            waybar,
+            format,
+            json,
+            ..
+        } if follow || waybar || format.is_some() => {
+            let format = if waybar {
+                bar::Format::Waybar
+            } else {
+                format.unwrap_or(if json { bar::Format::Json } else { bar::Format::Text })
+            };
+            return bar::run(named?, format, follow);
+        }
         Cmd::Serve { opts } => {
             let only = named?;
             return serve::serve(&ctx, only, &opts, VERSION);
@@ -420,6 +457,8 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             Ok(0)
         }
         Cmd::Folders { json } => rt()?.block_on(folders(&sel, &cfg, &ctx.dirs, json)),
+        Cmd::Flush(a) => handoff::flush(&sel, &cfg, &ctx.dirs, &a),
+        Cmd::Wait(a) => handoff::wait(&sel, &cfg, &ctx.dirs, &a),
         Cmd::CheckIgnore {
             paths,
             non_matching,
@@ -629,7 +668,7 @@ fn reload(json: bool) -> Result<u8> {
 }
 
 /// Local wall-clock time of a timestamp, `HH:MM:SS`.
-fn clock(ms: i64) -> String {
+pub(crate) fn clock(ms: i64) -> String {
     let secs = (ms / 1000) as libc::time_t;
     // SAFETY: zeroed tm is a valid out-parameter for localtime_r.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -1150,7 +1189,7 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
-fn rt() -> Result<tokio::runtime::Runtime> {
+pub(crate) fn rt() -> Result<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -1168,7 +1207,7 @@ fn absolute(p: &std::path::Path) -> Result<PathBuf> {
 /// A path given to `check-ignore`, vault-relative: an absolute path, or one
 /// relative to the current folder when that is inside the vault, must lie
 /// in the vault; anything else is taken as vault-relative already.
-fn vault_relative(vault: &std::path::Path, given: &str) -> Result<String> {
+pub(crate) fn vault_relative(vault: &std::path::Path, given: &str) -> Result<String> {
     use std::path::{Component, Path};
     let vault = std::fs::canonicalize(vault).unwrap_or_else(|_| vault.to_path_buf());
     let cwd = std::env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok());
@@ -1252,7 +1291,7 @@ fn check_ignore(
     Ok(if checks.iter().any(|c| !c.synced) { 0 } else { 1 })
 }
 
-fn engine_for(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, push: &PushOpts) -> Result<Engine> {
+pub(crate) fn engine_for(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, push: &PushOpts) -> Result<Engine> {
     engine_with_index(sel, cfg, dirs, push, None)
 }
 

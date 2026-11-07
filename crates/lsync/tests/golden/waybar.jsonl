@@ -1,0 +1,14 @@
+# synced
+{"alt":"ok","class":"ok","text":"synced","tooltip":"notes: synced"}
+# pushing
+{"alt":"syncing","class":"syncing","text":"pushing 2 changes","tooltip":"notes: pushing 2 changes"}
+# conflicts
+{"alt":"conflict","class":"conflict","text":"2 conflicts","tooltip":"notes: 2 conflicts\nwork: pulling"}
+# safety stop
+{"alt":"stopped","class":"stopped","text":"stopped","tooltip":"notes: safety stop: 30 files went missing &lt;all of Notes/&gt; &amp; more\nwork: error: index error"}
+# offline
+{"alt":"offline","class":"offline","text":"offline","tooltip":"notes: offline: changes feed failed: connection refused"}
+# paused and disabled
+{"alt":"paused","class":"paused","text":"paused","tooltip":"notes: paused"}
+# no service
+{"alt":"off","class":"off","text":"off","tooltip":"no lsync service is running"}

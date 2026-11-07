@@ -78,6 +78,20 @@ pub const CONNECT_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 type Listener = Arc<Mutex<Option<Arc<dyn StateListener>>>>;
 type Access = Arc<Mutex<Option<Arc<dyn VaultAccess>>>>;
 
+/// Called with every engine a vault runs (or a command runs on), as soon as
+/// it is opened and before it syncs: with the vault's ID. Must return quickly.
+pub type EngineHook = Arc<dyn Fn(&str, &Engine) + Send + Sync>;
+type Hook = Arc<Mutex<Option<EngineHook>>>;
+
+fn call_hook(hook: &Hook, id: &str, engine: &Engine) {
+    let h = lock(hook).clone();
+    if let Some(h) = h {
+        if std::panic::catch_unwind(AssertUnwindSafe(|| h(id, engine))).is_err() {
+            warn!("the engine hook failed");
+        }
+    }
+}
+
 /// One HTTP client (and so one connection pool and its TLS sessions) per
 /// server, shared by every vault on it (spec D6). Keyed by the server URL as
 /// accounts compare it; credentials go with each request, not the client.
@@ -160,6 +174,7 @@ struct Shared {
     wake: Notify,
     listener: Listener,
     access: Access,
+    hook: Hook,
     /// The running engine task, so a stop that times out can cancel it too
     /// (the supervisor alone is not enough: the task would run on, detached).
     run_abort: Mutex<Option<tokio::task::AbortHandle>>,
@@ -207,6 +222,7 @@ pub struct Host {
     stop_timeouts: Mutex<(Duration, Duration)>,
     listener: Listener,
     access: Access,
+    hook: Hook,
     pool: Pool,
     /// The state folder may be a dot-folder inside the vault (the CLI).
     hidden_state: std::sync::atomic::AtomicBool,
@@ -248,6 +264,7 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
         let opened = tokio::task::spawn_blocking(move || open_engine(&cfg, &access, &pool)).await;
         let failure = match opened {
             Ok(Ok(engine)) => {
+                call_hook(&shared.hook, &shared.cfg.id, &engine);
                 *lock(&shared.engine) = Some(engine.clone());
                 let mode = if shared.cfg.pull_only { "pull-only" } else { "two-way" };
                 info!("engine started ({mode}) for {}", shared.cfg.vault_path);
@@ -359,6 +376,7 @@ impl Host {
             stop_timeouts: Mutex::new((STOP_TIMEOUT, RELEASE_TIMEOUT)),
             listener: Arc::new(Mutex::new(None)),
             access: Arc::new(Mutex::new(None)),
+            hook: Arc::new(Mutex::new(None)),
             pool: Pool::default(),
             hidden_state: std::sync::atomic::AtomicBool::new(false),
         }
@@ -383,7 +401,9 @@ impl Host {
     /// second engine on the same folders (`Busy`). Blocks.
     pub fn open_engine(&self, cfg: &RunConfig) -> Result<Engine, HostError> {
         self.validate(cfg)?;
-        open_engine(cfg, &self.access, &self.pool)
+        let engine = open_engine(cfg, &self.access, &self.pool)?;
+        call_hook(&self.hook, &cfg.id, &engine);
+        Ok(engine)
     }
 
     /// How many servers the shared connection pools are for.
@@ -514,6 +534,7 @@ impl Host {
             wake: Notify::new(),
             listener: self.listener.clone(),
             access: self.access.clone(),
+            hook: self.hook.clone(),
             run_abort: Mutex::new(None),
             pool: self.pool.clone(),
         });
@@ -569,6 +590,13 @@ impl Host {
     /// could delete remote documents (see [`VaultAccess`]).
     pub fn set_vault_access(&self, access: Arc<dyn VaultAccess>) {
         *lock(&self.access) = Some(access);
+    }
+
+    /// Be told of every engine a vault runs, before it syncs (see
+    /// [`EngineHook`]): a service subscribes to its events there, so it
+    /// misses none.
+    pub fn set_engine_hook(&self, hook: EngineHook) {
+        *lock(&self.hook) = Some(hook);
     }
 
     /// Receive run-state changes of every vault.

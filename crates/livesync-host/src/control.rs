@@ -31,8 +31,8 @@
 //! engine's own locks still keep it off a vault a service holds).
 
 use crate::protocol::{
-    check_hello, code, event, method, AllowDeletesParams, CommandParams, CtlError, Event, Hello, Incoming,
-    ReloadParams, Request, Response, VaultParam, MAX_LINE, PROTOCOL,
+    check_hello, code, event, method, AllowDeletesParams, CommandParams, CtlError, Event, FlushParams, Hello, Incoming,
+    ReloadParams, Request, Response, VaultParam, WaitParams, MAX_LINE, PROTOCOL,
 };
 use crate::service::{Command, Service};
 use livesync_engine::platform::{read_holder, Holder, LockError, LockFile};
@@ -500,6 +500,9 @@ async fn connection(stream: tokio::net::UnixStream, service: Arc<Service>, polic
     });
     let mut reader = tokio::io::BufReader::new(read);
     let mut subscriptions = Vec::new();
+    // `wait` and `flush` are only waits for this client: they end with its
+    // connection (a command runs on, so its vault is restored).
+    let mut waits: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     loop {
         let mut buf = Vec::new();
         match (&mut reader)
@@ -561,10 +564,14 @@ async fn connection(stream: tokio::net::UnixStream, service: Arc<Service>, polic
         // A panic while handling it is a `failed` answer: the client never
         // waits for a response that will not come.
         let (svc, tx) = (service.clone(), tx.clone());
-        tokio::spawn(async move {
+        let cancellable = matches!(req.method.as_str(), method::WAIT | method::FLUSH);
+        let task = tokio::spawn(async move {
             let id = req.id.clone();
             let m = req.method.clone();
-            let handled = tokio::spawn(async move { handle(&svc, req).await }).await;
+            let inner = tokio::spawn(async move { handle(&svc, req).await });
+            // A wait ends with its client: aborting this task aborts it.
+            let _cancel = cancellable.then(|| AbortOnDrop(inner.abort_handle()));
+            let handled = inner.await;
             let resp = match handled {
                 Ok(Ok(v)) => Response::ok(id, v),
                 Ok(Err(e)) => Response::err(id, e),
@@ -579,12 +586,25 @@ async fn connection(stream: tokio::net::UnixStream, service: Arc<Service>, polic
             };
             let _ = tx.send(line(&resp)).await;
         });
+        if cancellable {
+            waits.retain(|w| !w.is_finished());
+            waits.push(task);
+        }
     }
-    for s in subscriptions {
+    for s in subscriptions.into_iter().chain(waits) {
         s.abort();
     }
     drop(tx);
     let _ = writer.await;
+}
+
+/// Aborts a task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn to_value(v: &impl serde::Serialize) -> Value {
@@ -679,6 +699,20 @@ async fn handle(svc: &Arc<Service>, req: Request) -> Result<Value, CtlError> {
         method::PULL => Ok(to_value(&cmd(Command::Pull).await?)),
         method::FETCH => Ok(to_value(&cmd(Command::Fetch).await?)),
         method::CONNECT => Ok(to_value(&cmd(Command::Connect).await?)),
+        method::FLUSH => {
+            let p: FlushParams = params(&req.params)?;
+            if p.vault.is_empty() {
+                return Err(CtlError::new(code::BAD_REQUEST, "parameters: vault is required"));
+            }
+            Ok(to_value(&svc.flush(p).await?))
+        }
+        method::WAIT => {
+            let p: WaitParams = params(&req.params)?;
+            if p.vault.is_empty() {
+                return Err(CtlError::new(code::BAD_REQUEST, "parameters: vault is required"));
+            }
+            Ok(to_value(&svc.wait(p).await?))
+        }
         method::ALLOW_DELETES => {
             let p: AllowDeletesParams = params(&req.params)?;
             if p.vault.is_empty() || p.stop.is_empty() {
@@ -1027,6 +1061,22 @@ impl Client {
         loop {
             if let Incoming::Event(e) = self.read()? {
                 return Ok(e);
+            }
+        }
+    }
+
+    /// The next event, waiting at most `wait`: `Ok(None)` when none came.
+    pub fn next_event_within(&mut self, wait: Duration) -> Result<Option<Event>, ClientError> {
+        let end = Instant::now() + wait;
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            match self.read_for(Some(left))? {
+                Some(Incoming::Event(e)) => return Ok(Some(e)),
+                Some(Incoming::Response(_)) => {}
+                None => return Ok(None),
             }
         }
     }

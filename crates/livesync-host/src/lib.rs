@@ -23,6 +23,7 @@ pub mod control;
 pub mod edit;
 pub mod legacy;
 pub mod migrate;
+pub mod notify;
 pub mod paths;
 pub mod protocol;
 pub mod run;
@@ -33,7 +34,7 @@ pub mod supervisor;
 pub use cancel::Cancel;
 pub use paths::paths_overlap;
 pub use run::{Handover, RunConfig, Tuning, WhatSyncs};
-pub use supervisor::{GateCheck, Host, RunState, StateListener, VaultAccess, VaultStatus};
+pub use supervisor::{EngineHook, GateCheck, Host, RunState, StateListener, VaultAccess, VaultStatus};
 
 use livesync_engine::EngineError;
 use livesync_remote::RemoteError;

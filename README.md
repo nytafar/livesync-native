@@ -229,6 +229,10 @@ lsync resume
 lsync sync-now                # reconnect and rescan now (every vault, or --vault NAME)
 lsync --vault notes allow-deletes   # confirm notes' mass-delete stop (shows it and asks)
 lsync reload                  # reread lsync.toml; only the vaults that changed restart
+lsync flush [PATH...]         # push now; returns once stored on the server, with the revisions
+lsync wait --applied PATH@REV # block until that revision is in the local file (or --idle)
+lsync status --follow --waybar  # one Waybar JSON line per change (--format=swiftbar|text|json)
+lsync serve --notify          # desktop notifications for stops, conflicts and a failing vault
 ```
 
 - **Reload.** `kill -HUP`, `lsync reload`, and every `lsync account ...`, `lsync vault ...` or `lsync configure` that changes the file make the service reread it. Only the vaults whose settings changed (an account's URL, user or password included) are started, stopped or restarted; the others keep running, also while the reload waits for a command running on one that changed. A file that cannot be read changes nothing. With `--vault NAME`, a vault removed from the file or disabled is stopped (it must be there when the service starts). `kill -USR1` is "sync now" for every vault; SIGTERM and SIGINT stop the service.
@@ -242,6 +246,8 @@ lsync reload                  # reread lsync.toml; only the vaults that changed 
 | `status` | Read from the service (the running engine's status). |
 | `sync`, `fetch`, `pull`, `connect` | The service stops the vault's engine, runs the command on an engine of its own with the vault's settings (and the command's `--allow-mass-delete`, `--remove-out-of-scope-copies`, `--adopt-tweaks`), and starts the vault's engine again, unless it was paused. Settings given only to this command (flags, `LSYNC_*`, a profile file that says otherwise) would not apply, so such a command is refused with what differs and what to do; for a paused vault it runs here instead, with its settings. The password is not compared: the service uses its own. |
 | `allow-deletes` | The service confirms the stop it shows (with the stop text the CLI read), and the vault's next full pass deletes the listed files. A stop holds only its own vault: the others keep syncing. |
+| `flush` | The vault's running engine pushes the paths now, without the settle wait, and answers once they are stored. Without a service: one two-way sync here, reported the same way. |
+| `wait` | The vault's running engine answers once the condition holds. Without a service: the vault runs here (only its pull side for `--applied`) until it holds. |
 | `daemon` | Refused: the service already runs the vault. |
 | `folders`, `probe`, `account`, `vault`, `configure` | Run here (they don't open the vault's engine); the edits tell the service to reload. |
 | `serve` | Refused while another service holds the control socket's folder. |
@@ -272,20 +278,68 @@ lsync reload                  # reread lsync.toml; only the vaults that changed 
 | Method | Params | Result |
 |---|---|---|
 | `hello` | | `protocol`, `version`, `pid`, `methods`, `config` (the file the service reads) |
-| `status` | `vault`? | `vaults`: per vault `name`, `state`, `message`, `paused`, `enabled`, `account`, `command`, `settings` (URL without credentials, user, database, folders, scope, mode, what syncs: ignore files, regexes, dot-paths, trash; never the password), `status` (as `lsync status --json`), `session` and `push` (this engine's counters), `deletes_waiting`, `mass_delete_allowed`, `mass_delete_waits` (allowed, but some of its files cannot be checked now), `fingerprint` (names `settings`; changes when they do) |
+| `status` | `vault`? | `vaults`: per vault `name`, `state`, `message`, `paused`, `enabled`, `account`, `command`, `settings` (URL without credentials, user, database, folders, scope, mode, what syncs: ignore files, regexes, dot-paths, trash; never the password), `status` (as `lsync status --json`), `session` and `push` (this engine's counters), `deletes_waiting`, `mass_delete_allowed`, `mass_delete_waits` (allowed, but some of its files cannot be checked now), `fingerprint` (names `settings`; changes when they do), `activity` (running only: `running`, `two_way`, `pull`: `starting`, `catching-up`, `live`, `applying` or `retrying`; `pushes`, `settling`, `pushing`, `push_due`, `deletes_waiting`, `flushes`) |
 | `events` | `vault`? | `subscribed`, then events |
 | `sync-now`, `pause`, `resume` | `vault`? (else every vault) | `vaults`: the names acted on |
 | `reload` | `wait`? (`false`: return at once with `scheduled`) | `started`, `stopped`, `restarted`, `unchanged`, `failed` (`vault`, `message`) |
 | `allow-deletes` | `vault`, `stop` (the vault's `status.safety_stop`, whole) | `vaults`: the vault. The next full pass deletes the files that stop listed. `no_stop` when it shows none; `stop_changed` when it shows another (the message quotes it); nothing is allowed then |
 | `sync`, `fetch`, `pull`, `connect` | `vault`, and `allow_mass_delete`, `remove_out_of_scope_copies`, `adopt_tweaks`, `fingerprint` (from the `status` whose settings the client compared: when the vault's settings changed since, nothing runs and the error is `changed`) | `report` (as the command's `--json` prints it), `wall_ms`, `peak_rss_kib` (the service's) |
+| `flush` | `vault`, `paths` (vault-relative; a folder stands for its files; none: every pending change), `timeout_ms`? | `all`, `paths` (per path `path`, `doc_id`, `rev`, `outcome`: `stored`, `deleted`, `conflict`, `not-synced`, `failed`, `held` or `missing`; `pushed`, `note`; with `all`, every revision the flush stored), `complete`, `safety_stop`, `issues`, `conflicts`. `timeout` when the time ran out, `blocked` at a gate's stop, `paused` |
+| `wait` | `vault`, and `idle: true` or `path` with `rev`? (without it, the server's revision when the wait begins), `timeout_ms`? | `vault`, `condition` (`idle` or `applied`), `path`, `rev`, `current_rev` (the revision in the local file now), `deleted`, `superseded` (a later revision is there), `waited_ms`. `timeout` (the message says what was outstanding), `blocked` (a stop, or a local edit or a conflict holds the revision back), `paused` |
 
 A vault's `state` is `starting`, `running`, `failed` (retrying), `stopped`, `paused`, `busy` (running a command for a client), `disabled` or `invalid` (its settings cannot be used, for example a missing password; `message` says why).
 
-Events: `state` (`state`, `message`), `paused` (`paused`), `pulled` (`written`, `deleted`, `adopted`, `dirty`, `conflicted`, `restored_edits`, `bytes_written`), `pushed` (`pushed`, `created`, `deleted`, `conflicts`, `chunks_uploaded`, `chunk_bytes`), `conflict` (`pulled`, `pushed`), `safety-stop` (`stop`: the text, or `null` once cleared), `upstream-stop` (`stop`: what changed upstream, or `null` once the remote is compatible again), `remote-locked` (`lock`: who holds a lock that came without a rebuild, or `null` once it no longer refuses this device; both are states, sent when one starts, ends or its reason changes, not at every recheck), `error` (`message`), `command` (`command`, `phase`: `started` or `finished`, `ok`, `message`), `reload` (the reload's result) and `lagged` (`missed`: events a slow reader lost). Counts are what happened since the vault's previous event of that kind, read from the engines about twice a second; `status` is the source of truth.
+Events: `state` (`state`, `message`), `paused` (`paused`), `pulled` (`written`, `deleted`, `adopted`, `dirty`, `conflicted`, `restored_edits`, `bytes_written`), `pushed` (`pushed`, `created`, `deleted`, `conflicts`, `chunks_uploaded`, `chunk_bytes`), `conflict` (`pulled`, `pushed`, `open`: the files in conflict now), `stored` and `applied` (`path`, `doc_id`, `rev`, `deleted`: one per revision this device stored on the server, or took from it into the local file, as the index records them), `activity` (`idle`, `connected`, `pull`: when one of them changes), `safety-stop` (`stop`: the text, or `null` once cleared), `upstream-stop` (`stop`: what changed upstream, or `null` once the remote is compatible again), `remote-locked` (`lock`: who holds a lock that came without a rebuild, or `null` once it no longer refuses this device; both are states, sent when one starts, ends or its reason changes, not at every recheck), `error` (`message`), `command` (`command`, `phase`: `started` or `finished`, `ok`, `message`), `reload` (the reload's result) and `lagged` (`missed`: events a slow reader lost). Counts are what happened since the vault's previous event of that kind, read from the engines about twice a second; `status` is the source of truth.
 
-Error codes: `bad_request`, `unsupported_version`, `unknown_method`, `unknown_vault`, `not_running`, `paused`, `busy`, `refused` (a gate refused; the message is the refusal), `invalid_config`, `failed`, `forbidden`, `shutting_down`, `changed`, `no_stop`, `stop_changed`.
+Error codes: `bad_request`, `unsupported_version`, `unknown_method`, `unknown_vault`, `not_running`, `paused`, `busy`, `refused` (a gate refused; the message is the refusal), `invalid_config`, `failed`, `forbidden`, `shutting_down`, `changed`, `no_stop`, `stop_changed`, `timeout` and `blocked` (`flush`, `wait`).
+
+A `wait` or `flush` ends with its connection: a client that goes away leaves nothing waiting in the service.
 
 From a shell: `printf '%s\n' '{"v":1,"id":1,"method":"status"}' | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/lsync/control.sock"`.
+
+</details>
+
+<details>
+<summary>Handing files over: flush and wait</summary>
+
+An agent on a server writes a note and needs to know when the laptop has it; a script on the laptop waits for exactly that version:
+
+```sh
+# on the server
+$ lsync flush notes/plan.md
+stored     3-9f2c41e0b8a5d7c6e4f1a2b3c4d5e6f7   notes/plan.md
+
+# on the laptop
+$ lsync wait --applied notes/plan.md@3-9f2c41e0b8a5d7c6e4f1a2b3c4d5e6f7 --timeout 120
+notes/plan.md is at 3-9f2c41e0b8a5d7c6e4f1a2b3c4d5e6f7 (after 0.4s)
+```
+
+- **`lsync flush [PATH...]`** pushes the files (a folder stands for its files) at once, without waiting for the save to settle, and returns once each is stored on the server, printing its outcome and the revision there. Without paths it pushes every pending change and lists the revisions it stored. A deletion goes out with the burst it is part of, so its answer can take the burst's quiet period (10 s). `--json` prints the report.
+- **`lsync wait --applied PATH[@REV]`** returns once that revision, or a later one, is in the local file (a later one is reported as `superseded`). Without `@REV` it waits for the revision the server has when the wait begins, or for the deletion when the server deleted the file. **`lsync wait --idle`** returns once nothing is pending or settling: the vault follows the server live, no local change waits to be pushed, no deletion is held, no document waits to be fetched again, for 0.6 s in a row.
+- **Timeouts.** Both give up after `--timeout SECS` (60 by default; 0 waits as long as it takes) with exit code 124 and what was still outstanding. A wait that cannot end well without a person ends at once with exit code 2: a safety stop, the upstream stop, a remote lock, a paused vault, or a revision held back by a local edit or a conflict.
+- Both run in the service when it runs the vault, and wait while it starts or restarts. Without a service, `flush` runs one two-way sync and `wait` runs the vault here until the condition holds (only its pull side for `--applied`, which never writes to the server).
+
+</details>
+
+<details>
+<summary>Status bars and notifications</summary>
+
+`lsync status --follow --waybar` prints one [Waybar](https://github.com/Alexays/Waybar) JSON line whenever the state of the service's vaults changes (`--vault NAME` for one). `class` and `alt` are the most pressing state of any vault: `stopped` (a safety stop, the upstream stop or a remote lock: something to act on), `error` (a vault fails or cannot run), `conflict`, `offline` (the server cannot be reached), `syncing`, `paused`, `ok`, or `off` (no service; it keeps looking for one). The tooltip has a line per vault. A Waybar module:
+
+```jsonc
+"custom/lsync": {
+    "exec": "lsync status --follow --waybar",
+    "return-type": "json",
+    "restart-interval": 10,
+    "format": "lsync {}"
+}
+```
+
+Style it with the classes, for example `#custom-lsync.stopped, #custom-lsync.error { color: #e06c75; }`. For icons, use `"format": "{icon} {}"` with `"format-icons"` keyed by the states above (`alt`).
+
+`lsync status --follow --format=swiftbar` does the same for [SwiftBar](https://github.com/swiftbar/SwiftBar) on macOS as a streamable plugin: put `exec lsync status --follow --format=swiftbar` in a plugin script with `# <swiftbar.type>streamable</swiftbar.type>`. `--format=text` and `--format=json` print a line for people or scripts. Without `--follow`, each prints one line and exits.
+
+**Notifications.** `lsync serve --notify` (or `LSYNC_NOTIFY=1`) shows desktop notifications, with `notify-send` on Linux and `osascript` on macOS, for a safety stop, the upstream stop, a remote lock, files newly in conflict, and a vault that keeps failing (its engine ends with an error, or it reports errors for 5 minutes without reaching the server in between). Each is shown once when it starts or its reason changes, never again while it holds; a file in conflict is shown again only after it was resolved and fell into conflict anew. `--notify-command PROGRAM` runs your own program instead, as `PROGRAM TITLE BODY` with `LSYNC_NOTIFY_KIND`, `LSYNC_NOTIFY_VAULT` and `LSYNC_NOTIFY_URGENCY` set.
 
 </details>
 
@@ -412,6 +466,7 @@ Exit codes:
 - 3: pull or sync finished, but something needs attention (dirty or pending files, local files that cannot sync, a safety stop); for `reload`, a vault that cannot run.
 - 4: probe failed or was inconclusive.
 - 5: `allow-deletes`: the stop shown is not the one given; nothing was allowed. (`allow-deletes` exits 1 when no safety stop is shown.)
+- `flush` and `wait`: 0 stored, or the condition holds; 1 an error; 2 blocked until a person acts (a safety stop, the upstream stop, a remote lock, a gate's refusal, a paused vault, a revision a local edit or a conflict holds back); 3 (`flush`) done, but not everything is on the server; 124 the timeout ran out (as `timeout(1)`).
 
 </details>
 
@@ -422,8 +477,8 @@ Exit codes:
 | `crates/livesync-model` | Pure model: doc types, path→ID, chunk IDs, the splitter, decompression codec, gate evaluation, milestone registration, folder scope |
 | `crates/livesync-remote` | CouchDB over HTTP (reqwest + rustls with bundled webpki roots): `_changes`, `_all_docs`, `_local` docs, backoff |
 | `crates/livesync-engine` | Pull and push loops, daemons, SQLite index, vault file operations; platform seams (`Watcher`, `FsRules`) |
-| `crates/livesync-host` | Hosting vaults for every front-end: one supervisor per vault (retries from 15 s to 15 min), accounts and vaults (`lsync.toml`), the secret stores, migration from profile files, the service (reload, pause, commands, events) and the control socket with its protocol and client |
-| `crates/lsync` | The CLI, including `serve`, the routing through the control socket, `probe` and the account and vault commands |
+| `crates/livesync-host` | Hosting vaults for every front-end: one supervisor per vault (retries from 15 s to 15 min), accounts and vaults (`lsync.toml`), the secret stores, migration from profile files, the service (reload, pause, commands, events, flush and wait), the control socket with its protocol and client, and notifications |
+| `crates/lsync` | The CLI, including `serve`, the routing through the control socket, `flush` and `wait`, the status bar output, `probe` and the account and vault commands |
 | `crates/livesync-ffi` | UniFFI surface for the app over `livesync-host`: one engine per profile, connect test, status, logs |
 | `crates/uniffi-bindgen` | UniFFI's Kotlin binding generator, pinned to the same version |
 | `android/` | The Android app (Kotlin, Compose): foreground service, onboarding, vault list, status screens |

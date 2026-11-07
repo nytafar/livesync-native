@@ -26,7 +26,7 @@
 //! `hello` first ([`check_hello`]): the major version, and that the methods
 //! it is about to use are there.
 
-use livesync_engine::{PullReport, PushReport, Status};
+use livesync_engine::{Activity, PullReport, PushReport, Reached, Status};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -61,6 +61,12 @@ pub mod method {
     /// its next full pass deletes the files that stop listed, and only
     /// those. `stop` is the stop as `status` showed it.
     pub const ALLOW_DELETES: &str = "allow-deletes";
+    /// Push a vault's local changes now and answer once they are stored on
+    /// the server (`FlushParams`, result `livesync_engine::FlushReport`).
+    pub const FLUSH: &str = "flush";
+    /// Answer once a vault is idle, or a revision of a file is in the local
+    /// file (`WaitParams`, result `WaitResult`).
+    pub const WAIT: &str = "wait";
 
     pub const ALL: &[&str] = &[
         HELLO,
@@ -75,6 +81,8 @@ pub mod method {
         FETCH,
         CONNECT,
         ALLOW_DELETES,
+        FLUSH,
+        WAIT,
     ];
 }
 
@@ -113,6 +121,13 @@ pub mod code {
     /// since the client read it); nothing was allowed. The message quotes
     /// the stop shown now.
     pub const STOP_CHANGED: &str = "stop_changed";
+    /// `flush`, `wait`: the time given ran out first. The message says what
+    /// was still outstanding.
+    pub const TIMEOUT: &str = "timeout";
+    /// `flush`, `wait`: it cannot happen until a person acts (a safety stop,
+    /// the upstream stop, a remote lock, a revision a local edit or a
+    /// conflict holds back). The message says which.
+    pub const BLOCKED: &str = "blocked";
 
     /// Every code above, for clients mapping a code to a constant.
     pub const ALL: &[&str] = &[
@@ -131,6 +146,8 @@ pub mod code {
         CHANGED,
         NO_STOP,
         STOP_CHANGED,
+        TIMEOUT,
+        BLOCKED,
     ];
 }
 
@@ -146,9 +163,24 @@ pub mod event {
     pub const PULLED: &str = "pulled";
     /// Local changes stored on the server: `{"pushed","created","deleted","conflicts","chunks_uploaded","chunk_bytes"}`.
     pub const PUSHED: &str = "pushed";
-    /// New conflicts: `{"pulled": n, "pushed": n}` (pulled: conflicted
-    /// documents seen; pushed: local edits stored as a branch).
+    /// New conflicts: `{"pulled": n, "pushed": n, "open": [path, ...]}`
+    /// (pulled: conflicted documents seen; pushed: local edits stored as a
+    /// branch; open: the files in conflict now, at most 100).
     pub const CONFLICT: &str = "conflict";
+    /// A revision this device stored on the server:
+    /// `{"path","doc_id","rev","deleted"}`. One per document, as precise as
+    /// the index: what `flush` answers with.
+    pub const STORED: &str = "stored";
+    /// A revision from the server is in the local file now (written,
+    /// adopted, a deletion carried out): `{"path","doc_id","rev","deleted"}`.
+    /// What `wait --applied` waits for.
+    pub const APPLIED: &str = "applied";
+    /// What a running vault does changed:
+    /// `{"idle": bool, "connected": bool, "pull": phase}`, where `idle`
+    /// means nothing is pending or settling (as far as the activity shows;
+    /// `wait` checks more), `connected` that the server answers, and `pull`
+    /// is `starting`, `catching-up`, `live`, `applying` or `retrying`.
+    pub const ACTIVITY: &str = "activity";
     /// The mass-delete safety stop: `{"stop": text}`, or `{"stop": null}`
     /// once it is cleared.
     pub const SAFETY_STOP: &str = "safety-stop";
@@ -338,6 +370,48 @@ pub struct AllowDeletesParams {
     pub stop: String,
 }
 
+/// The parameters of `flush`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FlushParams {
+    pub vault: String,
+    /// Vault-relative paths (a folder stands for its files); empty: every
+    /// pending change.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// How long to wait for the server; `None` or 0: as long as it takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// The parameters of `wait`: `idle`, or `path` (with `rev`, else the
+/// server's current revision of the file when the wait begins).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WaitParams {
+    pub vault: String,
+    #[serde(default)]
+    pub idle: bool,
+    /// Vault-relative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// How long to wait; `None` or 0: until it holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// The result of `wait`: the condition holds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WaitResult {
+    pub vault: String,
+    /// `idle` or `applied`.
+    pub condition: String,
+    #[serde(flatten)]
+    pub reached: Reached,
+    pub waited_ms: u64,
+}
+
 /// `{"wait": false}` returns at once with `{"scheduled": true}`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReloadParams {
@@ -449,6 +523,8 @@ pub struct VaultView {
     /// whenever `settings` does). A client that compared `settings` sends it
     /// back with a command (see [`CommandParams::fingerprint`]).
     pub fingerprint: Option<String>,
+    /// What the running engine is doing (running only).
+    pub activity: Option<Activity>,
 }
 
 /// The result of `status`.

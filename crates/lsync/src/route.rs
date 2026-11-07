@@ -236,6 +236,8 @@ pub fn route(r: &Resolved, what: &str, settings: bool) -> Result<Route> {
         "pull" => Some(method::PULL),
         "fetch" => Some(method::FETCH),
         "connect" => Some(method::CONNECT),
+        "flush" => Some(method::FLUSH),
+        "wait" => Some(method::WAIT),
         "allow-deletes" => Some(method::ALLOW_DELETES),
         _ => None,
     };

@@ -282,6 +282,13 @@ async fn a_flush_says_what_it_could_not_store_and_a_gate_stop_answers_at_once() 
     );
     assert!(!rep.complete);
     assert!(mock.doc("private/x.md").is_none());
+    // Stored with a caveat: stored, and the caveat as its note.
+    a.write("latin1.md", b"caf\xe9");
+    let rep = done(a.engine.flush(Some(vec!["latin1.md".into()])).await.unwrap());
+    let p = &rep.paths[0];
+    assert_eq!(p.outcome, "stored", "{p:?}");
+    assert!(p.note.as_deref().is_some_and(|n| n.contains("UTF-8")), "{p:?}");
+    assert!(rep.complete);
 
     // The upstream guard holds every push: the flush does not wait for it.
     a.index()

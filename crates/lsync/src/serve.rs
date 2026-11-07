@@ -8,6 +8,7 @@
 use crate::config::Setup;
 use anyhow::{anyhow, bail, Result};
 use livesync_host::control::{self, BindError, Kind, Policy};
+use livesync_host::notify::{self, Notifier};
 use livesync_host::service::{ConfigSource, FixedSource, Planned, Service, Source};
 use livesync_host::{Host, RunConfig};
 use std::sync::Arc;
@@ -26,6 +27,28 @@ pub struct ServeOpts {
     /// the group)
     #[arg(long, value_name = "GROUP", requires = "system")]
     pub socket_group: Option<String>,
+    /// Desktop notifications (notify-send on Linux, osascript on macOS) for
+    /// a safety stop, the upstream stop, a remote lock, new conflicts and a
+    /// vault that keeps failing: once each time one starts, never again
+    /// while it holds
+    #[arg(long, env = "LSYNC_NOTIFY")]
+    pub notify: bool,
+    /// Notify through this program instead, run as PROGRAM TITLE BODY with
+    /// LSYNC_NOTIFY_KIND, LSYNC_NOTIFY_VAULT and LSYNC_NOTIFY_URGENCY set
+    /// (implies --notify)
+    #[arg(long, env = "LSYNC_NOTIFY_COMMAND", value_name = "PROGRAM")]
+    pub notify_command: Option<std::path::PathBuf>,
+}
+
+impl ServeOpts {
+    /// The notifier asked for, if any.
+    fn notifier(&self) -> Option<Arc<dyn Notifier>> {
+        match &self.notify_command {
+            Some(p) => Some(Arc::new(notify::Program::new(p.clone()))),
+            None if self.notify => Some(Arc::new(notify::Desktop::new())),
+            None => None,
+        }
+    }
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
@@ -74,8 +97,12 @@ async fn signals(svc: &Arc<Service>) {
 }
 
 /// Serve the socket (when bound) and the vaults until a stop signal.
-async fn run(svc: Arc<Service>, bound: Option<control::Bound>, policy: Policy) {
+async fn run(svc: Arc<Service>, bound: Option<control::Bound>, policy: Policy, notifier: Option<Arc<dyn Notifier>>) {
     let activity = svc.spawn_activity();
+    let notifications = notifier.map(|n| {
+        info!("desktop notifications are on");
+        notify::spawn(svc.subscribe(), n)
+    });
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let server = bound.map(|b| tokio::spawn(control::serve(b, svc.clone(), policy, stop_rx)));
     // Where a `Type=notify` unit gets READY=1 (P1): every vault is started
@@ -94,6 +121,9 @@ async fn run(svc: Arc<Service>, bound: Option<control::Bound>, policy: Policy) {
     }
     svc.shutdown().await;
     activity.abort();
+    if let Some(n) = notifications {
+        n.abort();
+    }
 }
 
 fn policy(opts: &ServeOpts) -> Result<Policy> {
@@ -149,7 +179,7 @@ pub fn serve(ctx: &Setup, only: Option<String>, opts: &ServeOpts, version: &str)
         if svc.names().is_empty() {
             warn!("no vaults in the config yet; `lsync vault add` adds one, and this service picks it up");
         }
-        run(svc, Some(bound), policy).await;
+        run(svc, Some(bound), policy, opts.notifier()).await;
         Ok(0)
     })
 }
@@ -191,7 +221,7 @@ pub fn daemon(planned: Planned, version: &str) -> Result<u8> {
             svc.shutdown().await;
             bail!("daemon: {e}");
         }
-        run(svc, bound, Policy::own_user()).await;
+        run(svc, bound, Policy::own_user(), None).await;
         Ok(0)
     })
 }
