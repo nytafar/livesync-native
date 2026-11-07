@@ -11,7 +11,13 @@
 //!   supervisor retries), or it has reported errors for
 //!   [`KEEPS_FAILING`] without getting through to the server in between.
 //!   Announced once per such episode; the episode ends when the vault is
-//!   connected again (or paused, or stopped).
+//!   connected again (or paused, or stopped). A vault that keeps crashing
+//!   right after it connects is announced at most once per
+//!   [`FAILING_AGAIN`].
+//!
+//! What a vault shows when the notifier first hears of it (at the start, or
+//! when a reload adds it) is not news. When events were missed, the
+//! service's status is read and what changed meanwhile is announced.
 //!
 //! What is shown comes from [`Watch`], which only reads events, so tests feed
 //! it events and read its notices. A [`Notifier`] shows them: `notify-send`
@@ -28,6 +34,10 @@ use tracing::{debug, warn};
 /// How long a vault must keep reporting errors, without reaching the server
 /// in between, before it is announced as failing.
 pub const KEEPS_FAILING: Duration = Duration::from_secs(5 * 60);
+
+/// A vault that failed is announced again only this long after the last
+/// time, even if it connected in between (a crash loop).
+pub const FAILING_AGAIN: Duration = Duration::from_secs(30 * 60);
 
 /// Paths named in one conflict notice.
 const NAMED: usize = 3;
@@ -66,12 +76,34 @@ struct VaultSeen {
     failing_since: Option<i64>,
     /// This episode of failing was announced.
     failing_told: bool,
+    /// When failing was last announced (ms).
+    failing_told_at: Option<i64>,
+}
+
+impl VaultSeen {
+    /// Whether failing may be announced now (`ts`), and if so, mark it so.
+    fn tell_failing(&mut self, ts: i64) -> bool {
+        if self.failing_told {
+            return false;
+        }
+        self.failing_told = true;
+        if self
+            .failing_told_at
+            .is_some_and(|t| ts - t < FAILING_AGAIN.as_millis() as i64)
+        {
+            return false;
+        }
+        self.failing_told_at = Some(ts);
+        true
+    }
 }
 
 /// Turns the service's events into notices, once per change of state.
 #[derive(Debug, Default)]
 pub struct Watch {
     vaults: HashMap<String, VaultSeen>,
+    /// The vaults whose state at first sight was taken as known.
+    seeded: BTreeSet<String>,
 }
 
 fn text(v: &Value) -> Option<String> {
@@ -87,25 +119,59 @@ impl Watch {
     /// the files in conflict when it starts are not news.
     pub fn knowing(st: &crate::protocol::StatusResult) -> Watch {
         let mut w = Watch::new();
+        w.catch_up(st);
+        w
+    }
+
+    /// Whether this vault's state at first sight was taken in (a vault the
+    /// notifier has not seen yet wants [`Watch::catch_up`] first).
+    pub fn knows(&self, vault: &str) -> bool {
+        self.seeded.contains(vault)
+    }
+
+    /// Bring the watch up to the status the service shows now: for a vault
+    /// it knows, announce what changed (after missed events); a vault it
+    /// sees for the first time (the start, a reload added it) is taken as
+    /// it is, without notices.
+    pub fn catch_up(&mut self, st: &crate::protocol::StatusResult) -> Vec<Notice> {
+        let mut out = Vec::new();
         for v in &st.vaults {
             let Some(s) = &v.status else { continue };
-            let seen = w.vaults.entry(v.name.clone()).or_default();
+            let known = self.seeded.contains(&v.name);
+            self.seeded.insert(v.name.clone());
+            let ev = |kind: &str, data: Value| Event {
+                v: crate::protocol::PROTOCOL,
+                event: kind.into(),
+                vault: Some(v.name.clone()),
+                ts: crate::protocol::now_ms(),
+                data,
+            };
+            // As the service's events give them: the guards' stops without
+            // their time, the safety stop as recorded.
             let text = |x: &Option<String>| {
                 x.as_deref()
                     .map(|t| t.split_once(' ').map_or(t, |(_, m)| m).to_string())
             };
-            for (kind, stop) in [
-                (event::SAFETY_STOP, s.safety_stop.clone()),
-                (event::UPSTREAM_STOP, text(&s.upstream_stop)),
-                (event::REMOTE_LOCKED, text(&s.remote_locked)),
+            let open: Vec<&str> = s.conflicted.iter().map(|r| r.path.as_str()).collect();
+            for e in [
+                ev(event::SAFETY_STOP, serde_json::json!({ "stop": s.safety_stop })),
+                ev(
+                    event::UPSTREAM_STOP,
+                    serde_json::json!({ "stop": text(&s.upstream_stop) }),
+                ),
+                ev(
+                    event::REMOTE_LOCKED,
+                    serde_json::json!({ "lock": text(&s.remote_locked) }),
+                ),
+                ev(event::CONFLICT, serde_json::json!({ "open": open })),
             ] {
-                if let Some(t) = stop {
-                    seen.stops.insert(kind, t);
+                let told = self.on_event(&e);
+                if known {
+                    out.extend(told);
                 }
             }
-            seen.conflicts = s.conflicted.iter().map(|r| r.path.clone()).collect();
         }
-        w
+        out
     }
 
     /// The notices an event calls for (often none).
@@ -185,8 +251,7 @@ impl Watch {
             }
             event::ERROR => {
                 let since = *v.failing_since.get_or_insert(e.ts);
-                if !v.failing_told && e.ts - since >= KEEPS_FAILING.as_millis() as i64 {
-                    v.failing_told = true;
+                if !v.failing_told && e.ts - since >= KEEPS_FAILING.as_millis() as i64 && v.tell_failing(e.ts) {
                     let msg = text(&e.data["message"]).unwrap_or_default();
                     let mins = (e.ts - since) / 60_000;
                     return vec![notice(
@@ -201,10 +266,9 @@ impl Watch {
             event::STATE => match e.data["state"].as_str() {
                 Some("failed") => {
                     v.failing_since.get_or_insert(e.ts);
-                    if v.failing_told {
+                    if !v.tell_failing(e.ts) {
                         return vec![];
                     }
-                    v.failing_told = true;
                     let msg = text(&e.data["message"]).unwrap_or_else(|| "it ended with an error".into());
                     vec![notice(
                         "failing",
@@ -241,24 +305,45 @@ impl Watch {
     }
 }
 
+/// Reads the service's status (blocking), for [`spawn`].
+pub type StatusReader = Arc<dyn Fn() -> Option<crate::protocol::StatusResult> + Send + Sync>;
+
 /// Feed the service's events to a [`Watch`] and show its notices, until the
-/// events end. Notifiers run on a blocking thread.
+/// events end. `status` is read when events were missed (what changed is
+/// announced) and when a vault is first heard of (what it shows is not
+/// news). Notifiers and status reads run on a blocking thread.
 pub fn spawn(
     mut events: broadcast::Receiver<Event>,
     mut watch: Watch,
     notifier: Arc<dyn Notifier>,
+    status: StatusReader,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let read = |status: &StatusReader| {
+            let s = status.clone();
+            async move { tokio::task::spawn_blocking(move || s()).await.ok().flatten() }
+        };
         loop {
-            let e = match events.recv().await {
-                Ok(e) => e,
+            let notices = match events.recv().await {
+                Ok(e) => {
+                    let mut notices = Vec::new();
+                    if e.vault.as_ref().is_some_and(|v| !watch.knows(v)) {
+                        if let Some(st) = read(&status).await {
+                            notices.extend(watch.catch_up(&st));
+                        }
+                    }
+                    notices.extend(watch.on_event(&e));
+                    notices
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    debug!("notifications: {n} events missed");
-                    continue;
+                    debug!("notifications: {n} events missed; reading the status");
+                    match read(&status).await {
+                        Some(st) => watch.catch_up(&st),
+                        None => vec![],
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             };
-            let notices = watch.on_event(&e);
             if notices.is_empty() {
                 continue;
             }
@@ -338,7 +423,9 @@ impl Notifier for Desktop {
 }
 
 /// A program of the user's choice instead of the desktop's notifications
-/// (`lsync serve --notify-command`): run as `PROGRAM TITLE BODY`, with
+/// (`lsync serve --notify-command`): run as `PROGRAM -- TITLE BODY` (the
+/// `--` because the body may start with a file name such as `-u.md`, which
+/// an option parser like `notify-send`'s would take for an option), with
 /// `LSYNC_NOTIFY_KIND` (`safety-stop`, `upstream-stop`, `remote-locked`,
 /// `conflict`, `failing`), `LSYNC_NOTIFY_VAULT` and `LSYNC_NOTIFY_URGENCY`
 /// (`normal`, `critical`) set.
@@ -358,7 +445,8 @@ impl Program {
 
     pub fn command(&self, n: &Notice) -> std::process::Command {
         let mut c = std::process::Command::new(&self.program);
-        c.arg(&n.title)
+        c.arg("--")
+            .arg(&n.title)
             .arg(&n.body)
             .env("LSYNC_NOTIFY_KIND", n.kind)
             .env("LSYNC_NOTIFY_VAULT", n.vault.as_deref().unwrap_or(""))
@@ -562,6 +650,106 @@ mod tests {
         assert!(n[0].body.starts_with("new.md"), "{}", n[0].body);
     }
 
+    #[test]
+    fn a_vault_that_keeps_crashing_is_told_at_most_once_in_a_while() {
+        let mut w = Watch::new();
+        let min = 60_000;
+        let up = |ts: i64| ev(event::ACTIVITY, "notes", ts, json!({"connected": true}));
+        let failed = |ts: i64| {
+            ev(
+                event::STATE,
+                "notes",
+                ts,
+                json!({"state": "failed", "message": "panic"}),
+            )
+        };
+        let mut told = 0;
+        // It connects, then crashes, every minute for 20 minutes.
+        for i in 0..20 {
+            assert!(w.on_event(&up(i * min)).is_empty());
+            told += w.on_event(&failed(i * min + 1000)).len();
+        }
+        assert_eq!(told, 1, "once, not at every retry");
+        // Half an hour after the notice, still at it: told again.
+        assert!(w.on_event(&up(31 * min)).is_empty());
+        assert_eq!(kinds(&w.on_event(&failed(31 * min + 1000))), ["failing"]);
+    }
+
+    fn status_of(v: Value) -> crate::protocol::StatusResult {
+        serde_json::from_value(json!({ "vaults": v })).unwrap()
+    }
+
+    #[test]
+    fn after_missed_events_what_changed_is_told_and_a_new_vault_is_taken_as_it_is() {
+        let mut w = Watch::knowing(&status_of(json!([
+            {"name": "notes", "status": {"conflicted": [{"path": "a.md"}]}}
+        ])));
+        assert!(w.knows("notes") && !w.knows("work"));
+        // Missed: a safety stop came and a.md was resolved, b.md in conflict.
+        let n = w.catch_up(&status_of(json!([
+            {"name": "notes", "status": {"safety_stop": "1730000000000 30 files went missing", "conflicted": [{"path": "b.md"}]}},
+            {"name": "work", "status": {"safety_stop": "1730000000000 9 files went missing", "conflicted": [{"path": "w.md"}]}}
+        ])));
+        assert_eq!(kinds(&n), ["safety-stop", "conflict"], "{n:?}");
+        assert!(n[1].body.starts_with("b.md"), "{}", n[1].body);
+        // `work` came with a reload: what it showed then is no news.
+        assert!(w.knows("work"));
+        let c = ev(event::CONFLICT, "work", 1, json!({"open": ["w.md"]}));
+        assert!(w.on_event(&c).is_empty());
+        // a.md in conflict again, after it was resolved: told.
+        let c = ev(event::CONFLICT, "notes", 1, json!({"open": ["a.md", "b.md"]}));
+        assert_eq!(kinds(&w.on_event(&c)), ["conflict"]);
+    }
+
+    #[tokio::test]
+    async fn the_notifier_reads_the_status_for_a_vault_it_has_not_seen_and_after_a_lag() {
+        let (tx, rx) = broadcast::channel(2);
+        let fake = Arc::new(Fake(Mutex::new(vec![])));
+        let st = Arc::new(Mutex::new(status_of(json!([
+            {"name": "new", "status": {"conflicted": [{"path": "old.md"}]}}
+        ]))));
+        let reader = st.clone();
+        // Events pile up before the task reads them: it lags at once.
+        let stop = |t: &str| ev(event::SAFETY_STOP, "new", 1, json!({ "stop": t }));
+        tx.send(stop("x")).unwrap();
+        tx.send(stop("y")).unwrap();
+        tx.send(stop("z")).unwrap();
+        *st.lock().unwrap() = status_of(json!([
+            {"name": "new", "status": {"safety_stop": "z", "conflicted": [{"path": "old.md"}]}}
+        ]));
+        let task = spawn(
+            rx,
+            Watch::new(),
+            fake.clone(),
+            Arc::new(move || Some(reader.lock().unwrap().clone())),
+        );
+        // A conflict event for the vault it now knows: only the new file.
+        tx.send(ev(event::CONFLICT, "new", 1, json!({"open": ["old.md", "fresh.md"]})))
+            .unwrap();
+        drop(tx);
+        task.await.unwrap();
+        let got = fake.0.lock().unwrap().clone();
+        // The lag's status read was its first sight of `new`: taken as it
+        // is (the stop `z` included); the events read after it say nothing
+        // new; the conflict names only fresh.md.
+        assert_eq!(kinds(&got), ["conflict"], "{got:?}");
+        assert!(got[0].body.starts_with("fresh.md"), "{}", got[0].body);
+    }
+
+    #[test]
+    fn a_program_gets_the_title_and_body_after_a_double_dash() {
+        let n = Notice {
+            vault: Some("notes".into()),
+            kind: "conflict",
+            title: "lsync: a conflict in notes".into(),
+            body: "-u.md\nSee `lsync status`.".into(),
+            urgency: Urgency::Normal,
+        };
+        let c = Program::new("notify-send".into()).command(&n);
+        let args: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["--", "lsync: a conflict in notes", "-u.md\nSee `lsync status`."]);
+    }
+
     struct Fake(Mutex<Vec<Notice>>);
 
     impl Notifier for Fake {
@@ -574,7 +762,7 @@ mod tests {
     async fn the_events_reach_the_notifier_once() {
         let (tx, rx) = broadcast::channel(16);
         let fake = Arc::new(Fake(Mutex::new(vec![])));
-        let task = spawn(rx, Watch::new(), fake.clone());
+        let task = spawn(rx, Watch::new(), fake.clone(), Arc::new(|| None));
         for _ in 0..3 {
             tx.send(ev(event::SAFETY_STOP, "notes", 1, json!({"stop": "gone"})))
                 .unwrap();

@@ -104,13 +104,15 @@ async fn run(svc: Arc<Service>, bound: Option<control::Bound>, policy: Policy, n
             info!("desktop notifications are on");
             // What the service shows now is not news: only changes are told.
             let events = svc.subscribe();
-            let s = svc.clone();
-            let now = tokio::task::spawn_blocking(move || s.status(None)).await;
+            let weak = Arc::downgrade(&svc);
+            let status: notify::StatusReader = Arc::new(move || weak.upgrade()?.status(None).ok());
+            let s = status.clone();
+            let now = tokio::task::spawn_blocking(move || s()).await;
             let watch = match now {
-                Ok(Ok(st)) => notify::Watch::knowing(&st),
+                Ok(Some(st)) => notify::Watch::knowing(&st),
                 _ => notify::Watch::new(),
             };
-            Some(notify::spawn(events, watch, n))
+            Some(notify::spawn(events, watch, n, status))
         }
         None => None,
     };

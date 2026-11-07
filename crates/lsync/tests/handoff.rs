@@ -194,6 +194,13 @@ fn a_file_flushed_on_one_machine_is_waited_for_on_the_other() {
     assert!(text.contains(&format!("handoff.md is at {rev}")), "{text}");
     assert!(b.exits(0, &["wait", "--idle"]).contains("notes is idle"));
 
+    // A command line that does not parse, and a revision that is not one:
+    // 1, never the 2 that means blocked.
+    b.exits(1, &["wait"]);
+    b.exits(1, &["flush", "--no-such-flag"]);
+    b.exits(1, &["wait", "--applied", "handoff.md@99999999999999999999999-abc"]);
+    b.exits(0, &["wait", "--help"]);
+
     // Exit codes an agent can act on: 124 on timeout, on time.
     let t0 = Instant::now();
     let out = b.run(&["wait", "--applied", "handoff.md@9-0000", "--timeout", "1"]);
@@ -212,7 +219,7 @@ fn a_file_flushed_on_one_machine_is_waited_for_on_the_other() {
     assert_eq!(rep["paths"][0]["outcome"], "missing");
     // Exactly one condition.
     let out = b.run(&["wait"]);
-    assert_eq!(out.status.code(), Some(2), "clap's usage error");
+    assert_eq!(out.status.code(), Some(1), "a usage error is not \"blocked\"");
     assert!(String::from_utf8_lossy(&out.stderr).contains("--applied"));
 
     sa.stop();
@@ -256,7 +263,7 @@ fn the_status_line_follows_the_service_and_conflicts_are_notified_once() {
     std::fs::write(
         &script,
         format!(
-            "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$LSYNC_NOTIFY_KIND\" \"$LSYNC_NOTIFY_VAULT\" \"$1\" \"$2\" >> '{}'\n",
+            "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$LSYNC_NOTIFY_KIND\" \"$LSYNC_NOTIFY_VAULT\" \"$2\" \"$3\" >> '{}'\n",
             told.display()
         ),
     )

@@ -38,7 +38,7 @@ use crate::supervisor::{wait_released, RELEASE_TIMEOUT, STOP_TIMEOUT};
 use crate::{Host, HostError, RunConfig, RunState, StateListener};
 use livesync_engine::{
     Confirmation, Engine, EngineError, EngineEvent, FlushOutcome, FlushReport, PullPhase, PullReport, PushReport,
-    Target, WaitFor, WaitOutcome,
+    Target, WaitFor, WaitOutcome, WeakEngine, CONFLICTS_LISTED,
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -349,6 +349,10 @@ pub struct Service {
     vaults: Mutex<BTreeMap<String, Arc<Entry>>>,
     reload_lock: AsyncMutex<()>,
     events: broadcast::Sender<Event>,
+    /// `stored` and `applied`: one per file, so a cold sync sends many. On
+    /// their own channel, so they never push the other events (each sent
+    /// once) out of a slow subscriber's buffer.
+    revisions: broadcast::Sender<Event>,
     stopping: AtomicBool,
     version: String,
     /// What the activity poll last saw of each running engine.
@@ -361,9 +365,10 @@ impl Service {
     /// vaults until the first [`Service::reload`].
     pub fn new(host: Arc<Host>, source: Box<dyn Source>, version: &str) -> Arc<Service> {
         let (events, _) = broadcast::channel(EVENT_BUFFER);
+        let (revisions, _) = broadcast::channel(EVENT_BUFFER);
         host.set_listener(Arc::new(Forward(events.clone())));
         // Every engine's stored and applied revisions, from its first one.
-        let (tx, handle) = (events.clone(), host.handle().clone());
+        let (tx, handle) = (revisions.clone(), host.handle().clone());
         host.set_engine_hook(Arc::new(move |id: &str, engine: &Engine| {
             let mut rx = engine.subscribe();
             let (tx, id) = (tx.clone(), id.to_string());
@@ -379,7 +384,8 @@ impl Service {
                             let _ = tx.send(make_event(kind, Some(id.clone()), data));
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            debug!("vault {id}: {n} revision events missed")
+                            debug!("vault {id}: {n} revision events missed");
+                            let _ = tx.send(make_event(event::LAGGED, Some(id.clone()), json!({"missed": n})));
                         }
                         Err(broadcast::error::RecvError::Closed) => return,
                     }
@@ -392,6 +398,7 @@ impl Service {
             vaults: Mutex::new(BTreeMap::new()),
             reload_lock: AsyncMutex::new(()),
             events,
+            revisions,
             stopping: AtomicBool::new(false),
             version: version.to_string(),
             activity: Mutex::new(HashMap::new()),
@@ -413,8 +420,16 @@ impl Service {
         }
     }
 
+    /// The service's events, except `stored` and `applied`
+    /// ([`Service::subscribe_revisions`]).
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.events.subscribe()
+    }
+
+    /// `stored` and `applied` (and `lagged` when an engine's own buffer
+    /// overflowed before they got here).
+    pub fn subscribe_revisions(&self) -> broadcast::Receiver<Event> {
+        self.revisions.subscribe()
     }
 
     fn emit(&self, kind: &str, vault: Option<&str>, data: Value) {
@@ -976,8 +991,16 @@ impl Service {
     /// The running engine of a vault for `flush` or `wait`, waiting (until
     /// `deadline`) while it starts, retries or runs a command for a client.
     /// A vault that will not run without a person (paused, disabled,
-    /// unusable settings) is an error at once.
-    async fn engine_now(&self, name: &str, deadline: Option<Instant>) -> Result<Engine, CtlError> {
+    /// unusable settings) is an error at once. `ended`: an engine that
+    /// ended, which the supervisor has not let go of yet; it is waited out
+    /// like no engine at all (never returned again, so a caller does not
+    /// spin on it).
+    async fn engine_now(
+        &self,
+        name: &str,
+        deadline: Option<Instant>,
+        ended: Option<&WeakEngine>,
+    ) -> Result<Engine, CtlError> {
         loop {
             self.check_running()?;
             let entry = self.entry(name)?;
@@ -994,11 +1017,17 @@ impl Service {
             if v.planned.runnable().is_none() || (v.start_error.is_some() && !self.has_slot(name)) {
                 return Err(self.not_running(name, &v));
             }
-            if let Some(e) = self.host.engine(name) {
+            let current = self.host.engine(name);
+            let restarting = match (&current, ended) {
+                (Some(e), Some(old)) => e.same_as(old),
+                _ => false,
+            };
+            if let (Some(e), false) = (current, restarting) {
                 return Ok(e);
             }
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 let why = match (self.host.state(name), v.command) {
+                    _ if restarting => "its engine is restarting".to_string(),
                     (_, Some(c)) => format!("it is running `{}` for a client", c.name()),
                     (Some((s, m)), _) => format!(
                         "it is {}{}",
@@ -1037,8 +1066,9 @@ impl Service {
                 format!("vault {name} is pull-only and never writes to the server; there is nothing to flush"),
             ));
         }
+        let mut ended: Option<WeakEngine> = None;
         loop {
-            let engine = self.engine_now(&name, deadline).await?;
+            let engine = self.engine_now(&name, deadline, ended.as_ref()).await?;
             let flushed = engine.flush(paths.clone());
             let r = match deadline {
                 Some(d) => match tokio::time::timeout_at(d.into(), flushed).await {
@@ -1064,8 +1094,9 @@ impl Service {
             match r.map_err(engine_error)? {
                 FlushOutcome::Done(rep) => return Ok(rep),
                 FlushOutcome::Blocked(why) => return Err(CtlError::new(code::BLOCKED, format!("vault {name}: {why}"))),
-                // Its engine restarted (a reload, a command): the next one.
-                FlushOutcome::Stopped => continue,
+                // Its engine restarted (a reload, a command, a failure): the
+                // next one.
+                FlushOutcome::Stopped => ended = Some(engine.downgrade()),
             }
         }
     }
@@ -1082,6 +1113,12 @@ impl Service {
             (None, true) => None,
             _ => return Err(CtlError::new(code::BAD_REQUEST, "parameters: give either idle or path")),
         };
+        if let Some(r) = p.rev.as_deref().filter(|r| livesync_engine::parse_rev(r).is_none()) {
+            return Err(CtlError::new(
+                code::BAD_REQUEST,
+                format!("parameters: {r:?} is not a revision (<generation>-<hash>, as `lsync flush` prints it)"),
+            ));
+        }
         let t0 = Instant::now();
         let limit = p.timeout_ms.filter(|t| *t > 0).map(Duration::from_millis);
         let deadline = limit.map(|t| t0 + t);
@@ -1096,8 +1133,9 @@ impl Service {
             )
         };
         let mut target = p.rev.clone().map(Target::Rev);
+        let mut ended: Option<WeakEngine> = None;
         loop {
-            let engine = self.engine_now(&name, deadline).await?;
+            let engine = self.engine_now(&name, deadline, ended.as_ref()).await?;
             let cond = match &path {
                 None => WaitFor::Idle,
                 Some(path) => {
@@ -1137,7 +1175,7 @@ impl Service {
                     })
                 }
                 WaitOutcome::Blocked(why) => return Err(CtlError::new(code::BLOCKED, format!("vault {name}: {why}"))),
-                WaitOutcome::Stopped => continue,
+                WaitOutcome::Stopped => ended = Some(engine.downgrade()),
                 WaitOutcome::TimedOut(why) => return Err(timed_out(why)),
             }
         }
@@ -1282,19 +1320,28 @@ impl Service {
     fn poll_vault(&self, name: &str, final_read: bool) {
         let mut seen = lock(&self.activity);
         let Some(engine) = self.host.engine(name) else {
-            // The next engine starts its counters at zero.
-            seen.remove(name);
+            // The next engine starts its counters at zero; the files in
+            // conflict stay what they were.
+            if let Some(s) = seen.get_mut(name) {
+                *s = Seen {
+                    open: s.open.take(),
+                    ..Seen::default()
+                };
+            }
             return;
         };
         let s = seen.entry(name.to_string()).or_default();
         let (pull, push) = (engine.report(), engine.push_report());
         let moved = s.counters(self, name, &pull, &push, || {
-            engine.open_conflicts(100).unwrap_or_default()
+            engine.open_conflicts(CONFLICTS_LISTED).unwrap_or_default()
         });
         s.activity(self, name, &engine);
         if moved || final_read || s.status_at.is_none_or(|t| t.elapsed() >= STATUS_POLL) {
             if let Ok(a) = engine.alerts() {
                 s.status(self, name, a);
+            }
+            if let Ok(open) = engine.open_conflicts(CONFLICTS_LISTED) {
+                s.open_changed(self, name, open);
             }
             s.status_at = Some(Instant::now());
         }
@@ -1315,6 +1362,8 @@ struct Seen {
     locked: Option<Option<String>>,
     /// The activity last reported: idle, connected, the pull side's phase.
     active: Option<(bool, bool, PullPhase)>,
+    /// The files in conflict last reported (`None` until the first read).
+    open: Option<Vec<String>>,
 }
 
 /// `cur - prev`, where a smaller `cur` means the counters were reset (the
@@ -1373,11 +1422,13 @@ impl Seen {
             svc.emit(event::PUSHED, Some(name), pushed);
         }
         if conflicts_in + conflicts_out > 0 {
+            let open = open();
             svc.emit(
                 event::CONFLICT,
                 Some(name),
-                json!({"pulled": conflicts_in, "pushed": conflicts_out, "open": open()}),
+                json!({"pulled": conflicts_in, "pushed": conflicts_out, "open": open}),
             );
+            self.open = Some(open);
         }
         self.pull = pull.clone();
         self.push = push.clone();
@@ -1402,6 +1453,20 @@ impl Seen {
                 json!({"idle": now.0, "connected": now.1, "pull": now.2.as_str()}),
             );
         }
+    }
+
+    /// The files in conflict changed without new conflicts (one was
+    /// resolved, or went by another way): a `conflict` event with counts of
+    /// 0, so a client's list (and a notifier's memory) shrinks too.
+    fn open_changed(&mut self, svc: &Service, name: &str, open: Vec<String>) {
+        if self.open.as_ref().is_some_and(|before| *before != open) {
+            svc.emit(
+                event::CONFLICT,
+                Some(name),
+                json!({"pulled": 0, "pushed": 0, "open": open}),
+            );
+        }
+        self.open = Some(open);
     }
 
     fn status(&mut self, svc: &Service, name: &str, a: livesync_engine::Alerts) {

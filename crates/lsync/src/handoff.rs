@@ -10,9 +10,13 @@
 //! Exit codes, for scripts and agents:
 //! - 0: stored (flush), or the condition holds (wait);
 //! - 1: an error (no such vault, bad arguments, the service failed);
+//! - 1: also a command line clap cannot take, and a revision that is not
+//!   one;
 //! - 2: blocked: it cannot happen until a person acts (a safety stop, the
-//!   upstream stop, a remote lock, a gate's refusal, a paused vault, or a
-//!   revision a local edit or a conflict holds back);
+//!   upstream stop, a remote lock, a gate's refusal, a paused vault, a
+//!   revision a local edit or a conflict holds back, a revision on another
+//!   branch than the local file's or whose history the server cannot give,
+//!   or a file this vault does not sync);
 //! - 3: flush: done, but not everything is on the server (see the report);
 //! - 124: the timeout ran out first (as `timeout(1)` exits).
 
@@ -73,8 +77,9 @@ pub struct WaitArgs {
 
 /// `PATH@REV` as a path and a revision: the part after the last `@` is a
 /// revision only when it looks like one (`<generation>-<hash>`), so a path
-/// with an `@` in it stays whole.
-pub fn split_rev(s: &str) -> (String, Option<String>) {
+/// with an `@` in it stays whole. One that looks like a revision but is
+/// not a usable one (a generation of more than 64 bits, or 0) is an error.
+pub fn split_rev(s: &str) -> Result<(String, Option<String>)> {
     if let Some((p, r)) = s.rsplit_once('@') {
         let looks = r.split_once('-').is_some_and(|(g, h)| {
             !g.is_empty()
@@ -83,10 +88,16 @@ pub fn split_rev(s: &str) -> (String, Option<String>) {
                 && h.bytes().all(|b| b.is_ascii_alphanumeric())
         });
         if looks && !p.is_empty() {
-            return (p.to_string(), Some(r.to_string()));
+            if livesync_engine::parse_rev(r).is_none() {
+                bail!(
+                    "{r:?} is not a revision this lsync can wait for (its generation must be 1 to {})",
+                    u64::MAX
+                );
+            }
+            return Ok((p.to_string(), Some(r.to_string())));
         }
     }
-    (s.to_string(), None)
+    Ok((s.to_string(), None))
 }
 
 fn limit(secs: u64) -> Option<Duration> {
@@ -231,7 +242,7 @@ pub fn wait(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, a: &WaitArgs) -> Resu
     let r = config::resolve(sel, cfg, dirs, false)?;
     let applied = match &a.applied {
         Some(s) => {
-            let (p, rev) = split_rev(s);
+            let (p, rev) = split_rev(s)?;
             Some((crate::vault_relative(&r.vault, &p)?, rev))
         }
         None => None,
@@ -353,11 +364,14 @@ mod tests {
 
     #[test]
     fn a_revision_is_split_off_only_when_it_looks_like_one() {
-        assert_eq!(split_rev("a.md@3-abc"), ("a.md".into(), Some("3-abc".into())));
+        assert_eq!(split_rev("a.md@3-abc").unwrap(), ("a.md".into(), Some("3-abc".into())));
         assert_eq!(
-            split_rev("me@host.md@12-0f9e"),
+            split_rev("me@host.md@12-0f9e").unwrap(),
             ("me@host.md".into(), Some("12-0f9e".into()))
         );
+        for bad in ["a.md@99999999999999999999999-abc", "a.md@0-abc"] {
+            assert!(split_rev(bad).is_err(), "{bad}");
+        }
         for whole in [
             "a.md",
             "me@host.md",
@@ -368,7 +382,7 @@ mod tests {
             "@3-abc",
             "a.md@3-a.b",
         ] {
-            assert_eq!(split_rev(whole), (whole.to_string(), None), "{whole}");
+            assert_eq!(split_rev(whole).unwrap(), (whole.to_string(), None), "{whole}");
         }
     }
 

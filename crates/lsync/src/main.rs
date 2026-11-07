@@ -279,10 +279,13 @@ fn init_logging() {
 
 fn main() -> std::process::ExitCode {
     init_logging();
-    let matches = Cli::command().get_matches();
+    let matches = match Cli::command().try_get_matches() {
+        Ok(m) => m,
+        Err(e) => return usage_error(e),
+    };
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(c) => c,
-        Err(e) => e.exit(),
+        Err(e) => return usage_error(e),
     };
     match run(cli, &matches) {
         Ok(code) => std::process::ExitCode::from(code),
@@ -291,6 +294,14 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(1)
         }
     }
+}
+
+/// A command line clap cannot take: exit 1, as every other error does
+/// (clap's own 2 is `lsync flush`/`lsync wait`'s "blocked"). `--help` and
+/// `--version` print and exit 0.
+fn usage_error(e: clap::Error) -> std::process::ExitCode {
+    let _ = e.print();
+    std::process::ExitCode::from(if e.use_stderr() { 1 } else { 0 })
 }
 
 /// Whether an argument was given on the command line (not the environment

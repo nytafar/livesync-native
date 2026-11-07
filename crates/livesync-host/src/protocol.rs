@@ -165,8 +165,13 @@ pub mod event {
     pub const PUSHED: &str = "pushed";
     /// New conflicts: `{"pulled": n, "pushed": n, "open": [path, ...]}`
     /// (pulled: conflicted documents seen; pushed: local edits stored as a
-    /// branch; open: the files in conflict now, at most 100).
+    /// branch; open: the files in conflict now, the first 50 by path, as
+    /// `status` lists them). Also sent with both counts 0 when the files in
+    /// conflict changed otherwise (one was resolved).
     pub const CONFLICT: &str = "conflict";
+    /// `stored` and `applied` come on a channel of their own: their order
+    /// relative to the other events is not kept.
+    ///
     /// A revision this device stored on the server:
     /// `{"path","doc_id","rev","deleted"}`. One per document, as precise as
     /// the index: what `flush` answers with.
@@ -199,7 +204,9 @@ pub mod event {
     pub const COMMAND: &str = "command";
     /// The config was reread (`vault` is null): the reload report.
     pub const RELOAD: &str = "reload";
-    /// This subscriber fell behind and missed `{"missed": n}` events.
+    /// This subscriber fell behind and missed `{"missed": n}` events
+    /// (`vault` null), or an engine's `stored`/`applied` events were missed
+    /// before they reached the service (`vault` set). Read `status` again.
     pub const LAGGED: &str = "lagged";
 }
 

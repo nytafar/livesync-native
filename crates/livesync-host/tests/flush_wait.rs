@@ -40,8 +40,12 @@ struct Fixture {
 
 impl Fixture {
     fn new(vaults: &str) -> Fixture {
+        Fixture::with_workers(vaults, 4)
+    }
+
+    fn with_workers(vaults: &str, workers: usize) -> Fixture {
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(workers)
             .enable_all()
             .build()
             .unwrap();
@@ -128,6 +132,8 @@ fn a_flush_on_one_vault_and_a_wait_on_another_hand_a_file_over() {
     ));
     let (svc, path, stop) = f.start();
     let seen = subscribe(&path);
+    // The service's other events, without the revisions (their own channel).
+    let mut others = svc.subscribe();
     let mut c = Client::connect(&path).unwrap().unwrap();
     let hello = c.call(method::HELLO, Value::Null).unwrap();
     for m in [method::FLUSH, method::WAIT] {
@@ -224,6 +230,19 @@ fn a_flush_on_one_vault_and_a_wait_on_another_hand_a_file_over() {
     assert_eq!(e.code(), Some(code::BAD_REQUEST));
     let e = c.call(method::WAIT, json!({"vault": "b"})).unwrap_err();
     assert_eq!(e.code(), Some(code::BAD_REQUEST));
+    for bad in ["nope", "3-", "99999999999999999999999-abc"] {
+        let e = c
+            .call(method::WAIT, json!({"vault": "b", "path": "handoff.md", "rev": bad}))
+            .unwrap_err();
+        assert_eq!(e.code(), Some(code::BAD_REQUEST), "{bad}: {e}");
+    }
+    loop {
+        match others.try_recv() {
+            Ok(e) => assert!(e.event != "stored" && e.event != "applied", "{e:?}"),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
     let e = c
         .call(method::WAIT, json!({"vault": "nope", "idle": true}))
         .unwrap_err();
@@ -284,4 +303,139 @@ fn a_wait_covers_a_vault_still_starting_and_a_flush_ends_with_its_client() {
     let _ = stop.send(true);
     f.rt.block_on(svc.shutdown());
     assert!(t0.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn waits_and_flushes_across_an_engine_restart_leave_the_service_running() {
+    // Few workers: waits that spun on an ended engine would hold all of
+    // them, and the restart (and everything else) would never get one.
+    let f = Fixture::with_workers(&vault("a", ""), 2);
+    let (svc, path, stop) = f.start();
+    let mut c = Client::connect(&path).unwrap().unwrap();
+    c.set_timeout(Some(Duration::from_secs(10)));
+    wait_until("live", || live(&mut c, "a"));
+
+    // A slow server: a push pass is in flight when the engine ends, and the
+    // engine is only gone once that pass is over.
+    f.mock.state.lock().unwrap().write_delay = Some(Duration::from_secs(3));
+    let mut calls = Vec::new();
+    for i in 0..3 {
+        std::fs::write(f.home(&format!("a/f{i}.md")), format!("flushed {i}")).unwrap();
+        let p = path.clone();
+        calls.push(std::thread::spawn(move || {
+            let mut c = Client::connect(&p).unwrap().unwrap();
+            c.set_timeout(Some(Duration::from_secs(90)));
+            c.call(
+                method::FLUSH,
+                json!({"vault": "a", "paths": [format!("f{i}.md")], "timeout_ms": 60_000}),
+            )
+        }));
+        let p = path.clone();
+        calls.push(std::thread::spawn(move || {
+            let mut c = Client::connect(&p).unwrap().unwrap();
+            c.set_timeout(Some(Duration::from_secs(90)));
+            c.call(method::WAIT, json!({"vault": "a", "idle": true, "timeout_ms": 60_000}))
+        }));
+    }
+    let flushes = |c: &mut Client| -> u64 {
+        let st: StatusResult = serde_json::from_value(c.call(method::STATUS, json!({"vault": "a"})).unwrap()).unwrap();
+        st.vaults[0].activity.as_ref().map_or(0, |a| a.flushes)
+    };
+    let pushing = |c: &mut Client| -> bool {
+        let st: StatusResult = serde_json::from_value(c.call(method::STATUS, json!({"vault": "a"})).unwrap()).unwrap();
+        st.vaults[0].activity.as_ref().is_some_and(|a| a.pushing)
+    };
+    wait_until("a flush's pass in flight", || flushes(&mut c) > 0 && pushing(&mut c));
+
+    // The engine ends by itself: the plugin was turned on in the folder.
+    let obsidian = f.home("a/.obsidian");
+    std::fs::create_dir_all(obsidian.join("plugins/obsidian-livesync")).unwrap();
+    std::fs::write(obsidian.join("community-plugins.json"), r#"["obsidian-livesync"]"#).unwrap();
+    c.call(method::SYNC_NOW, json!({"vault": "a"})).unwrap();
+    let ended = || {
+        let st = svc.status(Some("a")).unwrap();
+        st.vaults[0].state == "failed"
+    };
+    // Checked from this thread: a starved runtime cannot answer at all.
+    let t0 = Instant::now();
+    while !ended() && t0.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let answers = c.call(method::STATUS, json!({"vault": "a"}));
+    if !ended() || answers.is_err() {
+        // The runtime is stuck: leave it behind rather than hang on it.
+        std::mem::forget(svc);
+        std::mem::forget(f);
+        panic!("the service stopped answering while its engine restarted: {answers:?}");
+    }
+
+    // Back: the plugin off again, the server taking writes, a retry now.
+    std::fs::remove_file(obsidian.join("community-plugins.json")).unwrap();
+    f.mock.state.lock().unwrap().write_delay = None;
+    c.call(method::SYNC_NOW, json!({"vault": "a"})).unwrap();
+    for (i, call) in calls.into_iter().enumerate() {
+        let r = call.join().unwrap();
+        let v = r.unwrap_or_else(|e| panic!("call {i}: {e}"));
+        if i % 2 == 0 {
+            assert_eq!(v["complete"], true, "{v}");
+        } else {
+            assert_eq!(v["condition"], "idle", "{v}");
+        }
+    }
+    for i in 0..3 {
+        assert!(f.mock.doc(&format!("f{i}.md")).is_some());
+    }
+    let _ = stop.send(true);
+    f.rt.block_on(svc.shutdown());
+}
+
+#[test]
+fn a_file_in_conflict_again_after_it_was_resolved_is_told_again() {
+    let f = Fixture::new(&vault("a", "mode = \"pull-only\""));
+    let first = f.mock.put_text("c.md", &["one"]);
+    let (svc, path, stop) = f.start();
+    let seen = subscribe(&path);
+    let mut c = Client::connect(&path).unwrap().unwrap();
+    wait_until("live", || live(&mut c, "a") && f.home("a/c.md").exists());
+    let conflicts = || -> Vec<Vec<String>> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.event == "conflict")
+            .map(|e| serde_json::from_value(e.data["open"].clone()).unwrap())
+            .collect()
+    };
+
+    // Two edits of one revision: a conflict.
+    let loser = f
+        .mock
+        .put_branch_with(f.mock.text_doc("c.md", "lost"), &first, "0000aaaa");
+    let kept = f
+        .mock
+        .put_branch_with(f.mock.text_doc("c.md", "kept"), &first, "ffffbbbb");
+    wait_until("in conflict", || conflicts().last() == Some(&vec!["c.md".to_string()]));
+    // Resolved on the server: the losing branch deleted.
+    f.mock.put_branch(json!({"_id": "c.md", "_deleted": true}), &loser);
+    wait_until("resolved", || conflicts().last() == Some(&vec![]));
+    // And in conflict again.
+    f.mock
+        .put_branch_with(f.mock.text_doc("c.md", "again 1"), &kept, "0000cccc");
+    f.mock
+        .put_branch_with(f.mock.text_doc("c.md", "again 2"), &kept, "ffffdddd");
+    wait_until("in conflict again", || {
+        conflicts().len() >= 3 && conflicts().last() == Some(&vec!["c.md".to_string()])
+    });
+
+    // What a notifier makes of these events: a notice each time.
+    let mut w = livesync_host::notify::Watch::new();
+    let notices: Vec<_> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|e| w.on_event(e))
+        .filter(|n| n.kind == "conflict")
+        .collect();
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    let _ = stop.send(true);
+    f.rt.block_on(svc.shutdown());
 }

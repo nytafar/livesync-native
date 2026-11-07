@@ -548,8 +548,9 @@ async fn connection(stream: tokio::net::UnixStream, service: Arc<Service>, polic
         }
         if req.method == method::EVENTS {
             match subscribe(&service, &req) {
-                Ok((filter, rx_events)) => {
+                Ok((filter, rx_events, rx_revisions)) => {
                     let _ = tx.send(line(&Response::ok(req.id, json!({"subscribed": true})))).await;
+                    subscriptions.push(tokio::spawn(forward(rx_revisions, filter.clone(), tx.clone())));
                     subscriptions.push(tokio::spawn(forward(rx_events, filter, tx.clone())));
                 }
                 Err(e) => {
@@ -618,7 +619,10 @@ fn params<T: serde::de::DeserializeOwned + Default>(p: &Value) -> Result<T, CtlE
     serde_json::from_value(p.clone()).map_err(|e| CtlError::new(code::BAD_REQUEST, format!("parameters: {e}")))
 }
 
-fn subscribe(service: &Service, req: &Request) -> Result<(Option<String>, broadcast::Receiver<Event>), CtlError> {
+type Subscribed = (Option<String>, broadcast::Receiver<Event>, broadcast::Receiver<Event>);
+
+/// The events (the revisions on their own channel) for one subscriber.
+fn subscribe(service: &Service, req: &Request) -> Result<Subscribed, CtlError> {
     let p: VaultParam = params(&req.params)?;
     if let Some(v) = &p.vault {
         if !service.names().contains(v) {
@@ -628,7 +632,7 @@ fn subscribe(service: &Service, req: &Request) -> Result<(Option<String>, broadc
             ));
         }
     }
-    Ok((p.vault, service.subscribe()))
+    Ok((p.vault, service.subscribe(), service.subscribe_revisions()))
 }
 
 async fn forward(mut rx: broadcast::Receiver<Event>, vault: Option<String>, tx: mpsc::Sender<String>) {
