@@ -1437,10 +1437,41 @@ pub(crate) fn vault_relative(vault: &std::path::Path, given: &str) -> Result<Str
             other => norm.push(other),
         }
     }
+    // The vault is compared resolved, so the path is too: through a
+    // symlink in its folders (macOS's /tmp and /var are links into
+    // /private), it still names a file in the vault.
+    let norm = if norm.starts_with(&vault) {
+        norm
+    } else {
+        resolve_folders(&norm)
+    };
     let rel = norm
         .strip_prefix(&vault)
         .map_err(|_| anyhow::anyhow!("{given}: outside the vault folder {}", vault.display()))?;
     Ok(rel.to_string_lossy().replace('\\', "/"))
+}
+
+/// `p` with its deepest existing folder resolved (symlinks followed) and
+/// the rest kept as given; the last component itself is never followed, so
+/// a symlink in the vault names itself, not its target.
+fn resolve_folders(p: &std::path::Path) -> PathBuf {
+    let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+        return p.to_path_buf();
+    };
+    let mut rest = vec![name];
+    let mut dir = parent;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(dir) {
+            return rest.iter().rev().fold(real, |acc, c| acc.join(c));
+        }
+        match (dir.parent(), dir.file_name()) {
+            (Some(up), Some(n)) => {
+                rest.push(n);
+                dir = up;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 fn check_ignore(
@@ -1715,6 +1746,37 @@ fn print_status(s: &livesync_engine::Status) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// A path through a symlinked folder, as every temp path on macOS is
+    /// (/var -> /private/var), names a file in the vault; the file itself
+    /// is not followed, and a path elsewhere is still refused.
+    #[test]
+    fn a_path_through_a_linked_folder_is_in_the_vault() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("private/var");
+        std::fs::create_dir_all(real.join("vault/sub")).unwrap();
+        let var = d.path().join("var");
+        std::os::unix::fs::symlink(&real, &var).unwrap();
+        let vault = var.join("vault");
+        let given = |p: &Path| p.to_str().unwrap().to_string();
+        assert_eq!(
+            vault_relative(&vault, &given(&vault.join("sub/new.md"))).unwrap(),
+            "sub/new.md"
+        );
+        assert_eq!(
+            vault_relative(&vault, &given(&vault.join("not/yet/there.md"))).unwrap(),
+            "not/yet/there.md"
+        );
+        assert_eq!(
+            vault_relative(&real.join("vault"), &given(&vault.join("a.md"))).unwrap(),
+            "a.md"
+        );
+        std::os::unix::fs::symlink(d.path(), real.join("vault/out")).unwrap();
+        assert_eq!(vault_relative(&vault, &given(&vault.join("out"))).unwrap(), "out");
+        let e = vault_relative(&vault, &given(&var.join("elsewhere.md"))).unwrap_err();
+        assert!(e.to_string().contains("outside the vault folder"), "{e}");
+    }
 
     #[test]
     fn only_a_command_at_a_terminal_may_show_keyring_dialogs() {
