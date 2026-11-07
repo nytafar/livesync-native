@@ -93,8 +93,9 @@ fn pull_only_profile_follows_the_remote_and_never_writes() {
     env.mock.clear_requests();
     let p = env.profile("p1", "vault");
     env.host.start(p.clone()).unwrap();
-    wait_until("a.md", Duration::from_secs(20), || {
-        read(&p, "notes/a.md").as_deref() == Some("hello world")
+    // The file is written inside the batch; `since` is stored after it.
+    wait_until("a.md and the batch stored", Duration::from_secs(20), || {
+        read(&p, "notes/a.md").as_deref() == Some("hello world") && env.status(&p).since.is_some()
     });
     let st = env.status(&p);
     assert_eq!(st.run_state, RunState::Running);
