@@ -182,9 +182,11 @@ fn the_guard_settings_are_checked_with_the_config() {
     assert_eq!(c.clock_jump, None);
     // A long heartbeat: the derived timeout stays below the HTTP read
     // timeout, so the longpoll's silence check still fires first.
-    let c = ec("heartbeat_secs = 60\n");
+    // The longest heartbeat allowed, with two heartbeats' margin.
+    let c = ec("heartbeat_secs = 44\n");
     assert_eq!(c.longpoll_timeout, Duration::from_secs(89));
     assert!(c.longpoll_timeout < livesync_remote::READ_TIMEOUT);
+    assert!(c.longpoll_timeout >= c.heartbeat * 2);
     let c = ec("");
     assert!(!c.allow_plugin);
     // lsync names its handover switch in the plugin guard's refusal.
@@ -195,12 +197,17 @@ fn the_guard_settings_are_checked_with_the_config() {
     for (bad, says) in [
         (
             "heartbeat_secs = 30\nlongpoll_timeout_secs = 20\n",
-            "must be longer than heartbeat_secs",
+            "longpoll_timeout_secs (20) must be at least two heartbeats (60 s",
         ),
-        // Past the HTTP client's 90 s read timeout: every longpoll would end
-        // in a transport error, or a dead link would never count as silent.
-        ("heartbeat_secs = 120\n", "heartbeat_secs (120) must be below 89"),
-        ("heartbeat_secs = 89\n", "heartbeat_secs (89) must be below 89"),
+        (
+            "heartbeat_secs = 30\nlongpoll_timeout_secs = 59\n",
+            "must be at least two heartbeats",
+        ),
+        // Two heartbeats would not fit below the HTTP client's 90 s read
+        // timeout: a derived timeout of 89 would be under 2.5 heartbeats.
+        ("heartbeat_secs = 45\n", "heartbeat_secs (45) must be at most 44"),
+        ("heartbeat_secs = 60\n", "heartbeat_secs (60) must be at most 44"),
+        ("heartbeat_secs = 120\n", "heartbeat_secs (120) must be at most 44"),
         (
             "longpoll_timeout_secs = 95\n",
             "longpoll_timeout_secs (95) must be below 90 s",

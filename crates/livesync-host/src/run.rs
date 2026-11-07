@@ -128,12 +128,15 @@ impl Tuning {
         // plain transport error: the longpoll's own silence limit has to
         // fire before it to be recognised (and reconnect on fresh connections).
         let read = livesync_remote::READ_TIMEOUT;
+        // The silence limit is at least two heartbeats, so one late
+        // heartbeat is not taken for a dead link; it all fits below `limit`.
         let limit = read - Duration::from_secs(1);
-        if heartbeat >= limit {
+        let max_heartbeat = limit / 2;
+        if heartbeat > max_heartbeat {
             return Err(format!(
-                "heartbeat_secs ({}) must be below {} (the HTTP read timeout is {} s, and the silence limit has to fit between them)",
+                "heartbeat_secs ({}) must be at most {} (the silence limit is at least two heartbeats, and has to stay below the HTTP read timeout of {} s)",
                 heartbeat.as_secs(),
-                limit.as_secs(),
+                max_heartbeat.as_secs(),
                 read.as_secs()
             ));
         }
@@ -142,10 +145,11 @@ impl Tuning {
             (None, Some(_)) => d::LONGPOLL_TIMEOUT.max(heartbeat * 5 / 2).min(limit),
             (None, None) => d::LONGPOLL_TIMEOUT,
         };
-        if timeout <= heartbeat {
+        if timeout < heartbeat * 2 {
             return Err(format!(
-                "longpoll_timeout_secs ({}) must be longer than heartbeat_secs ({}), or every longpoll is taken for dead",
+                "longpoll_timeout_secs ({}) must be at least two heartbeats ({} s with heartbeat_secs {}), or a late heartbeat is taken for a dead link",
                 timeout.as_secs(),
+                (heartbeat * 2).as_secs(),
                 heartbeat.as_secs()
             ));
         }

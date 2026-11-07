@@ -170,8 +170,8 @@ The guards and the connection take these (in seconds; edit them in the file):
 |---|---|---|
 | `allow_plugin` | `false` | sync two-way although the vault's Self-hosted LiveSync plugin is enabled (a handover) |
 | `regate_secs` | 300 | how often the running daemon checks the remote's version, features and tweaks again |
-| `heartbeat_secs` | 10 (Android 30) | the longpoll's heartbeat; below 89 |
-| `longpoll_timeout_secs` | 25 (Android 75; 2.5 heartbeats, at most 89, when only the heartbeat is set) | silence before the connection is taken for dead; longer than the heartbeat and below the HTTP read timeout of 90 s |
+| `heartbeat_secs` | 10 (Android 30) | the longpoll's heartbeat; at most 44 |
+| `longpoll_timeout_secs` | 25 (Android 75; 2.5 heartbeats, at most 89, when only the heartbeat is set) | silence before the connection is taken for dead; at least two heartbeats and below the HTTP read timeout of 90 s |
 | `clock_jump_secs` | 10 (Android: off) | a wall-clock jump this long past the monotonic clock is sleep: reconnect and rescan; `0` turns it off |
 
 A reverse proxy that buffers responses holds the heartbeats back, and the daemon then reconnects every `longpoll_timeout_secs`. Turn buffering off for `/_changes` (nginx: `proxy_buffering off`), or raise the timeout.
