@@ -75,19 +75,16 @@ fn line_diffs_match_diff_match_patch() {
 }
 
 #[test]
-fn a_trailing_deletion_stays_a_deletion() {
-    // Upstream's splitDiffPiece pushes a deletion with nothing after it as EQUAL.
+fn upstreams_split_turns_a_trailing_deletion_into_equal_lines() {
+    // The model of upstream: splitDiffPiece pushes a deletion with nothing
+    // after it as EQUAL.
     assert_eq!(
-        lines::split_for_test("a\nb\nc\n", "a\nb\n", false),
+        lines::split_for_test("a\nb\nc\n", "a\nb\n"),
         vec![(0, "a\n".into()), (0, "b\n".into()), (0, "c\n".into())]
-    );
-    assert_eq!(
-        lines::split_for_test("a\nb\nc\n", "a\nb\n", true),
-        vec![(0, "a\n".into()), (0, "b\n".into()), (-1, "c\n".into())]
     );
 }
 
-// ---------- rule 1: identical ----------
+// ---------- identical ----------
 
 #[test]
 fn identical_content_needs_nothing_new() {
@@ -123,7 +120,7 @@ fn same_data_different_deleted_flag_is_not_identical() {
     );
 }
 
-// ---------- rule 5: delete against edit ----------
+// ---------- delete against edit ----------
 
 #[test]
 fn the_edit_beats_the_delete() {
@@ -139,7 +136,7 @@ fn the_edit_beats_the_delete() {
         let m = merge(Kind::Markdown, &input, &Settings::default());
         assert_eq!((m.rule, m.outcome), (Rule::EditBeatsDelete, Outcome::Keep(keep)));
     }
-    // It needs no ancestor (D9: without one only rules 1 and 5 apply), and it
+    // It needs no ancestor (without one only rules 1 and 2 apply), and it
     // applies to binaries too: the live leaf is kept as it is.
     let input = Input {
         base: None,
@@ -233,7 +230,103 @@ fn kinds_come_from_the_settings() {
     assert_eq!(custom.kind_of("x.json"), Kind::Other);
 }
 
-// ---------- rule 2: lines ----------
+// ---------- lines ----------
+
+#[test]
+fn an_insertion_at_the_end_of_a_replaced_range_goes_after_it() {
+    let m = md("a\nb\nc\n", "a\nB\nC\n", "a\nb\nc\nd\n");
+    assert_eq!(written(&m), "a\nB\nC\nd\n");
+    // With ours newer upstream gives a B d C (theirs' line inside ours'
+    // replacement).
+    let m = run(Kind::Text, Some("a\nb\nc\n"), "a\nB\nC\n", "a\nb\nc\nd\n", true);
+    assert_eq!(written(&m), "a\nB\nC\nd\n");
+    assert_eq!(
+        upstream_line_merge("a\nb\nc\n", "a\nB\nC\n", "a\nb\nc\nd\n", false).unwrap(),
+        "a\nB\nd\nC\n"
+    );
+    assert_eq!(m.deviations, [Deviation::PositionOrder]);
+    // At its start: before it.
+    let m = md("a\nb\nc\n", "a\nB\nC\n", "a\nx\nb\nc\n");
+    assert_eq!(written(&m), "a\nx\nB\nC\n");
+}
+
+#[test]
+fn a_sub_item_stays_under_its_ticked_parent() {
+    let base = "- [ ] task\n- [ ] next\n";
+    let ticked = "- [x] task\n- [ ] next\n";
+    let sub = "- [ ] task\n  - detail\n- [ ] next\n";
+    for ours_newer in [false, true] {
+        let m = run(Kind::Markdown, Some(base), ticked, sub, ours_newer);
+        assert_eq!(written(&m), "- [x] task\n  - detail\n- [ ] next\n");
+        let m = run(Kind::Markdown, Some(base), sub, ticked, ours_newer);
+        assert_eq!(written(&m), "- [x] task\n  - detail\n- [ ] next\n");
+    }
+}
+
+#[test]
+fn a_line_changed_and_a_line_appended_after_it() {
+    // A lost-update guard's log case: the stale writer marked the entry done,
+    // the overwritten revision appended one.
+    let base = "# Log\n- 09 start\n";
+    let done = "# Log\n- 09 start (done)\n";
+    let more = "# Log\n- 09 start\n- 10 call\n";
+    for ours_newer in [false, true] {
+        let m = run(Kind::Markdown, Some(base), done, more, ours_newer);
+        assert_eq!(written(&m), "# Log\n- 09 start (done)\n- 10 call\n");
+        let m = run(Kind::Markdown, Some(base), more, done, ours_newer);
+        assert_eq!(written(&m), "# Log\n- 09 start (done)\n- 10 call\n");
+    }
+}
+
+#[test]
+fn an_insertion_inside_a_replaced_range_stays_open() {
+    let m = md("a\nb\nc\nd\n", "a\nX\nY\nd\n", "a\nb\nnew\nc\nd\n");
+    assert_eq!(
+        overlaps(&m),
+        [Overlap::Lines(LineOverlap {
+            base: 1..3,
+            ours: 1..3,
+            theirs: 1..4
+        })]
+    );
+    // Deleted lines with an insertion between them, too.
+    assert!(md("a\nb\nc\nd\n", "a\nd\n", "a\nb\nnew\nc\nd\n").outcome.is_open());
+}
+
+#[test]
+fn replacements_are_compared_whole() {
+    // Upstream merges these to "Meeting at 10, Room 1, Room 2".
+    let m = md(
+        "# M\nMeeting TBD\nend\n",
+        "# M\nMeeting at 10\nRoom 1\nend\n",
+        "# M\nMeeting at 10\nRoom 2\nend\n",
+    );
+    assert_eq!(
+        overlaps(&m),
+        [Overlap::Lines(LineOverlap {
+            base: 1..2,
+            ours: 1..3,
+            theirs: 1..3
+        })]
+    );
+    assert!(m.deviations.is_empty());
+    // The same multi-line replacement on both sides: once, as one block.
+    let m = md("a\nb\nc\n", "a\nB1\nB2\nB3\nc\n", "a\nB1\nB2\nB3\nc\nd\n");
+    assert_eq!(written(&m), "a\nB1\nB2\nB3\nc\nd\n");
+    // Two overlapping replacements of different ranges.
+    assert!(md("a\nb\nc\nd\n", "a\nX\nY\nd\n", "a\nb\nZ\nW\n").outcome.is_open());
+    // Adjacent ones merge.
+    assert_eq!(
+        written(&md("a\nb\nc\nd\n", "a\nB\nc\nd\n", "a\nb\nC\nd\n")),
+        "a\nB\nC\nd\n"
+    );
+}
+
+#[test]
+fn overlapping_deletions_delete_every_line() {
+    let m = md("a\nb\nc\nd\ne\n", "a\nd\ne\n", "a\nb\ne\n");
+    assert_eq!(written(&m), "a\ne\n");
+}
 
 #[test]
 fn one_sided_changes_are_taken() {
@@ -306,15 +399,11 @@ fn two_inserted_runs_go_in_whole_older_first() {
     let m = run(Kind::Text, Some(base), ours, theirs, true);
     assert_eq!(written(&m), "# Log\ntheirs 1\ntheirs 2\ntheirs 3\nours 1\nours 2\n");
     assert_eq!(m.deviations, [Deviation::RunOrder]);
-    // Upstream's interleaving, when the fix is undone.
-    let input = Input {
-        base: Some(ver(base, 1000)),
-        ours: ver(ours, OLD),
-        theirs: ver(theirs, NEW),
-    };
-    let m = merge_undoing(Kind::Text, &input, &Settings::default(), &[Deviation::RunOrder]);
-    assert_eq!(written(&m), "# Log\nours 1\ntheirs 1\nours 2\ntheirs 2\ntheirs 3\n");
-    assert!(m.deviations.is_empty());
+    // Upstream interleaves.
+    assert_eq!(
+        upstream_line_merge(base, ours, theirs, true).unwrap(),
+        "# Log\nours 1\ntheirs 1\nours 2\ntheirs 2\ntheirs 3\n"
+    );
 }
 
 #[test]
@@ -343,14 +432,30 @@ fn single_lines_inserted_at_one_point_are_upstreams_order() {
 }
 
 #[test]
-fn whole_runs_still_take_a_shared_line_once() {
-    // Both runs end in the same line: aligned on it, the lines before it whole.
+fn runs_sharing_lines_go_in_whole() {
+    // A shared last line that is not a whole prefix or suffix of the other run:
+    // both runs whole, the shared line in each.
     let m = run(Kind::Text, Some("a\n"), "a\no1\no2\nX\n", "a\nt1\nt2\nX\n", false);
-    assert_eq!(written(&m), "a\no1\no2\nt1\nt2\nX\n");
+    assert_eq!(written(&m), "a\no1\no2\nX\nt1\nt2\nX\n");
+    // Two fenced blocks, each whole (upstream pairs the fences).
+    let m = run(Kind::Text, Some("x\n"), "x\n```\nA\n```\n", "x\n```\nB\n```\n", false);
+    assert_eq!(written(&m), "x\n```\nA\n```\n```\nB\n```\n");
     assert_eq!(m.deviations, [Deviation::RunOrder]);
-    // A shared first line, then each side's own lines.
-    let m = run(Kind::Text, Some("a\n"), "a\nX\no1\no2\n", "a\nX\nt1\nt2\n", true);
-    assert_eq!(written(&m), "a\nX\nt1\nt2\no1\no2\n");
+    // Two paragraphs, each with its blank line.
+    let m = run(
+        Kind::Text,
+        Some("# Log\n"),
+        "# Log\n\nPara A\n",
+        "# Log\n\nPara B\n",
+        false,
+    );
+    assert_eq!(written(&m), "# Log\n\nPara A\n\nPara B\n");
+    // One run a whole suffix of the other: the longer, once.
+    let m = run(Kind::Text, Some("a\n"), "a\nX\n", "a\nY\nX\n", false);
+    assert_eq!(written(&m), "a\nY\nX\n");
+    // A whole prefix.
+    let m = run(Kind::Text, Some("a\n"), "a\nX\nY\n", "a\nX\n", true);
+    assert_eq!(written(&m), "a\nX\nY\n");
 }
 
 #[test]
@@ -377,23 +482,17 @@ fn the_same_insertion_on_both_sides_is_taken_once() {
     assert_eq!(m.deviations, [Deviation::SameInsertionOnce]);
     let m = run(Kind::Text, Some("a\n"), "a\nX\n", "a\nY\nX\n", true);
     assert_eq!(written(&m), "a\nY\nX\n");
-    // A blank line both added, around different text.
+    // A blank line both added, around different text: both runs whole.
     let m = md("x\n", "x\nours\n\n", "x\n\ntheirs\n");
-    assert_eq!(written(&m), "x\nours\n\ntheirs\n");
+    assert_eq!(written(&m), "x\nours\n\n\ntheirs\n");
 }
 
 #[test]
-fn the_same_lines_inserted_in_another_order_stay_open() {
+fn the_same_lines_inserted_in_another_order_go_in_whole() {
+    // Upstream pairs them to the same lines.
     let m = md("a\n", "a\nP\nQ\n", "a\nQ\nP\n");
-    assert_eq!(m.deviations, [Deviation::SameInsertionOnce]);
-    assert_eq!(
-        overlaps(&m),
-        [Overlap::Lines(LineOverlap {
-            base: 1..1,
-            ours: 1..3,
-            theirs: 1..3
-        })]
-    );
+    assert_eq!(written(&m), "a\nP\nQ\nQ\nP\n");
+    assert!(m.deviations.is_empty());
 }
 
 #[test]
@@ -534,10 +633,11 @@ fn a_trailing_deletion_against_a_change_of_it_stays_open() {
     // Upstream gives a b C, taking the change over the deletion.
     let m = md("a\nb\nc\n", "a\nb\n", "a\nb\nC\n");
     assert!(m.outcome.is_open());
-    assert_eq!(m.deviations, [Deviation::TrailingDeletion]);
+    assert!(m.deviations.is_empty(), "open is stricter, not a deviation");
 }
 
-/// D10: base R1, ours L (the local file), theirs R2 (what lsync wrote).
+/// A lost-update guard: base R1 (what a writer read), ours L (what it wrote),
+/// theirs R2 (the revision it overwrote). "Clean and M = L" must mean L holds R2.
 fn guard(r1: &str, l: &str, r2: &str) -> Option<String> {
     let input = Input {
         base: Some(ver(r1, 1000)),
@@ -613,7 +713,6 @@ fn names_are_stable() {
         devs,
         [
             "same_insertion_once",
-            "fallthrough_open",
             "glued_lines",
             "unparsable_json",
             "stricter_object_check",
@@ -622,7 +721,8 @@ fn names_are_stable() {
             "broken_frontmatter",
             "trailing_deletion",
             "run_order",
-            "emptied_open"
+            "emptied_open",
+            "position_order"
         ]
     );
     for r in Rule::ALL {
@@ -699,7 +799,7 @@ fn equal_mtimes_put_ours_first() {
     );
 }
 
-// ---------- rule 3: frontmatter ----------
+// ---------- frontmatter ----------
 
 const FM_BASE: &str = "---\ntitle: Note\ntags:\n  - a\nstatus: draft\n---\nbody\n";
 
@@ -815,12 +915,21 @@ fn frontmatter_changed_on_one_side_is_the_line_merge() {
 }
 
 #[test]
-fn a_line_merge_that_breaks_the_frontmatter_stays_open() {
-    // Both add a key at the same place by lines: no frontmatter in the base, so
-    // rule 3 does not apply, and the line merge would write `a` twice.
+fn frontmatter_added_on_both_sides_merges_key_by_key() {
+    // Both add frontmatter to a note without: merged key by key against an
+    // empty block, so `a` set differently is open, not two blocks of lines.
     let m = md("body\n", "---\na: 1\n---\nbody\n", "---\na: 2\n---\nbody\n");
-    assert_eq!(m.deviations, [Deviation::BrokenFrontmatter]);
-    assert_eq!(overlaps(&m), [Overlap::Whole(Reason::MergedFrontmatterInvalid)]);
+    assert_eq!(m.rule, Rule::Frontmatter);
+    assert_eq!(overlaps(&m), [Overlap::FrontmatterKey(Some("a".into()))]);
+    let m = md("body\n", "---\na: 1\n---\nbody\n", "---\nb: 2\n---\nbody\nmore\n");
+    assert_eq!(written(&m), "---\na: 1\nb: 2\n---\nbody\nmore\n");
+    // A block one side already had, unparsable or not, is that side's.
+    let m = md(
+        "---\na: 1\n---\nbody\n",
+        "---\na: 1\nb: [\n---\nbody\n",
+        "---\na: 1\n---\nbody\nmore\n",
+    );
+    assert_eq!(written(&m), "---\na: 1\nb: [\n---\nbody\nmore\n");
 }
 
 #[test]
@@ -838,7 +947,34 @@ fn body_overlaps_are_in_file_lines() {
     );
 }
 
-// ---------- rule 4: JSON ----------
+// ---------- JSON ----------
+
+#[test]
+fn json_equal_to_one_side_is_that_sides_bytes() {
+    // Ours' change is the only one; ours' formatting (odd as it is) is kept.
+    let b = "{\"a\": 1, \"b\": 1}\n";
+    let o = "{ \"a\" : 1,\n   \"b\": 2 }";
+    let t = "{\"a\": 1, \"b\": 1, \"c\": [] }\n";
+    let m = run(Kind::Object, Some(b), o, "{\"a\": 1.0, \"b\": 1}\n", true);
+    assert_eq!(written(&m), o);
+    // Otherwise the merged value in a side's style.
+    let m = run(Kind::Object, Some(b), o, t, false);
+    assert!(written(&m).contains("\"c\""));
+}
+
+#[test]
+fn json_number_changes_are_never_dropped() {
+    let m = run(
+        Kind::Object,
+        Some("{\"a\": 1e400, \"b\": 0}"),
+        "{\"a\": 2e400, \"b\": 0}",
+        "{\"a\": 1e400, \"b\": -0}",
+        false,
+    );
+    assert_eq!(written(&m), "{\"a\":2e400,\"b\":-0}");
+    let m = run(Kind::Object, Some("{\"a\": 0}"), "{\"a\": -0}", "{\"a\": 1}", false);
+    assert!(m.outcome.is_open());
+}
 
 const CANVAS: &str =
     "{\n\t\"nodes\": [\n\t\t{\n\t\t\t\"id\": \"n1\",\n\t\t\t\"text\": \"First\"\n\t\t}\n\t],\n\t\"edges\": []\n}";
@@ -1102,6 +1238,83 @@ fn merge3_closes_a_last_line_without_newline_before_a_marker() {
     );
     let crlf = m3(Kind::Text, Some("a\r\nb\r\n"), "a\r\nX\r\n", "a\r\nY\r\n");
     assert!(crlf.text.contains("<<<<<<< ours\r\nX\r\n||||||| base\r\n"));
+}
+
+#[test]
+fn merge3_agrees_with_merge() {
+    let cases = [
+        ("a\nb\nc\n", "a\nB\nC\n", "a\nb\nc\nd\n"),
+        ("a\nb\n", "", "a\nb\nc\n"),
+        ("a\nb", "a\nb\nleft", "a\nb\nright"),
+        ("---\na: 1\n---\nx\n", "---\na: [\n---\nx\n", "---\na: 2\n---\nx\n"),
+        (
+            "# M\nTBD\nend\n",
+            "# M\nAt 10\nRoom 1\nend\n",
+            "# M\nAt 10\nRoom 2\nend\n",
+        ),
+    ];
+    for (b, o, t) in cases {
+        let input = Input {
+            base: Some(ver(b, 1000)),
+            ours: ver(o, OLD),
+            theirs: ver(t, NEW),
+        };
+        let m = merge(Kind::Markdown, &input, &Settings::default());
+        let r = merge3(Kind::Markdown, &input, &Settings::default(), &Labels::default()).unwrap();
+        match &m.outcome {
+            Outcome::Write(w) => assert_eq!((r.conflicts, r.text.as_bytes()), (0, w.as_slice())),
+            Outcome::Open(_) => assert!(r.conflicts >= 1, "{b:?} {o:?} {t:?}: {r:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    // A whole-file reason is one whole-file hunk.
+    let r = m3(Kind::Text, Some("a\nb\n"), "", "a\nb\nc\n");
+    assert_eq!(r.conflicts, 1);
+    assert_eq!(
+        r.text,
+        "<<<<<<< ours\n||||||| base\na\nb\n=======\na\nb\nc\n>>>>>>> theirs\n"
+    );
+}
+
+#[test]
+fn merge3_of_json_is_the_object_merges_view() {
+    let b = "{\n  \"a\": 1,\n  \"b\": 1\n}\n";
+    // Clean: the merged file.
+    let r = m3(
+        Kind::Object,
+        Some(b),
+        "{\n  \"a\": 2,\n  \"b\": 1\n}\n",
+        "{\n  \"a\": 1,\n  \"b\": 2\n}\n",
+    );
+    assert_eq!((r.conflicts, r.text.as_str()), (0, "{\n  \"a\": 2,\n  \"b\": 2\n}\n"));
+    // Open, though the lines would merge: one whole-file hunk.
+    let r = m3(
+        Kind::Object,
+        Some(b),
+        "{\n  \"a\": 2,\n  \"b\": 1\n}\n",
+        "{\n  \"a\": \"2\",\n  \"b\": 1\n}\n",
+    );
+    assert_eq!(r.conflicts, 1);
+    assert!(r.text.starts_with("<<<<<<< ours\n{"));
+}
+
+#[test]
+fn too_large_stays_open() {
+    let base: String = (0..MAX_LINES / 3 + 1).map(|i| format!("{i}\n")).collect();
+    let ours = format!("{base}ours\n");
+    let theirs = format!("x\n{base}");
+    let m = run(Kind::Text, Some(&base), &ours, &theirs, false);
+    assert_eq!(overlaps(&m), [Overlap::Whole(Reason::TooLarge)]);
+    assert_eq!(m3(Kind::Text, Some(&base), &ours, &theirs).conflicts, 1);
+    let big = "x".repeat(MAX_BYTES / 2);
+    let m = run(
+        Kind::Object,
+        Some("{}"),
+        &format!("{{\"a\":\"{big}\"}}"),
+        &format!("{{\"b\":\"{big}\"}}"),
+        false,
+    );
+    assert_eq!(overlaps(&m), [Overlap::Whole(Reason::TooLarge)]);
 }
 
 #[test]

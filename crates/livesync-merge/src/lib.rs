@@ -1,111 +1,143 @@
-//! The merge rules of the desktop spec's D9, as a pure library: no I/O, no
-//! network, no engine. The conflict resolver and the lost-update guard (D10)
-//! call [`merge`]; `lsync conflicts show` calls [`merge3`].
+//! Conflict merging for Obsidian vaults synced with Self-hosted LiveSync, as a
+//! pure library: no I/O, no network, no engine. A conflict resolver calls
+//! [`merge`]; a lost-update guard calls it with the revision a writer started
+//! from as the base, the writer's file as ours and the revision it overwrote
+//! as theirs; `lsync conflicts show` calls [`merge3`].
 //!
 //! Given a base (or none), ours and theirs, each with content, mtime and the
 //! deleted flag, [`merge`] returns which rule decided ([`Rule`], for the log)
 //! and the outcome: the two sides are the same, keep one side as it is, write
-//! new content, or open with the overlaps that stop it. The rules apply in D9's
-//! order:
+//! new content, or open with the overlaps that stop it. The guiding rule: an
+//! automatic merge never drops or garbles a line either side added, and never
+//! brings back one a side deleted; any doubt stays open for a person or an
+//! agent. The rules apply in order:
 //!
 //! 1. **Identical** content and deleted flag: [`Outcome::Identical`].
-//! 2. **Deleted against live** (D9 rule 5): the live side is kept,
-//!    [`Outcome::Keep`], with or without a base. Two deleted sides with
-//!    different data stay open.
+//! 2. **Deleted against live**: the live side is kept, [`Outcome::Keep`], with
+//!    or without a base. A delete can be repeated; a lost edit cannot be
+//!    recovered. Two deleted sides with different data stay open.
 //! 3. **No base** (or a deleted base): open.
 //! 4. **Emptied**: a side with no content (or only whitespace) against a base
 //!    with content: open (see below).
-//! 5. **Markdown and text** ([`Kind::Markdown`], [`Kind::Text`]): upstream's
-//!    three-way line merge (commonlib `ConflictManager.mergeSensibly`).
-//! 6. **Frontmatter** ([`Kind::Markdown`] only), when both sides changed the
-//!    YAML block, each differently: key by key, with [`Settings::newest_keys`];
-//!    the body as in 5. When only one side changed it, 5 applies to the file.
-//! 7. **`.json`/`.canvas`** ([`Kind::Object`]): upstream's object merge
-//!    (`ConflictManager.mergeObject`, `utils.patch.ts`).
-//! 8. **Anything else** ([`Kind::Other`]): open.
+//! 5. **Too large**: past [`MAX_BYTES`] or [`MAX_LINES`], open
+//!    ([`Reason::TooLarge`]), so a merge's work is bounded.
+//! 6. **Markdown and text** ([`Kind::Markdown`], [`Kind::Text`]): a three-way
+//!    line merge (below).
+//! 7. **Frontmatter** ([`Kind::Markdown`] only), when both sides changed the
+//!    YAML block, each differently: key by key. A key changed on one side is
+//!    taken; a key changed on both sides differently stays open, unless it is
+//!    listed in [`Settings::newest_keys`], where the newer side's value is taken.
+//!    A base without frontmatter counts as an empty block. The body merges by
+//!    lines. When only one side changed the block, 6 applies to the file.
+//! 8. **`.json`/`.canvas`** ([`Kind::Object`]): an object merge: a patch per
+//!    side against the base; arrays whose elements all have an `id` merge by
+//!    id, other arrays are replaced whole; a key changed on both sides stays
+//!    open. The result keeps the file's own formatting.
+//! 9. **Anything else** ([`Kind::Other`]): open.
 //!
 //! Which paths are which kind is a setting ([`Settings::kind_of`]), as is the
-//! list of timestamp keys. Nothing is built in beyond D9's defaults.
+//! list of timestamp keys.
+//!
+//! # The line merge
+//!
+//! Each side is diffed against the base by lines (diff-match-patch's line
+//! mode), and each diff becomes changes: base lines `a..b` became these lines.
+//!
+//! - A change only one side made is taken; the same change on both sides once.
+//! - Changes are placed by base position: a line one side inserted between
+//!   base lines `i` and `i + 1` comes after everything the other side made of
+//!   lines up to `i`, and before everything it made of lines from `i + 1`. A
+//!   line replaced on one side keeps a line the other side added under it
+//!   beneath it, and a multi-line replacement stays one block.
+//! - Two insertions at one point: the same lines are taken once, and so is a
+//!   run that the other holds as a whole prefix or suffix (the longer is
+//!   taken); otherwise both runs go in whole, the older side's first, so two
+//!   appends to a log both survive intact.
+//! - Overlapping deletions on both sides: every line either deleted goes.
+//! - Everything else where the sides' changes touch the same base lines stays
+//!   open: two different replacements of overlapping lines (whole replacements
+//!   are compared, not their first lines), a deletion against a change, an
+//!   insertion strictly inside lines the other side replaced.
+//! - A result that would join a line without its newline to the next stays
+//!   open.
 //!
 //! # Where this differs from upstream, and why
 //!
-//! Where upstream merges, the result here is upstream's byte for byte, except
-//! where [`Merge::deviations`] says otherwise. A corpus generated by commonlib's
-//! own `ConflictManager` (`fixtures/golden/merge.json`, from `tools/golden`)
-//! pins that, and checks that each reported deviation is the difference it
-//! names. The deviations:
+//! Upstream is commonlib's `ConflictManager` (`@vrtmrz/livesync-commonlib`,
+//! pinned in `tools/golden`). A corpus generated by upstream's own code
+//! (`fixtures/golden/merge.json`) is the oracle: every case must give
+//! upstream's result, or be open where upstream merges (stricter), or carry a
+//! [`Deviation`] whose shape the corpus test checks. This crate also holds a
+//! model of upstream's line and object merges, which the corpus test checks
+//! case by case against upstream's output, and each line-merge result is
+//! compared with that model to report its deviations. Never garbling a file
+//! outranks matching upstream. The deviations:
 //!
-//! - **The same insertion on both sides is taken once** (D9's first
-//!   clarification). Upstream pairs two runs of inserted lines line by line, so
-//!   `[X]` against `[Y, X]` gives `X Y X`. Here the runs are aligned on their
-//!   common lines first (`Y X`); if a shared line cannot be taken once (both
-//!   inserted `P Q` and `Q P`), it is a conflict. [`Deviation::SameInsertionOnce`].
-//! - **Two runs inserted at one point go in whole, the older side's first.**
-//!   Upstream pairs them line by line (ours `A B` and theirs `C D` after one
-//!   line give `A C B D`), which garbles two multi-line appends to a log or a
-//!   daily note, the case D9's "keeps both, the older first" exists for. Here
-//!   the older side's run goes in whole, then the newer side's (`A B C D`);
-//!   lines both runs share are still taken once, as above, with only the lines
-//!   between them placed whole. Where the whole-run order alone would join two
-//!   lines (a run whose last line has no newline going first), it is a
-//!   conflict; where upstream's interleaving joins two lines and the whole runs
-//!   do not, it merges. [`Deviation::RunOrder`].
-//! - **A trailing deletion is carried.** Upstream's `splitDiffPiece` turns a
-//!   deletion that is the last change of a side's diff into unchanged lines:
-//!   base `a b c`, ours `a b`, theirs `a B c` merges to `a B c` upstream, and
-//!   ours' deletion is lost even when theirs left `c` alone. Here it is carried
-//!   like any other deletion (`a B`), and a trailing deletion against a change
-//!   of the same lines is open, as D9's delete-against-change rule says. The
-//!   lost-update guard (D10) depends on it: with a lost trailing deletion,
-//!   "clean and M = L" would wrongly say L already holds R2.
-//!   [`Deviation::TrailingDeletion`].
-//! - **An emptied side never merges.** Where the base has content and a side
-//!   is empty (no bytes, or only spaces, tabs and line ends), the merge is open
-//!   whatever the other side did, an unchanged side included
-//!   ([`Rule::Emptied`], [`Reason::Emptied`]). Upstream takes the emptying (or,
-//!   against an edit, keeps the edit). An accidental truncation (an editor
-//!   crash, a stray `> file`, a partial write) is the most destructive
-//!   one-sided change and the commonest glitch, so a person or an agent
-//!   confirms it. Both sides emptied alike is rule 1; a deleted leaf is not
-//!   emptied (rule 2 applies). [`Deviation::EmptiedOpen`], reported for the
-//!   kinds upstream merges.
-//! - **No truncated merge** (the second clarification): upstream's "weird
-//!   condition" branch ends the loop with the merge marked good. Here it is a
-//!   conflict. [`Deviation::FallthroughOpen`]; no input is known to reach it.
-//! - **No glued lines.** Where a line follows a line that has no newline (two
-//!   appends after an unterminated last line, or a deletion that leaves one),
-//!   upstream joins them: `left` and `right` become `leftright`. Both added lines
-//!   are lost as lines, so it is a conflict. [`Deviation::GluedLines`]. Notes
-//!   without a final newline are common, so this is not rare.
+//! - **Changes placed by base position** ([`Deviation::PositionOrder`]).
+//!   Upstream walks both diffs line by line, so a side's insertion can land in
+//!   the middle of the other side's replacement (base `a b c`, ours `a B C`,
+//!   theirs adds `d` after `c`: upstream can give `a B d C`), a sub-item added
+//!   under a ticked checkbox can come out above it, and two different
+//!   replacements that start with the same line merge into a mix of both.
+//!   Here placement follows base positions, and the last case is open.
+//!   Reported, too, where this merge merges and upstream gives up.
+//! - **Two runs inserted at one point go in whole, the older side's first**
+//!   ([`Deviation::RunOrder`]). Upstream pairs them line by line (ours `A B`
+//!   and theirs `C D` after one line give `A C B D`), which garbles two
+//!   multi-line appends. Where whole runs alone would join a line without its
+//!   newline to the next (a run ending a file without one, going first), it
+//!   is open.
+//! - **The same insertion on both sides is taken once**
+//!   ([`Deviation::SameInsertionOnce`]): where one run equals the other or
+//!   holds it as a whole prefix or suffix. Upstream's pairing can take a line
+//!   twice: `[X]` against `[Y, X]` gives `X Y X`; here `Y X`.
+//! - **A trailing deletion is carried** ([`Deviation::TrailingDeletion`]).
+//!   Upstream turns a deletion that is the last change of a side's diff into
+//!   unchanged lines: base `a b c`, ours `a b`, theirs `a B c` merges to
+//!   `a B c`, and ours' deletion is lost. Here it is carried like any other
+//!   (`a B`). A lost-update guard depends on it: with a lost trailing
+//!   deletion, "the merge equals the writer's file" would wrongly say the
+//!   writer's file already holds the other revision.
+//! - **An emptied side never merges** ([`Deviation::EmptiedOpen`],
+//!   [`Rule::Emptied`]). Where the base has content and a side is empty (no
+//!   bytes, or only spaces, tabs and line ends), the merge is open whatever the
+//!   other side did, an unchanged side included. An accidental truncation (an
+//!   editor crash, a stray `> file`, a partial write) is the most destructive
+//!   one-sided change and the commonest glitch, so a person confirms it. Both
+//!   sides emptied alike is rule 1; a deleted leaf is not emptied (rule 2).
+//! - **No glued lines** ([`Deviation::GluedLines`]). Where a line follows a
+//!   line that has no newline (two appends after an unterminated last line),
+//!   upstream joins them: `left` and `right` become `leftright`. Here that is
+//!   open (or, where whole runs avoid it, merged). Notes without a final
+//!   newline are common, so this is not rare.
+//! - **Upstream's truncated merge is not copied.** Its walk has an exit that
+//!   returns what it merged so far as the result; this merge has no such exit.
 //! - **JSON is written in the file's own style** (indent, line ends, final
 //!   newline; the newer side's where the sides differ), where upstream writes
-//!   `JSON.stringify(v)` unindented. Numbers keep their source text (upstream
-//!   rounds integers past 2^53); keys keep their order (JavaScript moves
-//!   integer-like keys and ids first, [`Deviation::NumericKeyOrder`]).
-//! - **JSON that upstream would guess at stays open**: invalid JSON (upstream
-//!   reads it as `{}`, i.e. everything deleted), a key twice in one object, lone
-//!   surrogates, ids that are not strings or plain integers, two elements with
-//!   one id. [`Deviation::UnparsableJson`].
-//! - **JSON overlaps upstream misses stay open**: upstream compares changed
-//!   leaves by dotted path with JavaScript's `==`, so `1` against `"1"` is no
-//!   conflict, and neither is a deleted (or replaced) object against an edit
-//!   inside it, or two different replacements of one value; each loses one
-//!   side. [`Deviation::StricterObjectCheck`].
-//! - **A plain array changed on one side is taken.** Upstream's patch swaps every
-//!   plain array (one whose elements do not all have an `id`) whole even when it
-//!   did not change, so a one-sided change conflicts upstream, and an unchanged
-//!   array's swap can revert the other side's change to that key. D9 reads
-//!   "other arrays are replaced whole". [`Deviation::ObjectResultDiffers`].
-//! - **Frontmatter** merges key by key (rule 5 above), which upstream does not
-//!   do at all ([`Rule::Frontmatter`]). A line merge that would leave a
-//!   frontmatter block the YAML parser does not understand stays open.
-//!   [`Deviation::BrokenFrontmatter`].
-//!
-//! [`Deviation::TrailingDeletion`] and [`Deviation::RunOrder`] are reported only
-//! where they change the result: the line merge is run again without that fix,
-//! and the deviation is listed when the two results differ (another text, or
-//! merged against open). The corpus test checks that undoing exactly the
-//! reported ones gives upstream's result.
+//!   `JSON.stringify(v)` unindented; where the merged value is one side's, that
+//!   side's bytes are returned as they are. Numbers keep their source text
+//!   (upstream rounds integers past 2^53), and a change is never dropped:
+//!   `1e400` against `2e400`, or `0` against `-0`, is a change. Keys keep their
+//!   order (JavaScript moves integer-like keys and ids first,
+//!   [`Deviation::NumericKeyOrder`]).
+//! - **JSON that upstream would guess at stays open**
+//!   ([`Deviation::UnparsableJson`]): invalid JSON (upstream reads it as `{}`,
+//!   i.e. everything deleted), a key twice in one object, lone surrogates, ids
+//!   that are not strings or plain integers, two elements with one id.
+//! - **JSON overlaps upstream misses stay open**
+//!   ([`Deviation::StricterObjectCheck`]): upstream compares changed leaves by
+//!   dotted path with JavaScript's `==`, so `1` against `"1"` is no conflict,
+//!   and neither is a deleted (or replaced) object against an edit inside it,
+//!   or two different replacements of one value; each loses one side.
+//! - **A plain array changed on one side is taken**
+//!   ([`Deviation::ObjectResultDiffers`]). Upstream's patch swaps every plain
+//!   array whole even when it did not change, so a one-sided change conflicts
+//!   upstream, and an unchanged array's swap can revert the other side's
+//!   change to that key.
+//! - **Frontmatter** merges key by key (rule 7), which upstream does not do at
+//!   all ([`Rule::Frontmatter`]). A line merge that would leave a frontmatter
+//!   block the YAML parser does not understand stays open
+//!   ([`Deviation::BrokenFrontmatter`]).
 //!
 //! Kept from upstream on purpose, though it surprises: with equal mtimes, ours
 //! goes first (upstream's `<=`), so only distinct mtimes make the merge
@@ -114,11 +146,10 @@
 //! # Stable names
 //!
 //! [`Rule`], [`Deviation`], [`Reason`], [`Overlap`], [`Outcome`], [`Which`]
-//! and [`Side`] have an `as_str` form (snake case), which the resolver writes to
-//! its `resolutions` table and `lsync conflicts show --json` prints. These
-//! strings are an interface: a variant may be added, but an existing string
-//! never changes meaning or spelling. [`Rule::parse`] and [`Deviation::parse`]
-//! read them back.
+//! and [`Side`] have an `as_str` form (snake case), for a resolver's log and
+//! JSON output. These strings are an interface: a variant may be added, but an
+//! existing string never changes meaning or spelling. [`Rule::parse`] and
+//! [`Deviation::parse`] read them back.
 
 mod dmp;
 mod frontmatter;
@@ -331,6 +362,8 @@ pub enum Reason {
     /// This side is empty, or only whitespace, where the base has content.
     /// Both sides emptied (differently) names ours.
     Emptied(Which),
+    /// Larger than [`MAX_BYTES`] or [`MAX_LINES`].
+    TooLarge,
 }
 
 /// A place where this crate's result differs from upstream's by design (see
@@ -340,8 +373,6 @@ pub enum Deviation {
     /// A line both sides inserted is taken once where upstream takes it twice
     /// (merged), or it cannot be taken once (open).
     SameInsertionOnce,
-    /// Upstream's fallthrough would return a truncated merge: open.
-    FallthroughOpen,
     /// Upstream would join two lines into one: open.
     GluedLines,
     /// JSON upstream would read as `{}` or take on with a guess: open.
@@ -363,6 +394,9 @@ pub enum Deviation {
     RunOrder,
     /// A side was emptied: open, where upstream would merge.
     EmptiedOpen,
+    /// Changes placed by their base position where upstream's walk puts
+    /// them elsewhere, or merged where upstream gives up.
+    PositionOrder,
 }
 
 fn open(rule: Rule, overlaps: Vec<Overlap>) -> Merge {
@@ -378,50 +412,101 @@ fn utf8<'a>(v: &Version<'a>, w: Which) -> Result<&'a str, Reason> {
     std::str::from_utf8(v.content).map_err(|_| Reason::NotUtf8(w))
 }
 
+/// The most a line or object merge takes on, the base and both sides
+/// together: past it, the merge is open ([`Reason::TooLarge`]). The object
+/// merge's cost grows with the bytes (about 100 ms a MiB at worst on a 2020s
+/// desktop, release build).
+pub const MAX_BYTES: usize = 1 << 20;
+/// The most lines a line or object merge takes on, the base and both sides
+/// together. The line diff's worst case (both sides rewritten) grows with the
+/// square of the lines: about 65 ms at this limit, 95 ms at 12 000.
+pub const MAX_LINES: usize = 10_000;
+
+/// What [`merge3`] shows for a merge, built with it so the two always agree.
+enum View {
+    /// Nothing to show as text.
+    Nothing,
+    /// The file as it is (identical sides, or a clean merge).
+    Text(String),
+    /// The line walk, with its conflict hunks.
+    Walk(lines::Walk),
+    /// The whole file as one conflict.
+    Whole,
+    /// No base: every difference between the sides.
+    TwoWay,
+}
+
 /// Merge `input` as `kind`. See the crate docs for the rules.
 pub fn merge(kind: Kind, input: &Input, settings: &Settings) -> Merge {
-    merge_in(kind, input, settings, lines::Mode::FIXED)
+    decide(kind, input, settings).0
 }
 
-/// [`merge`] with some of the line merge's fixes to upstream switched off, so a
-/// test can check that undoing exactly the reported [`Deviation::TrailingDeletion`]
-/// and [`Deviation::RunOrder`] gives upstream's result. Other deviations in
-/// `undo` are ignored. Not for production use.
-#[doc(hidden)]
-pub fn merge_undoing(kind: Kind, input: &Input, settings: &Settings, undo: &[Deviation]) -> Merge {
-    let mode = lines::Mode {
-        carry_trailing: !undo.contains(&Deviation::TrailingDeletion),
-        whole_runs: !undo.contains(&Deviation::RunOrder),
-    };
-    merge_in(kind, input, settings, mode)
+fn too_large(input: &Input) -> bool {
+    let all = [
+        input.base.map(|b| b.content).unwrap_or_default(),
+        input.ours.content,
+        input.theirs.content,
+    ];
+    all.iter().map(|c| c.len()).sum::<usize>() > MAX_BYTES
+        || all
+            .iter()
+            .map(|c| c.iter().filter(|b| **b == b'\n').count() + 1)
+            .sum::<usize>()
+            > MAX_LINES
 }
 
-fn merge_in(kind: Kind, input: &Input, settings: &Settings, mode: lines::Mode) -> Merge {
+fn decide(kind: Kind, input: &Input, settings: &Settings) -> (Merge, View) {
     let (ours, theirs) = (&input.ours, &input.theirs);
     if ours.content == theirs.content && ours.deleted == theirs.deleted {
-        return Merge {
+        let view = match std::str::from_utf8(ours.content) {
+            Ok(s) if !ours.deleted && kind != Kind::Other => View::Text(s.to_string()),
+            _ => View::Nothing,
+        };
+        let m = Merge {
             rule: Rule::Identical,
             outcome: Outcome::Identical,
             deviations: Vec::new(),
             newest_taken: Vec::new(),
         };
+        return (m, view);
     }
     match (ours.deleted, theirs.deleted) {
-        (true, true) => return open(Rule::BothDeleted, vec![Overlap::Whole(Reason::BothDeleted)]),
+        (true, true) => {
+            return (
+                open(Rule::BothDeleted, vec![Overlap::Whole(Reason::BothDeleted)]),
+                View::Nothing,
+            )
+        }
         (true, false) | (false, true) => {
-            return Merge {
+            let m = Merge {
                 rule: Rule::EditBeatsDelete,
                 outcome: Outcome::Keep(if ours.deleted { Side::Theirs } else { Side::Ours }),
                 deviations: Vec::new(),
                 newest_taken: Vec::new(),
-            }
+            };
+            return (m, View::Nothing);
         }
         (false, false) => {}
     }
+    let two_way = if kind == Kind::Other {
+        View::Nothing
+    } else {
+        View::TwoWay
+    };
     let base = match input.base {
-        None => return open(Rule::NoBase, vec![Overlap::Whole(Reason::NoBase)]),
-        Some(b) if b.deleted => return open(Rule::BaseDeleted, vec![Overlap::Whole(Reason::BaseDeleted)]),
+        None => return (open(Rule::NoBase, vec![Overlap::Whole(Reason::NoBase)]), two_way),
+        Some(b) if b.deleted => {
+            return (
+                open(Rule::BaseDeleted, vec![Overlap::Whole(Reason::BaseDeleted)]),
+                two_way,
+            )
+        }
         Some(b) => b,
+    };
+    let whole = if kind == Kind::Other {
+        View::Nothing
+    } else {
+        View::Whole
     };
     let blank = |v: &Version| v.content.iter().all(u8::is_ascii_whitespace);
     if !blank(&base) && (blank(ours) || blank(theirs)) {
@@ -430,12 +515,17 @@ fn merge_in(kind: Kind, input: &Input, settings: &Settings, mode: lines::Mode) -
         if kind != Kind::Other {
             m.deviations.push(Deviation::EmptiedOpen);
         }
-        return m;
+        return (m, whole);
     }
     let rule = match kind {
         Kind::Markdown | Kind::Text => Rule::Lines,
         Kind::Object => Rule::Object,
-        Kind::Other => return open(Rule::Unsupported, vec![Overlap::Whole(Reason::Unsupported)]),
+        Kind::Other => {
+            return (
+                open(Rule::Unsupported, vec![Overlap::Whole(Reason::Unsupported)]),
+                View::Nothing,
+            )
+        }
     };
     let texts = (|| {
         Ok::<_, Reason>((
@@ -446,16 +536,26 @@ fn merge_in(kind: Kind, input: &Input, settings: &Settings, mode: lines::Mode) -
     })();
     let (b, o, t) = match texts {
         Ok(x) => x,
-        Err(r) => return open(rule, vec![Overlap::Whole(r)]),
+        Err(r) => return (open(rule, vec![Overlap::Whole(r)]), View::Nothing),
     };
+    if too_large(input) {
+        return (open(rule, vec![Overlap::Whole(Reason::TooLarge)]), View::Whole);
+    }
     let ours_first = ours.mtime <= theirs.mtime;
     match kind {
-        Kind::Object => merge_object(b, o, t, ours, theirs, ours_first),
+        Kind::Object => {
+            let m = merge_object(b, o, t, ours, theirs, ours_first);
+            let view = match &m.outcome {
+                Outcome::Write(out) => View::Text(String::from_utf8(out.clone()).expect("UTF-8")),
+                _ => View::Whole,
+            };
+            (m, view)
+        }
         Kind::Markdown => {
-            if let Some(m) = merge_frontmatter(b, o, t, ours, theirs, settings, mode) {
-                return m;
+            if let Some(r) = merge_frontmatter(b, o, t, ours, theirs, settings) {
+                return r;
             }
-            let mut m = merge_lines(b, o, t, ours_first, mode);
+            let (mut m, mut view) = merge_lines(b, o, t, ours_first);
             if let Outcome::Write(out) = &m.outcome {
                 let out = std::str::from_utf8(out).expect("merged from UTF-8");
                 if let Some(d) = frontmatter::split(out) {
@@ -465,27 +565,48 @@ fn merge_in(kind: Kind, input: &Input, settings: &Settings, mode: lines::Mode) -
                     if !known && !frontmatter::understood(d.block) {
                         m.deviations.push(Deviation::BrokenFrontmatter);
                         m.outcome = Outcome::Open(vec![Overlap::Whole(Reason::MergedFrontmatterInvalid)]);
+                        view = View::Whole;
                     }
                 }
             }
-            m
+            (m, view)
         }
-        _ => merge_lines(b, o, t, ours_first, mode),
+        _ => merge_lines(b, o, t, ours_first),
     }
 }
 
-fn merge_lines(b: &str, o: &str, t: &str, ours_first: bool, mode: lines::Mode) -> Merge {
-    let w = lines::walk_in(b, o, t, ours_first, mode);
+fn merge_lines(b: &str, o: &str, t: &str, ours_first: bool) -> (Merge, View) {
+    let w = lines::walk(b, o, t, ours_first);
     let outcome = match w.text() {
         Some(text) => Outcome::Write(text.into_bytes()),
+        None if w.glued => Outcome::Open(vec![Overlap::Whole(Reason::GluedLines)]),
         None => Outcome::Open(w.hunks().map(|h| Overlap::Lines(h.at.clone())).collect()),
     };
-    Merge {
+    let m = Merge {
         rule: Rule::Lines,
         outcome,
-        deviations: w.deviations,
+        deviations: w.deviations.clone(),
         newest_taken: Vec::new(),
-    }
+    };
+    (m, View::Walk(w))
+}
+
+/// Upstream's line merge (commonlib 0.2.1 `mergeSensibly`), as this crate
+/// models it: the merged text, or `None` where upstream does not merge. For
+/// tests that check the model against upstream's own output; not part of the
+/// interface.
+#[doc(hidden)]
+pub fn upstream_line_merge(base: &str, ours: &str, theirs: &str, ours_first: bool) -> Option<String> {
+    lines::upstream(base, ours, theirs, ours_first).text
+}
+
+/// Upstream's object merge (commonlib 0.2.1 `mergeObject`), as this crate
+/// models it, written as `JSON.stringify` would (keys in this crate's order):
+/// `Some(None)` where upstream does not merge, `None` where the model does not
+/// cover the input. For tests; not part of the interface.
+#[doc(hidden)]
+pub fn upstream_object_merge(base: &str, ours: &str, theirs: &str, ours_first: bool) -> Option<Option<String>> {
+    json::upstream_merge(base, ours, theirs, ours_first)
 }
 
 fn json_style(b: &str, o: &str, t: &str, ours: &Version, theirs: &Version) -> json::Style {
@@ -521,7 +642,7 @@ fn merge_object(b: &str, o: &str, t: &str, ours: &Version, theirs: &Version, our
     }
 }
 
-/// Rule 3, if it applies.
+/// The frontmatter rule, if it applies.
 fn merge_frontmatter(
     b: &str,
     o: &str,
@@ -529,12 +650,25 @@ fn merge_frontmatter(
     ours: &Version,
     theirs: &Version,
     settings: &Settings,
-    mode: lines::Mode,
-) -> Option<Merge> {
-    let (db, d_o, dt) = (frontmatter::split(b)?, frontmatter::split(o)?, frontmatter::split(t)?);
+) -> Option<(Merge, View)> {
+    let (d_o, dt) = (frontmatter::split(o)?, frontmatter::split(t)?);
+    // A base without frontmatter has an empty block, so two sides that each
+    // added one merge key by key rather than as two blocks of lines.
+    let (db, synthetic) = match frontmatter::split(b) {
+        Some(d) => (d, 0),
+        None => (
+            frontmatter::Doc {
+                open: d_o.open,
+                block: "",
+                close: d_o.open,
+                body: b,
+            },
+            2,
+        ),
+    };
     let ours_first = ours.mtime <= theirs.mtime;
     let ours_newer = (ours.mtime != theirs.mtime).then_some(ours.mtime > theirs.mtime);
-    let fm = |overlaps| Some(open(Rule::Frontmatter, overlaps));
+    let fm = |overlaps| Some((open(Rule::Frontmatter, overlaps), View::Whole));
     match frontmatter::merge_block(&db, &d_o, &dt, ours_first, ours_newer, &settings.newest_keys) {
         frontmatter::FmOutcome::NotApplicable => None,
         frontmatter::FmOutcome::Unparsable(w) => fm(vec![Overlap::Whole(Reason::InvalidFrontmatter(w))]),
@@ -542,14 +676,42 @@ fn merge_frontmatter(
         frontmatter::FmOutcome::Block { parts, newest_taken } => {
             let mut overlaps = Vec::new();
             let mut block = String::new();
-            for p in &parts {
+            // The view: the opening fence, the block key by key, the closing
+            // fence, the body's walk.
+            let mut view = lines::Walk::default();
+            view.segs.push(lines::Seg::Clean(db.open.to_string()));
+            for p in parts {
                 match p {
-                    frontmatter::Part::Text(s) => block.push_str(s),
-                    frontmatter::Part::Conflict { key, .. } => overlaps.push(Overlap::FrontmatterKey(key.clone())),
+                    frontmatter::Part::Text(s) => {
+                        block.push_str(&s);
+                        view.segs.push(lines::Seg::Clean(s));
+                    }
+                    frontmatter::Part::Conflict {
+                        key,
+                        base,
+                        ours,
+                        theirs,
+                    } => {
+                        overlaps.push(Overlap::FrontmatterKey(key));
+                        view.segs.push(lines::Seg::Conflict(lines::Hunk {
+                            at: LineOverlap {
+                                base: 0..0,
+                                ours: 0..0,
+                                theirs: 0..0,
+                            },
+                            base: base.unwrap_or_default(),
+                            ours: ours.unwrap_or_default(),
+                            theirs: theirs.unwrap_or_default(),
+                        }));
+                    }
                 }
             }
-            let w = lines::walk_in(db.body, d_o.body, dt.body, ours_first, mode);
-            let (ob, oo, ot) = (db.body_line_offset(), d_o.body_line_offset(), dt.body_line_offset());
+            let w = lines::walk(db.body, d_o.body, dt.body, ours_first);
+            let (ob, oo, ot) = (
+                db.body_line_offset() - synthetic,
+                d_o.body_line_offset(),
+                dt.body_line_offset(),
+            );
             for h in w.hunks() {
                 let shift = |r: &Range<usize>, by: usize| r.start + by..r.end + by;
                 overlaps.push(Overlap::Lines(LineOverlap {
@@ -561,36 +723,45 @@ fn merge_frontmatter(
             let mut m = open(Rule::Frontmatter, Vec::new());
             m.deviations = w.deviations.clone();
             m.newest_taken = newest_taken;
+            // The closing fence's line end, three-way.
+            let close = match (d_o.close == db.close, dt.close == db.close, d_o.close == dt.close) {
+                (_, _, true) | (_, true, _) => Some(d_o.close),
+                (true, _, _) => Some(dt.close),
+                _ => None,
+            };
+            if w.glued {
+                m.outcome = Outcome::Open(vec![Overlap::Whole(Reason::GluedLines)]);
+                return Some((m, View::Whole));
+            }
             if !overlaps.is_empty() {
                 m.outcome = Outcome::Open(overlaps);
-                return Some(m);
+                view.segs
+                    .push(lines::Seg::Clean(close.unwrap_or(d_o.close).to_string()));
+                view.segs.extend(w.segs);
+                return Some((m, View::Walk(view)));
             }
             if !frontmatter::understood(&block) {
                 m.outcome = Outcome::Open(vec![Overlap::Whole(Reason::MergedFrontmatterInvalid)]);
-                return Some(m);
+                return Some((m, View::Whole));
             }
-            let body = w.text().expect("clean walk");
-            // The closing fence's line end, three-way; a body after a fence
-            // without one would be glued to it.
-            let close = match (d_o.close == db.close, dt.close == db.close, d_o.close == dt.close) {
-                (_, _, true) | (_, true, _) => d_o.close,
-                (true, _, _) => dt.close,
-                _ => {
-                    m.outcome = Outcome::Open(vec![Overlap::Lines(LineOverlap {
-                        base: ob - 1..ob,
-                        ours: oo - 1..oo,
-                        theirs: ot - 1..ot,
-                    })]);
-                    return Some(m);
-                }
+            let Some(close) = close else {
+                m.outcome = Outcome::Open(vec![Overlap::Lines(LineOverlap {
+                    base: if synthetic > 0 { 0..0 } else { ob - 1..ob },
+                    ours: oo - 1..oo,
+                    theirs: ot - 1..ot,
+                })]);
+                return Some((m, View::Whole));
             };
+            let body = w.text().expect("clean walk");
+            // A body after a fence without a line end would be glued to it.
             if !close.ends_with('\n') && !body.is_empty() {
                 m.deviations.push(Deviation::GluedLines);
                 m.outcome = Outcome::Open(vec![Overlap::Whole(Reason::GluedLines)]);
-                return Some(m);
+                return Some((m, View::Whole));
             }
-            m.outcome = Outcome::Write(format!("{}{}{}{}", db.open, block, close, body).into_bytes());
-            Some(m)
+            let text = format!("{}{}{}{}", d_o.open, block, close, body);
+            m.outcome = Outcome::Write(text.clone().into_bytes());
+            Some((m, View::Text(text)))
         }
     }
 }
@@ -601,80 +772,45 @@ pub struct Merge3 {
     /// The merged file, with diff3-style markers (`<<<<<<<`, `|||||||`,
     /// `=======`, `>>>>>>>`) around just the overlapping hunks.
     pub text: String,
-    /// How many hunks carry markers. Zero: `text` is the automatic merge.
+    /// How many hunks carry markers. Zero exactly when [`merge`] merges (or
+    /// finds the sides identical): `text` is then its result.
     pub conflicts: usize,
 }
 
-/// The `merge3` text of D9's `conflicts show`: everything that merges is
-/// merged as [`merge`] would, and each overlap is shown with ours, the base and
-/// theirs between markers. Frontmatter conflicts are marked per key when the
-/// frontmatter rule applies. JSON is shown as lines (the markers make it
-/// invalid JSON until resolved). Without a base, every difference is marked.
+/// The `merge3` text of `lsync conflicts show`, built from the same decision
+/// as [`merge`], so the two agree: a clean merge is shown as the merged file,
+/// with no markers; an open one with at least one marked hunk. Line conflicts
+/// are marked hunk by hunk, frontmatter conflicts key by key. Where the reason
+/// is about the whole file (a side emptied, frontmatter that does not parse,
+/// JSON, a file too large to merge), the whole file is one hunk. Without a
+/// base, every difference is marked.
 ///
 /// `None` when there is nothing to show as text: a deleted side, content that
 /// is not UTF-8, or [`Kind::Other`].
 pub fn merge3(kind: Kind, input: &Input, settings: &Settings, labels: &Labels) -> Option<Merge3> {
-    if kind == Kind::Other || input.ours.deleted || input.theirs.deleted {
-        return None;
-    }
-    let o = std::str::from_utf8(input.ours.content).ok()?;
-    let t = std::str::from_utf8(input.theirs.content).ok()?;
-    let base = match input.base {
-        Some(b) if !b.deleted => Some(std::str::from_utf8(b.content).ok()?),
-        _ => None,
-    };
-    let eol = lines::eol_of(&[o, t]);
-    let ours_first = input.ours.mtime <= input.theirs.mtime;
-    let Some(b) = base else {
-        let w = lines::walk_two_way(o, t);
-        return Some(Merge3 {
-            conflicts: w.hunks().count(),
-            text: lines::render(&w, labels, eol),
-        });
-    };
-    if kind == Kind::Markdown {
-        if let (Some(db), Some(d_o), Some(dt)) = (frontmatter::split(b), frontmatter::split(o), frontmatter::split(t)) {
-            let ours_newer = (input.ours.mtime != input.theirs.mtime).then_some(input.ours.mtime > input.theirs.mtime);
-            if let frontmatter::FmOutcome::Block { parts, .. } =
-                frontmatter::merge_block(&db, &d_o, &dt, ours_first, ours_newer, &settings.newest_keys)
-            {
-                let mut text = String::from(db.open);
-                let mut conflicts = 0;
-                for p in parts {
-                    match p {
-                        frontmatter::Part::Text(s) => text.push_str(&s),
-                        frontmatter::Part::Conflict { base, ours, theirs, .. } => {
-                            conflicts += 1;
-                            let h = lines::Walk {
-                                segs: vec![lines::Seg::Conflict(lines::Hunk {
-                                    at: LineOverlap {
-                                        base: 0..0,
-                                        ours: 0..0,
-                                        theirs: 0..0,
-                                    },
-                                    base: base.unwrap_or_default(),
-                                    ours: ours.unwrap_or_default(),
-                                    theirs: theirs.unwrap_or_default(),
-                                })],
-                                ..lines::Walk::default()
-                            };
-                            lines::render_into(&mut text, &h, labels, eol);
-                        }
-                    }
-                }
-                // As in `merge`; a fence whose line end differs on all three is shown as ours.
-                text.push_str(if dt.close == db.close { d_o.close } else { dt.close });
-                let w = lines::walk(db.body, d_o.body, dt.body, ours_first);
-                conflicts += w.hunks().count();
-                lines::render_into(&mut text, &w, labels, eol);
-                return Some(Merge3 { text, conflicts });
-            }
+    let view = decide(kind, input, settings).1;
+    fn text<'a>(v: Option<&Version<'a>>) -> Option<&'a str> {
+        match v {
+            Some(v) if !v.deleted => std::str::from_utf8(v.content).ok(),
+            _ => None,
         }
     }
-    let w = lines::walk(b, o, t, ours_first);
+    let (o, t) = (text(Some(&input.ours))?, text(Some(&input.theirs))?);
+    let b = match &input.base {
+        Some(v) if !v.deleted => text(Some(v))?,
+        _ => "",
+    };
+    let eol = lines::eol_of(&[o, t, b]);
+    let walk = match view {
+        View::Nothing => return None,
+        View::Text(text) => return Some(Merge3 { text, conflicts: 0 }),
+        View::Walk(w) => w,
+        View::Whole => lines::Walk::whole(b, o, t),
+        View::TwoWay => lines::walk_two_way(o, t),
+    };
     Some(Merge3 {
-        conflicts: w.hunks().count(),
-        text: lines::render(&w, labels, eol),
+        conflicts: walk.hunks().count(),
+        text: lines::render(&walk, labels, eol),
     })
 }
 
@@ -724,7 +860,6 @@ names!(Rule {
 
 names!(Deviation {
     SameInsertionOnce => "same_insertion_once",
-    FallthroughOpen => "fallthrough_open",
     GluedLines => "glued_lines",
     UnparsableJson => "unparsable_json",
     StricterObjectCheck => "stricter_object_check",
@@ -734,6 +869,7 @@ names!(Deviation {
     TrailingDeletion => "trailing_deletion",
     RunOrder => "run_order",
     EmptiedOpen => "emptied_open",
+    PositionOrder => "position_order",
 });
 
 names!(Which {
@@ -764,6 +900,7 @@ impl Reason {
             Reason::MergedFrontmatterInvalid => "merged_frontmatter_invalid",
             Reason::GluedLines => "glued_lines",
             Reason::Emptied(_) => "emptied",
+            Reason::TooLarge => "too_large",
         }
     }
     /// The version the reason is about, where it names one.

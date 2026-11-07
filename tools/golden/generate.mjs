@@ -411,6 +411,16 @@ await mergeBoth("lines/empty-base-same", "note.md", "", L("same"), L("same"));
 await mergeBoth("lines/emptied-vs-edit", "note.md", L("a", "b"), "", L("a", "B"));
 await mergeBoth("lines/emptied-vs-unchanged", "note.md", L("a", "b"), "", L("a", "b", "c"));
 await mergeBoth("lines/both-emptied", "note.md", L("a", "b"), "", "");
+// Placement by base position, and runs that share lines.
+await mergeBoth("lines/insert-after-replaced-range", "note.md", L("a", "b", "c"), L("a", "B", "C"), L("a", "b", "c", "d"));
+await mergeBoth("lines/insert-before-replaced-range", "note.md", L("a", "b", "c"), L("a", "B", "C"), L("a", "x", "b", "c"));
+await mergeBoth("lines/checkbox-sub-item", "todo.md", L("- [ ] task", "- [ ] next"), L("- [x] task", "- [ ] next"), L("- [ ] task", "  - detail", "- [ ] next"));
+await mergeBoth("lines/log-done-and-append", "daily.md", L("# Log", "- 09 start"), L("# Log", "- 09 start (done)"), L("# Log", "- 09 start", "- 10 call"));
+await mergeBoth("lines/deviation-replaced-shared-first-line", "note.md", L("# M", "Meeting TBD", "end"), L("# M", "Meeting at 10", "Room 1", "end"), L("# M", "Meeting at 10", "Room 2", "end"));
+await mergeBoth("lines/insert-inside-replaced-range", "note.md", L("a", "b", "c", "d"), L("a", "X", "Y", "d"), L("a", "b", "new", "c", "d"));
+await mergeBoth("lines/deviation-fences", "note.md", L("x"), L("x", "```", "A", "```"), L("x", "```", "B", "```"));
+await mergeBoth("lines/deviation-paragraphs", "daily.md", L("# Log"), L("# Log", "", "Para A"), L("# Log", "", "Para B"));
+await mergeBoth("lines/overlapping-deletions", "note.md", L("a", "b", "c", "d", "e"), L("a", "d", "e"), L("a", "b", "e"));
 await mergeBoth("lines/deviation-whitespace-emptied", "note.md", L("a", "b"), "\n\n", L("a", "b", "c"));
 await mergeBoth("lines/blank-lines", "note.md", L("a", "", "b"), L("a", "", "", "b", "left"), L("right", "a", "", "b"));
 await mergeBoth("lines/unicode", "note.md", L("æøå", "日本語", "😀"), L("ÆØÅ", "日本語", "😀"), L("æøå", "日本語", "🎉"));

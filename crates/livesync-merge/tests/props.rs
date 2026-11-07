@@ -1,8 +1,11 @@
-//! Property tests for D9's safety bar: no automatic merge drops a line (or a
-//! JSON value) that either side added, nor brings back a line a side deleted;
-//! two runs inserted at one point come out whole, the older first; and a merge
-//! is symmetric up to the order the mtimes give.
-use livesync_merge::{merge, Input, Kind, Merge, Outcome, Overlap, Reason, Rule, Settings, Side, Version};
+//! Property tests for the merge's safety bar: no automatic merge drops a line
+//! (or a JSON value) that either side added, nor brings back one a side
+//! deleted; changes are placed by base position; two runs inserted at one
+//! point come out whole, the older first; `merge3` agrees with `merge`; and a
+//! merge is symmetric up to the order the mtimes give.
+use livesync_merge::{
+    merge, merge3, Input, Kind, Labels, Merge, Outcome, Overlap, Reason, Rule, Settings, Side, Version,
+};
 use proptest::prelude::*;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -116,26 +119,16 @@ fn text_case() -> impl Strategy<Value = Case> {
         })
 }
 
-/// Markdown with frontmatter: a few keys, values that change, a body.
+/// Markdown with frontmatter: a few keys, each side setting, adding or
+/// deleting one or two of them, and editing the body.
 fn markdown_case() -> impl Strategy<Value = Case> {
-    let fm = prop::collection::btree_map(
-        prop::sample::select(&["title", "tags", "status", "date", "aliases"][..]),
-        0..4u8,
-        0..4,
-    );
-    let side = || {
-        (
-            prop::collection::btree_map(
-                prop::sample::select(&["title", "tags", "status", "date", "aliases"][..]),
-                0..4u8,
-                0..4,
-            ),
-            prop::collection::vec(edit(), 0..4),
-            any::<bool>(),
-        )
-    };
-    (fm, prop::collection::vec(word(), 0..6), side(), side()).prop_map(|(fb, body, (fo, eo, ko), (ft, et, kt))| {
-        let render = |m: &std::collections::BTreeMap<&'static str, u8>, body: &[String]| {
+    const KEYS: [&str; 5] = ["title", "tags", "status", "date", "aliases"];
+    type Fm = std::collections::BTreeMap<&'static str, u8>;
+    let fm = prop::collection::btree_map(prop::sample::select(&KEYS[..]), 0..4u8, 0..4);
+    let edits = || prop::collection::vec((prop::sample::select(&KEYS[..]), 0..5u8), 0..3);
+    let side = move || (edits(), prop::collection::vec(edit(), 0..4));
+    (fm, prop::collection::vec(word(), 0..6), side(), side()).prop_map(|(fb, body, (ko, eo), (kt, et))| {
+        let render = |m: &Fm, body: &[String]| {
             let mut s = String::from("---\n");
             for (k, v) in m {
                 if *k == "tags" {
@@ -148,18 +141,22 @@ fn markdown_case() -> impl Strategy<Value = Case> {
             s.push_str(&join(body, "\n", true));
             s
         };
-        let pick = |keep: bool, side: &std::collections::BTreeMap<&'static str, u8>| {
-            // Keep the base block (one-sided change) or take the side's.
-            if keep {
-                fb.clone()
-            } else {
-                side.clone()
+        // 4 deletes the key; anything else sets it.
+        let apply_keys = |edits: &[(&'static str, u8)]| {
+            let mut m: Fm = fb.clone();
+            for (k, v) in edits {
+                if *v == 4 {
+                    m.remove(k);
+                } else {
+                    m.insert(k, *v);
+                }
             }
+            m
         };
         Case {
             base: render(&fb, &body),
-            ours: render(&pick(ko, &fo), &apply(&body, &eo)),
-            theirs: render(&pick(kt, &ft), &apply(&body, &et)),
+            ours: render(&apply_keys(&ko), &apply(&body, &eo)),
+            theirs: render(&apply_keys(&kt), &apply(&body, &et)),
         }
     })
 }
@@ -211,7 +208,7 @@ fn keeps_added_lines(c: &Case, out: &str) -> Result<(), TestCaseError> {
 }
 
 /// A base line a side deleted must not be in the result more often than on
-/// that side (D10 relies on a deletion being carried). Only meaningful where
+/// that side (a lost-update guard relies on a deletion being carried). Only meaningful where
 /// no side inserts a line the base has (which would be a move).
 fn keeps_deletions(c: &Case, out: &str) -> Result<(), TestCaseError> {
     let (b, o, t, m) = (counts(&c.base), counts(&c.ours), counts(&c.theirs), counts(out));
@@ -315,8 +312,21 @@ struct Runs {
 }
 
 fn runs_case() -> impl Strategy<Value = Runs> {
-    (0..8usize, any::<prop::sample::Index>(), 1..5usize, 1..5usize)
-        .prop_flat_map(|(n, at, ko, kt)| {
+    let shared = || {
+        prop::collection::vec(
+            prop::option::weighted(0.4, prop::sample::select(&["```", "", "X", "- item"][..])),
+            4,
+        )
+    };
+    (
+        0..8usize,
+        any::<prop::sample::Index>(),
+        1..5usize,
+        1..5usize,
+        shared(),
+        shared(),
+    )
+        .prop_flat_map(|(n, at, ko, kt, so, st)| {
             let at = at.index(n + 1);
             // A change away from the insertion point: not the line before or after it.
             let away: Vec<usize> = (0..n).filter(|q| *q + 1 != at && *q != at).collect();
@@ -326,21 +336,24 @@ fn runs_case() -> impl Strategy<Value = Runs> {
                 prop::option::of(prop::sample::select(away)).boxed()
             };
             (
-                Just(n),
-                Just(at),
-                Just(ko),
-                Just(kt),
+                Just((n, at, ko, kt)),
+                Just((so, st)),
                 change.clone(),
                 change,
                 any::<bool>(),
                 prop::sample::select(&["entry", "- item", "", "  detail"][..]),
             )
         })
-        .prop_map(|(n, at, ko, kt, oc, tc, ours_newer, word)| Runs {
+        .prop_map(|((n, at, ko, kt), (so, st), oc, tc, ours_newer, word)| Runs {
             base: (0..n).map(|i| format!("base {i}")).collect(),
             at,
-            ours: (0..ko).map(|i| format!("{word} ours {i}")).collect(),
-            theirs: (0..kt).map(|i| format!("{word} theirs {i}")).collect(),
+            // Some lines both runs may share (fences, blank lines).
+            ours: (0..ko)
+                .map(|i| so[i].map_or_else(|| format!("{word} ours {i}"), str::to_string))
+                .collect(),
+            theirs: (0..kt)
+                .map(|i| st[i].map_or_else(|| format!("{word} theirs {i}"), str::to_string))
+                .collect(),
             ours_change: oc,
             theirs_change: tc.filter(|q| Some(*q) != oc),
             ours_newer,
@@ -373,7 +386,8 @@ proptest! {
     #![proptest_config(config())]
 
     /// Both sides insert a run at one point: the merge is clean and holds the
-    /// older side's run whole, then the newer side's.
+    /// older side's run whole, then the newer side's; a run the other holds as
+    /// a whole prefix or suffix (or the same run) once.
     #[test]
     fn inserted_runs_stay_whole_older_first(r in runs_case()) {
         let c = Case {
@@ -382,14 +396,210 @@ proptest! {
             theirs: r.side(&r.theirs, r.theirs_change, &[], None),
         };
         let (older, newer) = if r.ours_newer { (&r.theirs, &r.ours) } else { (&r.ours, &r.theirs) };
-        let want = r.side(older, r.ours_change, newer, r.theirs_change);
+        let holds = |long: &[String], short: &[String]| long.starts_with(short) || long.ends_with(short);
+        let want = if holds(newer, older) {
+            r.side(newer, r.ours_change, &[], r.theirs_change)
+        } else if holds(older, newer) {
+            r.side(older, r.ours_change, &[], r.theirs_change)
+        } else {
+            r.side(older, r.ours_change, newer, r.theirs_change)
+        };
         let (mo, mt) = if r.ours_newer { (3000, 2000) } else { (2000, 3000) };
         for kind in [Kind::Text, Kind::Markdown] {
             match run(kind, &c, mo, mt).outcome {
                 Outcome::Write(out) => prop_assert_eq!(std::str::from_utf8(&out).unwrap(), want.as_str(), "{:?}", c),
+                Outcome::Identical => prop_assert_eq!(&c.ours, &want),
                 other => prop_assert!(false, "{other:?}\n{c:?}"),
             }
         }
+    }
+}
+
+/// Changes at distinct base positions on each side: per base line, kept or
+/// replaced (with zero to two lines) by one side; per gap between lines,
+/// lines inserted by one side, both, or none. Never two changes touching the
+/// same base lines, so the merge is clean and its order is known.
+#[derive(Clone, Debug)]
+struct Positions {
+    n: usize,
+    /// Per base line: 0 kept, 1 ours replaced, 2 theirs replaced; and how many lines.
+    lines: Vec<(u8, usize)>,
+    /// Per gap (n + 1): 0 none, 1 ours, 2 theirs, 3 both; and how many lines.
+    gaps: Vec<(u8, usize)>,
+    ours_newer: bool,
+}
+
+fn positions_case() -> impl Strategy<Value = Positions> {
+    (0..10usize, any::<bool>())
+        .prop_flat_map(|(n, ours_newer)| {
+            (
+                Just(n),
+                prop::collection::vec((0..3u8, 0..3usize), n),
+                prop::collection::vec((0..4u8, 1..3usize), n + 1),
+                Just(ours_newer),
+            )
+        })
+        .prop_map(|(n, lines, mut gaps, ours_newer)| {
+            for g in 0..=n {
+                let before = if g > 0 { lines[g - 1].0 } else { 0 };
+                let after = if g < n { lines[g].0 } else { 0 };
+                // Both inserting next to a replaced line: no order to expect.
+                if gaps[g].0 == 3 && (before != 0 || after != 0) {
+                    gaps[g].0 = 1;
+                }
+                // Inside one side's replaced block, only that side inserts.
+                if before != 0 && before == after && gaps[g].0 != 0 {
+                    gaps[g].0 = before;
+                }
+            }
+            Positions {
+                n,
+                lines,
+                gaps,
+                ours_newer,
+            }
+        })
+}
+
+impl Positions {
+    fn fresh(who: &str, at: &str, k: usize) -> Vec<String> {
+        (0..k).map(|i| format!("{who} {at} {i}")).collect()
+    }
+    /// One side's file (`side` 1 ours, 2 theirs), or the expected merge (0).
+    fn text(&self, side: u8) -> String {
+        let mut v: Vec<String> = Vec::new();
+        let older_first = if self.ours_newer { [2u8, 1] } else { [1, 2] };
+        for g in 0..=self.n {
+            let (a, k) = self.gaps[g];
+            for who in older_first {
+                if (a == who || a == 3) && (side == 0 || side == who) {
+                    v.extend(Self::fresh(
+                        if who == 1 { "ours" } else { "theirs" },
+                        &format!("gap {g}"),
+                        k,
+                    ));
+                }
+            }
+            if g < self.n {
+                let (a, k) = self.lines[g];
+                if a != 0 && (side == 0 || side == a) {
+                    v.extend(Self::fresh(
+                        if a == 1 { "ours" } else { "theirs" },
+                        &format!("line {g}"),
+                        k,
+                    ));
+                } else {
+                    v.push(format!("base {g}"));
+                }
+            }
+        }
+        join(&v, "\n", true)
+    }
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Changes at distinct positions: the merge places each by its base
+    /// position (an insertion between base lines i and i + 1 after what the
+    /// other side made of line i, before what it made of line i + 1).
+    #[test]
+    fn changes_are_placed_by_base_position(p in positions_case()) {
+        let base: Vec<String> = (0..p.n).map(|i| format!("base {i}")).collect();
+        let c = Case { base: join(&base, "\n", true), ours: p.text(1), theirs: p.text(2) };
+        let (mo, mt) = if p.ours_newer { (3000, 2000) } else { (2000, 3000) };
+        let want = p.text(0);
+        for kind in [Kind::Text, Kind::Markdown] {
+            let m = run(kind, &c, mo, mt);
+            match m.outcome {
+                Outcome::Write(out) => prop_assert_eq!(std::str::from_utf8(&out).unwrap(), want.as_str(), "{:?}", c),
+                Outcome::Identical => prop_assert_eq!(&c.ours, &want),
+                Outcome::Open(o) if c.base.trim().is_empty() || !(c.ours.trim().is_empty() || c.theirs.trim().is_empty()) => {
+                    prop_assert!(false, "{o:?}\n{c:?}")
+                }
+                // An emptied side stays open.
+                Outcome::Open(_) => {}
+                other => prop_assert!(false, "{other:?}\n{c:?}"),
+            }
+        }
+    }
+}
+
+/// `merge3` agrees with `merge`: clean exactly when `merge` writes (or finds
+/// the sides identical), and then the same text; every line either side
+/// added is in it.
+fn merge3_agrees(kind: Kind, c: &Case, mo: i64, mt: i64) -> Result<(), TestCaseError> {
+    let input = Input {
+        base: Some(Version {
+            content: c.base.as_bytes(),
+            mtime: 1000,
+            deleted: false,
+        }),
+        ours: Version {
+            content: c.ours.as_bytes(),
+            mtime: mo,
+            deleted: false,
+        },
+        theirs: Version {
+            content: c.theirs.as_bytes(),
+            mtime: mt,
+            deleted: false,
+        },
+    };
+    let m = merge(kind, &input, &Settings::default());
+    let r = merge3(kind, &input, &Settings::default(), &Labels::default()).expect("text");
+    match &m.outcome {
+        Outcome::Write(w) => {
+            prop_assert_eq!(r.conflicts, 0, "{:?}", c);
+            prop_assert_eq!(r.text.as_bytes(), w.as_slice(), "{:?}", c);
+        }
+        Outcome::Identical => prop_assert_eq!((r.conflicts, r.text.as_str()), (0, c.ours.as_str())),
+        Outcome::Open(_) => {
+            prop_assert!(r.conflicts >= 1, "open, but merge3 has no conflict\n{:?}\n{:?}", c, r);
+            if kind != Kind::Object {
+                let (b, o) = (counts(&c.base), counts(&r.text));
+                for side in [&c.ours, &c.theirs] {
+                    for (line, n) in counts(side) {
+                        let added = n.saturating_sub(b.get(line).copied().unwrap_or(0));
+                        // A last line without its newline gets one before a marker.
+                        let with = |e: &str| o.get(format!("{line}{e}").as_str()).copied().unwrap_or(0);
+                        let got = o.get(line).copied().unwrap_or(0)
+                            + if line.ends_with('\n') {
+                                0
+                            } else {
+                                with("\n") + with("\r\n")
+                            };
+                        prop_assert!(got >= added, "{line:?} not shown\n{c:?}\n{}", r.text);
+                    }
+                }
+            }
+        }
+        Outcome::Keep(_) => prop_assert!(false, "no deleted leaves here"),
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    #[test]
+    fn merge3_agrees_with_merge_on_lines(c in text_case(), ours_newer in any::<bool>()) {
+        let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
+        for kind in [Kind::Text, Kind::Markdown] {
+            merge3_agrees(kind, &c, mo, mt)?;
+        }
+    }
+
+    #[test]
+    fn merge3_agrees_with_merge_on_frontmatter(c in markdown_case(), ours_newer in any::<bool>()) {
+        let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
+        merge3_agrees(Kind::Markdown, &c, mo, mt)?;
+    }
+
+    #[test]
+    fn merge3_agrees_with_merge_on_json(c in json_case(), ours_newer in any::<bool>()) {
+        let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
+        merge3_agrees(Kind::Object, &c, mo, mt)?;
     }
 }
 
@@ -547,6 +757,29 @@ fn leaves(v: &Value, path: String, out: &mut Vec<(String, String)>) {
     }
 }
 
+/// A base value one side deleted, and the other left as it was, is not in
+/// the result.
+fn keeps_deletions_json(c: &Case, out: &str) -> Result<(), TestCaseError> {
+    let get = |s: &str| {
+        let mut l = Vec::new();
+        leaves(&serde_json::from_str(s).unwrap(), String::new(), &mut l);
+        l
+    };
+    let (b, o, t, m) = (get(&c.base), get(&c.ours), get(&c.theirs), get(out));
+    let has_path = |l: &[(String, String)], p: &str| l.iter().any(|(q, _)| q == p);
+    for leaf in &b {
+        for (side, other) in [(&o, &t), (&t, &o)] {
+            if !has_path(side, &leaf.0) && other.contains(leaf) {
+                prop_assert!(
+                    !has_path(&m, &leaf.0),
+                    "{leaf:?} deleted, but merged\n{c:?}\nmerged {out}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn keeps_added_values(c: &Case, out: &str) -> Result<(), TestCaseError> {
     let get = |s: &str| {
         let mut l = Vec::new();
@@ -572,6 +805,7 @@ proptest! {
         let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
         if let Outcome::Write(out) = run(Kind::Object, &c, mo, mt).outcome {
             keeps_added_values(&c, std::str::from_utf8(&out).unwrap())?;
+            keeps_deletions_json(&c, std::str::from_utf8(&out).unwrap())?;
         }
     }
 
@@ -579,4 +813,36 @@ proptest! {
     fn object_merges_are_symmetric(c in json_case()) {
         symmetric(&run(Kind::Object, &c, 2000, 3000), &run(Kind::Object, &swapped(&c), 3000, 2000))?;
     }
+}
+
+/// The generators reach real merges, not just opens: a share of each one's
+/// cases is written.
+#[test]
+fn generators_reach_merges() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let mut share = |name: &str, strat: BoxedStrategy<Case>, kind: Kind, rule: Rule, min: f64| {
+        let (mut written, n) = (0, 2000);
+        for i in 0..n {
+            let c = strat.new_tree(&mut runner).unwrap().current();
+            let (mo, mt) = if i % 2 == 0 { (2000, 3000) } else { (3000, 2000) };
+            let m = run(kind, &c, mo, mt);
+            if m.rule == rule && matches!(m.outcome, Outcome::Write(_)) {
+                written += 1;
+            }
+        }
+        let got = written as f64 / n as f64;
+        eprintln!("{name}: {:.0}% written", got * 100.0);
+        assert!(got >= min, "{name}: only {:.0}% of cases merge", got * 100.0);
+    };
+    share("lines", text_case().boxed(), Kind::Text, Rule::Lines, 0.3);
+    share(
+        "frontmatter",
+        markdown_case().boxed(),
+        Kind::Markdown,
+        Rule::Frontmatter,
+        0.15,
+    );
+    share("json", json_case().boxed(), Kind::Object, Rule::Object, 0.3);
 }

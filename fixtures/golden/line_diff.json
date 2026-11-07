@@ -962,6 +962,330 @@
    ]
   },
   {
+   "a": "a\nb\nc\n",
+   "b": "a\nB\nC\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     -1,
+     "b\nc\n"
+    ],
+    [
+     1,
+     "B\nC\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\n",
+   "b": "a\nB\nC\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     -1,
+     "b\nc\n"
+    ],
+    [
+     1,
+     "B\nC\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\n",
+   "b": "a\nB\nC\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     -1,
+     "b\nc\n"
+    ],
+    [
+     1,
+     "B\nC\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\n",
+   "b": "a\nB\nC\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     -1,
+     "b\nc\n"
+    ],
+    [
+     1,
+     "B\nC\n"
+    ]
+   ]
+  },
+  {
+   "a": "- [ ] task\n- [ ] next\n",
+   "b": "- [x] task\n- [ ] next\n",
+   "diffs": [
+    [
+     -1,
+     "- [ ] task\n"
+    ],
+    [
+     1,
+     "- [x] task\n"
+    ],
+    [
+     0,
+     "- [ ] next\n"
+    ]
+   ]
+  },
+  {
+   "a": "- [ ] task\n- [ ] next\n",
+   "b": "- [x] task\n- [ ] next\n",
+   "diffs": [
+    [
+     -1,
+     "- [ ] task\n"
+    ],
+    [
+     1,
+     "- [x] task\n"
+    ],
+    [
+     0,
+     "- [ ] next\n"
+    ]
+   ]
+  },
+  {
+   "a": "# Log\n- 09 start\n",
+   "b": "# Log\n- 09 start (done)\n",
+   "diffs": [
+    [
+     0,
+     "# Log\n"
+    ],
+    [
+     -1,
+     "- 09 start\n"
+    ],
+    [
+     1,
+     "- 09 start (done)\n"
+    ]
+   ]
+  },
+  {
+   "a": "# Log\n- 09 start\n",
+   "b": "# Log\n- 09 start (done)\n",
+   "diffs": [
+    [
+     0,
+     "# Log\n"
+    ],
+    [
+     -1,
+     "- 09 start\n"
+    ],
+    [
+     1,
+     "- 09 start (done)\n"
+    ]
+   ]
+  },
+  {
+   "a": "# M\nMeeting TBD\nend\n",
+   "b": "# M\nMeeting at 10\nRoom 1\nend\n",
+   "diffs": [
+    [
+     0,
+     "# M\n"
+    ],
+    [
+     -1,
+     "Meeting TBD\n"
+    ],
+    [
+     1,
+     "Meeting at 10\nRoom 1\n"
+    ],
+    [
+     0,
+     "end\n"
+    ]
+   ]
+  },
+  {
+   "a": "# M\nMeeting TBD\nend\n",
+   "b": "# M\nMeeting at 10\nRoom 1\nend\n",
+   "diffs": [
+    [
+     0,
+     "# M\n"
+    ],
+    [
+     -1,
+     "Meeting TBD\n"
+    ],
+    [
+     1,
+     "Meeting at 10\nRoom 1\n"
+    ],
+    [
+     0,
+     "end\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\nd\n",
+   "b": "a\nX\nY\nd\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     -1,
+     "b\nc\n"
+    ],
+    [
+     1,
+     "X\nY\n"
+    ],
+    [
+     0,
+     "d\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\nd\n",
+   "b": "a\nX\nY\nd\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     -1,
+     "b\nc\n"
+    ],
+    [
+     1,
+     "X\nY\n"
+    ],
+    [
+     0,
+     "d\n"
+    ]
+   ]
+  },
+  {
+   "a": "x\n",
+   "b": "x\n```\nA\n```\n",
+   "diffs": [
+    [
+     0,
+     "x\n"
+    ],
+    [
+     1,
+     "```\nA\n```\n"
+    ]
+   ]
+  },
+  {
+   "a": "x\n",
+   "b": "x\n```\nA\n```\n",
+   "diffs": [
+    [
+     0,
+     "x\n"
+    ],
+    [
+     1,
+     "```\nA\n```\n"
+    ]
+   ]
+  },
+  {
+   "a": "# Log\n",
+   "b": "# Log\n\nPara A\n",
+   "diffs": [
+    [
+     0,
+     "# Log\n"
+    ],
+    [
+     1,
+     "\nPara A\n"
+    ]
+   ]
+  },
+  {
+   "a": "# Log\n",
+   "b": "# Log\n\nPara A\n",
+   "diffs": [
+    [
+     0,
+     "# Log\n"
+    ],
+    [
+     1,
+     "\nPara A\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\nd\ne\n",
+   "b": "a\nd\ne\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     -1,
+     "b\nc\n"
+    ],
+    [
+     0,
+     "d\ne\n"
+    ]
+   ]
+  },
+  {
+   "a": "a\nb\nc\nd\ne\n",
+   "b": "a\nd\ne\n",
+   "diffs": [
+    [
+     0,
+     "a\n"
+    ],
+    [
+     -1,
+     "b\nc\n"
+    ],
+    [
+     0,
+     "d\ne\n"
+    ]
+   ]
+  },
+  {
    "a": "a\nb\n",
    "b": "\n\n",
    "diffs": [

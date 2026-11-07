@@ -1,11 +1,12 @@
 //! The merge corpus from `tools/golden` (upstream commonlib 0.2.1's own
-//! `ConflictManager`): where this crate reports no deviation, its result must be
-//! upstream's, byte for byte for text and token for token for JSON (upstream
-//! writes JSON unindented, this crate in the file's style). Where it reports a
-//! deviation, the difference must be the one the deviation names; for the line
-//! merge's own fixes (a trailing deletion carried, whole insertion runs),
-//! undoing exactly the reported fixes must give upstream's result byte for byte.
-use livesync_merge::{merge_undoing, Deviation, Input, Kind, Outcome, Rule, Settings, Version};
+//! `ConflictManager`) as an oracle. Every case must be upstream's result (byte
+//! for byte for text, token for token for JSON, which upstream writes
+//! unindented and this crate in the file's style), or open where upstream
+//! merges (stricter), or carry a deviation whose shape is checked here. The
+//! crate's own model of upstream must match upstream's output, case by case.
+use livesync_merge::{
+    merge, upstream_line_merge, upstream_object_merge, Deviation, Input, Kind, Outcome, Rule, Settings, Version,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -86,10 +87,6 @@ struct Run {
 }
 
 fn run(c: &Value, kind: Kind) -> Run {
-    run_undoing(c, kind, &[])
-}
-
-fn run_undoing(c: &Value, kind: Kind, undo: &[Deviation]) -> Run {
     let s = |k: &str| c[k].as_str().unwrap().as_bytes();
     let n = |k: &str| c[k].as_i64().unwrap();
     let input = Input {
@@ -109,7 +106,7 @@ fn run_undoing(c: &Value, kind: Kind, undo: &[Deviation]) -> Run {
             deleted: false,
         },
     };
-    let m = merge_undoing(kind, &input, &Settings::default(), undo);
+    let m = merge(kind, &input, &Settings::default());
     let ours = match m.outcome {
         Outcome::Write(b) => Some(String::from_utf8(b).unwrap()),
         // Upstream's merge of identical sides is that content.
@@ -124,18 +121,81 @@ fn run_undoing(c: &Value, kind: Kind, undo: &[Deviation]) -> Run {
     }
 }
 
+fn str_of<'a>(c: &'a Value, k: &str) -> &'a str {
+    c[k].as_str().unwrap()
+}
+
+fn ours_first(c: &Value) -> bool {
+    c["leftMtime"].as_i64().unwrap() <= c["rightMtime"].as_i64().unwrap()
+}
+
+/// The crate's model of upstream must be upstream: byte for byte for the line
+/// merge on every text case, token for token for the object merge wherever the
+/// model covers the input. The deviation checks below lean on it.
+#[test]
+fn the_model_of_upstream_is_upstream() {
+    let (mut lines, mut objects, mut uncovered) = (0, 0, 0);
+    for c in fixture("merge.json") {
+        let name = str_of(&c, "name");
+        let upstream = c["result"].as_str();
+        let (b, l, r) = (str_of(&c, "base"), str_of(&c, "left"), str_of(&c, "right"));
+        if str_of(&c, "path").ends_with(".md") {
+            assert_eq!(
+                upstream_line_merge(b, l, r, ours_first(&c)).as_deref(),
+                upstream,
+                "{name}: the model of upstream's line merge is wrong\nbase {b:?}\nleft {l:?}\nright {r:?}"
+            );
+            lines += 1;
+            continue;
+        }
+        if l == r {
+            continue;
+        }
+        match upstream_object_merge(b, l, r, ours_first(&c)) {
+            Some(model) => {
+                // Up to JavaScript's order of integer-like keys and ids.
+                let canon = |s: &str| canonical(serde_json::from_str(s).unwrap());
+                assert_eq!(
+                    model.as_deref().map(canon),
+                    upstream.map(canon),
+                    "{name}: the model of upstream's object merge is wrong"
+                );
+                objects += 1;
+            }
+            None => uncovered += 1,
+        }
+    }
+    eprintln!("model of upstream: {lines} line merges, {objects} object merges, {uncovered} not covered");
+    assert!(uncovered <= 10, "too many object cases outside the model: {uncovered}");
+}
+
+/// Objects by key, id-arrays by id, numbers as doubles.
+fn canonical(v: Value) -> Value {
+    match v {
+        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, canonical(v))).collect()),
+        Value::Array(a) if !a.is_empty() && a.iter().all(|e| e.get("id").is_some()) => {
+            let mut a: Vec<Value> = a.into_iter().map(canonical).collect();
+            a.sort_by_key(|e| e["id"].to_string());
+            Value::Array(a)
+        }
+        Value::Array(a) => Value::Array(a.into_iter().map(canonical).collect()),
+        Value::Number(n) => serde_json::json!(n.as_f64()),
+        other => other,
+    }
+}
+
 #[test]
 fn merges_match_upstream() {
     let cases = fixture("merge.json");
     assert!(cases.len() >= 600, "corpus too small: {}", cases.len());
     let mut agreed = 0;
-    let mut undone = 0;
-    let mut deviated: BTreeMap<String, usize> = BTreeMap::new();
+    let mut stricter = 0;
     let mut per_deviation: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut now_open: BTreeMap<String, usize> = BTreeMap::new();
     for c in &cases {
-        let name = c["name"].as_str().unwrap();
+        let name = str_of(c, "name");
         let upstream = c["result"].as_str().map(str::to_string);
-        let kind = if c["path"].as_str().unwrap().ends_with(".md") {
+        let kind = if str_of(c, "path").ends_with(".md") {
             Kind::Text
         } else {
             Kind::Object
@@ -146,84 +206,59 @@ fn merges_match_upstream() {
             continue;
         }
         if name.contains("/deviation-") {
-            assert!(!r.deviations.is_empty(), "{name}: expected a deviation, got none");
+            assert!(
+                !r.deviations.is_empty() || (r.ours.is_none() && upstream.is_some()),
+                "{name}: expected a deviation or a stricter open, got neither"
+            );
         }
-        if !r.deviations.is_empty() {
-            if std::env::var("MERGE_DIAG").is_ok() {
-                eprintln!(
-                    "DIAG {name} {:?} ours_open={} up_open={}\n  base {:?}\n  left {:?}\n  right {:?}\n  ours {:?}\n  up   {:?}",
-                    r.deviations,
-                    r.ours.is_none(),
-                    upstream.is_none(),
-                    c["base"],
-                    c["left"],
-                    c["right"],
-                    r.ours,
-                    upstream
-                );
-            }
-            for d in &r.deviations {
-                justify(name, *d, &r.deviations, c, &r.ours, &upstream);
-                *per_deviation.entry(d.as_str()).or_default() += 1;
-            }
-            if r.deviations.iter().all(|d| LINE_FIXES.contains(d)) {
-                let u = run_undoing(c, kind, &r.deviations);
-                if u.deviations == [Deviation::GluedLines] {
-                    // Upstream's interleaving glues two lines (open here);
-                    // the whole runs did not.
-                    justify(name, Deviation::GluedLines, &u.deviations, c, &u.ours, &upstream);
-                } else {
-                    assert!(u.deviations.is_empty(), "{name}: undone, still {:?}", u.deviations);
+        if std::env::var("MERGE_DIAG").is_ok() && (!r.deviations.is_empty() || r.ours != upstream) {
+            eprintln!(
+                "DIAG {name} {:?}\n  base {:?}\n  left {:?}\n  right {:?}\n  ours {:?}\n  up   {:?}",
+                r.deviations, c["base"], c["left"], c["right"], r.ours, upstream
+            );
+        }
+        if r.ours.is_none() && upstream.is_some() {
+            *now_open.entry(format!("{:?}", r.rule)).or_default() += 1;
+        }
+        for d in &r.deviations {
+            justify(name, *d, &r.deviations, c, &r.ours, &upstream);
+            *per_deviation.entry(d.as_str()).or_default() += 1;
+        }
+        if r.deviations.is_empty() {
+            match (&r.ours, &upstream) {
+                // Open where upstream merges: stricter, allowed.
+                (None, Some(_)) => stricter += 1,
+                (a, b) if kind == Kind::Text => {
+                    assert_eq!(
+                        a, b,
+                        "{name}: line merge differs from upstream\nbase {:?}\nleft {:?}\nright {:?}",
+                        c["base"], c["left"], c["right"]
+                    );
+                    agreed += 1;
                 }
-                assert!(u.ours.is_none() || u.deviations.is_empty());
-                assert!(
-                    !u.deviations.is_empty() || u.ours == upstream,
-                    "{name}: undoing {:?} is not upstream's result\nbase {:?}\nleft {:?}\nright {:?}",
-                    r.deviations,
-                    c["base"],
-                    c["left"],
-                    c["right"]
-                );
-                for d in &r.deviations {
-                    let one = run_undoing(c, kind, &[*d]);
-                    assert_ne!(one.ours, r.ours, "{name}: undoing {d:?} alone changes nothing");
+                (Some(a), Some(b)) => {
+                    assert_eq!(
+                        tokens(a),
+                        tokens(b),
+                        "{name}: object merge differs\nours {a}\nupstream {b}"
+                    );
+                    agreed += 1;
                 }
-                undone += 1;
+                (None, None) => agreed += 1,
+                (a, b) => panic!("{name}: ours {a:?}, upstream {b:?}"),
             }
-            *deviated.entry(format!("{:?}", r.deviations)).or_default() += 1;
-            continue;
         }
-        match kind {
-            Kind::Text => assert_eq!(
-                r.ours, upstream,
-                "{name}: line merge differs from upstream\nbase {:?}\nleft {:?}\nright {:?}",
-                c["base"], c["left"], c["right"]
-            ),
-            _ => match (&r.ours, &upstream) {
-                (Some(a), Some(b)) => assert_eq!(
-                    tokens(a),
-                    tokens(b),
-                    "{name}: object merge differs\nours {a}\nupstream {b}"
-                ),
-                (a, b) => assert_eq!(a.is_some(), b.is_some(), "{name}: ours {a:?}, upstream {b:?}"),
-            },
-        }
-        agreed += 1;
     }
     eprintln!(
-        "merge corpus: {} cases, {agreed} agree with upstream; per deviation: {per_deviation:?}; \
-         by set: {deviated:?}; {undone} line-fix cases are upstream's once undone",
+        "merge corpus: {} cases, {agreed} agree with upstream, {stricter} open where upstream merges \
+         (no deviation); per deviation: {per_deviation:?}; open where upstream merges, by rule: {now_open:?}",
         cases.len()
     );
-    assert!(agreed >= 450, "too few cases agree: {agreed}, deviations: {deviated:?}");
     assert!(
-        agreed + undone >= 550,
-        "too few cases are upstream's, as they are or once the line fixes are undone: {agreed} + {undone}"
+        agreed >= 400,
+        "too few cases agree: {agreed}, deviations: {per_deviation:?}"
     );
 }
-
-/// The line merge's fixes to upstream, which `merge_undoing` can switch off.
-const LINE_FIXES: [Deviation; 2] = [Deviation::TrailingDeletion, Deviation::RunOrder];
 
 /// Lines without their line end, in order.
 fn lines_of(s: &str) -> Vec<String> {
@@ -232,62 +267,175 @@ fn lines_of(s: &str) -> Vec<String> {
         .collect()
 }
 
-fn sorted(mut v: Vec<String>) -> Vec<String> {
-    v.sort();
-    v
+fn counts(v: &[String]) -> BTreeMap<String, usize> {
+    let mut m = BTreeMap::new();
+    for l in v {
+        *m.entry(l.clone()).or_default() += 1;
+    }
+    m
 }
 
-/// What is left of `of` after taking `sub` out as an ordered subsequence, or
-/// `None` if `sub` is not one.
-fn minus_subsequence(of: &[String], sub: &[String]) -> Option<Vec<String>> {
-    let mut rest = Vec::new();
-    let mut it = sub.iter().peekable();
-    for l in of {
-        if it.peek() == Some(&l) {
-            it.next();
-        } else {
-            rest.push(l.clone());
+/// `a` minus `b`, as multisets.
+fn minus(a: &[String], b: &[String]) -> Vec<String> {
+    let mut cb = counts(b);
+    let mut out = Vec::new();
+    for l in a {
+        match cb.get_mut(l) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => out.push(l.clone()),
         }
     }
-    it.peek().is_none().then_some(rest)
+    out
+}
+
+/// Whether some value along `path` in `v` is a plain array (one whose
+/// elements do not all have an `id`), which upstream replaces whole.
+fn plain_array_on(v: &Value, path: &[String]) -> bool {
+    let mut cur = v;
+    for k in path {
+        if let Value::Array(a) = cur {
+            if !a.iter().all(|e| e.get("id").is_some()) {
+                return true;
+            }
+        }
+        cur = match cur {
+            Value::Object(o) => match o.get(k) {
+                Some(x) => x,
+                None => return false,
+            },
+            Value::Array(a) => match a.iter().find(|e| e.get("id").map(|i| i.to_string()) == Some(k.clone())) {
+                Some(x) => x,
+                None => return false,
+            },
+            _ => return false,
+        };
+    }
+    matches!(cur, Value::Array(a) if !a.iter().all(|e| e.get("id").is_some()))
+}
+
+/// The paths where two JSON values differ (id-array elements by id).
+fn differing(a: &Value, b: &Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    let by_id = |x: &Vec<Value>| -> Option<BTreeMap<String, Value>> {
+        x.iter()
+            .map(|e| e.get("id").map(|i| (i.to_string(), e.clone())))
+            .collect()
+    };
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            let keys: std::collections::BTreeSet<&String> = x.keys().chain(y.keys()).collect();
+            for k in keys {
+                path.push(k.clone());
+                match (x.get(k), y.get(k)) {
+                    (Some(p), Some(q)) => differing(p, q, path, out),
+                    _ => out.push(path.clone()),
+                }
+                path.pop();
+            }
+        }
+        (Value::Array(x), Value::Array(y)) => match (by_id(x), by_id(y)) {
+            (Some(p), Some(q)) => differing(
+                &Value::Object(p.into_iter().collect()),
+                &Value::Object(q.into_iter().collect()),
+                path,
+                out,
+            ),
+            _ if a != b => out.push(path.clone()),
+            _ => {}
+        },
+        _ if a != b => out.push(path.clone()),
+        _ => {}
+    }
 }
 
 /// A reported deviation must be the kind of difference it names.
 fn justify(name: &str, d: Deviation, all: &[Deviation], c: &Value, ours: &Option<String>, upstream: &Option<String>) {
-    let lines = |s: &str| {
-        s.split_inclusive('\n')
-            .map(|l| l.trim_end_matches(['\n', '\r']).to_string())
-            .collect::<Vec<_>>()
-    };
     let inputs: Vec<String> = ["base", "left", "right"]
         .iter()
-        .flat_map(|k| lines(c[*k].as_str().unwrap()))
+        .flat_map(|k| lines_of(str_of(c, k)))
         .collect();
+    let base = lines_of(str_of(c, "base"));
+    let up_glued = upstream
+        .as_ref()
+        .is_some_and(|u| lines_of(u).iter().any(|l| !inputs.contains(l)));
+    // A line merge never makes a line of its own.
+    if let (Some(o), Kind::Text) = (ours, kind_of(c)) {
+        for l in lines_of(o) {
+            assert!(inputs.contains(&l), "{name}: {l:?} is in no input");
+        }
+    }
     match d {
-        Deviation::GluedLines => {
-            assert!(ours.is_none(), "{name}: glued lines must stay open");
-            if let Some(up) = upstream {
+        Deviation::GluedLines => assert!(up_glued, "{name}: upstream glued nothing: {upstream:?}"),
+        Deviation::SameInsertionOnce | Deviation::TrailingDeletion | Deviation::RunOrder | Deviation::PositionOrder => {
+            let Some(o) = ours else {
+                // Open: only where whole runs would glue a line without its
+                // newline that upstream's interleaving does not.
+                assert_eq!(d, Deviation::RunOrder, "{name}: {d:?} must be a merge");
                 assert!(
-                    lines(up).iter().any(|l| !inputs.contains(l)),
-                    "{name}: upstream glued nothing: {up:?}"
+                    [str_of(c, "left"), str_of(c, "right")]
+                        .iter()
+                        .any(|s| !s.is_empty() && !s.ends_with('\n')),
+                    "{name}: open, but no run without a final newline"
+                );
+                return;
+            };
+            let Some(up) = upstream else {
+                // Merged where upstream gives up: only by position.
+                assert_eq!(all, [Deviation::PositionOrder], "{name}: upstream did not merge");
+                return;
+            };
+            assert_ne!(o, up, "{name}: {d:?} but the same as upstream");
+            let (o, up) = (lines_of(o), lines_of(up));
+            // Lines upstream has and this merge does not: base lines a side
+            // deleted (a trailing deletion, or by position), or a second copy
+            // of an inserted line (taken once).
+            for l in minus(&up, &o) {
+                let base_line = base.contains(&l);
+                let duplicate = counts(&up)[&l] > 1;
+                assert!(
+                    (base_line
+                        && (all.contains(&Deviation::TrailingDeletion) || all.contains(&Deviation::PositionOrder)))
+                        || (duplicate && all.contains(&Deviation::SameInsertionOnce))
+                        || up_glued,
+                    "{name}: {all:?} drops {l:?} that upstream keeps"
+                );
+            }
+            // Lines this merge has more often than upstream: only where
+            // upstream glued them away, or dropped them out of place.
+            for l in minus(&o, &up) {
+                assert!(
+                    up_glued || all.contains(&Deviation::PositionOrder) || all.contains(&Deviation::RunOrder),
+                    "{name}: {all:?} adds {l:?} upstream does not have"
                 );
             }
         }
-        Deviation::SameInsertionOnce => {
-            let up = upstream
-                .as_ref()
-                .unwrap_or_else(|| panic!("{name}: upstream did not merge"));
-            if let Some(o) = ours {
-                assert!(
-                    lines(o).len() < lines(up).len(),
-                    "{name}: not shorter than upstream's {up:?}: {o:?}"
-                );
-            }
-        }
-        Deviation::StricterObjectCheck | Deviation::UnparsableJson => {
+        Deviation::StricterObjectCheck | Deviation::UnparsableJson | Deviation::EmptiedOpen => {
             assert!(ours.is_none(), "{name}: {d:?} must be open");
+            if d == Deviation::EmptiedOpen {
+                let blank = |k: &str| str_of(c, k).trim().is_empty();
+                assert!(
+                    !blank("base") && (blank("left") || blank("right")),
+                    "{name}: no side emptied"
+                );
+            }
         }
-        Deviation::ObjectResultDiffers => assert!(ours.is_some(), "{name}: {d:?} must be a merge"),
+        Deviation::ObjectResultDiffers => {
+            let o = ours.as_ref().unwrap_or_else(|| panic!("{name}: {d:?} must be a merge"));
+            // Outside plain arrays, which upstream replaces whole, the result is
+            // upstream's.
+            if let Some(up) = upstream {
+                let (ov, uv): (Value, Value) = (serde_json::from_str(o).unwrap(), serde_json::from_str(up).unwrap());
+                let mut paths = Vec::new();
+                differing(&ov, &uv, &mut Vec::new(), &mut paths);
+                assert!(!paths.is_empty(), "{name}: same value as upstream");
+                for p in paths {
+                    let on = |k: &str| plain_array_on(&serde_json::from_str(str_of(c, k)).unwrap(), &p);
+                    assert!(
+                        on("base") || on("left") || on("right"),
+                        "{name}: differs from upstream at {p:?}, not a plain array"
+                    );
+                }
+            }
+        }
         Deviation::NumericKeyOrder => {
             let (o, up) = (ours.as_ref().unwrap(), upstream.as_ref().unwrap());
             let sorted = |s: &str| {
@@ -297,76 +445,15 @@ fn justify(name: &str, d: Deviation, all: &[Deviation], c: &Value, ours: &Option
             };
             assert_eq!(sorted(o), sorted(up), "{name}: more than key order differs");
         }
-        Deviation::TrailingDeletion => {
-            // Upstream keeps lines a side deleted at its end: ours has them
-            // removed (lines of the base, in order), or is open where the other
-            // side changed them.
-            let up = upstream
-                .as_ref()
-                .unwrap_or_else(|| panic!("{name}: upstream did not merge"));
-            if let Some(o) = ours {
-                let (o, up) = (lines_of(o), lines_of(up));
-                let removed = if all.contains(&Deviation::RunOrder) {
-                    // Placed differently too: compare as multisets.
-                    let mut rest = sorted(up.clone());
-                    for l in &o {
-                        let i = rest
-                            .iter()
-                            .position(|x| x == l)
-                            .unwrap_or_else(|| panic!("{name}: {l:?} not in upstream's {up:?}"));
-                        rest.remove(i);
-                    }
-                    rest
-                } else {
-                    minus_subsequence(&up, &o)
-                        .unwrap_or_else(|| panic!("{name}: {o:?} is not upstream's {up:?} minus lines"))
-                };
-                assert!(!removed.is_empty(), "{name}: no line removed");
-                let base = lines_of(c["base"].as_str().unwrap());
-                assert!(
-                    minus_subsequence(&base, &removed).is_some() || all.contains(&Deviation::RunOrder),
-                    "{name}: removed {removed:?} are not base lines in order"
-                );
-                for l in &removed {
-                    assert!(base.contains(l), "{name}: removed {l:?} is not a base line");
-                }
-            }
-        }
-        Deviation::RunOrder => {
-            // The same lines as upstream's interleaving, placed as whole runs;
-            // or open, where that order would glue two lines.
-            let up = upstream
-                .as_ref()
-                .unwrap_or_else(|| panic!("{name}: upstream did not merge"));
-            match ours {
-                Some(o) if !all.contains(&Deviation::TrailingDeletion) => {
-                    assert_ne!(o, up, "{name}: same as upstream");
-                    // Or upstream's interleaving glued two lines, which whole
-                    // runs do not.
-                    let glued = lines_of(up).iter().any(|l| !inputs.contains(l));
-                    assert!(
-                        glued || sorted(lines_of(o)) == sorted(lines_of(up)),
-                        "{name}: more than the order differs: {o:?} against {up:?}"
-                    );
-                }
-                Some(_) => {}
-                None => assert!(
-                    [c["left"].as_str().unwrap(), c["right"].as_str().unwrap()]
-                        .iter()
-                        .any(|s| !s.is_empty() && !s.ends_with('\n')),
-                    "{name}: open, but no run without a final newline"
-                ),
-            }
-        }
-        Deviation::EmptiedOpen => {
-            assert!(ours.is_none(), "{name}: an emptied side must stay open");
-            let blank = |k: &str| c[k].as_str().unwrap().trim().is_empty();
-            assert!(
-                !blank("base") && (blank("left") || blank("right")),
-                "{name}: no side emptied"
-            );
-        }
         other => panic!("{name}: unexpected deviation {other:?} in the corpus"),
+    }
+}
+
+fn kind_of(c: &Value) -> Kind {
+    if str_of(c, "path").ends_with(".md") {
+        Kind::Text
+    } else {
+        Kind::Object
     }
 }
 

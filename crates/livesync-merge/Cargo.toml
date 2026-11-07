@@ -1,6 +1,6 @@
 [package]
 name = "livesync-merge"
-description = "D9's conflict merge rules (line, frontmatter, JSON) as a pure library"
+description = "Conflict merge rules for LiveSync vaults (line, frontmatter, JSON) as a pure library"
 edition.workspace = true
 license.workspace = true
 version.workspace = true

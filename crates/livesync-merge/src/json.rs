@@ -31,8 +31,11 @@ impl PartialEq for Json {
 }
 
 /// Upstream compares numbers through `JSON.stringify`, i.e. as doubles. Two
-/// texts for the same double are equal here too, unless one has more digits
-/// than a double holds: then a change in the last digits is still a change.
+/// texts are equal here only when they are the same text, or both are finite
+/// doubles JavaScript treats as equal, with the same sign (`0` and `-0`
+/// differ, which `JSON.stringify` hides), and neither has more digits than a
+/// double holds. So a change is never dropped silently: `1e400` against
+/// `2e400` (both infinite as doubles) is a change, as is one in the 17th digit.
 fn num_eq(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -48,7 +51,8 @@ fn num_eq(a: &str, b: &str) -> bool {
     if digits(a) > 15 || digits(b) > 15 {
         return false;
     }
-    matches!((a.parse::<f64>(), b.parse::<f64>()), (Ok(x), Ok(y)) if x == y)
+    matches!((a.parse::<f64>(), b.parse::<f64>()),
+        (Ok(x), Ok(y)) if x.is_finite() && y.is_finite() && x == y && x.is_sign_negative() == y.is_sign_negative())
 }
 
 impl Json {
@@ -70,20 +74,6 @@ impl Json {
 
 fn obj_get<'a>(o: &'a [(String, Json)], k: &str) -> Option<&'a Json> {
     o.iter().find(|(kk, _)| kk == k).map(|(_, v)| v)
-}
-
-fn obj_set(o: &mut Vec<(String, Json)>, k: &str, v: Json) {
-    if let Some(slot) = o.iter_mut().find(|(kk, _)| kk == k) {
-        slot.1 = v;
-    } else {
-        o.push((k.to_string(), v));
-    }
-}
-
-fn obj_remove(o: &mut Vec<(String, Json)>, k: &str) {
-    if let Some(i) = o.iter().position(|(kk, _)| kk == k) {
-        o.remove(i);
-    }
 }
 
 // ---------- parsing ----------
@@ -153,6 +143,7 @@ impl Parser<'_> {
             Some(b'{') => {
                 self.i += 1;
                 let mut o: Vec<(String, Json)> = Vec::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 self.ws();
                 if self.eat(b'}') {
                     return Ok(Json::Obj(o));
@@ -166,7 +157,7 @@ impl Parser<'_> {
                     }
                     self.ws();
                     let v = self.value(depth + 1)?;
-                    if k.contains('\u{1}') || o.iter().any(|(kk, _)| *kk == k) {
+                    if k.contains('\u{1}') || !seen.insert(k.clone()) {
                         self.unsupported = true;
                     }
                     o.push((k, v));
@@ -441,7 +432,8 @@ enum Patch {
 /// Upstream's patch has a plain array (one whose elements do not all have an
 /// `id`) swapped whole even when it did not change, so a plain array changed on
 /// one side always conflicts there. `ours` leaves unchanged arrays out, so a
-/// one-sided change is taken, as D9 reads ("other arrays are replaced whole").
+/// one-sided change is taken ("other arrays are replaced whole" means a
+/// changed array).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Upstream,
@@ -479,9 +471,10 @@ fn id_key(e: &Json) -> Result<String, Shape> {
 /// upstream; that is `Err` here.
 fn id_object(a: &[Json]) -> Result<Vec<(String, Json)>, Shape> {
     let mut o: Vec<(String, Json)> = Vec::with_capacity(a.len());
+    let mut seen = std::collections::HashSet::new();
     for e in a {
         let k = id_key(e)?;
-        if obj_get(&o, &k).is_some() {
+        if !seen.insert(k.clone()) {
             return Err(Shape);
         }
         o.push((k, e.clone()));
@@ -489,10 +482,16 @@ fn id_object(a: &[Json]) -> Result<Vec<(String, Json)>, Shape> {
     Ok(o)
 }
 
+/// An object's keys, for lookups in linear time overall.
+fn index(o: &[(String, Json)]) -> std::collections::HashMap<&str, &Json> {
+    o.iter().map(|(k, v)| (k.as_str(), v)).collect()
+}
+
 fn gen_patch(from: &[(String, Json)], to: &[(String, Json)], mode: Mode) -> Result<Vec<(String, Patch)>, Shape> {
     let mut ret = Vec::new();
+    let (fi, ti) = (index(from), index(to));
     for (k, value) in to {
-        let Some(v) = obj_get(from, k) else {
+        let Some(v) = fi.get(k.as_str()).copied() else {
             ret.push((k.clone(), Patch::Set(value.clone())));
             continue;
         };
@@ -525,7 +524,7 @@ fn gen_patch(from: &[(String, Json)], to: &[(String, Json)], mode: Mode) -> Resu
         }
     }
     for (k, _) in from {
-        if obj_get(to, k).is_none() {
+        if !ti.contains_key(k.as_str()) {
             ret.push((k.clone(), Patch::Deleted));
         }
     }
@@ -572,24 +571,35 @@ fn flatten(patch: &[(String, Patch)], path: &mut Vec<PathSeg>, id_level: bool, o
 
 /// The paths where both sides changed the same thing differently: the same
 /// leaf to different values, or one side a key and the other something under it.
+/// In the order of the left side's leaves.
 fn overlaps(left: &[(Vec<PathSeg>, Leaf)], right: &[(Vec<PathSeg>, Leaf)]) -> Vec<Vec<PathSeg>> {
+    use std::collections::{HashMap, HashSet};
+    let rmap: HashMap<&[PathSeg], &Leaf> = right.iter().map(|(p, v)| (p.as_slice(), v)).collect();
+    // Every proper prefix of a right path.
+    let mut rpre: HashSet<&[PathSeg]> = HashSet::new();
+    for (p, _) in right {
+        for n in 0..p.len() {
+            rpre.insert(&p[..n]);
+        }
+    }
     let mut found: Vec<Vec<PathSeg>> = Vec::new();
+    let mut seen: HashSet<Vec<PathSeg>> = HashSet::new();
+    let mut hit = |p: &[PathSeg], found: &mut Vec<Vec<PathSeg>>| {
+        if seen.insert(p.to_vec()) {
+            found.push(p.to_vec());
+        }
+    };
     for (lp, lv) in left {
-        for (rp, rv) in right {
-            let hit = if lp == rp {
-                lv != rv
-            } else if rp.starts_with(lp) {
-                *lv != Leaf::EmptyObject
-            } else if lp.starts_with(rp) {
-                *rv != Leaf::EmptyObject
-            } else {
-                false
-            };
-            if hit {
-                let p = if lp.len() <= rp.len() { lp } else { rp };
-                if !found.contains(p) {
-                    found.push(p.clone());
-                }
+        // A right leaf under this one, or this one changed differently.
+        if (*lv != Leaf::EmptyObject && rpre.contains(lp.as_slice()))
+            || rmap.get(lp.as_slice()).is_some_and(|rv| *rv != lv)
+        {
+            hit(lp, &mut found);
+        }
+        // A right leaf above this one.
+        for n in 0..lp.len() {
+            if rmap.get(&lp[..n]).is_some_and(|rv| **rv != Leaf::EmptyObject) {
+                hit(&lp[..n], &mut found);
             }
         }
     }
@@ -694,17 +704,39 @@ fn loose_eq(a: &UpVal, b: &UpVal) -> bool {
 /// `applyPatch`. `Err` where upstream throws, and where it would write a patch
 /// itself into the file (a nested patch on a key the other side deleted).
 fn apply(target: &mut Vec<(String, Json)>, patch: &[(String, Patch)]) -> Result<(), Shape> {
+    let mut at: std::collections::HashMap<String, usize> =
+        target.iter().enumerate().map(|(i, (k, _))| (k.clone(), i)).collect();
+    let mut gone = vec![false; target.len()];
+    let set = |target: &mut Vec<(String, Json)>,
+               at: &mut std::collections::HashMap<String, usize>,
+               gone: &mut Vec<bool>,
+               k: &str,
+               v: Json| match at.get(k) {
+        Some(&i) => target[i].1 = v,
+        None => {
+            at.insert(k.to_string(), target.len());
+            target.push((k.to_string(), v));
+            gone.push(false);
+        }
+    };
     for (k, p) in patch {
         match p {
-            Patch::Deleted => obj_remove(target, k),
-            Patch::Swap(v) => obj_set(target, k, v.clone()),
-            Patch::Set(v) => apply_raw(target, k, v)?,
-            Patch::Nested(sub) => match target.iter_mut().find(|(kk, _)| kk == k) {
-                Some((_, Json::Obj(o))) => apply(o, sub)?,
+            Patch::Deleted => {
+                if let Some(i) = at.remove(k.as_str()) {
+                    gone[i] = true;
+                }
+            }
+            Patch::Swap(v) => set(target, &mut at, &mut gone, k, v.clone()),
+            Patch::Set(v) => match at.get(k.as_str()) {
+                Some(&i) => apply_raw_into(&mut target[i].1, v)?,
+                None => set(target, &mut at, &mut gone, k, v.clone()),
+            },
+            Patch::Nested(sub) => match at.get(k.as_str()).map(|&i| &mut target[i].1) {
+                Some(Json::Obj(o)) => apply(o, sub)?,
                 _ => return Err(Shape),
             },
             Patch::IdArray(sub) => {
-                let cur = match obj_get(target, k) {
+                let cur = match at.get(k.as_str()).map(|&i| &target[i].1) {
                     None => Vec::new(),
                     Some(Json::Arr(a)) => a.clone(),
                     Some(_) => return Err(Shape),
@@ -718,39 +750,40 @@ fn apply(target: &mut Vec<(String, Json)>, patch: &[(String, Patch)]) -> Result<
                     }
                     arr.push(e);
                 }
-                obj_set(target, k, Json::Arr(arr));
+                set(target, &mut at, &mut gone, k, Json::Arr(arr));
             }
         }
+    }
+    if gone.iter().any(|g| *g) {
+        let mut i = 0;
+        target.retain(|_| {
+            i += 1;
+            !gone[i - 1]
+        });
     }
     Ok(())
 }
 
 /// A raw value from a patch: set it, or, where both sides added the key,
 /// merge objects key by key as upstream does.
-fn apply_raw(target: &mut Vec<(String, Json)>, k: &str, v: &Json) -> Result<(), Shape> {
-    let Some(slot) = target.iter_mut().find(|(kk, _)| kk == k) else {
-        target.push((k.to_string(), v.clone()));
-        return Ok(());
-    };
+fn apply_raw_into(slot: &mut Json, v: &Json) -> Result<(), Shape> {
     match v {
-        Json::Obj(vo) => match &mut slot.1 {
+        Json::Obj(vo) => match slot {
             Json::Obj(o) => {
-                for (kk, vv) in vo {
-                    apply_raw(o, kk, vv)?;
-                }
-                Ok(())
+                let patch: Vec<(String, Patch)> = vo.iter().map(|(k, x)| (k.clone(), Patch::Set(x.clone()))).collect();
+                apply(o, &patch)
             }
             _ => Err(Shape),
         },
         Json::Arr(_) => {
-            if slot.1 == *v {
+            if *slot == *v {
                 Ok(())
             } else {
                 Err(Shape)
             }
         }
         _ => {
-            slot.1 = v.clone();
+            *slot = v.clone();
             Ok(())
         }
     }
@@ -835,6 +868,12 @@ pub(crate) fn merge(base: &str, ours: &str, theirs: &str, ours_first: bool, styl
         }
     }
     let value = obj_get(&out, "data").cloned().unwrap_or(Json::Null);
+    // The result is one side's value: that side's bytes as they are, so a
+    // caller comparing with that side sees its own file.
+    let side = [(ow, ours), (tw, theirs)]
+        .into_iter()
+        .find(|(w, _)| obj_get(w, "data") == Some(&value))
+        .map(|(_, text)| text.to_string());
     let mut deviations = Vec::new();
     if upstream.as_ref() != Some(&Some(value.clone())) {
         deviations.push(Deviation::ObjectResultDiffers);
@@ -843,9 +882,23 @@ pub(crate) fn merge(base: &str, ours: &str, theirs: &str, ours_first: bool, styl
         deviations.push(Deviation::NumericKeyOrder);
     }
     ObjectMerge {
-        outcome: ObjectOutcome::Merged(style.write(&value)),
+        outcome: ObjectOutcome::Merged(side.unwrap_or_else(|| style.write(&value))),
         deviations,
     }
+}
+
+/// [`upstream_result`] on the texts, written as `JSON.stringify` writes it.
+/// `None` where the model does not cover the input (any side that does not
+/// parse here, which upstream reads as `{}`, or a shape the patch rejects).
+pub(crate) fn upstream_merge(base: &str, ours: &str, theirs: &str, ours_first: bool) -> Option<Option<String>> {
+    let wrap = |s: &str| parse(s).ok().map(|v| vec![("data".to_string(), v)]);
+    let (bw, ow, tw) = (wrap(base)?, wrap(ours)?, wrap(theirs)?);
+    let compact = Style {
+        indent: None,
+        eol: "\n",
+        final_newline: false,
+    };
+    upstream_result(&bw, &ow, &tw, ours_first).map(|r| r.map(|v| compact.write(&v)))
 }
 
 /// JavaScript lists integer-like keys first, in numeric order, so upstream
@@ -911,5 +964,9 @@ mod tests {
         assert!(num_eq("1e3", "1000"));
         assert!(!num_eq("12345678901234567890", "12345678901234567891"));
         assert!(!num_eq("1", "2"));
+        assert!(!num_eq("1e400", "2e400"));
+        assert!(!num_eq("0", "-0"));
+        assert!(num_eq("-0", "-0.0"));
+        assert!(num_eq("1e400", "1e400"));
     }
 }

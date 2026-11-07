@@ -626,6 +626,186 @@
    "result": "a\nb\n"
   },
   {
+   "name": "lines/insert-after-replaced-range",
+   "path": "note.md",
+   "base": "a\nb\nc\n",
+   "left": "a\nB\nC\n",
+   "right": "a\nb\nc\nd\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "a\nB\nC\nd\n"
+  },
+  {
+   "name": "lines/insert-after-replaced-range/left-newer",
+   "path": "note.md",
+   "base": "a\nb\nc\n",
+   "left": "a\nB\nC\n",
+   "right": "a\nb\nc\nd\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "a\nB\nd\nC\n"
+  },
+  {
+   "name": "lines/insert-before-replaced-range",
+   "path": "note.md",
+   "base": "a\nb\nc\n",
+   "left": "a\nB\nC\n",
+   "right": "a\nx\nb\nc\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "a\nx\nB\nC\n"
+  },
+  {
+   "name": "lines/insert-before-replaced-range/left-newer",
+   "path": "note.md",
+   "base": "a\nb\nc\n",
+   "left": "a\nB\nC\n",
+   "right": "a\nx\nb\nc\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "a\nx\nB\nC\n"
+  },
+  {
+   "name": "lines/checkbox-sub-item",
+   "path": "todo.md",
+   "base": "- [ ] task\n- [ ] next\n",
+   "left": "- [x] task\n- [ ] next\n",
+   "right": "- [ ] task\n  - detail\n- [ ] next\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "- [x] task\n  - detail\n- [ ] next\n"
+  },
+  {
+   "name": "lines/checkbox-sub-item/left-newer",
+   "path": "todo.md",
+   "base": "- [ ] task\n- [ ] next\n",
+   "left": "- [x] task\n- [ ] next\n",
+   "right": "- [ ] task\n  - detail\n- [ ] next\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "  - detail\n- [x] task\n- [ ] next\n"
+  },
+  {
+   "name": "lines/log-done-and-append",
+   "path": "daily.md",
+   "base": "# Log\n- 09 start\n",
+   "left": "# Log\n- 09 start (done)\n",
+   "right": "# Log\n- 09 start\n- 10 call\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "# Log\n- 09 start (done)\n- 10 call\n"
+  },
+  {
+   "name": "lines/log-done-and-append/left-newer",
+   "path": "daily.md",
+   "base": "# Log\n- 09 start\n",
+   "left": "# Log\n- 09 start (done)\n",
+   "right": "# Log\n- 09 start\n- 10 call\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "# Log\n- 10 call\n- 09 start (done)\n"
+  },
+  {
+   "name": "lines/deviation-replaced-shared-first-line",
+   "path": "note.md",
+   "base": "# M\nMeeting TBD\nend\n",
+   "left": "# M\nMeeting at 10\nRoom 1\nend\n",
+   "right": "# M\nMeeting at 10\nRoom 2\nend\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "# M\nMeeting at 10\nRoom 1\nRoom 2\nend\n"
+  },
+  {
+   "name": "lines/deviation-replaced-shared-first-line/left-newer",
+   "path": "note.md",
+   "base": "# M\nMeeting TBD\nend\n",
+   "left": "# M\nMeeting at 10\nRoom 1\nend\n",
+   "right": "# M\nMeeting at 10\nRoom 2\nend\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "# M\nMeeting at 10\nRoom 2\nRoom 1\nend\n"
+  },
+  {
+   "name": "lines/insert-inside-replaced-range",
+   "path": "note.md",
+   "base": "a\nb\nc\nd\n",
+   "left": "a\nX\nY\nd\n",
+   "right": "a\nb\nnew\nc\nd\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "a\nX\nnew\nY\nd\n"
+  },
+  {
+   "name": "lines/insert-inside-replaced-range/left-newer",
+   "path": "note.md",
+   "base": "a\nb\nc\nd\n",
+   "left": "a\nX\nY\nd\n",
+   "right": "a\nb\nnew\nc\nd\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "a\nnew\nX\nY\nd\n"
+  },
+  {
+   "name": "lines/deviation-fences",
+   "path": "note.md",
+   "base": "x\n",
+   "left": "x\n```\nA\n```\n",
+   "right": "x\n```\nB\n```\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "x\n```\nA\nB\n```\n"
+  },
+  {
+   "name": "lines/deviation-fences/left-newer",
+   "path": "note.md",
+   "base": "x\n",
+   "left": "x\n```\nA\n```\n",
+   "right": "x\n```\nB\n```\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "x\n```\nB\nA\n```\n"
+  },
+  {
+   "name": "lines/deviation-paragraphs",
+   "path": "daily.md",
+   "base": "# Log\n",
+   "left": "# Log\n\nPara A\n",
+   "right": "# Log\n\nPara B\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "# Log\n\nPara A\nPara B\n"
+  },
+  {
+   "name": "lines/deviation-paragraphs/left-newer",
+   "path": "daily.md",
+   "base": "# Log\n",
+   "left": "# Log\n\nPara A\n",
+   "right": "# Log\n\nPara B\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "# Log\n\nPara B\nPara A\n"
+  },
+  {
+   "name": "lines/overlapping-deletions",
+   "path": "note.md",
+   "base": "a\nb\nc\nd\ne\n",
+   "left": "a\nd\ne\n",
+   "right": "a\nb\ne\n",
+   "leftMtime": 2000,
+   "rightMtime": 3000,
+   "result": "a\ne\n"
+  },
+  {
+   "name": "lines/overlapping-deletions/left-newer",
+   "path": "note.md",
+   "base": "a\nb\nc\nd\ne\n",
+   "left": "a\nd\ne\n",
+   "right": "a\nb\ne\n",
+   "leftMtime": 3000,
+   "rightMtime": 2000,
+   "result": "a\ne\n"
+  },
+  {
    "name": "lines/deviation-whitespace-emptied",
    "path": "note.md",
    "base": "a\nb\n",

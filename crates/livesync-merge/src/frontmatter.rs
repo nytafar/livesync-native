@@ -1,5 +1,5 @@
-//! D9 rule 3: frontmatter merged key by key (not upstream's; upstream merges the
-//! block as lines).
+//! Frontmatter merged key by key (not upstream's; upstream merges the block as
+//! lines).
 //!
 //! The block is split into its top-level entries as written (a key line and the
 //! lines under it), so a merged block keeps each entry's own text, comments and
