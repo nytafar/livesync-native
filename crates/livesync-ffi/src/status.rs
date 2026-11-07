@@ -138,6 +138,9 @@ pub struct ProfileStatus {
     pub local_issues: i64,
     pub attention: Vec<AttentionItem>,
     pub scope: Option<String>,
+    /// "obsidian" (the folder has `.obsidian/`) or "plain" (any other folder
+    /// of notes).
+    pub folder_kind: Option<String>,
     /// A full fetch or a resolution is owed; pushes are held until a two-way
     /// run completes it.
     pub needs_full_fetch: bool,
@@ -237,6 +240,7 @@ pub(crate) fn from_engine(
         local_issues: 0,
         attention: vec![],
         scope: None,
+        folder_kind: None,
         needs_full_fetch: false,
         resolve_owed: false,
         safety_stop: None,
@@ -287,6 +291,9 @@ pub(crate) fn from_engine(
     out.pending = st.pending.len() as i64;
     out.local_issues = st.local_issues.len() as i64;
     out.scope = st.scope.clone();
+    out.folder_kind = serde_json::to_value(st.folder_kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string));
     out.needs_full_fetch = st.needs_full_fetch;
     out.resolve_owed = st.resolve_owed;
     out.safety_stop = st.safety_stop.clone();

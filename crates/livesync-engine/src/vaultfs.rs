@@ -459,25 +459,16 @@ fn numbered(name: &str, n: usize) -> String {
 }
 
 /// Move `src` to `dst` without replacing anything at `dst`.
+///
+/// A rename, so the source moves in one step (an editor's atomic save that
+/// lands meanwhile is either moved whole or left in place; the caller
+/// checks which file moved). The destination is a fresh name in a trash
+/// folder, so the check before it only races another trash writer.
 fn move_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
-    match fs::hard_link(src, dst) {
-        Ok(()) => {
-            if let Err(e) = fs::remove_file(src) {
-                let _ = fs::remove_file(dst);
-                return Err(e);
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
-        Err(_) => {
-            // No hard links here (Android's FUSE, some network mounts):
-            // check, then rename.
-            if fs::symlink_metadata(dst).is_ok() {
-                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
-            }
-            fs::rename(src, dst)
-        }
+    if fs::symlink_metadata(dst).is_ok() {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
     }
+    fs::rename(src, dst)
 }
 
 /// Percent-encode a path for a `.trashinfo` file (RFC 2396, `/` kept).
@@ -591,10 +582,28 @@ fn move_to_trash(root: &Path, rel: &str, target: &Path, trash: &Trash) -> io::Re
     }
 }
 
+/// Drop the `.trashinfo` record of a file moved back out of a system trash.
+fn remove_trashinfo(trash: &Trash, moved: &Path) {
+    if let (Trash::System(SystemTrash { info: Some(dir), .. }), Some(name)) = (trash, moved.file_name()) {
+        let _ = fs::remove_file(dir.join(format!("{}.trashinfo", name.to_string_lossy())));
+    }
+}
+
 /// [`remove_if_matches`], but into `trash` (unless it says delete). Only a
 /// regular file that still hashes to `hash` is touched; empty parent
 /// folders are removed afterwards, never `root` itself.
 pub fn trash_if_matches(root: &Path, rel: &str, hash: &str, trash: &Trash) -> io::Result<RemoveOutcome> {
+    trash_if_matches_with(root, rel, hash, trash, || {})
+}
+
+/// `before_move` runs between the check and the move (tests use it to race).
+fn trash_if_matches_with(
+    root: &Path,
+    rel: &str,
+    hash: &str,
+    trash: &Trash,
+    before_move: impl FnOnce(),
+) -> io::Result<RemoveOutcome> {
     let target = root.join(rel);
     if *trash == Trash::Delete {
         return remove_if_matches(root, &target, hash);
@@ -614,7 +623,24 @@ pub fn trash_if_matches(root: &Path, rel: &str, hash: &str, trash: &Trash) -> io
     if found != hash {
         return Ok(RemoveOutcome::Diverged { found });
     }
+    let ours = f.metadata().ok().and_then(|m| crate::platform::file_id(&m));
+    before_move();
     let to = move_to_trash(root, rel, &target, trash)?;
+    // Another file took the name between the check and the move (an
+    // editor's atomic save): that one moved. Move it back, or hand its
+    // content back so the caller puts it back.
+    let moved = fs::symlink_metadata(&to)
+        .ok()
+        .and_then(|m| crate::platform::file_id(&m));
+    if ours.is_some() && moved.is_some() && ours != moved {
+        let content = fs::read(&to)?;
+        let found = hash_bytes(&content);
+        if fs::symlink_metadata(&target).is_err() && fs::rename(&to, &target).is_ok() {
+            remove_trashinfo(trash, &to);
+            return Ok(RemoveOutcome::Diverged { found });
+        }
+        return Ok(RemoveOutcome::Raced { displaced: content });
+    }
     // An edit through a handle opened before the move lands in the moved
     // file; it is returned so the caller puts it back.
     let (after, content) = hash_reader(&mut f)?;
@@ -894,6 +920,24 @@ mod tests {
         fs::write(e.path().join(".trash"), b"not a folder").unwrap();
         assert!(trash_if_matches(e.path(), "y.md", &s.hash, &Trash::Vault).is_err());
         assert!(e.path().join("y.md").exists());
+    }
+
+    #[test]
+    fn an_atomic_save_racing_the_trash_move_is_not_lost() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let s = atomic_write(&root.join("n.md"), b"synced", 0, &Expect::Absent)
+            .unwrap()
+            .state;
+        // The editor saves by writing a temp file and renaming it over n.md
+        // after our check, before our move.
+        let out = trash_if_matches_with(root, "n.md", &s.hash, &Trash::Vault, || {
+            fs::write(root.join("tmp-save"), b"new edit").unwrap();
+            fs::rename(root.join("tmp-save"), root.join("n.md")).unwrap();
+        })
+        .unwrap();
+        assert!(matches!(out, RemoveOutcome::Diverged { .. }), "{out:?}");
+        assert_eq!(fs::read(root.join("n.md")).unwrap(), b"new edit", "moved back");
     }
 
     #[test]

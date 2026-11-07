@@ -26,6 +26,12 @@
 #   S8  the lsync daemon: 30 of 40 notes deleted in two bursts across settle
 #       windows still stop (nothing deleted remotely); a confirmed sync
 #       deletes them, and a second daemon takes the remote deletes in
+#   S9  ignore files both ways: a fixture with nested .gitignores pushes the
+#       set commonlib's rules predict, from lsync and from the official CLI
+#       (useIgnoreFiles on); remote documents at ignored paths are not
+#       written; a path that becomes ignored is untracked, never deleted
+#   S10 remote deletes land in .trash/ with their folders, the emptied
+#       folder goes, and nothing is pushed back
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -443,6 +449,124 @@ if want S7; then
   check "profile A's daemon did not stop on them" test "$(lsa_status | jfield '.get("safety_stop")')" == null
   check "profile A kept the other 10" file_is "$W/vault/s8/n35.md" "note 35"
 fi
+fi
+
+# --- S9: ignore files ------------------------------------------------------------
+# A separate lsync profile (D) with ignore files on, scoped to its folders.
+lsd() { local rc=0; LSYNC_DB=$DB LSYNC_VAULT=$W/vault-d LSYNC_STATE_DIR=$W/state-d LSYNC_CONFIG=$W/d.toml \
+        LSYNC_DEVICE_NAME=interop-d LSYNC_IGNORE_FILES=.gitignore "$BIN" --include s9l,s10 "$@" 2>>"$W/lsync-d.log" || rc=$?; [[ $rc == 0 || $rc == 3 ]] || return $rc; }
+# The live documents under a prefix, as paths relative to it.
+live_under() {
+  couch "$LSYNC_URL/$DB/_all_docs?include_docs=true&startkey=%22$1%2F%22&endkey=%22$1%2F%EF%BF%B0%22" | python3 -c '
+import json, sys
+pre = sys.argv[1] + "/"
+rows = json.load(sys.stdin)["rows"]
+out = sorted(r["doc"]["path"][len(pre):] for r in rows
+             if r.get("doc") and r["doc"].get("type") in ("plain", "newnote") and not r["doc"].get("deleted"))
+print(" ".join(out))' "$1"
+}
+s9_fixture() { # s9_fixture <folder>
+  local d=$1
+  mkdir -p "$d/notes/drafts" "$d/code/venv/lib" "$d/build" "$d/sub/build"
+  printf '*.log\nbuild/\n!keep.log\nprivate.md\n' > "$d/.gitignore"
+  printf 'drafts/\n*.tmp\n!keep.tmp\nsecret\n!secret/public.md\n' > "$d/notes/.gitignore"
+  printf '!*.md\n' > "$d/notes/drafts/.gitignore"
+  printf '*\n' > "$d/code/venv/.gitignore"
+  local f
+  for f in a.md a.log keep.log private.md sub/private.md sub/a.log build/out.md sub/build/out.md \
+           notes/n.md notes/x.tmp notes/keep.tmp notes/drafts/d.md notes/drafts/d.txt \
+           notes/secret/x.md notes/secret/public.md code/main.py code/venv/lib/x.py; do
+    mkdir -p "$(dirname "$d/$f")"; printf '%s\n' "$f" > "$d/$f"
+  done
+}
+# What commonlib's isAcceptedAll accepts in that fixture (see
+# fixtures/golden/ignore_all.json and crates/livesync-engine/tests/filters.rs).
+S9_WANT="a.md code/main.py keep.log notes/drafts/d.md notes/keep.tmp notes/n.md notes/secret/public.md sub/a.log sub/build/out.md sub/private.md"
+if want S9; then
+log "S9 ignore files both ways (nested .gitignores; lsync and the official CLI)"
+s9_fixture "$W/vault-d/s9l"
+lsd sync >/dev/null
+got=$(live_under s9l)
+check "lsync pushes exactly what commonlib's rules accept" test "$got" == "$S9_WANT"
+[[ "$got" == "$S9_WANT" ]] || log "    got:  $got"$'\n'"    want: $S9_WANT"
+# The official CLI on the same fixture, with useIgnoreFiles on. A new CLI
+# device starts with a fetch (also after S6's rebuild).
+SRC="$W/cli.json" DST="$W/cli-i.json" node -e '
+const fs = require("fs"); const d = JSON.parse(fs.readFileSync(process.env.SRC, "utf8"));
+d.useIgnoreFiles = true; d.ignoreFiles = ".gitignore";
+fs.writeFileSync(process.env.DST, JSON.stringify(d, null, 2), { mode: 0o600 });'
+mkdir -p "$W/clidb-i" "$W/clivault-i"
+clii() { node "$CLI_JS" "$W/clidb-i" --settings "$W/cli-i.json" --vault "$W/clivault-i" "$@" >>"$W/cli-ignore.log" 2>&1; }
+clii fetch --force --write-settings || true
+s9_fixture "$W/clivault-i/s9c"
+clii mirror || true
+clii sync || true
+got_cli=$(live_under s9c)
+if [[ -z "$got_cli" ]]; then
+  bad "the official CLI pushed nothing from its vault (see cli-ignore.log)"
+else
+  log "    official CLI pushed: $got_cli"
+  check "the official CLI (useIgnoreFiles) pushes the same set as lsync" test "$got_cli" == "$got"
+fi
+# The vault-root ignore file: commonlib asks for it as "/.gitignore". lsync
+# reads it, as the plugin does; the official CLI's storage layer refuses a
+# path with a leading slash, so it does not (logged, not judged).
+printf 's9l/rootcheck.md\n' > "$W/vault-d/.gitignore"
+printf 'root rule\n' > "$W/vault-d/s9l/rootcheck.md"
+lsd sync >/dev/null
+check "lsync honours the vault-root ignore file" test "$(couch -o /dev/null -w '%{http_code}' "$LSYNC_URL/$DB/s9l%2Frootcheck.md")" == 404
+printf 's9c/rootcheck.md\n' > "$W/clivault-i/.gitignore"
+printf 'root rule\n' > "$W/clivault-i/s9c/rootcheck.md"
+clii mirror || true
+clii sync || true
+if [[ "$(couch -o /dev/null -w '%{http_code}' "$LSYNC_URL/$DB/s9c%2Frootcheck.md")" == 404 ]]; then
+  log "    note: the official CLI honoured the vault-root ignore file"
+else
+  log "    note: the official CLI does not honour the vault-root ignore file (it pushed s9c/rootcheck.md)"
+fi
+# Remote -> local: documents at ignored paths are not written.
+printf 'r\n' | cli put s9l/remote.log >/dev/null
+printf 'r\n' | cli put s9l/build/r.md >/dev/null
+printf 'r\n' | cli put s9l/notes/drafts/r.md >/dev/null
+printf 'r\n' | cli put s9l/r.md >/dev/null
+cli sync >/dev/null
+lsd sync >/dev/null
+check "a remote document at a synced path arrives" file_is "$W/vault-d/s9l/r.md" "r"
+check "an accepted path inside an ignored folder arrives (nearest ignore file decides)" file_is "$W/vault-d/s9l/notes/drafts/r.md" "r"
+check "remote documents at ignored paths are not written (*.log)" gone "$W/vault-d/s9l/remote.log"
+check "remote documents at ignored paths are not written (build/)" gone "$W/vault-d/s9l/build/r.md"
+check "check-ignore names the rule" bash -c "LSYNC_DB=$DB LSYNC_VAULT=$W/vault-d LSYNC_STATE_DIR=$W/state-d LSYNC_CONFIG=$W/d.toml LSYNC_IGNORE_FILES=.gitignore '$BIN' --include s9l,s10 check-ignore s9l/notes/x.tmp 2>/dev/null | grep -q '^s9l/notes/.gitignore:2:\*.tmp'"
+# A path that becomes ignored: untracked, never deleted remotely.
+printf '*.md\n' > "$W/vault-d/s9l/sub/.gitignore"
+lsd sync >/dev/null
+rm "$W/vault-d/s9l/sub/private.md"
+lsd sync >/dev/null
+check "a file deleted after it became ignored stays live remotely" remote_live s9l/sub/private.md
+# And one that stops being ignored is fetched back.
+rm "$W/vault-d/s9l/sub/.gitignore"
+lsd sync >/dev/null
+check "a path that stops being ignored is caught up" file_is "$W/vault-d/s9l/sub/private.md" "sub/private.md"
+fi
+
+# --- S10: the trash ----------------------------------------------------------------
+if want S10; then
+log "S10 remote deletes land in .trash/ with their folders; nothing is pushed back"
+printf 'to be deleted\n' | cli put s10/sub/t.md >/dev/null
+printf 'stays\n' | cli put s10/keep.md >/dev/null
+cli sync >/dev/null
+lsd sync >/dev/null
+check "the file arrives" file_is "$W/vault-d/s10/sub/t.md" "to be deleted"
+cli rm s10/sub/t.md >/dev/null
+cli sync >/dev/null
+lsd sync >/dev/null
+check "the remote delete moved it to .trash/ with its folders" file_is "$W/vault-d/.trash/s10/sub/t.md" "to be deleted"
+check "it is gone from its folder" gone "$W/vault-d/s10/sub/t.md"
+check "the emptied folder is removed" gone "$W/vault-d/s10/sub"
+check "a folder holding anything stays" file_is "$W/vault-d/s10/keep.md" "stays"
+lsd sync >/dev/null
+check "nothing is pushed back: still deleted remotely" remote_deleted s10/sub/t.md
+check "nothing in .trash/ is pushed" test "$(couch -o /dev/null -w '%{http_code}' "$LSYNC_URL/$DB/.trash%2Fs10%2Fsub%2Ft.md")" == 404
+check "the CLI no longer lists it" bash -c "! node '$CLI_JS' '$W/clidb' --settings '$W/cli.json' cat s10/sub/t.md >/dev/null 2>&1"
 fi
 
 [[ $FAIL -eq 0 ]]

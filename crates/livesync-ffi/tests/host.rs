@@ -101,6 +101,7 @@ fn pull_only_profile_follows_the_remote_and_never_writes() {
     assert!(st.pull_only);
     assert!(st.has_index);
     assert_eq!(st.tracked_files, 1);
+    assert_eq!(st.folder_kind.as_deref(), Some("plain"));
     assert!(st.since.is_some());
     assert!(
         st.last_gate.as_deref().unwrap_or("").contains("ok"),
