@@ -10,3 +10,10 @@ cc 33e7c9b6ed179327c33375ab5740a8ebef54bec5da378b5e9f8465b762379e22 # shrinks to
 cc d3f4b450785bdaf5b6f81ef271aeeef7b8aed744fbad17494e5ce779d99d7754 # shrinks to c = Case { base: "{\n  \"a\": [\n    {\n      \"id\": \"n2\",\n      \"v\": 0\n    }\n  ]\n}", ours: "{\n  \"a\": [\n    {\n      \"id\": \"n1\",\n      \"v\": 0\n    }\n  ]\n}", theirs: "{\n  \"a\": []\n}" }, ours_newer = false
 cc 1baea318347ff9562ac61506ca4f7bdd666c89440b0a78262013fda0284776f7 # shrinks to c = Case { base: "alpha\r\nalpha\r\n", ours: "", theirs: "alpha\r\nalpha\r\nalpha" }, ours_newer = false
 cc 6a8746f6dfa9b7fe7e508c730b886f1cf4d02158ee4d932abb6d1ac5ecc73e3c # shrinks to r = Runs { base: [], at: 0, ours: ["X"], theirs: ["X"], ours_change: None, theirs_change: None, ours_newer: false }
+cc de6c2d39a540b2fd3fffed9611bf290ddc2a5fb7f3d51a0c59d94a2e5901529e # shrinks to c = Case { base: "", ours: "bravo\n", theirs: "bravo" }, ours_newer = false
+cc 11e36a07c92fae96da9a34eb54dcab2f04314e0a94e85d19baead276a3b5cf4c # shrinks to c = Case { base: "base 0\nbase 1", ours: "base 0", theirs: "base 0\nbase 1\n" }, ours_newer = false
+cc b6f79f859cb09d13476e92d491624f2f7fc88c1e74dd725da9998b794a5d78ba # shrinks to c = Case { base: "alpha\nalpha\nx", ours: "alpha\nalpha\nalpha changed", theirs: "alpha\nalpha\nx\n" }, ours_newer = false
+cc c7a9806fe47971842c031d33c531f1d5d95f089aa10ac865990dee82a27eaff2 # shrinks to c = Case { base: "alpha\nalpha\nalpha\nbravo", ours: "alpha changed\nalpha\nalpha\n", theirs: "bravo\n" }, ours_newer = false
+cc 1a57690d2a112727d81ee35ccdee5a03da825a20dcea5ce6480866853bfefd23 # shrinks to g = Truth { n: 1, lines: [(0, 1)], gaps: [(4, 1), (0, 1)], ours_newer: true, fin: [true, true, false] }
+cc 6dabf82d243f1f59d495ebcb38f10b6951685be89dc6bccda4c19c42c862808d # shrinks to c = Case { base: "charlie\n---\n", ours: "---\ncharlie\n---\nbravo", theirs: "bravo\n---" }, ours_newer = false
+cc 59afdb465360abc47d2fc5d3de0c5a511da7294e2ad35dd6b0fd953c6437ac19 # shrinks to g = Truth { n: 2, lines: [(0, 1), (2, 1)], gaps: [(4, 1), (0, 1), (0, 1)], ours_newer: true, fin: [false, false, false] }

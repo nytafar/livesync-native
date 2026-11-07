@@ -10,6 +10,11 @@
 //! up on a diff that takes longer than a second and returns delete-all/insert-all,
 //! which depends on the machine. Without it the result is the one upstream
 //! computes whenever it finishes in time.
+//!
+//! Every step counts against a [`Budget`] instead: a deterministic count of
+//! the work done (lines read, tokens compared, diagonals searched), so the
+//! same input runs out of it on every machine, and a diff that would take too
+//! long ends with [`OutOfBudget`] rather than a result.
 
 /// A diff operation, with upstream's numbering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +26,49 @@ pub(crate) enum Op {
 
 pub(crate) type Diff = (Op, Vec<u32>);
 
+/// The work a merge may do, in steps (see the module docs).
+#[derive(Debug)]
+pub(crate) struct Budget {
+    left: u64,
+}
+
+/// The [`Budget`] ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutOfBudget;
+
+impl Budget {
+    pub fn new(steps: u64) -> Budget {
+        Budget { left: steps }
+    }
+    /// For tests and the model of upstream, which are not bounded.
+    pub fn unlimited() -> Budget {
+        Budget { left: u64::MAX }
+    }
+    /// Count `n` steps.
+    pub fn spend(&mut self, n: usize) -> Result<(), OutOfBudget> {
+        match self.left.checked_sub(n as u64 + 1) {
+            Some(l) => {
+                self.left = l;
+                Ok(())
+            }
+            None => {
+                self.left = 0;
+                Err(OutOfBudget)
+            }
+        }
+    }
+    /// Count the work of reading `text` (splitting, hashing or copying its
+    /// lines): four steps a line and one per five bytes, which costs about
+    /// what a step of the diff does.
+    pub fn read(&mut self, text: &str) -> Result<(), OutOfBudget> {
+        self.spend(text.len() / 5 + 4 * text.bytes().filter(|b| *b == b'\n').count())
+    }
+    #[cfg(test)]
+    pub fn left(&self) -> u64 {
+        self.left
+    }
+}
+
 /// Lines as tokens: `line_array[token]` is the line, `line_array[0]` is unused.
 pub(crate) struct Lines<'a> {
     pub line_array: Vec<&'a str>,
@@ -31,16 +79,22 @@ pub(crate) struct Lines<'a> {
 /// `diff_linesToChars_`: split both texts into lines (each keeping its `\n`)
 /// and number the distinct lines. As upstream, text1 may use 40 000 distinct
 /// lines and both together 65 535; past that the rest of a text is one line.
-pub(crate) fn lines_to_chars<'a>(text1: &'a str, text2: &'a str) -> Lines<'a> {
+pub(crate) fn lines_to_chars<'a>(
+    text1: &'a str,
+    text2: &'a str,
+    budget: &mut Budget,
+) -> Result<Lines<'a>, OutOfBudget> {
+    budget.read(text1)?;
+    budget.read(text2)?;
     let mut line_array: Vec<&'a str> = vec![""];
     let mut hash: std::collections::HashMap<&'a str, u32> = std::collections::HashMap::new();
     let chars1 = munge(text1, 40_000, &mut line_array, &mut hash);
     let chars2 = munge(text2, 65_535, &mut line_array, &mut hash);
-    Lines {
+    Ok(Lines {
         line_array,
         chars1,
         chars2,
-    }
+    })
 }
 
 fn munge<'a>(
@@ -81,12 +135,13 @@ fn munge<'a>(
 }
 
 /// `diff_main(text1, text2, false)` on tokens.
-pub(crate) fn diff_main(text1: &[u32], text2: &[u32]) -> Vec<Diff> {
+pub(crate) fn diff_main(text1: &[u32], text2: &[u32], b: &mut Budget) -> Result<Vec<Diff>, OutOfBudget> {
+    b.spend(text1.len() + text2.len())?;
     if text1 == text2 {
         if !text1.is_empty() {
-            return vec![(Op::Equal, text1.to_vec())];
+            return Ok(vec![(Op::Equal, text1.to_vec())]);
         }
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let prefix = common_prefix(text1, text2);
     let (common_prefix, text1, text2) = (&text1[..prefix], &text1[prefix..], &text2[prefix..]);
@@ -95,64 +150,69 @@ pub(crate) fn diff_main(text1: &[u32], text2: &[u32]) -> Vec<Diff> {
     let text1 = &text1[..text1.len() - suffix];
     let text2 = &text2[..text2.len() - suffix];
 
-    let mut diffs = compute(text1, text2);
+    let mut diffs = compute(text1, text2, b)?;
     if !common_prefix.is_empty() {
         diffs.insert(0, (Op::Equal, common_prefix.to_vec()));
     }
     if !common_suffix.is_empty() {
         diffs.push((Op::Equal, common_suffix.to_vec()));
     }
-    cleanup_merge(&mut diffs);
-    diffs
+    cleanup_merge(&mut diffs, b)?;
+    Ok(diffs)
 }
 
-fn compute(text1: &[u32], text2: &[u32]) -> Vec<Diff> {
+fn compute(text1: &[u32], text2: &[u32], b: &mut Budget) -> Result<Vec<Diff>, OutOfBudget> {
     if text1.is_empty() {
-        return vec![(Op::Insert, text2.to_vec())];
+        return Ok(vec![(Op::Insert, text2.to_vec())]);
     }
     if text2.is_empty() {
-        return vec![(Op::Delete, text1.to_vec())];
+        return Ok(vec![(Op::Delete, text1.to_vec())]);
     }
     let (long, short) = if text1.len() > text2.len() {
         (text1, text2)
     } else {
         (text2, text1)
     };
-    if let Some(i) = index_of(long, short, 0) {
+    if let Some(i) = index_of(long, short, 0, b)? {
         let op = if text1.len() > text2.len() {
             Op::Delete
         } else {
             Op::Insert
         };
-        return vec![
+        return Ok(vec![
             (op, long[..i].to_vec()),
             (Op::Equal, short.to_vec()),
             (op, long[i + short.len()..].to_vec()),
-        ];
+        ]);
     }
     if short.len() == 1 {
-        return vec![(Op::Delete, text1.to_vec()), (Op::Insert, text2.to_vec())];
+        return Ok(vec![(Op::Delete, text1.to_vec()), (Op::Insert, text2.to_vec())]);
     }
-    if let Some(hm) = half_match(text1, text2) {
-        let mut diffs = diff_main(hm.text1_a, hm.text2_a);
+    if let Some(hm) = half_match(text1, text2, b)? {
+        let mut diffs = diff_main(hm.text1_a, hm.text2_a, b)?;
         diffs.push((Op::Equal, hm.common));
-        diffs.extend(diff_main(hm.text1_b, hm.text2_b));
-        return diffs;
+        diffs.extend(diff_main(hm.text1_b, hm.text2_b, b)?);
+        return Ok(diffs);
     }
-    bisect(text1, text2)
+    bisect(text1, text2, b)
 }
 
-fn index_of(hay: &[u32], needle: &[u32], from: usize) -> Option<usize> {
+/// The first `needle` in `hay` at or after `from`, as `indexOf`.
+fn index_of(hay: &[u32], needle: &[u32], from: usize, b: &mut Budget) -> Result<Option<usize>, OutOfBudget> {
     if needle.is_empty() {
-        return (from <= hay.len()).then_some(from);
+        return Ok((from <= hay.len()).then_some(from));
     }
     if from >= hay.len() || needle.len() > hay.len() - from {
-        return None;
+        return Ok(None);
     }
-    hay[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|p| p + from)
+    for at in from..=hay.len() - needle.len() {
+        let same = common_prefix(&hay[at..at + needle.len()], needle);
+        b.spend(same)?;
+        if same == needle.len() {
+            return Ok(Some(at));
+        }
+    }
+    Ok(None)
 }
 
 fn common_prefix(a: &[u32], b: &[u32]) -> usize {
@@ -174,19 +234,19 @@ struct HalfMatch<'a> {
 /// `[long_a, long_b, short_a, short_b, common]`
 type Hm<'a> = (&'a [u32], &'a [u32], &'a [u32], &'a [u32], Vec<u32>);
 
-fn half_match<'a>(text1: &'a [u32], text2: &'a [u32]) -> Option<HalfMatch<'a>> {
+fn half_match<'a>(text1: &'a [u32], text2: &'a [u32], b: &mut Budget) -> Result<Option<HalfMatch<'a>>, OutOfBudget> {
     let (long, short) = if text1.len() > text2.len() {
         (text1, text2)
     } else {
         (text2, text1)
     };
     if long.len() < 4 || short.len() * 2 < long.len() {
-        return None;
+        return Ok(None);
     }
-    let hm1 = half_match_i(long, short, long.len().div_ceil(4));
-    let hm2 = half_match_i(long, short, long.len().div_ceil(2));
+    let hm1 = half_match_i(long, short, long.len().div_ceil(4), b)?;
+    let hm2 = half_match_i(long, short, long.len().div_ceil(2), b)?;
     let hm = match (hm1, hm2) {
-        (None, None) => return None,
+        (None, None) => return Ok(None),
         (Some(h), None) | (None, Some(h)) => h,
         (Some(h1), Some(h2)) => {
             if h1.4.len() > h2.4.len() {
@@ -197,7 +257,7 @@ fn half_match<'a>(text1: &'a [u32], text2: &'a [u32]) -> Option<HalfMatch<'a>> {
         }
     };
     let (la, lb, sa, sb, common) = hm;
-    Some(if text1.len() > text2.len() {
+    Ok(Some(if text1.len() > text2.len() {
         HalfMatch {
             text1_a: la,
             text1_b: lb,
@@ -213,17 +273,23 @@ fn half_match<'a>(text1: &'a [u32], text2: &'a [u32]) -> Option<HalfMatch<'a>> {
             text2_b: lb,
             common,
         }
-    })
+    }))
 }
 
-fn half_match_i<'a>(long: &'a [u32], short: &'a [u32], i: usize) -> Option<Hm<'a>> {
+fn half_match_i<'a>(
+    long: &'a [u32],
+    short: &'a [u32],
+    i: usize,
+    b: &mut Budget,
+) -> Result<Option<Hm<'a>>, OutOfBudget> {
     let seed = &long[i..(i + long.len() / 4).min(long.len())];
     let mut best_common: Vec<u32> = Vec::new();
     let mut best: Option<(usize, usize, usize, usize)> = None;
     let mut from = 0usize;
-    while let Some(j) = index_of(short, seed, from) {
+    while let Some(j) = index_of(short, seed, from, b)? {
         let prefix_len = common_prefix(&long[i..], &short[j..]);
         let suffix_len = common_suffix(&long[..i], &short[..j]);
+        b.spend(prefix_len + suffix_len)?;
         if best_common.len() < suffix_len + prefix_len {
             best_common = short[j - suffix_len..j + prefix_len].to_vec();
             best = Some((i - suffix_len, i + prefix_len, j - suffix_len, j + prefix_len));
@@ -231,19 +297,28 @@ fn half_match_i<'a>(long: &'a [u32], short: &'a [u32], i: usize) -> Option<Hm<'a
         from = j + 1;
     }
     if best_common.len() * 2 >= long.len() {
-        let (la, lb, sa, sb) = best?;
-        Some((&long[..la], &long[lb..], &short[..sa], &short[sb..], best_common))
+        let Some((la, lb, sa, sb)) = best else {
+            return Ok(None);
+        };
+        Ok(Some((
+            &long[..la],
+            &long[lb..],
+            &short[..sa],
+            &short[sb..],
+            best_common,
+        )))
     } else {
-        None
+        Ok(None)
     }
 }
 
-fn bisect(text1: &[u32], text2: &[u32]) -> Vec<Diff> {
+fn bisect(text1: &[u32], text2: &[u32], b: &mut Budget) -> Result<Vec<Diff>, OutOfBudget> {
     let n1 = text1.len() as isize;
     let n2 = text2.len() as isize;
     let max_d = (n1 + n2 + 1) / 2;
     let v_offset = max_d;
     let v_length = 2 * max_d;
+    b.spend(2 * v_length as usize)?;
     let mut v1 = vec![-1isize; v_length as usize];
     let mut v2 = vec![-1isize; v_length as usize];
     v1[(v_offset + 1) as usize] = 0;
@@ -261,10 +336,12 @@ fn bisect(text1: &[u32], text2: &[u32]) -> Vec<Diff> {
                 v1[(k1_offset - 1) as usize] + 1
             };
             let mut y1 = x1 - k1;
+            let from = x1;
             while x1 < n1 && y1 < n2 && text1[x1 as usize] == text2[y1 as usize] {
                 x1 += 1;
                 y1 += 1;
             }
+            b.spend((x1 - from) as usize)?;
             v1[k1_offset as usize] = x1;
             if x1 > n1 {
                 k1end += 2;
@@ -275,7 +352,7 @@ fn bisect(text1: &[u32], text2: &[u32]) -> Vec<Diff> {
                 if k2_offset >= 0 && k2_offset < v_length && v2[k2_offset as usize] != -1 {
                     let x2 = n1 - v2[k2_offset as usize];
                     if x1 >= x2 {
-                        return bisect_split(text1, text2, x1 as usize, y1 as usize);
+                        return bisect_split(text1, text2, x1 as usize, y1 as usize, b);
                     }
                 }
             }
@@ -290,10 +367,12 @@ fn bisect(text1: &[u32], text2: &[u32]) -> Vec<Diff> {
                 v2[(k2_offset - 1) as usize] + 1
             };
             let mut y2 = x2 - k2;
+            let from = x2;
             while x2 < n1 && y2 < n2 && text1[(n1 - x2 - 1) as usize] == text2[(n2 - y2 - 1) as usize] {
                 x2 += 1;
                 y2 += 1;
             }
+            b.spend((x2 - from) as usize)?;
             v2[k2_offset as usize] = x2;
             if x2 > n1 {
                 k2end += 2;
@@ -306,26 +385,28 @@ fn bisect(text1: &[u32], text2: &[u32]) -> Vec<Diff> {
                     let y1 = v_offset + x1 - k1_offset;
                     let x2m = n1 - x2;
                     if x1 >= x2m {
-                        return bisect_split(text1, text2, x1 as usize, y1 as usize);
+                        return bisect_split(text1, text2, x1 as usize, y1 as usize, b);
                     }
                 }
             }
             k2 += 2;
         }
     }
-    vec![(Op::Delete, text1.to_vec()), (Op::Insert, text2.to_vec())]
+    Ok(vec![(Op::Delete, text1.to_vec()), (Op::Insert, text2.to_vec())])
 }
 
-fn bisect_split(text1: &[u32], text2: &[u32], x: usize, y: usize) -> Vec<Diff> {
-    let mut diffs = diff_main(&text1[..x], &text2[..y]);
-    diffs.extend(diff_main(&text1[x..], &text2[y..]));
-    diffs
+fn bisect_split(text1: &[u32], text2: &[u32], x: usize, y: usize, b: &mut Budget) -> Result<Vec<Diff>, OutOfBudget> {
+    let mut diffs = diff_main(&text1[..x], &text2[..y], b)?;
+    diffs.extend(diff_main(&text1[x..], &text2[y..], b)?);
+    Ok(diffs)
 }
 
 /// `diff_cleanupMerge`: join adjacent edits, factor out common affixes and
 /// shift single edits sideways, as upstream.
-fn cleanup_merge(diffs: &mut Vec<Diff>) {
+fn cleanup_merge(diffs: &mut Vec<Diff>, b: &mut Budget) -> Result<(), OutOfBudget> {
     loop {
+        // Each pass reads (and may move) every token.
+        b.spend(diffs.len() + diffs.iter().map(|d| d.1.len()).sum::<usize>())?;
         diffs.push((Op::Equal, Vec::new()));
         let mut pointer = 0usize;
         let mut count_delete = 0usize;
@@ -401,6 +482,7 @@ fn cleanup_merge(diffs: &mut Vec<Diff>) {
         let mut pointer = 1usize;
         while pointer + 1 < diffs.len() {
             if diffs[pointer - 1].0 == Op::Equal && diffs[pointer + 1].0 == Op::Equal {
+                b.spend(diffs[pointer - 1].1.len() + diffs[pointer].1.len() + diffs[pointer + 1].1.len())?;
                 let prev = diffs[pointer - 1].1.clone();
                 let next = diffs[pointer + 1].1.clone();
                 let cur = diffs[pointer].1.clone();
@@ -425,7 +507,7 @@ fn cleanup_merge(diffs: &mut Vec<Diff>) {
             pointer += 1;
         }
         if !changes {
-            return;
+            return Ok(());
         }
     }
 }
@@ -445,8 +527,10 @@ pub(crate) fn to_text(diffs: &[Diff], line_array: &[&str]) -> Vec<(Op, String)> 
 }
 
 /// The line-mode diff mergeSensibly computes between two texts.
-pub(crate) fn line_diff(a: &str, b: &str) -> Vec<(Op, String)> {
-    let lines = lines_to_chars(a, b);
-    let diffs = diff_main(&lines.chars1, &lines.chars2);
-    to_text(&diffs, &lines.line_array)
+pub(crate) fn line_diff(a: &str, b: &str, budget: &mut Budget) -> Result<Vec<(Op, String)>, OutOfBudget> {
+    let lines = lines_to_chars(a, b, budget)?;
+    let diffs = diff_main(&lines.chars1, &lines.chars2, budget)?;
+    budget.read(a)?;
+    budget.read(b)?;
+    Ok(to_text(&diffs, &lines.line_array))
 }

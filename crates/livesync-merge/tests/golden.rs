@@ -2,10 +2,15 @@
 //! `ConflictManager`) as an oracle. Every case must be upstream's result (byte
 //! for byte for text, token for token for JSON, which upstream writes
 //! unindented and this crate in the file's style), or open where upstream
-//! merges (stricter), or carry a deviation whose shape is checked here. The
-//! crate's own model of upstream must match upstream's output, case by case.
+//! merges (stricter), or carry a deviation whose shape is checked here. Every
+//! line merge that writes, labelled or not, must also pass the placement
+//! oracle (`oracle/mod.rs`), so no label can cover a wrong merge. The crate's
+//! own model of upstream must match upstream's output, case by case.
+mod oracle;
+
 use livesync_merge::{
-    merge, upstream_line_merge, upstream_object_merge, Deviation, Input, Kind, Outcome, Rule, Settings, Version,
+    line_merge_trace, merge, upstream_line_merge, upstream_object_merge, Deviation, Input, Kind, Outcome, Rule,
+    Settings, Version,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -190,6 +195,7 @@ fn merges_match_upstream() {
     assert!(cases.len() >= 600, "corpus too small: {}", cases.len());
     let mut agreed = 0;
     let mut stricter = 0;
+    let mut oracle_checked = 0;
     let mut per_deviation: BTreeMap<&str, usize> = BTreeMap::new();
     let mut now_open: BTreeMap<String, usize> = BTreeMap::new();
     for c in &cases {
@@ -204,6 +210,20 @@ fn merges_match_upstream() {
         if r.rule == Rule::Identical {
             // Rule 1 runs before the merge, upstream (`tryAutoMerge`) as here.
             continue;
+        }
+        if r.rule == Rule::Lines {
+            let (b, l, rt) = (str_of(c, "base"), str_of(c, "left"), str_of(c, "right"));
+            let t = line_merge_trace(b, l, rt, ours_first(c)).expect("within the budget");
+            assert_eq!(t.text, r.ours, "{name}: the trace is not the merge");
+            if let Err(e) = oracle::check(b, l, rt, ours_first(c), &t) {
+                panic!(
+                    "{name}: {e} ({:?})\nbase {b:?}\nleft {l:?}\nright {rt:?}\nmerged {:?}\nupstream {upstream:?}",
+                    r.deviations, r.ours
+                );
+            }
+            if r.ours.is_some() {
+                oracle_checked += 1;
+            }
         }
         if name.contains("/deviation-") {
             assert!(
@@ -251,7 +271,8 @@ fn merges_match_upstream() {
     }
     eprintln!(
         "merge corpus: {} cases, {agreed} agree with upstream, {stricter} open where upstream merges \
-         (no deviation); per deviation: {per_deviation:?}; open where upstream merges, by rule: {now_open:?}",
+         (no deviation); {oracle_checked} line merges pass the oracle; per deviation: {per_deviation:?}; \
+         open where upstream merges, by rule: {now_open:?}",
         cases.len()
     );
     assert!(

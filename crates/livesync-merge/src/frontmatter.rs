@@ -7,6 +7,7 @@
 //! whose keys are exactly the entries found, in order. Anything else is not
 //! understood and stays open.
 
+use crate::dmp::{Budget, OutOfBudget};
 use crate::lines;
 use std::collections::HashSet;
 use yaml_rust2::{Yaml, YamlLoader};
@@ -215,12 +216,13 @@ pub(crate) fn merge_block(
     ours_first: bool,
     ours_newer: Option<bool>,
     newest_keys: &[String],
-) -> FmOutcome {
+    budget: &mut Budget,
+) -> Result<FmOutcome, OutOfBudget> {
     if base.block == ours.block || base.block == theirs.block || ours.block == theirs.block {
-        return FmOutcome::NotApplicable;
+        return Ok(FmOutcome::NotApplicable);
     }
     if base.open != ours.open || base.open != theirs.open {
-        return FmOutcome::NotApplicable;
+        return Ok(FmOutcome::NotApplicable);
     }
     let parsed = [
         (crate::Which::Base, entries(base.block)),
@@ -231,7 +233,7 @@ pub(crate) fn merge_block(
     for (w, p) in parsed {
         match p {
             Ok(e) => es.push(e),
-            Err(_) => return FmOutcome::Unparsable(w),
+            Err(_) => return Ok(FmOutcome::Unparsable(w)),
         }
     }
     let [b, o, t] = [&es[0], &es[1], &es[2]];
@@ -245,16 +247,16 @@ pub(crate) fn merge_block(
             })
             .collect()
     };
-    let w = lines::walk(&order(b), &order(o), &order(t), ours_first);
+    let w = lines::walk(&order(b), &order(o), &order(t), ours_first, budget)?;
     let Some(merged_order) = w.text() else {
-        return FmOutcome::Order;
+        return Ok(FmOutcome::Order);
     };
     let order_keys: Vec<Option<String>> = merged_order
         .lines()
         .map(|l| l.strip_prefix('k').map(str::to_string))
         .collect();
     if order_keys.iter().collect::<HashSet<_>>().len() != order_keys.len() {
-        return FmOutcome::Order;
+        return Ok(FmOutcome::Order);
     }
 
     let get = |e: &[Entry], k: &Option<String>| e.iter().find(|x| &x.key == k).map(|x| x.text.to_string());
@@ -307,7 +309,7 @@ pub(crate) fn merge_block(
         }
         if !matches!(p, Part::Conflict { .. }) {
             // Every entry kept must have found its place.
-            return FmOutcome::Order;
+            return Ok(FmOutcome::Order);
         }
         let src = [b, o, t]
             .into_iter()
@@ -322,5 +324,5 @@ pub(crate) fn merge_block(
         parts.insert(i, p.clone());
         placed.insert(i, k.clone());
     }
-    FmOutcome::Block { parts, newest_taken }
+    Ok(FmOutcome::Block { parts, newest_taken })
 }

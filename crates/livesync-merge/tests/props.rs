@@ -2,9 +2,14 @@
 //! (or a JSON value) that either side added, nor brings back one a side
 //! deleted; changes are placed by base position; two runs inserted at one
 //! point come out whole, the older first; `merge3` agrees with `merge`; and a
-//! merge is symmetric up to the order the mtimes give.
+//! merge is symmetric up to the order the mtimes give. Every clean line merge
+//! is also checked against the oracle (`oracle/mod.rs`), and a placement fuzz
+//! checks merges against the ground truth its generator knows.
+mod oracle;
+
 use livesync_merge::{
-    merge, merge3, Input, Kind, Labels, Merge, Outcome, Overlap, Reason, Rule, Settings, Side, Version,
+    line_merge_trace, merge, merge3, upstream_line_merge, Input, Kind, Labels, Merge, Outcome, Overlap, Reason, Rule,
+    Settings, Side, Version,
 };
 use proptest::prelude::*;
 use serde_json::{json, Map, Value};
@@ -190,14 +195,37 @@ fn counts(s: &str) -> HashMap<&str, usize> {
     m
 }
 
+/// The base's lines, its last line without a newline counted with one too: a
+/// side that only added the newline did not add a line.
+fn base_counts(base: &str) -> HashMap<String, usize> {
+    let mut m: HashMap<String, usize> = counts(base).into_iter().map(|(l, n)| (l.to_string(), n)).collect();
+    if let Some(last) = base.split_inclusive('\n').next_back().filter(|l| !l.ends_with('\n')) {
+        for eol in ["\n", "\r\n"] {
+            *m.entry(format!("{last}{eol}")).or_default() += 1;
+        }
+    }
+    m
+}
+
+/// How often `line` is in a text's `counts`, a last line without its newline
+/// counted as the same line with one, and the other way round.
+fn found(o: &HashMap<&str, usize>, line: &str) -> usize {
+    let n = |l: &str| o.get(l).copied().unwrap_or(0);
+    match line.strip_suffix('\n') {
+        None => n(line) + n(&format!("{line}\n")) + n(&format!("{line}\r\n")),
+        Some(l) => n(line) + n(l.strip_suffix('\r').unwrap_or(l)),
+    }
+}
+
 /// Every line a side has more often than the base must be in the result at
-/// least that many times more.
+/// least that many times more (a side's last line without its newline may be
+/// there with one, where both sides added it).
 fn keeps_added_lines(c: &Case, out: &str) -> Result<(), TestCaseError> {
-    let (b, o) = (counts(&c.base), counts(out));
+    let (b, o) = (base_counts(&c.base), counts(out));
     for side in [&c.ours, &c.theirs] {
         for (line, n) in counts(side) {
             let added = n.saturating_sub(b.get(line).copied().unwrap_or(0));
-            let got = o.get(line).copied().unwrap_or(0);
+            let got = found(&o, line);
             prop_assert!(
                 got >= added,
                 "line {line:?} added {added}x, merged has {got}x\n{c:?}\nmerged {out:?}"
@@ -241,6 +269,26 @@ fn emptied_stays_open(c: &Case, m: &Merge) -> Result<(), TestCaseError> {
     Ok(())
 }
 
+/// The line merge of `c` (as [`Kind::Text`]) passes the oracle, and its trace
+/// is the merge.
+fn passes_oracle(c: &Case, ours_mtime: i64, theirs_mtime: i64) -> Result<(), TestCaseError> {
+    let m = run(Kind::Text, c, ours_mtime, theirs_mtime);
+    if m.rule != Rule::Lines {
+        return Ok(());
+    }
+    let ours_first = ours_mtime <= theirs_mtime;
+    let t = line_merge_trace(&c.base, &c.ours, &c.theirs, ours_first).expect("within the budget");
+    let written = match &m.outcome {
+        Outcome::Write(w) => Some(String::from_utf8(w.clone()).unwrap()),
+        _ => None,
+    };
+    prop_assert_eq!(&t.text, &written, "the trace is not the merge\n{:?}", c);
+    if let Err(e) = oracle::check(&c.base, &c.ours, &c.theirs, ours_first, &t) {
+        prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, written);
+    }
+    Ok(())
+}
+
 fn swapped(c: &Case) -> Case {
     Case {
         base: c.base.clone(),
@@ -275,6 +323,7 @@ proptest! {
                 keeps_added_lines(&c, std::str::from_utf8(&out).unwrap())?;
             }
         }
+        passes_oracle(&c, mo, mt)?;
     }
 
     #[test]
@@ -405,6 +454,7 @@ proptest! {
             r.side(older, r.ours_change, newer, r.theirs_change)
         };
         let (mo, mt) = if r.ours_newer { (3000, 2000) } else { (2000, 3000) };
+        passes_oracle(&c, mo, mt)?;
         for kind in [Kind::Text, Kind::Markdown] {
             match run(kind, &c, mo, mt).outcome {
                 Outcome::Write(out) => prop_assert_eq!(std::str::from_utf8(&out).unwrap(), want.as_str(), "{:?}", c),
@@ -509,6 +559,7 @@ proptest! {
         let c = Case { base: join(&base, "\n", true), ours: p.text(1), theirs: p.text(2) };
         let (mo, mt) = if p.ours_newer { (3000, 2000) } else { (2000, 3000) };
         let want = p.text(0);
+        passes_oracle(&c, mo, mt)?;
         for kind in [Kind::Text, Kind::Markdown] {
             let m = run(kind, &c, mo, mt);
             match m.outcome {
@@ -557,18 +608,12 @@ fn merge3_agrees(kind: Kind, c: &Case, mo: i64, mt: i64) -> Result<(), TestCaseE
         Outcome::Open(_) => {
             prop_assert!(r.conflicts >= 1, "open, but merge3 has no conflict\n{:?}\n{:?}", c, r);
             if kind != Kind::Object {
-                let (b, o) = (counts(&c.base), counts(&r.text));
+                let (b, o) = (base_counts(&c.base), counts(&r.text));
                 for side in [&c.ours, &c.theirs] {
                     for (line, n) in counts(side) {
                         let added = n.saturating_sub(b.get(line).copied().unwrap_or(0));
                         // A last line without its newline gets one before a marker.
-                        let with = |e: &str| o.get(format!("{line}{e}").as_str()).copied().unwrap_or(0);
-                        let got = o.get(line).copied().unwrap_or(0)
-                            + if line.ends_with('\n') {
-                                0
-                            } else {
-                                with("\n") + with("\r\n")
-                            };
+                        let got = found(&o, line);
                         prop_assert!(got >= added, "{line:?} not shown\n{c:?}\n{}", r.text);
                     }
                 }
@@ -655,6 +700,286 @@ proptest! {
                 let out = std::str::from_utf8(&out).unwrap();
                 keeps_added_lines(&c, out)?;
                 keeps_deletions(&c, out)?;
+            }
+        }
+        passes_oracle(&c, mo, mt)?;
+    }
+}
+
+/// Every kind of change on each side, per base line and per gap between
+/// lines, touching ones included, with lines named after where they belong:
+/// `b i` base line i, `o l i k`/`t l i k`/`s l i k` a replacement of line i by
+/// ours, theirs or both alike, `o g i k`/`t g i k`/`s g i k` lines inserted in
+/// gap i (before base line i). So the right merge is known without a merge.
+#[derive(Clone, Debug)]
+struct Truth {
+    n: usize,
+    /// Per base line: 0 kept, 1 ours deletes, 2 theirs deletes, 3 both delete,
+    /// 4 ours replaces, 5 theirs replaces, 6 both replace alike, 7 both
+    /// replace differently; and with how many lines.
+    lines: Vec<(u8, usize)>,
+    /// Per gap: 0 nothing, 1 ours inserts, 2 theirs inserts, 3 both the same,
+    /// 4 both different lines, 5 theirs inserts what ours does and one more, 6
+    /// ours what theirs does and one more; and how many lines.
+    gaps: Vec<(u8, usize)>,
+    ours_newer: bool,
+    /// Whether base, ours and theirs end with a newline.
+    fin: [bool; 3],
+}
+
+fn truth_case() -> impl Strategy<Value = Truth> {
+    (
+        0..8usize,
+        any::<bool>(),
+        prop::array::uniform3(prop::bool::weighted(0.85)),
+    )
+        .prop_flat_map(|(n, ours_newer, fin)| {
+            (
+                Just(n),
+                prop::collection::vec(
+                    (prop::sample::select(&[0u8, 0, 0, 1, 2, 3, 4, 5, 6, 7][..]), 1..3usize),
+                    n,
+                ),
+                prop::collection::vec(
+                    (prop::sample::select(&[0u8, 0, 0, 1, 2, 3, 4, 5, 6][..]), 1..3usize),
+                    n + 1,
+                ),
+                Just(ours_newer),
+                Just(fin),
+            )
+        })
+        .prop_map(|(n, lines, gaps, ours_newer, fin)| Truth {
+            n,
+            lines,
+            gaps,
+            ours_newer,
+            fin,
+        })
+}
+
+impl Truth {
+    /// Side 1 ours, 2 theirs.
+    fn side(&self, side: u8) -> Vec<String> {
+        let mut v = Vec::new();
+        for g in 0..=self.n {
+            let (op, k) = self.gaps[g];
+            let mk = |who: &str, k: usize| (0..k).map(|j| format!("{who} g {g} {j}")).collect::<Vec<_>>();
+            let extra = |who: &str| format!("{who} g {g} extra");
+            match (op, side) {
+                (1, 1) => v.extend(mk("o", k)),
+                (2, 2) => v.extend(mk("t", k)),
+                (3, _) => v.extend(mk("s", k)),
+                (4, 1) => v.extend(mk("o", k)),
+                (4, 2) => v.extend(mk("t", k)),
+                (5, _) | (6, _) => {
+                    v.extend(mk("s", k));
+                    if (op, side) == (5, 2) || (op, side) == (6, 1) {
+                        v.push(extra(if side == 1 { "o" } else { "t" }));
+                    }
+                }
+                _ => {}
+            }
+            if g < self.n {
+                let (op, k) = self.lines[g];
+                let mk = |who: &str, k: usize| (0..k).map(|j| format!("{who} l {g} {j}")).collect::<Vec<_>>();
+                match (op, side) {
+                    (0, _) | (1, 2) | (2, 1) | (4, 2) | (5, 1) => v.push(format!("b {g}")),
+                    (4, 1) | (7, 1) => v.extend(mk("o", k)),
+                    (5, 2) | (7, 2) => v.extend(mk("t", k)),
+                    (6, _) => v.extend(mk("s", k)),
+                    _ => {}
+                }
+            }
+        }
+        v
+    }
+    fn text(&self, lines: &[String], fin: bool) -> String {
+        join(lines, "\n", fin)
+    }
+    fn case(&self) -> Case {
+        let base: Vec<String> = (0..self.n).map(|i| format!("b {i}")).collect();
+        Case {
+            base: self.text(&base, self.fin[0]),
+            ours: self.text(&self.side(1), self.fin[1]),
+            theirs: self.text(&self.side(2), self.fin[2]),
+        }
+    }
+    /// Where a line belongs: base line i at 2i + 1, gap i at 2i.
+    fn coord(line: &str) -> usize {
+        let w: Vec<&str> = line.split(' ').collect();
+        match w.as_slice() {
+            ["b", i] => 2 * i.parse::<usize>().unwrap() + 1,
+            [_, "l", i, ..] => 2 * i.parse::<usize>().unwrap() + 1,
+            [_, "g", i, ..] => 2 * i.parse::<usize>().unwrap(),
+            _ => panic!("{line:?}"),
+        }
+    }
+    /// Whether `out` is a right merge: every line either side added once, the
+    /// base lines both kept, nothing else; in base order; each side's lines in
+    /// that side's order; two different runs at a gap with nothing changed
+    /// beside it whole, the older first.
+    fn right(&self, out: &str) -> Result<(), String> {
+        let got: Vec<&str> = out.split('\n').filter(|l| !l.is_empty()).collect();
+        let (o, t) = (self.side(1), self.side(2));
+        let mut want: Vec<&str> = Vec::new();
+        for l in o.iter().chain(&t) {
+            if !l.starts_with("b ") && !want.contains(&l.as_str()) {
+                want.push(l);
+            }
+        }
+        for l in o.iter().filter(|l| l.starts_with("b ") && t.contains(l)) {
+            want.push(l);
+        }
+        for w in &want {
+            let n = got.iter().filter(|g| *g == w).count();
+            if n != 1 {
+                return Err(format!("{w:?} is there {n}x"));
+            }
+        }
+        if let Some(x) = got.iter().find(|g| !want.contains(g)) {
+            return Err(format!("{x:?} should not be there"));
+        }
+        if got.windows(2).any(|p| Self::coord(p[0]) > Self::coord(p[1])) {
+            return Err("not in base order".into());
+        }
+        for side in [&o, &t] {
+            let mut it = side.iter();
+            if !got
+                .iter()
+                .filter(|l| side.iter().any(|s| s == *l))
+                .all(|l| it.any(|s| s == l))
+            {
+                return Err("a side's own order changed".into());
+            }
+        }
+        for g in 0..=self.n {
+            // Unchanged on both sides, its line end included.
+            let c = self.case();
+            let piece = |text: &str, i: usize| -> Option<String> {
+                text.split_inclusive('\n')
+                    .find(|l| l.trim_end_matches('\n') == format!("b {i}"))
+                    .map(str::to_string)
+            };
+            let quiet = |i: Option<usize>| {
+                i.is_none_or(|i| {
+                    let b = piece(&c.base, i);
+                    self.lines[i].0 == 0 && piece(&c.ours, i) == b && piece(&c.theirs, i) == b
+                })
+            };
+            if self.gaps[g].0 != 4 || !quiet(g.checked_sub(1)) || !quiet((g < self.n).then_some(g)) {
+                continue;
+            }
+            let at = |who: &str| -> Vec<usize> {
+                let p = format!("{who} g {g} ");
+                got.iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.starts_with(&p))
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            let (older, newer) = if self.ours_newer {
+                (at("t"), at("o"))
+            } else {
+                (at("o"), at("t"))
+            };
+            let block = |v: &[usize]| v.windows(2).all(|w| w[1] == w[0] + 1);
+            if !block(&older) || !block(&newer) || older.last() > newer.first() {
+                return Err(format!("the runs at gap {g} are not whole, older first"));
+            }
+        }
+        Ok(())
+    }
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Every clean line merge of every kind of change, touching ones
+    /// included, is the right merge by the generator's ground truth, and
+    /// passes the oracle.
+    #[test]
+    fn line_merges_are_right_by_ground_truth(g in truth_case()) {
+        let c = g.case();
+        let (mo, mt) = if g.ours_newer { (3000, 2000) } else { (2000, 3000) };
+        passes_oracle(&c, mo, mt)?;
+        if let Outcome::Write(out) = run(Kind::Text, &c, mo, mt).outcome {
+            let out = String::from_utf8(out).unwrap();
+            if let Err(e) = g.right(&out) {
+                prop_assert!(false, "{}\n{:?}\nmerged {:?}\nupstream {:?}", e, c, out,
+                    upstream_line_merge(&c.base, &c.ours, &c.theirs, !g.ours_newer));
+            }
+        }
+    }
+}
+
+/// A lost-update guard's case: R2 is R1 with remote changes, and L is R2 with
+/// a writer's changes that insert lines, or delete or replace lines R1 had,
+/// leaving every line R2 added (and every deletion it made) alone. L already
+/// holds R2. Lines are distinct; L and R2 end their lines.
+fn guard_case() -> impl Strategy<Value = (Case, bool)> {
+    let edits = || prop::collection::vec((0..3u8, any::<prop::sample::Index>()), 0..5);
+    (0..8usize, edits(), edits(), any::<bool>(), any::<bool>()).prop_map(|(n, remote, writer, l_newer, fin)| {
+        let r1: Vec<String> = (0..n).map(|i| format!("- {i:02} entry")).collect();
+        let edit =
+            |v: &mut Vec<String>, who: &str, edits: &[(u8, prop::sample::Index)], may_touch: &dyn Fn(&str) -> bool| {
+                for (k, (op, i)) in edits.iter().enumerate() {
+                    match op {
+                        0 => {
+                            let at = i.index(v.len() + 1);
+                            v.insert(at, format!("- {who} {k}"));
+                        }
+                        1 if !v.is_empty() => {
+                            let at = i.index(v.len());
+                            if may_touch(&v[at]) {
+                                v.remove(at);
+                            }
+                        }
+                        2 if !v.is_empty() => {
+                            let at = i.index(v.len());
+                            if may_touch(&v[at]) {
+                                v[at] = format!("{} by {who} {k}", v[at]);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            };
+        let mut r2 = r1.clone();
+        edit(&mut r2, "remote", &remote, &|_| true);
+        let mut l = r2.clone();
+        edit(&mut l, "writer", &writer, &|x| r1.iter().any(|b| b == x));
+        let c = Case {
+            base: join(&r1, "\n", fin),
+            ours: join(&l, "\n", true),
+            theirs: join(&r2, "\n", true),
+        };
+        (c, l_newer)
+    })
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// The lost-update guard's contract: where L already holds R2, the merge
+    /// of base R1, ours L and theirs R2 is L (or open). The one exception is
+    /// by design: L and R2 inserted runs at one point that share lines but
+    /// neither holds the other as a whole prefix or suffix (the writer put
+    /// lines between R2's), which go in whole.
+    #[test]
+    fn a_writer_that_saw_the_remote_change_already_holds_it((c, l_newer) in guard_case()) {
+        let (mo, mt) = if l_newer { (3000, 2000) } else { (2000, 3000) };
+        passes_oracle(&c, mo, mt)?;
+        for kind in [Kind::Text, Kind::Markdown] {
+            match run(kind, &c, mo, mt).outcome {
+                Outcome::Write(out) if out != c.ours.as_bytes() => {
+                    let t = line_merge_trace(&c.base, &c.ours, &c.theirs, mo <= mt).unwrap();
+                    prop_assert!(
+                        oracle::shares_lines_in_whole_runs(&c.base, &c.ours, &c.theirs, &t),
+                        "{:?}\nmerged {:?}", c, String::from_utf8(out)
+                    );
+                }
+                Outcome::Keep(_) => prop_assert!(false),
+                _ => {}
             }
         }
     }
@@ -813,6 +1138,72 @@ proptest! {
     fn object_merges_are_symmetric(c in json_case()) {
         symmetric(&run(Kind::Object, &c, 2000, 3000), &run(Kind::Object, &swapped(&c), 3000, 2000))?;
     }
+}
+
+/// The oracle is not a rubber stamp: a merge made wrong in each way the safety
+/// bar names fails it.
+#[test]
+fn the_oracle_rejects_wrong_merges() {
+    use livesync_merge::{LineTrace, Src};
+    let text = |t: &LineTrace, b: &str, o: &str, th: &str| -> String {
+        let (bl, ol, tl): (Vec<&str>, Vec<&str>, Vec<&str>) = (
+            b.split_inclusive('\n').collect(),
+            o.split_inclusive('\n').collect(),
+            th.split_inclusive('\n').collect(),
+        );
+        t.merged
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| match *s {
+                Src::Base(i) => bl[i],
+                Src::Ours(j) | Src::Both(j, _) => ol[j],
+                Src::Theirs(k) => tl[k],
+            })
+            .collect()
+    };
+    let wrong = |b: &str, o: &str, th: &str, f: &dyn Fn(&mut Vec<Src>)| {
+        let mut t = line_merge_trace(b, o, th, true).unwrap();
+        assert!(oracle::check(b, o, th, true, &t).is_ok(), "the right merge passes");
+        f(t.merged.as_mut().unwrap());
+        t.text = Some(text(&t, b, o, th));
+        oracle::check(b, o, th, true, &t).err()
+    };
+    let (b, o, t) = ("a\nb\nc\n", "a\nB\nc\nd\n", "x\na\nb\nc\n");
+    // A line taken twice.
+    assert!(wrong(b, o, t, &|m| m.push(Src::Ours(3))).is_some());
+    // A line dropped.
+    assert!(wrong(b, o, t, &|m| {
+        m.retain(|s| *s != Src::Theirs(0));
+    })
+    .is_some());
+    // Out of a side's order.
+    assert!(wrong(b, o, t, &|m| m.swap(1, 3)).is_some());
+    // A base line ours replaced, back.
+    assert!(wrong(b, o, t, &|m| m.insert(2, Src::Base(1))).is_some());
+    // A line glued: theirs' last line without its newline, not last.
+    let (b2, o2, t2) = ("a\n", "a\nx\n", "a\ny");
+    assert!(wrong(b2, o2, t2, &|m| {
+        let last = m.pop().unwrap();
+        m.insert(1, last);
+    })
+    .is_some());
+    // An insertion placed against base order: theirs' x after ours' B.
+    assert!(wrong(b, o, t, &|m| {
+        let x = m.remove(0);
+        m.insert(2, x);
+    })
+    .is_some());
+    // A shared insertion taken from both sides.
+    let (b4, o4, t4) = ("# Log\n- 09\n", "# Log\n- 09 done\n- 10\n", "# Log\n- 09\n- 10\n");
+    assert!(wrong(b4, o4, t4, &|m| {
+        // Ours' "- 10" and theirs' "- 10" both, instead of once.
+        let both = m.iter().position(|s| matches!(s, Src::Both(..))).unwrap();
+        let Src::Both(j, k) = m[both] else { unreachable!() };
+        m[both] = Src::Ours(j);
+        m.insert(both + 1, Src::Theirs(k));
+    })
+    .is_some());
 }
 
 /// The generators reach real merges, not just opens: a share of each one's
