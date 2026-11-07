@@ -336,10 +336,19 @@ impl Index {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         // Fail closed on an index a newer binary wrote: its tables may carry
         // data this one would not keep up to date.
-        let found: Option<String> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
-            .optional()
-            .unwrap_or(None);
+        // Only a missing `meta` table (a new index) means "no version"; any
+        // other read error is passed up, so a busy lock can't skip the check.
+        let has_meta: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+            [],
+            |r| r.get(0),
+        )?;
+        let found: Option<String> = if has_meta {
+            conn.query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
+                .optional()?
+        } else {
+            None
+        };
         if let Some(v) = found.as_deref().and_then(|v| v.parse::<u64>().ok()) {
             let known: u64 = SCHEMA_VERSION.parse().unwrap();
             if v > known {
