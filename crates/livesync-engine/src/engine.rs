@@ -367,13 +367,13 @@ pub mod connection_defaults {
     /// The default regate interval.
     pub const REGATE: Duration = Duration::from_secs(300);
 
-    // Each platform's heartbeat comes well within its silence limit, and the
-    // limit within the client's read timeout.
+    // Each platform's silence limit is at least two heartbeats (as
+    // `Tuning` requires of a setting), and within the client's read timeout.
     const _: () = {
         let read = livesync_remote::READ_TIMEOUT.as_millis();
-        assert!(DESKTOP_HEARTBEAT.as_millis() < DESKTOP_LONGPOLL_TIMEOUT.as_millis());
+        assert!(DESKTOP_HEARTBEAT.as_millis() * 2 <= DESKTOP_LONGPOLL_TIMEOUT.as_millis());
         assert!(DESKTOP_LONGPOLL_TIMEOUT.as_millis() < read);
-        assert!(ANDROID_HEARTBEAT.as_millis() < ANDROID_LONGPOLL_TIMEOUT.as_millis());
+        assert!(ANDROID_HEARTBEAT.as_millis() * 2 <= ANDROID_LONGPOLL_TIMEOUT.as_millis());
         assert!(ANDROID_LONGPOLL_TIMEOUT.as_millis() < read);
     };
 }

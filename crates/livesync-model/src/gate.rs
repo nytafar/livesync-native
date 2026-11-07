@@ -126,7 +126,7 @@ pub enum Refusal {
     /// The plugin guard could not look into `folder` (a top-level
     /// dot-folder, or the vault itself), so it fails closed. The folder may
     /// have nothing to do with Obsidian (a root-owned `.snapshots`).
-    #[error("{folder} could not be checked for the Self-hosted LiveSync plugin ({why}), so this client does not sync {vault} two-way: make {folder} readable to this user, or move it out of the vault{}", unchecked_handover_text(.handover))]
+    #[error("{}", unchecked_text(.vault, .folder, .why, .handover))]
     PluginUnchecked {
         vault: String,
         folder: String,
@@ -208,6 +208,20 @@ fn handover_text(handover: &Option<String>) -> String {
         Some(h) => format!(", or, for a deliberate handover, {h}"),
         None => ", then start syncing here again; this app does not run beside the plugin".into(),
     }
+}
+
+/// The message of [`Refusal::PluginUnchecked`]: a dot-folder in the vault,
+/// or the vault folder itself.
+fn unchecked_text(vault: &str, folder: &str, why: &str, handover: &Option<String>) -> String {
+    let fix = if folder == vault {
+        format!("this client does not sync it two-way: make {vault} listable by this user")
+    } else {
+        format!("this client does not sync {vault} two-way: make {folder} readable to this user, or move it out of the vault")
+    };
+    format!(
+        "{folder} could not be checked for the Self-hosted LiveSync plugin ({why}), so {fix}{}",
+        unchecked_handover_text(handover)
+    )
 }
 
 /// The override for [`Refusal::PluginUnchecked`], where there is one.
@@ -857,6 +871,18 @@ mod tests {
         }
         assert!(r(Some("run with --allow-plugin")).contains("run with --allow-plugin"));
         assert!(!r(None).contains("allow"));
+        // The vault folder itself cannot be listed.
+        let m = Refusal::PluginUnchecked {
+            vault: "/v".into(),
+            folder: "/v".into(),
+            why: "it cannot be listed: Permission denied".into(),
+            handover: None,
+        }
+        .to_string();
+        assert!(
+            m.contains("/v could not be checked") && m.contains("make /v listable") && !m.contains("out of the vault"),
+            "{m}"
+        );
     }
 
     #[test]

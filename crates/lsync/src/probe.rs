@@ -406,8 +406,37 @@ fn getprop(key: &str) -> Option<String> {
 /// where the Self-hosted LiveSync plugin is enabled, the plugin pushes those
 /// notes and their deletions to the real database. The same check as the
 /// plugin guard of two-way sync (`livesync_engine::folderkind`).
+#[cfg(test)]
 pub fn livesync_enabled(vault: &Path) -> Option<String> {
     livesync_engine::folderkind::livesync_plugin_enabled(vault)
+}
+
+/// Why the probe refuses `vault`, if it does: the plugin is enabled, or a
+/// folder could not be checked for it (failing closed, without blaming the
+/// plugin), as the sync guard words it.
+fn refusal(vault: &Path) -> Option<String> {
+    use livesync_engine::folderkind::{check_livesync_plugin, PluginCheck};
+    let v = vault.display();
+    let leak = "The probe writes, renames and deletes lsync-probe*.md notes, and the plugin would push \
+                them and their deletions to the real database.";
+    match check_livesync_plugin(vault) {
+        PluginCheck::Clear => None,
+        PluginCheck::Enabled(why) => Some(format!(
+            "refusing to probe {v}: the Self-hosted LiveSync plugin is enabled in this vault ({why}). \
+             {leak} Probe a vault without LiveSync, or disable the plugin in Obsidian first."
+        )),
+        PluginCheck::Unchecked { folder, why } => {
+            let fix = if folder == v.to_string() {
+                format!("make {folder} listable by this user")
+            } else {
+                format!("make {folder} readable to this user, or move it out of the vault")
+            };
+            Some(format!(
+                "refusing to probe {v}: {folder} could not be checked for the Self-hosted LiveSync plugin ({why}). \
+                 {leak} To probe here, {fix}."
+            ))
+        }
+    }
 }
 
 pub fn run(args: ProbeArgs) -> Result<u8> {
@@ -415,14 +444,8 @@ pub fn run(args: ProbeArgs) -> Result<u8> {
     if !vault.is_dir() {
         bail!("{} is not a directory", vault.display());
     }
-    if let Some(why) = livesync_enabled(&vault) {
-        bail!(
-            "refusing to probe {}: the Self-hosted LiveSync plugin is enabled in this vault ({why}). \
-             The probe writes, renames and deletes lsync-probe*.md notes, and the plugin would push \
-             them and their deletions to the real database. Probe a vault without LiveSync, \
-             or disable the plugin in Obsidian first.",
-            vault.display()
-        );
+    if let Some(why) = refusal(&vault) {
+        bail!("{why}");
     }
     let mut p = Prompter {
         stdin: Box::leak(Box::new(std::io::stdin())).lock(),
@@ -725,5 +748,25 @@ mod tests {
         // Listed but not installed: fine.
         std::fs::remove_dir_all(v.join(".obsidian/plugins")).unwrap();
         assert!(livesync_enabled(v).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_dot_folder_refuses_by_name_without_blaming_the_plugin() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let v = d.path();
+        let s = v.join(".snapshots");
+        std::fs::create_dir_all(s.join("1")).unwrap();
+        std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads anything; the check is moot there.
+        let blocked = std::fs::read_dir(&s).is_err();
+        let r = refusal(v);
+        std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if blocked {
+            let m = r.expect("it fails closed");
+            assert!(m.contains(".snapshots could not be checked"), "{m}");
+            assert!(!m.contains("is enabled") && !m.contains("disable the plugin"), "{m}");
+        }
     }
 }
