@@ -485,3 +485,97 @@ fn serve_with_one_vault_stops_it_when_it_is_removed() {
     assert!(r.contains("unchanged  -"), "{r}");
     assert_eq!(svc.stop(), Some(0));
 }
+
+/// The vault in the service's `status --all`, `Null` while there is none.
+fn served_view(m: &Machine, vault: &str) -> Value {
+    let out = m.run(&["status", "--all", "--json"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+    v["vaults"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["name"] == vault))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn the_plugin_guard_holds_in_the_service_and_a_routed_command_can_hand_over() {
+    let rt = runtime();
+    let mock = rt.block_on(Mock::start());
+    mock.put_text("Notes/a.md", &["note a"]);
+    let m = Machine::with_vault(&mock);
+    let o = m.folder("notes/.obsidian");
+    std::fs::create_dir_all(o.join("plugins/obsidian-livesync")).unwrap();
+    std::fs::write(o.join("community-plugins.json"), r#"["obsidian-livesync"]"#).unwrap();
+
+    let svc = m.spawn(&["serve"], "serve.log");
+    // The service's engine refuses the vault, says why, and runs nothing.
+    wait_until("the refusal in the service", || {
+        let v = served_view(&m, "notes");
+        v["state"] == "failed"
+            && v["message"]
+                .as_str()
+                .is_some_and(|s| s.contains("Self-hosted LiveSync plugin enabled"))
+    });
+    assert!(!m.folder("notes/Notes/a.md").exists());
+    assert_eq!(served_view(&m, "notes")["settings"]["allow_plugin"], false);
+    // A routed sync is refused the same way...
+    let out = m.run(&["--vault", "notes", "sync"]);
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{e}");
+    assert!(e.contains("plugin enabled") && e.contains("--allow-plugin"), "{e}");
+    assert!(svc.log().contains("running `sync` for a client"), "{}", svc.log());
+    assert!(mock.writes().is_empty(), "nothing written past the guard");
+    // ... and `--allow-plugin` hands that one command over, in the service.
+    m.ok(&["--vault", "notes", "sync", "--allow-plugin"]);
+    assert!(m.folder("notes/Notes/a.md").exists());
+    // The service's own engine stays refused.
+    wait_until("the vault refused again", || {
+        served_view(&m, "notes")["state"] == "failed"
+    });
+
+    // `allow_plugin = true` for the vault lets the service run it.
+    let cfg = m.root.join("config/lsync/lsync.toml");
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str("allow_plugin = true\n");
+    std::fs::write(&cfg, text).unwrap();
+    let r = m.json(&["reload", "--json"]);
+    assert_eq!(r["restarted"], serde_json::json!(["notes"]), "{r}");
+    wait_until("the vault running", || {
+        let v = served_view(&m, "notes");
+        v["state"] == "running" && v["settings"]["allow_plugin"] == true
+    });
+    assert_eq!(svc.stop(), Some(0));
+}
+
+#[test]
+fn an_upstream_change_shows_as_a_stop_in_the_service() {
+    let rt = runtime();
+    let mock = rt.block_on(Mock::start());
+    mock.put_text("Notes/a.md", &["note a"]);
+    let m = Machine::with_vault(&mock);
+    // The guard's and the connection's timings from lsync.toml.
+    let cfg = m.root.join("config/lsync/lsync.toml");
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str("regate_secs = 1\nheartbeat_secs = 1\nlongpoll_timeout_secs = 3\n");
+    std::fs::write(&cfg, text).unwrap();
+    let svc = m.spawn(&["serve"], "serve.log");
+    wait_until("the vault running in the service", || {
+        m.served_state("notes").as_deref() == Some("running") && m.folder("notes/Notes/a.md").exists()
+    });
+    mock.put(serde_json::json!({"_id": "obsydian_livesync_version", "type": "versioninfo", "version": 13, "used_features": ["teleport-v1"]}));
+    wait_until("the upstream stop in status --all", || {
+        let t = m.ok(&["status", "--all"]);
+        t.contains("UPSTREAM STOP") && t.contains("teleport-v1")
+    });
+    let st = m.json(&["--vault", "notes", "status", "--json"]);
+    let stop = st["upstream_stop"].as_str().unwrap_or_default().to_string();
+    assert!(stop.contains("is the newest version known to work"), "{stop}");
+    // Back to what lsync knows: the vault resumes by itself.
+    mock.put(serde_json::json!({"_id": "obsydian_livesync_version", "type": "versioninfo", "version": 12}));
+    wait_until("the stop cleared", || {
+        m.json(&["--vault", "notes", "status", "--json"])["upstream_stop"].is_null()
+    });
+    mock.put_text("Notes/b.md", &["note b"]);
+    wait_until("syncing again", || m.folder("notes/Notes/b.md").exists());
+    assert_eq!(svc.stop(), Some(0));
+}

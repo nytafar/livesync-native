@@ -10,6 +10,7 @@
 
 pub mod engine;
 pub mod filters;
+pub mod folderkind;
 pub mod folders;
 pub mod fsrules;
 pub mod index;

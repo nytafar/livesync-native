@@ -909,6 +909,7 @@ impl Engine {
     /// for later instead of pushed now. Refuses (an error) while a full
     /// fetch is owed or this node still has to be marked resolved.
     pub async fn push_all(&self, defer_recent: bool) -> Result<PushReport> {
+        self.check_plugin_guard()?;
         match self.full_pass(&RenameHints::default(), None, defer_recent).await? {
             Some((rep, _)) => Ok(rep),
             None => Err(EngineError::Other(format!(

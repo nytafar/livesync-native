@@ -272,6 +272,10 @@ pub struct CommandParams {
     /// `sync`, `fetch`: as `--remove-out-of-scope-copies`.
     #[serde(default)]
     pub remove_out_of_scope_copies: bool,
+    /// `sync`, `fetch`: as `--allow-plugin`, for this command only (a vault
+    /// with `allow_plugin = true` is allowed anyway).
+    #[serde(default)]
+    pub allow_plugin: bool,
     /// `connect`: accept changed PREFERRED tweaks.
     #[serde(default)]
     pub adopt_tweaks: bool,
@@ -365,6 +369,9 @@ pub struct Settings {
     pub sync_dot_paths: Vec<String>,
     /// `vault`, `system` or `none`.
     pub trash: String,
+    /// Two-way sync runs although the vault's Self-hosted LiveSync plugin is
+    /// enabled (`allow_plugin = true`, a deliberate handover).
+    pub allow_plugin: bool,
 }
 
 /// One vault in `status`.

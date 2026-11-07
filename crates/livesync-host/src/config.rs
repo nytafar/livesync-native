@@ -108,6 +108,10 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 fn yes() -> bool {
     true
 }
@@ -169,6 +173,14 @@ pub struct Vault {
     /// Tuning: chunk-fetch requests in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+    /// Run two-way although this Obsidian vault's Self-hosted LiveSync
+    /// plugin is enabled (a deliberate handover; see `--allow-plugin`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_plugin: bool,
+    /// Tuning: how often the remote's version document, features and tweaks
+    /// are checked again while running, in seconds (default 300).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regate_secs: Option<u64>,
     /// Tuning: the longpoll's heartbeat in seconds (default 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat_secs: Option<u64>,
@@ -202,15 +214,19 @@ impl Vault {
             enabled: true,
             max_size_mb: None,
             concurrency: None,
+            allow_plugin: false,
+            regate_secs: None,
             heartbeat_secs: None,
             longpoll_timeout_secs: None,
             clock_jump_secs: None,
         }
     }
 
-    /// The connection timings, as the host runs them.
+    /// The plugin guard's switch and the timings, as the host runs them.
     pub fn tuning(&self) -> Tuning {
         Tuning {
+            allow_plugin: self.allow_plugin,
+            regate_secs: self.regate_secs,
             heartbeat_secs: self.heartbeat_secs,
             longpoll_timeout_secs: self.longpoll_timeout_secs,
             clock_jump_secs: self.clock_jump_secs,

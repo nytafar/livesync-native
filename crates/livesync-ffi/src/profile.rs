@@ -87,7 +87,8 @@ impl ProfileConfig {
             // The desktop defaults: remote deletions go to the vault's
             // `.trash/`; no ignore files or dot-paths yet (no UI for them).
             what_syncs: WhatSyncs::default(),
-            // No timing settings in the app yet: the platform defaults apply.
+            // The app has no plugin handover switch or timing settings yet:
+            // the guards and the platform defaults apply.
             tuning: Default::default(),
         }
     }

@@ -18,6 +18,51 @@ pub const KNOWN_FEATURES: [&str; 3] = [
 ];
 pub const PREFERRED: &str = "PREFERRED";
 
+/// The newest Self-hosted LiveSync release this client was checked against
+/// (the interop scenarios against the official CLI of the same release tag,
+/// which shares the plugin's `livesync-commonlib`). Named in every refusal
+/// that an upstream change causes; keep it in step with `COMPATIBILITY.md`.
+macro_rules! tested_plugin_version {
+    () => {
+        "1.0.46"
+    };
+}
+/// That release's version (written once, in the macro, for `concat!`).
+pub const TESTED_PLUGIN_VERSION: &str = tested_plugin_version!();
+
+/// What a refusal caused by an upstream change says about known-good versions.
+const KNOWN_GOOD: &str = concat!(
+    "Self-hosted LiveSync ",
+    tested_plugin_version!(),
+    " is the newest version known to work with lsync, as long as it does not turn on what is named here (see COMPATIBILITY.md)"
+);
+
+/// Every key a PREFERRED tweak set may hold that this client knows about:
+/// the compared ones ([`TWEAK_RULES`]), the rest of upstream's
+/// `TweakValuesTemplate` (`tweak.definition.ts`), and keys older plugin
+/// versions wrote there. Any other key is a setting a newer plugin added,
+/// and is refused until it is adopted ([`unknown_tweaks`]).
+pub const KNOWN_UNCOMPARED_TWEAKS: [&str; 15] = [
+    // TweakValuesRecommendedTemplate
+    "useIgnoreFiles",
+    "useCustomRequestHandler",
+    "batch_size",
+    "batches_limit",
+    "useTimeouts",
+    "readChunksOnline",
+    "hashCacheMaxCount",
+    "hashCacheMaxAmount",
+    "concurrencyOfReadChunksOnline",
+    "minimumIntervalOfReadChunksOnline",
+    "ignoreFiles",
+    "syncMaxSizeInMB",
+    // TweakValuesTemplate
+    "tweakModified",
+    // Written by older plugin versions (0.2x).
+    "doNotUseFixedRevisionForChunks",
+    "useIndexedDBAdapter",
+];
+
 /// The chunk-format range this client reads. Matches upstream's advertised
 /// `node_chunk_info` (`{min:0, max:2400, current:2}`).
 pub const OUR_CHUNK_RANGE: (i64, i64) = (0, 2400);
@@ -33,11 +78,13 @@ pub enum Refusal {
     InvalidVersionDoc(String),
     #[error("the remote database generation {0} is older than 12 and needs migration by an official client")]
     OlderGeneration(i64),
-    #[error("the remote database generation {0} is newer than this client supports (max {REMOTE_FEATURE_GENERATION})")]
+    #[error("the remote database's version document (`obsydian_livesync_version`) is at generation {0}, newer than this client knows (12 and {REMOTE_FEATURE_GENERATION}): a newer Self-hosted LiveSync raised it. {KNOWN_GOOD}")]
     UnsupportedGeneration(i64),
-    #[error("the remote database uses features this client does not know: {0}")]
+    #[error("the remote database's version document lists features this client does not know: {0}; a newer Self-hosted LiveSync turned them on, and they stay on. {KNOWN_GOOD}")]
     UnknownFeatures(String),
-    #[error("the remote database uses features this client does not implement yet: {0}")]
+    #[error(
+        "the remote database's version document lists features this client does not implement yet: {0}. {KNOWN_GOOD}"
+    )]
     UnsupportedFeatures(String),
     #[error("the remote database has no milestone document `_local/obsydian_livesync_milestone`; set it up with an official client first")]
     MissingMilestone,
@@ -53,14 +100,38 @@ pub enum Refusal {
     MissingPreferredTweaks,
     #[error("remote setting not supported by this client: {0}")]
     UnsupportedSetting(String),
-    #[error("the remote's PREFERRED settings changed since setup: {0}; re-adopt them with `lsync connect --adopt-tweaks` after checking")]
+    #[error("the remote's PREFERRED settings (the milestone's tweaks) changed since this device adopted them: {0}. {KNOWN_GOOD}; once you checked the change was meant, adopt it with `lsync connect --adopt-tweaks`")]
     TweakMismatch(String),
+    #[error("the remote's PREFERRED settings (the milestone's tweaks) hold settings this client does not know: {0}; a newer Self-hosted LiveSync may have added them. {KNOWN_GOOD}; once you checked they do not change what is stored, adopt them with `lsync connect --adopt-tweaks`")]
+    UnknownTweaks(String),
     #[error("encrypted or obfuscated content found ({0}); end-to-end encryption is not supported yet")]
     EncryptedContent(String),
     #[error("the local index belongs to a different remote ({0}); use another state directory or reset the index")]
     ForeignIndex(String),
     #[error("the local index belongs to the vault folder {index_vault}, not {vault}; use the profile or state directory that belongs to {vault}, or a new one")]
     ForeignVault { index_vault: String, vault: String },
+    #[error("{vault} is an Obsidian vault with the Self-hosted LiveSync plugin enabled ({why}): the plugin and lsync would both write this folder and the database. Disable the plugin in Obsidian on this device (Settings, Community plugins), or, for a deliberate handover, run with --allow-plugin (or set allow_plugin = true for the vault)")]
+    PluginEnabled { vault: String, why: String },
+}
+
+impl Refusal {
+    /// Whether this refusal means the remote moved on past what this client
+    /// knows (a newer plugin's generation, features or settings): the upstream
+    /// guard's stop, shown as such in `status` and lifted only when the
+    /// remote is compatible again (or the change is adopted).
+    pub fn is_upstream_change(&self) -> bool {
+        matches!(
+            self,
+            Refusal::UnsupportedGeneration(_)
+                | Refusal::UnknownFeatures(_)
+                | Refusal::UnsupportedFeatures(_)
+                | Refusal::IncompatibleChunkVersion(..)
+                | Refusal::UnsupportedSetting(_)
+                | Refusal::TweakMismatch(_)
+                | Refusal::UnknownTweaks(_)
+                | Refusal::EncryptedContent(_)
+        )
+    }
 }
 
 /// Version document: `obsydian_livesync_version`.
@@ -297,6 +368,55 @@ pub fn compare_tweaks(adopted: &Map<String, Value>, preferred: &Map<String, Valu
     out
 }
 
+/// PREFERRED tweaks this client does not know ([`TWEAK_RULES`] and
+/// [`KNOWN_UNCOMPARED_TWEAKS`] aside), unless `adopted` holds the same key with
+/// the same value (a person adopted it with `--adopt-tweaks`, or it was there
+/// when this device first adopted the tweaks). Each as `key=value`, or
+/// `key: old -> new` when an adopted value changed. A key that went away is
+/// not new, so it is not listed.
+pub fn unknown_tweaks(adopted: Option<&Map<String, Value>>, preferred: &Map<String, Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    for (key, value) in preferred {
+        let known = TWEAK_RULES.iter().any(|(k, _)| k == key) || KNOWN_UNCOMPARED_TWEAKS.contains(&key.as_str());
+        if known {
+            continue;
+        }
+        match adopted.and_then(|a| a.get(key)) {
+            Some(a) if a == value => {}
+            Some(a) => out.push(format!("{key}: {a} -> {value}")),
+            None => out.push(format!("{key}={value}")),
+        }
+    }
+    out
+}
+
+/// The newest Self-hosted LiveSync the milestone's `node_info` lists (lsync
+/// nodes and `our_node` aside), for refusal messages: which release raised
+/// the remote past this client, as far as the milestone tells.
+pub fn newest_remote_plugin(milestone: &Value, our_node: &str) -> Option<String> {
+    let info = milestone.get("node_info")?.as_object()?;
+    let mut best: Option<(Vec<u64>, String, String)> = None;
+    for (node, i) in info {
+        if node == our_node || i.get("app_version").and_then(Value::as_str) == Some("lsync") {
+            continue;
+        }
+        let Some(v) = i.get("plugin_version").and_then(Value::as_str) else {
+            continue;
+        };
+        let key = version_key(v);
+        if best.as_ref().is_none_or(|(b, _, _)| key > *b) {
+            let device = i.get("device_name").and_then(Value::as_str).unwrap_or(node).to_string();
+            best = Some((key, v.to_string(), device));
+        }
+    }
+    best.map(|(_, v, device)| format!("Self-hosted LiveSync {v} on {device:?}"))
+}
+
+/// `1.0.46` -> `[1, 0, 46]`; anything after the numbers is ignored.
+fn version_key(v: &str) -> Vec<u64> {
+    v.split(['.', '-', '+']).map_while(|p| p.parse::<u64>().ok()).collect()
+}
+
 /// The settings this client can read. Absent keys take upstream's defaults.
 pub fn assess_supported_tweaks(p: &Map<String, Value>) -> Result<(), Refusal> {
     let unsupported = |m: String| Err(Refusal::UnsupportedSetting(m));
@@ -447,5 +567,69 @@ mod tests {
         // Unadvertised (no known default) is not a mismatch.
         let a = json!({"useEden":false});
         assert!(compare_tweaks(a.as_object().unwrap(), b.as_object().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn unknown_tweaks_are_named_with_their_values() {
+        let o = |v: Value| v.as_object().unwrap().clone();
+        // Upstream's whole template, and the legacy keys, are known.
+        let p = o(json!({"customChunkSize": 60, "batch_size": 25, "tweakModified": 1,
+            "doNotUseFixedRevisionForChunks": true, "ignoreFiles": ".gitignore"}));
+        assert!(unknown_tweaks(None, &p).is_empty());
+        // A new key is refused with its value...
+        let p = o(json!({"customChunkSize": 60, "useWarpChunks": true}));
+        assert_eq!(unknown_tweaks(None, &p), vec!["useWarpChunks=true".to_string()]);
+        assert_eq!(
+            unknown_tweaks(Some(&o(json!({"customChunkSize": 60}))), &p),
+            vec!["useWarpChunks=true".to_string()]
+        );
+        // ... until it is adopted with that value; a changed value is named again.
+        assert!(unknown_tweaks(Some(&p), &p).is_empty());
+        let changed = o(json!({"customChunkSize": 60, "useWarpChunks": false}));
+        assert_eq!(
+            unknown_tweaks(Some(&p), &changed),
+            vec!["useWarpChunks: true -> false".to_string()]
+        );
+        // A key that went away is not new.
+        assert!(unknown_tweaks(Some(&p), &o(json!({"customChunkSize": 60}))).is_empty());
+    }
+
+    #[test]
+    fn upstream_refusals_name_the_change_and_the_known_good_version() {
+        for (r, what) in [
+            (Refusal::UnsupportedGeneration(14), "generation 14"),
+            (Refusal::UnknownFeatures("teleport-v1".into()), "teleport-v1"),
+            (Refusal::TweakMismatch("customChunkSize: 60 -> 100".into()), "60 -> 100"),
+            (
+                Refusal::UnknownTweaks("useWarpChunks=true".into()),
+                "useWarpChunks=true",
+            ),
+        ] {
+            let msg = r.to_string();
+            assert!(r.is_upstream_change(), "{msg}");
+            assert!(msg.contains(what), "{msg}");
+            assert!(
+                msg.contains(&format!("Self-hosted LiveSync {TESTED_PLUGIN_VERSION} is the newest")),
+                "{msg}"
+            );
+        }
+        assert!(!Refusal::Locked.is_upstream_change());
+        assert!(!Refusal::NotCouchDb.is_upstream_change());
+    }
+
+    #[test]
+    fn newest_remote_plugin_skips_lsync_and_this_node() {
+        let m = json!({"node_info": {
+            "a": {"device_name": "desk", "app_version": "1.12.7", "plugin_version": "1.0.9"},
+            "b": {"device_name": "laptop", "app_version": "1.12.7", "plugin_version": "1.0.46"},
+            "c": {"device_name": "phone", "app_version": "1.10.3", "plugin_version": "0.25.61"},
+            "me": {"device_name": "me", "app_version": "1.12.7", "plugin_version": "9.9.9"},
+            "l": {"device_name": "server", "app_version": "lsync", "plugin_version": "5.0.0"}
+        }});
+        assert_eq!(
+            newest_remote_plugin(&m, "me").as_deref(),
+            Some("Self-hosted LiveSync 1.0.46 on \"laptop\"")
+        );
+        assert_eq!(newest_remote_plugin(&json!({}), "me"), None);
     }
 }

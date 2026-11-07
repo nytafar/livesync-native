@@ -91,6 +91,10 @@ pub(crate) mod meta_keys {
     /// The local filters (ignore files included) the index last synced
     /// with (JSON `FilterState`), to catch up what they stop hiding.
     pub const FILTERS: &str = "filters";
+    /// The upstream guard stopped syncing: the remote uses a generation,
+    /// feature or setting this client does not know (`<ms> <message>`). Set
+    /// by the refusal, cleared by the next gate that passes.
+    pub const UPSTREAM_STOP: &str = "upstream_stop";
 }
 
 /// Aborts a spawned task when dropped.
@@ -149,8 +153,13 @@ pub struct EngineConfig {
     pub concurrency: usize,
     /// `_changes` page size.
     pub batch_limit: usize,
-    /// How often the daemon re-runs the connect gate.
+    /// How often the daemon re-runs the connect gate (the upstream guard
+    /// reads the version document, `used_features` and the tweaks each
+    /// time), and how long it waits before checking again after a refusal.
     pub regate_interval: Duration,
+    /// Run two-way on an Obsidian vault whose Self-hosted LiveSync plugin is
+    /// enabled (a deliberate handover). Off: two-way sync refuses it.
+    pub allow_plugin: bool,
     /// The longpoll's heartbeat: CouchDB sends a newline this often while
     /// nothing changes.
     pub heartbeat: Duration,
@@ -274,6 +283,9 @@ pub mod connection_defaults {
     pub const LONGPOLL_TIMEOUT: Duration = Duration::from_secs(90);
     #[cfg(target_os = "android")]
     pub const CLOCK_JUMP: Option<Duration> = None;
+
+    /// The default regate interval.
+    pub const REGATE: Duration = Duration::from_secs(300);
 }
 
 impl EngineConfig {
@@ -302,7 +314,8 @@ impl EngineConfig {
             write_nomedia: cfg!(target_os = "android"),
             concurrency: 6,
             batch_limit: 250,
-            regate_interval: Duration::from_secs(300),
+            regate_interval: connection_defaults::REGATE,
+            allow_plugin: false,
             heartbeat: connection_defaults::HEARTBEAT,
             longpoll_timeout: connection_defaults::LONGPOLL_TIMEOUT,
             clock_jump: connection_defaults::CLOCK_JUMP,
@@ -487,6 +500,11 @@ pub struct Status {
     /// pull completes a plain owed fetch, never this.
     pub resolve_owed: bool,
     pub safety_stop: Option<String>,
+    /// The upstream guard's stop: the remote moved past what this client
+    /// knows (which generation, feature or setting, and the newest plugin
+    /// version known to work), `<ms> <message>`. Syncing resumes by itself
+    /// once the remote is compatible again.
+    pub upstream_stop: Option<String>,
     /// After a rebuild: the refetch is waiting (or owes a wait) for the
     /// remote to stop changing. `<ms> <description>`.
     pub rebuild_wait: Option<String>,
@@ -807,7 +825,49 @@ impl Engine {
     }
 
     pub(crate) fn record_error(&self, e: &EngineError) {
-        let _ = self.with_index(|ix| ix.set_meta(meta::LAST_ERROR, &format!("{} {e}", vaultfs::now_ms())));
+        let now = vaultfs::now_ms();
+        let _ = self.with_index(|ix| ix.set_meta(meta::LAST_ERROR, &format!("{now} {e}")));
+        if let EngineError::Refused(r) = e {
+            if r.is_upstream_change() {
+                self.record_upstream_stop(r, now);
+            }
+        }
+    }
+
+    /// Record the upstream guard's stop for `status`, with the newest
+    /// plugin the milestone lists, and log it once per distinct message.
+    fn record_upstream_stop(&self, r: &Refusal, now: i64) {
+        let node = self.node_id();
+        let milestone = self.inner.last_milestone.lock().unwrap().clone();
+        let seen = milestone.and_then(|m| gate::newest_remote_plugin(&m, &node));
+        let msg = match seen {
+            Some(s) => format!("{r} (the newest plugin the remote's milestone lists: {s})"),
+            None => r.to_string(),
+        };
+        let before = self.with_index(|ix| ix.get_meta(meta::UPSTREAM_STOP)).ok().flatten();
+        if before.as_deref().and_then(|b| b.split_once(' ')).map(|(_, m)| m) != Some(msg.as_str()) {
+            warn!("upstream guard: syncing stopped for {}: {msg}", self.inner.vault_canon);
+        }
+        let _ = self.with_index(|ix| ix.set_meta(meta::UPSTREAM_STOP, &format!("{now} {msg}")));
+    }
+
+    /// The plugin guard (spec D16): refuse two-way sync on an Obsidian vault
+    /// whose Self-hosted LiveSync plugin is enabled, unless allowed.
+    pub fn check_plugin_guard(&self) -> Result<()> {
+        if self.inner.cfg.allow_plugin {
+            return Ok(());
+        }
+        match crate::folderkind::livesync_plugin_enabled(Path::new(&self.inner.vault_canon)) {
+            None => Ok(()),
+            Some(why) => {
+                let e = EngineError::Refused(Refusal::PluginEnabled {
+                    vault: self.inner.vault_canon.clone(),
+                    why,
+                });
+                self.record_error(&e);
+                Err(e)
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -830,6 +890,10 @@ impl Engine {
                 ix.set_meta(meta::LAST_GATE_OK, &now.to_string())?;
                 // A passed gate supersedes any earlier failure.
                 ix.delete_meta(meta::LAST_ERROR)?;
+                if ix.get_meta(meta::UPSTREAM_STOP)?.is_some() {
+                    info!("upstream guard: the remote is compatible again; syncing resumes");
+                    ix.delete_meta(meta::UPSTREAM_STOP)?;
+                }
             }
             Ok(())
         });
@@ -866,13 +930,14 @@ impl Engine {
         }
         let info = couch.db_info().await?;
         let version_doc = couch.get_doc(VERSION_DOC_ID, false).await?;
+        // Read before the version document is judged, so a refusal can name
+        // the plugin versions the milestone lists.
+        let milestone = couch.get_doc(&format!("_local/{MILESTONE_LOCAL_ID}"), false).await?;
+        if let Some(m) = &milestone {
+            *self.inner.last_milestone.lock().unwrap() = Some(m.clone());
+        }
         let version = gate::assess_version_doc(version_doc.as_ref(), info.doc_count > 0)?;
-        let milestone = couch
-            .get_doc(&format!("_local/{MILESTONE_LOCAL_ID}"), false)
-            .await?
-            .ok_or(Refusal::MissingMilestone)?;
-        *self.inner.last_milestone.lock().unwrap() = Some(milestone.clone());
-        let milestone = Milestone::parse(&milestone)?;
+        let milestone = Milestone::parse(&milestone.ok_or(Refusal::MissingMilestone)?)?;
         let node_id = self.node_id();
         let (fresh, rebuilt, owed) = {
             let ix = self.inner.index.lock().unwrap();
@@ -923,23 +988,28 @@ impl Engine {
             }
             let adopted: Option<Map<String, Value>> =
                 ix.get_meta(meta::TWEAKS)?.and_then(|s| serde_json::from_str(&s).ok());
-            match adopted {
-                Some(a) => {
-                    let diff = gate::compare_tweaks(&a, &preferred);
-                    if !diff.is_empty() {
-                        if adopt_tweaks {
-                            warn!("re-adopting changed PREFERRED tweaks: {}", diff.join("; "));
-                            ix.set_meta(meta::TWEAKS, &serde_json::to_string(&preferred).unwrap())?;
-                            adopted_now = true;
-                        } else {
-                            return Err(Refusal::TweakMismatch(diff.join("; ")).into());
-                        }
-                    }
+            // Settings a newer plugin added are refused like changed ones,
+            // also at first contact, until a person adopts them.
+            let unknown = gate::unknown_tweaks(adopted.as_ref(), &preferred);
+            let diff = adopted
+                .as_ref()
+                .map(|a| gate::compare_tweaks(a, &preferred))
+                .unwrap_or_default();
+            if !adopt_tweaks {
+                if !diff.is_empty() {
+                    return Err(Refusal::TweakMismatch(diff.join("; ")).into());
                 }
-                None => {
-                    ix.set_meta(meta::TWEAKS, &serde_json::to_string(&preferred).unwrap())?;
-                    adopted_now = true;
+                if !unknown.is_empty() {
+                    return Err(Refusal::UnknownTweaks(unknown.join(", ")).into());
                 }
+            }
+            if adopted.is_none() || !diff.is_empty() || !unknown.is_empty() {
+                if !diff.is_empty() || !unknown.is_empty() {
+                    let all: Vec<String> = diff.iter().chain(&unknown).cloned().collect();
+                    warn!("adopting changed or new PREFERRED tweaks: {}", all.join("; "));
+                }
+                ix.set_meta(meta::TWEAKS, &serde_json::to_string(&preferred).unwrap())?;
+                adopted_now = true;
             }
             match ix.get_meta(meta::CREATED)?.and_then(|s| s.parse::<i64>().ok()) {
                 Some(c) if c != milestone.created => {
@@ -2348,7 +2418,12 @@ impl Engine {
     /// settle queue, periodic rescans) beside it. Pushes start once the gate
     /// passed, the remote was caught up (with a full fetch when one is owed)
     /// and this node is registered in the milestone.
+    ///
+    /// Refuses at once on an Obsidian vault whose Self-hosted LiveSync
+    /// plugin is enabled (unless `allow_plugin`); the check is repeated at
+    /// every regate, and ends the run when the plugin was turned on.
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        self.check_plugin_guard()?;
         // Each side stops when the caller says so, or when the other side
         // ended (a fatal error on one side stops both).
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -2383,6 +2458,7 @@ impl Engine {
     /// One two-way pass: gate, pull until caught up (a full fetch when one is
     /// owed), register, then push everything that changed locally.
     pub async fn sync_once(&self) -> Result<SyncReport> {
+        self.check_plugin_guard()?;
         let start = Instant::now();
         self.reset_report();
         let gate = self.connect_gate(false).await?;
@@ -2414,6 +2490,8 @@ impl Engine {
     /// next sync and mark this node resolved after it. This is how a lock
     /// that does not come with a rebuild (or `cleaned`) is cleared.
     pub fn request_full_fetch(&self) -> Result<()> {
+        // A fetch is the start of a two-way sync: refused like one.
+        self.check_plugin_guard()?;
         self.with_index(|ix| {
             ix.reset_for_rebuild()?;
             ix.set_meta(meta::NEEDS_FETCH, &vaultfs::now_ms().to_string())?;
@@ -2623,6 +2701,12 @@ impl Engine {
             if *shutdown.borrow() {
                 return Ok(());
             }
+            if two_way {
+                if let Err(e) = self.check_plugin_guard() {
+                    self.inner.push_enabled.store(false, Ordering::SeqCst);
+                    return Err(e);
+                }
+            }
             self.reset_report();
             let gate = match self.connect_gate(false).await {
                 Ok(g) => {
@@ -2653,7 +2737,7 @@ impl Engine {
                         EngineError::Refused(
                             Refusal::MissingMilestone | Refusal::Locked | Refusal::MissingVersionDoc,
                         ) => Duration::from_secs(30),
-                        EngineError::Refused(_) => Duration::from_secs(300),
+                        EngineError::Refused(_) => self.inner.cfg.regate_interval,
                         EngineError::Remote(_) => backoff.next_delay(),
                         _ => return Err(e),
                     };
@@ -2715,7 +2799,7 @@ impl Engine {
                 self.record_error(&e);
                 self.inner.push_enabled.store(false, Ordering::SeqCst);
                 let wait = match &e {
-                    EngineError::Refused(_) => Duration::from_secs(300),
+                    EngineError::Refused(_) => self.inner.cfg.regate_interval,
                     EngineError::Remote(_) | EngineError::Other(_) => backoff.next_delay(),
                     _ => return Err(e),
                 };
@@ -2819,8 +2903,14 @@ impl Engine {
                             }
                             Err(e) => {
                                 self.record_error(&e);
+                                if let EngineError::Refused(_) = e {
+                                    // A version document that changed in the
+                                    // feed, encrypted content: stop pushing
+                                    // too until a gate passes again.
+                                    self.inner.push_enabled.store(false, Ordering::SeqCst);
+                                }
                                 let wait = match &e {
-                                    EngineError::Refused(_) => Duration::from_secs(300),
+                                    EngineError::Refused(_) => self.inner.cfg.regate_interval,
                                     EngineError::Remote(_) => backoff.next_delay(),
                                     _ => return Err(e),
                                 };
@@ -2975,6 +3065,7 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
         needs_full_fetch: ix.get_meta(meta::NEEDS_FETCH)?.is_some() || ix.get_meta(meta::RESOLVE_OWED)?.is_some(),
         resolve_owed: ix.get_meta(meta::RESOLVE_OWED)?.is_some(),
         safety_stop: ix.get_meta(meta::SAFETY_STOP)?,
+        upstream_stop: ix.get_meta(meta::UPSTREAM_STOP)?,
         rebuild_wait: ix.get_meta(meta::REBUILD_WAIT)?,
         rebuild_orphans: ix
             .get_meta(meta::ORPHANS)?

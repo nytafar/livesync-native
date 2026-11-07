@@ -194,6 +194,12 @@ struct PushOpts {
     /// When the folder scope narrows, remove the clean local copies that fell out of it
     #[arg(long)]
     remove_out_of_scope_copies: bool,
+    /// Sync two-way although this Obsidian vault has the Self-hosted
+    /// LiveSync plugin enabled: a deliberate handover, where you make sure
+    /// the plugin does not sync at the same time (also: allow_plugin = true
+    /// for the vault in lsync.toml)
+    #[arg(long)]
+    allow_plugin: bool,
 }
 
 fn init_logging() {
@@ -441,7 +447,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         Cmd::Sync { json, push } => rt()?.block_on(async {
             two_way_allowed(&sel, "sync")?;
             if let Some((mut client, vault, fingerprint)) = routed(&sel, &cfg, &ctx.dirs, "sync")? {
-                return run_routed(&mut client, method::SYNC, &vault, fingerprint, &push, json);
+                return run_routed(&mut client, method::SYNC, &vault, fingerprint, &sel, &push, json);
             }
             let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             run_sync(&engine, json, false).await
@@ -449,7 +455,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         Cmd::Fetch { json, push } => rt()?.block_on(async {
             two_way_allowed(&sel, "fetch")?;
             if let Some((mut client, vault, fingerprint)) = routed(&sel, &cfg, &ctx.dirs, "fetch")? {
-                return run_routed(&mut client, method::FETCH, &vault, fingerprint, &push, json);
+                return run_routed(&mut client, method::FETCH, &vault, fingerprint, &sel, &push, json);
             }
             let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             run_sync(&engine, json, true).await
@@ -613,6 +619,11 @@ fn status_all(json: bool) -> Result<u8> {
             .status
             .as_ref()
             .and_then(|s| s.safety_stop.as_ref().map(|t| format!("SAFETY STOP {t}")))
+            .or_else(|| {
+                v.status
+                    .as_ref()
+                    .and_then(|s| s.upstream_stop.as_ref().map(|t| format!("UPSTREAM STOP {t}")))
+            })
             // A running engine's message is its mode, shown already.
             .or_else(|| v.message.clone().filter(|m| m != mode))
             .unwrap_or_default();
@@ -656,6 +667,7 @@ fn run_routed(
     m: &str,
     vault: &str,
     fingerprint: Option<String>,
+    sel: &Selected,
     push: &PushOpts,
     json: bool,
 ) -> Result<u8> {
@@ -664,6 +676,7 @@ fn run_routed(
         "fingerprint": fingerprint,
         "allow_mass_delete": push.allow_mass_delete,
         "remove_out_of_scope_copies": push.remove_out_of_scope_copies,
+        "allow_plugin": push.allow_plugin || sel.tuning.allow_plugin,
     });
     match command(c, m, p)? {
         Ok(r) => print_sync(
@@ -717,7 +730,10 @@ fn run_config_for(
         allow_mass_delete: push.allow_mass_delete,
         remove_out_of_scope_copies: push.remove_out_of_scope_copies,
         rebuild_quiet: quiet.map(Duration::from_secs),
-        tuning: sel.tuning.clone(),
+        tuning: livesync_host::Tuning {
+            allow_plugin: sel.tuning.allow_plugin || push.allow_plugin,
+            ..sel.tuning.clone()
+        },
     })
 }
 
@@ -735,7 +751,14 @@ fn two_way_allowed(sel: &Selected, what: &str) -> Result<()> {
 
 async fn run_sync(engine: &Engine, json: bool, fetch: bool) -> Result<u8> {
     if fetch {
-        engine.request_full_fetch()?;
+        match engine.request_full_fetch() {
+            Ok(()) => {}
+            Err(EngineError::Refused(r)) => {
+                eprintln!("fetch refused: {r}");
+                return Ok(2);
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
     let t0 = Instant::now();
     let rep: SyncReport = match engine.sync_once().await {
@@ -1054,6 +1077,7 @@ fn engine_for(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, push: &PushOpts) ->
     sel.tuning
         .apply(&mut ec)
         .map_err(|e| anyhow::anyhow!("[vault.{}]: {e}", sel.name))?;
+    ec.allow_plugin |= push.allow_plugin;
     if ec.index_path.starts_with(&ec.vault)
         && !ec
             .index_path
@@ -1162,6 +1186,12 @@ fn print_status(s: &livesync_engine::Status) {
     }
     if let Some(stop) = &s.safety_stop {
         println!("SAFETY STOP     {stop} (lsync sync --allow-mass-delete)");
+    }
+    if let Some(stop) = &s.upstream_stop {
+        println!("UPSTREAM STOP   {stop}");
+        println!(
+            "                (syncing resumes by itself once the remote is compatible again; see COMPATIBILITY.md)"
+        );
     }
     println!("last error      {}", s.last_error.as_deref().unwrap_or("-"));
     println!("files           {:?}", s.counts);

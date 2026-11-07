@@ -72,14 +72,20 @@ pub struct RunConfig {
     /// (`None`: the engine's default; tests shorten it).
     pub rebuild_quiet: Option<std::time::Duration>,
     pub what_syncs: WhatSyncs,
-    /// The connection timings.
+    /// The plugin guard's handover switch and the gate and connection timings.
     pub tuning: Tuning,
 }
 
-/// A vault's connection settings (spec D8). `None` keeps the engine's
-/// platform default (`livesync_engine::engine::connection_defaults`).
+/// A vault's guard and connection settings (spec D8, D16). `None` keeps the
+/// engine's platform default (`livesync_engine::engine::connection_defaults`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tuning {
+    /// Run two-way although the vault's Self-hosted LiveSync plugin is
+    /// enabled (a deliberate handover).
+    pub allow_plugin: bool,
+    /// How often the remote's version document, features and tweaks are
+    /// checked again while running, in seconds (default 300).
+    pub regate_secs: Option<u64>,
     /// The longpoll's heartbeat in seconds (default 10; Android 30).
     pub heartbeat_secs: Option<u64>,
     /// Seconds without a heartbeat before the connection is taken for dead
@@ -93,8 +99,12 @@ pub struct Tuning {
 
 impl Tuning {
     /// The timings as the engine takes them.
-    fn timings(&self) -> Result<(Duration, Duration, Option<Duration>), String> {
+    fn timings(&self) -> Result<(Duration, Duration, Duration, Option<Duration>), String> {
         use livesync_engine::engine::connection_defaults as d;
+        let regate = self.regate_secs.map_or(d::REGATE, Duration::from_secs);
+        if regate < Duration::from_secs(1) {
+            return Err("regate_secs must be at least 1".into());
+        }
         let heartbeat = self.heartbeat_secs.map_or(d::HEARTBEAT, Duration::from_secs);
         if heartbeat < Duration::from_secs(1) {
             return Err("heartbeat_secs must be at least 1".into());
@@ -116,7 +126,7 @@ impl Tuning {
             Some(0) => None,
             Some(s) => Some(Duration::from_secs(s)),
         };
-        Ok((heartbeat, timeout, jump))
+        Ok((regate, heartbeat, timeout, jump))
     }
 
     pub fn check(&self) -> Result<(), String> {
@@ -124,7 +134,9 @@ impl Tuning {
     }
 
     pub fn apply(&self, ec: &mut EngineConfig) -> Result<(), String> {
-        let (heartbeat, timeout, jump) = self.timings()?;
+        let (regate, heartbeat, timeout, jump) = self.timings()?;
+        ec.allow_plugin = self.allow_plugin;
+        ec.regate_interval = regate;
         ec.heartbeat = heartbeat;
         ec.longpoll_timeout = timeout;
         ec.clock_jump = jump;

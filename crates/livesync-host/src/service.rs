@@ -288,6 +288,7 @@ pub fn settings_of(cfg: &RunConfig) -> Settings {
         sync_only_regex: cfg.what_syncs.sync_only_regex.clone(),
         sync_dot_paths: cfg.what_syncs.sync_dot_paths.clone(),
         trash: cfg.what_syncs.trash.as_str().to_string(),
+        allow_plugin: cfg.tuning.allow_plugin,
     }
 }
 
@@ -836,6 +837,7 @@ impl Service {
             let mut run = cfg.clone();
             run.allow_mass_delete = p.allow_mass_delete;
             run.remove_out_of_scope_copies = p.remove_out_of_scope_copies;
+            run.tuning.allow_plugin |= p.allow_plugin;
             let adopt = p.adopt_tweaks;
             tokio::spawn(async move {
                 let released = !had_engine || svc.stop_engine(&name).await;

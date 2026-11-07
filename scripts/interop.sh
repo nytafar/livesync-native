@@ -32,6 +32,9 @@
 #       written; a path that becomes ignored is untracked, never deleted
 #   S10 remote deletes land in .trash/ with their folders, the emptied
 #       folder goes, and nothing is pushed back
+#   S11 the upstream guard on the CLI's own defaults: a database the CLI sets
+#       up untouched is synced, or (when it turns features on) refused with a
+#       message naming each feature and the newest plugin version known to work
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -66,6 +69,7 @@ cleanup() {
   echo "passed $PASS, failed $FAIL (database $DB, work folder $W)" | tee -a "$RESULTS"
   if [[ "${KEEP:-0}" != 1 ]]; then
     couch -X DELETE "$LSYNC_URL/$DB" >/dev/null || true
+    couch -X DELETE "$LSYNC_URL/$DB-defaults" >/dev/null || true
     [[ "$W" == /tmp/lsync-it.* ]] && rm -rf -- "$W"
   fi
   exit $rc
@@ -139,14 +143,23 @@ log "== interop run $RUN: lsync $(git rev-parse --short HEAD) vs official CLI $C
 couch -X PUT "$LSYNC_URL/$DB" >/dev/null
 
 # --- setup: the CLI initialises the database with our setup's tweaks -----------
-node "$CLI_JS" init-settings --force "$W/cli.json" >>"$W/cli.log" 2>&1
-SETTINGS="$W/cli.json" DBN="$DB" node -e '
-const fs = require("fs"); const p = process.env.SETTINGS; const d = JSON.parse(fs.readFileSync(p, "utf8"));
+# pathNormalizationVersion 0 is the path identity of every database set up
+# before 1.0.46, which a newer plugin joining it keeps. From 1.0.46 on, a new
+# database gets NFC path identity (`nfc-path-identity-v1`), which lsync does
+# not implement yet: S11 checks how such a database is refused.
+node "$CLI_JS" init-settings --force "$W/cli-defaults.json" >>"$W/cli.log" 2>&1
+cli_settings() { # cli_settings <src> <dst> <database> [JSON of more settings]
+  local more=${4:-}
+  [[ -n "$more" ]] || more='{}'
+  SRC="$1" DST="$2" DBN="$3" MORE="$more" node -e '
+const fs = require("fs"); const d = JSON.parse(fs.readFileSync(process.env.SRC, "utf8"));
 Object.assign(d, { couchDB_URI: process.env.LSYNC_URL, couchDB_USER: process.env.LSYNC_USER,
   couchDB_PASSWORD: process.env.LSYNC_PASSWORD, couchDB_DBNAME: process.env.DBN, remoteType: "",
-  customChunkSize: 60, isConfigured: true, liveSync: false, syncOnStart: false, syncOnSave: false,
-  usePluginSync: false });
-fs.writeFileSync(p, JSON.stringify(d, null, 2), { mode: 0o600 });'
+  isConfigured: true, liveSync: false, syncOnStart: false, syncOnSave: false }, JSON.parse(process.env.MORE));
+fs.writeFileSync(process.env.DST, JSON.stringify(d, null, 2), { mode: 0o600 });'
+}
+cli_settings "$W/cli-defaults.json" "$W/cli.json" "$DB" \
+  '{"customChunkSize": 60, "usePluginSync": false, "pathNormalizationVersion": 0}'
 mkdir -p "$W/clidb" "$W/vault" "$W/vault-b" "$W/src"
 printf 'init\n' | cli put setup/init.md >/dev/null
 cli sync >/dev/null
@@ -567,6 +580,43 @@ lsd sync >/dev/null
 check "nothing is pushed back: still deleted remotely" remote_deleted s10/sub/t.md
 check "nothing in .trash/ is pushed" test "$(couch -o /dev/null -w '%{http_code}' "$LSYNC_URL/$DB/.trash%2Fs10%2Fsub%2Ft.md")" == 404
 check "the CLI no longer lists it" bash -c "! node '$CLI_JS' '$W/clidb' --settings '$W/cli.json' cat s10/sub/t.md >/dev/null 2>&1"
+fi
+
+# --- S11: the upstream guard on the CLI's own defaults ---------------------------
+if want S11; then
+log "S11 a database the CLI sets up with its own defaults"
+couch -X PUT "$LSYNC_URL/$DB-defaults" >/dev/null
+cli_settings "$W/cli-defaults.json" "$W/cli-d9.json" "$DB-defaults"
+mkdir -p "$W/clidb-d9" "$W/vault-d9"
+cli9() { node "$CLI_JS" "$W/clidb-d9" --settings "$W/cli-d9.json" "$@" 2>>"$W/cli.log"; }
+lsd9() { LSYNC_DB=$DB-defaults LSYNC_VAULT=$W/vault-d9 LSYNC_STATE_DIR=$W/state-d9 LSYNC_CONFIG=$W/d9.toml \
+         LSYNC_DEVICE_NAME=interop-d9 "$BIN" "$@"; }
+printf 'defaults\n' | cli9 put s9/init.md >/dev/null
+cli9 sync >/dev/null
+features=$(couch "$LSYNC_URL/$DB-defaults/obsydian_livesync_version" |
+  python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin).get("used_features", [])))')
+log "    the CLI's defaults turn on: ${features:-no features}"
+rc=0
+lsd9 sync >/dev/null 2>"$W/lsync-d9.log" || rc=$?
+if [[ -n "$features" ]]; then
+  check "lsync refuses it (exit $rc; 2 is a gate's refusal)" test "$rc" -eq 2
+  for f in $features; do
+    check "  ... naming $f" grep -q -- "$f" "$W/lsync-d9.log"
+  done
+  # A feature lsync has never heard of is news: fail, so someone looks.
+  check "  ... all of them features lsync knows of (if not, see COMPATIBILITY.md)" \
+    bash -c "! grep -q 'features this client does not know' '$W/lsync-d9.log'"
+  check "  ... and the newest plugin version known to work" \
+    grep -q "is the newest version known to work with lsync" "$W/lsync-d9.log"
+  st9=$(lsd9 status --json 2>/dev/null || true)
+  check "  ... and status shows the upstream stop" \
+    test "$(echo "$st9" | jfield '.get("upstream_stop") is not None')" == true
+  check "  ... and nothing was written to the database" bash -c \
+    "! curl -sS -u '$LSYNC_USER:$LSYNC_PASSWORD' '$LSYNC_URL/$DB-defaults/_local/obsydian_livesync_milestone' | grep -q interop-d9"
+else
+  check "lsync syncs it (exit $rc)" test "$rc" -eq 0 -o "$rc" -eq 3
+  check "  ... and has the CLI's note" file_is "$W/vault-d9/s9/init.md" "defaults"
+fi
 fi
 
 [[ $FAIL -eq 0 ]]

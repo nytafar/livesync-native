@@ -92,7 +92,72 @@ fn vaults_from_the_config_run_side_by_side_as_separate_nodes() {
 }
 
 #[test]
-fn the_connection_settings_are_checked_with_the_config() {
+fn an_upstream_change_stops_only_the_vault_on_that_database() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (changed, other) = rt.block_on(async { (Mock::start().await, Mock::start().await) });
+    changed.put_text("a.md", &["a"]);
+    other.put_text("b.md", &["b"]);
+    let d = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        home: Some(d.path().join("home")),
+        config: d.path().join("config/lsync"),
+        state: d.path().join("state/lsync"),
+    };
+    // Two-way vaults with the guard's timings from lsync.toml.
+    let text = format!(
+        "[account.one]\nurl = \"{}\"\nusername = \"u\"\n\n[account.two]\nurl = \"{}\"\nusername = \"u\"\n\n\
+         [vault.changed]\naccount = \"one\"\ndatabase = \"{DB}\"\nfolder = \"~/changed\"\nregate_secs = 1\nheartbeat_secs = 1\nlongpoll_timeout_secs = 3\n\n\
+         [vault.other]\naccount = \"two\"\ndatabase = \"{DB}\"\nfolder = \"~/other\"\nregate_secs = 1\nclock_jump_secs = 0\n",
+        changed.url, other.url
+    );
+    let cfg = Config::parse(&text, &dirs).unwrap();
+    let host = Host::new().unwrap();
+    for (name, v) in &cfg.vault {
+        let rc = v.run_config(name, &cfg.account[&v.account], Some("p"), &dirs).unwrap();
+        host.start(rc).unwrap();
+    }
+    let home = d.path().join("home");
+    wait_until("both vaults", || {
+        home.join("changed/a.md").exists() && home.join("other/b.md").exists()
+    });
+    let status = |name: &str| {
+        let v = &cfg.vault[name];
+        host.status(
+            name,
+            &v.folder_path(&dirs).display().to_string(),
+            &v.state_path(name, &dirs).display().to_string(),
+        )
+    };
+    // A newer plugin turns a feature on in one database.
+    changed.put(serde_json::json!({"_id": "obsydian_livesync_version", "type": "versioninfo", "version": 13, "used_features": ["teleport-v1"]}));
+    wait_until("the upstream stop", || {
+        status("changed")
+            .snapshot
+            .and_then(|s| s.upstream_stop)
+            .is_some_and(|m| m.contains("teleport-v1"))
+    });
+    // The vault keeps running (stopped inside the engine, not failed), and
+    // the other vault syncs on.
+    assert_eq!(status("changed").state, RunState::Running);
+    other.put_text("b2.md", &["b2"]);
+    wait_until("the other vault syncs on", || home.join("other/b2.md").exists());
+    assert!(status("other").snapshot.unwrap().upstream_stop.is_none());
+    changed.put_text("a2.md", &["a2"]);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!home.join("changed/a2.md").exists(), "the stopped vault pulled");
+    // The remote goes back: the vault resumes by itself.
+    changed.put(serde_json::json!({"_id": "obsydian_livesync_version", "type": "versioninfo", "version": 12}));
+    wait_until("the stopped vault resumes", || home.join("changed/a2.md").exists());
+    assert!(status("changed").snapshot.unwrap().upstream_stop.is_none());
+    host.stop_all();
+}
+
+#[test]
+fn the_guard_settings_are_checked_with_the_config() {
     let d = tempfile::tempdir().unwrap();
     let dirs = Dirs {
         home: Some(d.path().join("home")),
@@ -108,17 +173,21 @@ fn the_connection_settings_are_checked_with_the_config() {
             .engine_config()
             .unwrap()
     };
+    let c = ec("allow_plugin = true\nregate_secs = 60\n");
+    assert!(c.allow_plugin);
+    assert_eq!(c.regate_interval, Duration::from_secs(60));
     // Only a heartbeat: the timeout follows at 2.5 heartbeats.
     let c = ec("heartbeat_secs = 30\nclock_jump_secs = 0\n");
     assert_eq!(c.longpoll_timeout, Duration::from_secs(75));
     assert_eq!(c.clock_jump, None);
     let c = ec("");
-    assert_eq!(c.heartbeat, livesync_engine::engine::connection_defaults::HEARTBEAT);
+    assert!(!c.allow_plugin);
     for (bad, says) in [
         (
             "heartbeat_secs = 30\nlongpoll_timeout_secs = 20\n",
             "must be longer than heartbeat_secs",
         ),
+        ("regate_secs = 0\n", "regate_secs must be at least 1"),
         ("heartbeat_secs = 0\n", "heartbeat_secs must be at least 1"),
     ] {
         let e = Config::parse(&format!("{base}{bad}"), &dirs).unwrap_err();

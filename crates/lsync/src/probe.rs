@@ -404,26 +404,10 @@ fn getprop(key: &str) -> Option<String> {
 ///
 /// The probe writes, edits, renames and deletes `lsync-probe*.md`. In a vault
 /// where the Self-hosted LiveSync plugin is enabled, the plugin pushes those
-/// notes and their deletions to the real database. Enabled means the plugin
-/// folder exists and `.obsidian/community-plugins.json` lists it; when that
-/// file exists but cannot be read, assume enabled.
+/// notes and their deletions to the real database. The same check as the
+/// plugin guard of two-way sync (`livesync_engine::folderkind`).
 pub fn livesync_enabled(vault: &Path) -> Option<String> {
-    const ID: &str = "obsidian-livesync";
-    let obsidian = vault.join(".obsidian");
-    if !obsidian.join("plugins").join(ID).is_dir() {
-        return None;
-    }
-    let list = obsidian.join("community-plugins.json");
-    let text = match std::fs::read_to_string(&list) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => return Some(format!("{} exists but cannot be read ({e})", list.display())),
-    };
-    match serde_json::from_str::<Vec<String>>(&text) {
-        Ok(ids) if ids.iter().any(|i| i == ID) => Some(format!("{} lists {ID}", list.display())),
-        Ok(_) => None,
-        Err(e) => Some(format!("{} cannot be parsed ({e})", list.display())),
-    }
+    livesync_engine::folderkind::livesync_plugin_enabled(vault)
 }
 
 pub fn run(args: ProbeArgs) -> Result<u8> {
