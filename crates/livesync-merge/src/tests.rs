@@ -538,6 +538,100 @@ fn the_lost_update_guard_sees_lost_appends_as_blocks() {
     assert_eq!(guard(r1, l, r2).as_deref(), Some(l));
 }
 
+// ---------- stable names ----------
+
+#[test]
+fn names_are_stable() {
+    let rules: Vec<&str> = Rule::ALL.iter().map(|r| r.as_str()).collect();
+    assert_eq!(
+        rules,
+        [
+            "identical",
+            "edit_beats_delete",
+            "both_deleted",
+            "no_base",
+            "base_deleted",
+            "lines",
+            "frontmatter",
+            "object",
+            "unsupported"
+        ]
+    );
+    let devs: Vec<&str> = Deviation::ALL.iter().map(|d| d.as_str()).collect();
+    assert_eq!(
+        devs,
+        [
+            "same_insertion_once",
+            "fallthrough_open",
+            "glued_lines",
+            "unparsable_json",
+            "stricter_object_check",
+            "object_result_differs",
+            "numeric_key_order",
+            "broken_frontmatter",
+            "trailing_deletion",
+            "run_order"
+        ]
+    );
+    for r in Rule::ALL {
+        assert_eq!(Rule::parse(r.as_str()), Some(*r));
+        assert_eq!(r.to_string(), r.as_str());
+    }
+    for d in Deviation::ALL {
+        assert_eq!(Deviation::parse(d.as_str()), Some(*d));
+    }
+    assert_eq!(Rule::parse("Lines"), None);
+    let which: Vec<&str> = Which::ALL.iter().map(|w| w.as_str()).collect();
+    assert_eq!(which, ["base", "ours", "theirs"]);
+    let sides: Vec<&str> = Side::ALL.iter().map(|s| s.as_str()).collect();
+    assert_eq!(sides, ["ours", "theirs"]);
+    let reasons = [
+        (Reason::NoBase, "no_base"),
+        (Reason::BaseDeleted, "base_deleted"),
+        (Reason::BothDeleted, "both_deleted"),
+        (Reason::Unsupported, "unsupported"),
+        (Reason::NotUtf8(Which::Base), "not_utf8"),
+        (Reason::InvalidJson(Which::Ours), "invalid_json"),
+        (Reason::UnsupportedJson(Which::Theirs), "unsupported_json"),
+        (Reason::JsonShape, "json_shape"),
+        (Reason::InvalidFrontmatter(Which::Ours), "invalid_frontmatter"),
+        (Reason::MergedFrontmatterInvalid, "merged_frontmatter_invalid"),
+        (Reason::GluedLines, "glued_lines"),
+    ];
+    for (r, s) in reasons {
+        assert_eq!(r.as_str(), s);
+    }
+    assert_eq!(Reason::InvalidJson(Which::Ours).to_string(), "invalid_json(ours)");
+    assert_eq!(Reason::InvalidJson(Which::Ours).which(), Some(Which::Ours));
+    assert_eq!(Reason::JsonShape.to_string(), "json_shape");
+    let overlaps = [
+        (
+            Overlap::Lines(LineOverlap {
+                base: 0..0,
+                ours: 0..0,
+                theirs: 0..0,
+            }),
+            "lines",
+        ),
+        (Overlap::Key(Vec::new()), "key"),
+        (Overlap::FrontmatterKey(None), "frontmatter_key"),
+        (Overlap::FrontmatterOrder, "frontmatter_order"),
+        (Overlap::Whole(Reason::NoBase), "whole"),
+    ];
+    for (o, s) in overlaps {
+        assert_eq!(o.as_str(), s);
+    }
+    let outcomes = [
+        (Outcome::Identical, "identical"),
+        (Outcome::Keep(Side::Ours), "keep"),
+        (Outcome::Write(Vec::new()), "write"),
+        (Outcome::Open(Vec::new()), "open"),
+    ];
+    for (o, s) in outcomes {
+        assert_eq!(o.as_str(), s);
+    }
+}
+
 #[test]
 fn equal_mtimes_put_ours_first() {
     let input = Input {

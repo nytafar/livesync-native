@@ -24,7 +24,7 @@ npm ci                           # installs the pinned commonlib (see package.js
 node generate.mjs ../../fixtures/golden
 ```
 
-Bump the pinned version in `tools/golden/package.json`, and the version assertions in `crates/livesync-model/tests/golden.rs` and `crates/livesync-model/tests/golden_ignore.rs`, together.
+Bump the pinned version in `tools/golden/package.json` and every assertion of it together: `crates/livesync-model/tests/golden.rs`, `crates/livesync-model/tests/golden_ignore.rs`, `crates/livesync-merge/tests/golden.rs` and `crates/livesync-merge/src/tests.rs` (`grep -rn 'meta"\]\["version' crates` finds them all). A bump can change upstream's merge results; the merge corpus test then says which cases differ.
 
 ## Android app (APK)
 

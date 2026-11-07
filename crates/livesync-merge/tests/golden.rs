@@ -131,7 +131,7 @@ fn merges_match_upstream() {
     let mut agreed = 0;
     let mut undone = 0;
     let mut deviated: BTreeMap<String, usize> = BTreeMap::new();
-    let mut per_deviation: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_deviation: BTreeMap<&str, usize> = BTreeMap::new();
     for c in &cases {
         let name = c["name"].as_str().unwrap();
         let upstream = c["result"].as_str().map(str::to_string);
@@ -164,7 +164,7 @@ fn merges_match_upstream() {
             }
             for d in &r.deviations {
                 justify(name, *d, &r.deviations, c, &r.ours, &upstream);
-                *per_deviation.entry(format!("{d:?}")).or_default() += 1;
+                *per_deviation.entry(d.as_str()).or_default() += 1;
             }
             if r.deviations.iter().all(|d| LINE_FIXES.contains(d)) {
                 let u = run_undoing(c, kind, &r.deviations);

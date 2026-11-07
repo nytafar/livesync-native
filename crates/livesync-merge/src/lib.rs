@@ -100,6 +100,15 @@
 //! Kept from upstream on purpose, though it surprises: with equal mtimes, ours
 //! goes first (upstream's `<=`), so only distinct mtimes make the merge
 //! symmetric.
+//!
+//! # Stable names
+//!
+//! [`Rule`], [`Deviation`], [`Reason`], [`Overlap`], [`Outcome`], [`Which`]
+//! and [`Side`] have an `as_str` form (snake case), which the resolver writes to
+//! its `resolutions` table and `lsync conflicts show --json` prints. These
+//! strings are an interface: a variant may be added, but an existing string
+//! never changes meaning or spelling. [`Rule::parse`] and [`Deviation::parse`]
+//! read them back.
 
 mod dmp;
 mod frontmatter;
@@ -645,3 +654,132 @@ pub fn merge3(kind: Kind, input: &Input, settings: &Settings, labels: &Labels) -
 
 #[cfg(test)]
 mod tests;
+
+/// `as_str` and `parse` over a fixed table of names.
+macro_rules! names {
+    ($t:ty { $($v:ident => $s:literal,)* }) => {
+        impl $t {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [$t] = &[$(<$t>::$v,)*];
+            /// The stable name (see the crate docs).
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(<$t>::$v => $s,)*
+                }
+            }
+            /// The variant named `s` by [`Self::as_str`].
+            pub fn parse(s: &str) -> Option<$t> {
+                match s {
+                    $($s => Some(<$t>::$v),)*
+                    _ => None,
+                }
+            }
+        }
+        impl std::fmt::Display for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
+names!(Rule {
+    Identical => "identical",
+    EditBeatsDelete => "edit_beats_delete",
+    BothDeleted => "both_deleted",
+    NoBase => "no_base",
+    BaseDeleted => "base_deleted",
+    Lines => "lines",
+    Frontmatter => "frontmatter",
+    Object => "object",
+    Unsupported => "unsupported",
+});
+
+names!(Deviation {
+    SameInsertionOnce => "same_insertion_once",
+    FallthroughOpen => "fallthrough_open",
+    GluedLines => "glued_lines",
+    UnparsableJson => "unparsable_json",
+    StricterObjectCheck => "stricter_object_check",
+    ObjectResultDiffers => "object_result_differs",
+    NumericKeyOrder => "numeric_key_order",
+    BrokenFrontmatter => "broken_frontmatter",
+    TrailingDeletion => "trailing_deletion",
+    RunOrder => "run_order",
+});
+
+names!(Which {
+    Base => "base",
+    Ours => "ours",
+    Theirs => "theirs",
+});
+
+names!(Side {
+    Ours => "ours",
+    Theirs => "theirs",
+});
+
+impl Reason {
+    /// The stable name of the reason, without the side it names (see
+    /// [`Reason::which`]).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Reason::NoBase => "no_base",
+            Reason::BaseDeleted => "base_deleted",
+            Reason::BothDeleted => "both_deleted",
+            Reason::Unsupported => "unsupported",
+            Reason::NotUtf8(_) => "not_utf8",
+            Reason::InvalidJson(_) => "invalid_json",
+            Reason::UnsupportedJson(_) => "unsupported_json",
+            Reason::JsonShape => "json_shape",
+            Reason::InvalidFrontmatter(_) => "invalid_frontmatter",
+            Reason::MergedFrontmatterInvalid => "merged_frontmatter_invalid",
+            Reason::GluedLines => "glued_lines",
+        }
+    }
+    /// The version the reason is about, where it names one.
+    pub const fn which(self) -> Option<Which> {
+        match self {
+            Reason::NotUtf8(w)
+            | Reason::InvalidJson(w)
+            | Reason::UnsupportedJson(w)
+            | Reason::InvalidFrontmatter(w) => Some(w),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Reason {
+    /// The name, and the side where it names one: `invalid_json(ours)`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.which() {
+            Some(w) => write!(f, "{}({})", self.as_str(), w.as_str()),
+            None => f.write_str(self.as_str()),
+        }
+    }
+}
+
+impl Overlap {
+    /// The stable name of the kind of overlap.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Overlap::Lines(_) => "lines",
+            Overlap::Key(_) => "key",
+            Overlap::FrontmatterKey(_) => "frontmatter_key",
+            Overlap::FrontmatterOrder => "frontmatter_order",
+            Overlap::Whole(_) => "whole",
+        }
+    }
+}
+
+impl Outcome {
+    /// The stable name of the kind of outcome.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Outcome::Identical => "identical",
+            Outcome::Keep(_) => "keep",
+            Outcome::Write(_) => "write",
+            Outcome::Open(_) => "open",
+        }
+    }
+}
