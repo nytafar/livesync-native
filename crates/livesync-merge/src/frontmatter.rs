@@ -247,7 +247,7 @@ pub(crate) fn merge_block(
             })
             .collect()
     };
-    let w = lines::walk(&order(b), &order(o), &order(t), ours_first, budget)?;
+    let w = lines::walk_unchecked(&order(b), &order(o), &order(t), ours_first, budget)?;
     let Some(merged_order) = w.text() else {
         return Ok(FmOutcome::Order);
     };

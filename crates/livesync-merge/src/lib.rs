@@ -54,24 +54,26 @@
 //!   run that the other holds as a whole prefix or suffix (the longer is
 //!   taken); otherwise both runs go in whole, the older side's first, so two
 //!   appends to a log both survive intact (two fenced code blocks, each
-//!   whole). But where that would put a line both runs have in twice and the
-//!   runs are likely one, or may be cut another way, it is open: one run has
-//!   all the other's lines (not blank) in any order (a writer that saw R2's
-//!   appended lines and put a line between them); a run holds a copy of a
-//!   base line its side's diff deleted, or of the base line next to the point
-//!   (the diff may have kept the wrong copy); the runs share a line and the
-//!   point is beside a blank base line (blank lines align any way). The same
-//!   holds for two insertions
-//!   with only unchanged lines between them, compared with those lines (a
-//!   blank line both added, one above a blank line and one below it, once).
+//!   whole). But where the runs are likely one, it is open: one run has all
+//!   the other's lines (not blank) in any order (a writer that saw R2's
+//!   appended lines and put a line between them), or one run is only blank
+//!   lines (the other side may have typed onto them). The same holds for two
+//!   insertions with only unchanged lines between them, compared with those
+//!   lines (a blank line both added, one above a blank line and one below it,
+//!   once).
 //! - Where a side's insertion meets the other side's change (at its start or
-//!   end), the two are compared as two runs at one point: where one's lines
-//!   hold the other's as a whole prefix or suffix, the shared lines are taken
-//!   once (L marked a log entry done and appended the line R2 appended: L).
+//!   end), the shared lines are taken once where the change's lines hold the
+//!   insertion's as a whole prefix or suffix (L marked a log entry done and
+//!   appended the line R2 appended: L). Where the insertion holds the whole
+//!   change instead (L ticked a task and added it anew; R2 only ticked it),
+//!   the inserting side may have made the same change and typed the old line
+//!   again: open.
 //!   Likewise a change whose lines begin or end with exactly the other side's
 //!   change of the lines at that end is split there, so that part is the same
 //!   change on both sides (both ticked the second task, one also the first).
-//! - Overlapping deletions on both sides: every line either deleted goes.
+//! - Overlapping deletions on both sides: every line either deleted goes
+//!   (where each side keeps, beside its own deletion, a line the other
+//!   deleted, the check below leaves it open).
 //! - Everything else where the sides' changes touch the same base lines stays
 //!   open: two different replacements of overlapping lines (whole replacements
 //!   are compared, not their first lines), a deletion against a change, an
@@ -86,18 +88,21 @@
 //!   file's last line without a newline is the same line as one with it.
 //! - A result that would join a line without its newline to the next stays
 //!   open.
-//! - Every clean result is checked by line counts alone, with no alignment:
-//!   for each line that is not blank, by how often it is in the base, ours,
-//!   theirs and the result. More than either side has (a line both sides
-//!   added, taken twice), a line neither side has more often than the base
-//!   there more often than a side keeps it (a deleted line come back), or
-//!   fewer than both sides have (each side deleted another copy, counted
-//!   between anchor lines each file has once) leaves the whole file open.
-//!   Repeated lines (blank lines, `---`, a list item) are where the two
-//!   sides' diffs can line up the same lines differently; this catches what
-//!   that does to a merge, whatever step it went wrong in. A lost-update guard
-//!   reads "clean and equal to L" as "L holds R2", so a line taken twice or
-//!   brought back must never be clean.
+//! - Every clean result is checked against what the three files say, with
+//!   no alignment of the merge's: lines each file has once (anchors) are the
+//!   same line in all three, so between them a stretch only one side changed
+//!   must come out as that side's, byte for byte; a stretch both sides changed
+//!   must merge the same under every other way of lining it up. It is open
+//!   where a side may be the other side's file with lines of its own on top,
+//!   or with a line the other removed typed back right beside its own change
+//!   (both readings are plausible, and they disagree); where a line both
+//!   sides added would be there twice from two places; where a line one side
+//!   moved is one the other removed; where lines would come out of a side's
+//!   order. A lost-update guard reads "clean and equal to L" as "L holds R2",
+//!   so a line taken twice, dropped or brought back must never be clean.
+//!   The price: a line one side deleted right beside the other side's change
+//!   (an append after it, an edit of the next line) stays open, as git's
+//!   merge does.
 //!
 //! # Where this differs from upstream, and why
 //!
@@ -207,6 +212,7 @@
 //! existing string never changes meaning or spelling. [`Rule::parse`] and
 //! [`Deviation::parse`] read them back.
 
+mod check;
 mod dmp;
 mod frontmatter;
 mod json;

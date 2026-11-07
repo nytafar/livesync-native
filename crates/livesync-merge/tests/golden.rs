@@ -4,7 +4,8 @@
 //! unindented and this crate in the file's style), or open where upstream
 //! merges (stricter), or carry a deviation whose shape is checked here. Every
 //! line merge that writes, labelled or not, must also pass the placement
-//! oracle (`oracle/mod.rs`), so no label can cover a wrong merge. The crate's
+//! oracle and the oracle no alignment enters (`oracle/mod.rs`), so no label
+//! can cover a wrong merge. The crate's
 //! own model of upstream must match upstream's output, case by case.
 mod oracle;
 
@@ -215,7 +216,11 @@ fn merges_match_upstream() {
             let (b, l, rt) = (str_of(c, "base"), str_of(c, "left"), str_of(c, "right"));
             let t = line_merge_trace(b, l, rt, ours_first(c)).expect("within the budget");
             assert_eq!(t.text, r.ours, "{name}: the trace is not the merge");
-            if let Err(e) = oracle::check(b, l, rt, ours_first(c), &t).and_then(|_| oracle::counts(b, l, rt, &t)) {
+            let independent = |t: &livesync_merge::LineTrace| match &t.text {
+                Some(m) => oracle::independent(b, l, rt, m),
+                None => Ok(()),
+            };
+            if let Err(e) = oracle::check(b, l, rt, ours_first(c), &t).and_then(|_| independent(&t)) {
                 panic!(
                     "{name}: {e} ({:?})\nbase {b:?}\nleft {l:?}\nright {rt:?}\nmerged {:?}\nupstream {upstream:?}",
                     r.deviations, r.ours
@@ -275,8 +280,10 @@ fn merges_match_upstream() {
          open where upstream merges, by rule: {now_open:?}",
         cases.len()
     );
+    // Fewer than at first (447): many random and repeated-line cases are
+    // ones where which line is whose cannot be told, and stay open.
     assert!(
-        agreed >= 400,
+        agreed >= 390,
         "too few cases agree: {agreed}, deviations: {per_deviation:?}"
     );
 }

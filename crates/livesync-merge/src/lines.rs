@@ -20,9 +20,8 @@
 //!
 //! Each step trusts the two diffs' alignments with the base, and where lines
 //! repeat (blank lines, `---`, copies) the two diffs can line up the same
-//! lines differently. So a clean result is checked last by line counts alone
-//! ([`counts_hold`]), which no alignment enters, and is open where they are
-//! not counts a right merge can have.
+//! lines differently. So a clean result is checked last ([`crate::check`])
+//! against what the three files say, and is open where it fails.
 //!
 //! Every merged line records where it comes from ([`Src`]), which lets the
 //! tests check a merge against an oracle that knows nothing of how it was
@@ -145,7 +144,7 @@ pub(crate) fn pieces(text: &str) -> impl Iterator<Item = &str> {
 }
 
 /// A line without its line end, for comparing lines that may end a file.
-fn content(line: &str) -> &str {
+pub(crate) fn content(line: &str) -> &str {
     line.trim_end_matches(['\n', '\r'])
 }
 
@@ -173,7 +172,7 @@ fn held(long: &[&str], short: &[&str], prefer_end: bool) -> Option<usize> {
 }
 
 /// A line with nothing but white space on it.
-fn blank(line: &str) -> bool {
+pub(crate) fn blank(line: &str) -> bool {
     line.trim().is_empty()
 }
 
@@ -320,6 +319,60 @@ fn keep_unterminated_last(base: &[&str], d: &mut SideDiff) {
     d.changes.splice(ci..=ci, parts);
     d.equal_at[nb - 1] = Some(x);
     d.base_of[x] = Some(nb - 1);
+}
+
+/// For each base line, the line of `side` that keeps it by the line diff `d`
+/// (the base's last line without its newline as the merge counts it), and whether
+/// a change of the side is next to it (it removed the line before or after,
+/// or inserted lines right before or after it; blank lines between count as
+/// next to it).
+pub(crate) fn kept(base: &[&str], side: &str, d: &[(Op, String)]) -> (Vec<Option<usize>>, Vec<bool>) {
+    let mut s = side_diff(d, base.len(), side);
+    keep_unterminated_last(base, &mut s);
+    let n = base.len();
+    let k: Vec<bool> = s.equal_at.iter().map(Option::is_some).collect();
+    // Insertions at each gap (gap i is before base line i).
+    let mut ins = vec![false; n + 1];
+    for c in &s.changes {
+        if !c.side.is_empty() {
+            ins[c.base.start] = true;
+            ins[c.base.end] = true;
+        }
+    }
+    // Next to it: up to the nearest base lines around it that are not blank,
+    // those included (blank lines between do not part a line from a change).
+    let beside = (0..n)
+        .map(|i| {
+            // Lines `lo..=hi` and the gaps between them (with the file's
+            // start or end where no such line is).
+            let lo = (0..i).rev().find(|&j| !blank(base[j]));
+            let hi = (i + 1..n).find(|&j| !blank(base[j]));
+            let lines = lo.unwrap_or(0)..=hi.unwrap_or(n - 1);
+            let gaps = lo.map_or(0, |l| l + 1)..=hi.unwrap_or(n);
+            lines.into_iter().any(|j| j != i && !k[j]) || gaps.into_iter().any(|g| ins[g])
+        })
+        .collect();
+    (s.equal_at, beside)
+}
+
+/// For each line of `side`, where it stands in the base by the line diff
+/// `d`: `2 i + 1` for base line `i` it keeps or begins a replacement of,
+/// `2 g` for lines it inserted at gap `g` (before base line `g`).
+pub(crate) fn positions(base: &[&str], side: &str, d: &[(Op, String)]) -> Vec<usize> {
+    let mut s = side_diff(d, base.len(), side);
+    keep_unterminated_last(base, &mut s);
+    let mut at: Vec<usize> = s.base_of.iter().map(|b| b.map_or(0, |i| 2 * i + 1)).collect();
+    for c in &s.changes {
+        let p = if c.inserts() {
+            2 * c.base.start
+        } else {
+            2 * c.base.start + 1
+        };
+        for x in c.side.clone() {
+            at[x] = p;
+        }
+    }
+    at
 }
 
 /// Whether two changes of different sides touch the same base lines: two
@@ -482,8 +535,6 @@ struct Events {
     absorbed: bool,
     /// Pieces of both sides placed by position at a seam.
     placed: bool,
-    /// Two runs at one point that went in whole: (side, lines) of each.
-    whole: Vec<[(usize, Range<usize>); 2]>,
 }
 
 /// What a group of changes becomes.
@@ -511,9 +562,10 @@ struct Merger<'a> {
     base: Vec<&'a str>,
     sides: [SideDiff<'a>; 2],
     ours_first: bool,
-    /// For each side, the base lines its diff deleted that are not blank, by
-    /// content.
-    deleted: [HashSet<&'a str>; 2],
+    /// Two runs at one point where one is blank lines only stay open (see
+    /// [`Merger::runs`]); off for [`crate::check`]'s other alignments, where
+    /// which blank line is new is arbitrary.
+    blank_runs_open: bool,
 }
 
 /// The side lines of one side's piece.
@@ -585,12 +637,9 @@ impl<'a> Merger<'a> {
         if changes.len() == 2 && changes.iter().all(|(_, c)| c.inserts()) {
             let run = |s: usize| changes.iter().find(|(x, _)| *x == s).unwrap().1.side.clone();
             let (fs, ss) = if self.ours_first { (0, 1) } else { (1, 0) };
-            let (out, once) = match self.runs(fs, run(fs), ss, run(ss), start) {
+            let (out, once) = match self.runs(fs, run(fs), ss, run(ss)) {
                 Runs::Once(out) => (out, true),
-                Runs::Whole(out) => {
-                    ev.whole.push([(fs, run(fs)), (ss, run(ss))]);
-                    (out, false)
-                }
+                Runs::Whole(out) => (out, false),
                 Runs::Open => {
                     let text = |s: usize| self.sides[s].lines[run(s)].concat();
                     return Ok(Unit {
@@ -697,42 +746,22 @@ impl<'a> Merger<'a> {
     /// Two runs inserted at one point, side `fs`'s first. The same run, or one
     /// holding the other as a whole prefix or suffix, is taken once (the
     /// longer); otherwise both whole, the first first, two separate blocks
-    /// (two fenced code blocks, each whole). But both whole puts the lines
-    /// they share in twice, so it is open wherever which lines are the runs is
-    /// not sure, or they are likely one run:
+    /// (two fenced code blocks, each whole). It is open where the runs are
+    /// likely one:
     ///
     /// - one has all the other's lines that are not blank (in any order): one
     ///   run with lines put in it or moved (a writer that saw the other side's
     ///   run and added to it);
-    /// - a run holds a copy of a base line its side deleted: the diff may have
-    ///   kept the wrong copy (a blank line instead of the line);
-    /// - a run holds a copy of the base line before or after the point (the
-    ///   nearest that is not blank: blank lines align any way): the diff could
-    ///   as well have kept that copy and split the run around it;
-    /// - they share a line (not blank) at a point beside a blank base line:
-    ///   the diffs could have cut either side's lines at another blank line.
-    fn runs(&self, fs: usize, first: Range<usize>, ss: usize, second: Range<usize>, at: usize) -> Runs {
+    /// - one is only blank lines: the other side may have typed its lines
+    ///   onto them (a writer that saw the new empty line), or added its own.
+    ///
+    /// Where the diffs may have cut the runs at other lines (repeated or blank
+    /// lines), [`crate::check`] finds it.
+    fn runs(&self, fs: usize, first: Range<usize>, ss: usize, second: Range<usize>) -> Runs {
         let lines = |s: usize, r: &Range<usize>| &self.sides[s].lines[r.clone()];
         let (a, b) = (lines(fs, &first), lines(ss, &second));
-        let base = &self.base;
-        let beside: Vec<&str> = [
-            base[..at].iter().rev().find(|l| !blank(l)),
-            base[at..].iter().find(|l| !blank(l)),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|l| content(l))
-        .collect();
-        let splits = a.iter().chain(b).any(|l| beside.contains(&content(l)));
-        let moved = |s: usize, run: &[&str]| run.iter().any(|l| self.deleted[s].contains(content(l)));
-        let loose = [at.checked_sub(1), Some(at)]
-            .into_iter()
-            .flatten()
-            .any(|i| base.get(i).is_some_and(|l| blank(l)));
-        let shared = a
-            .iter()
-            .any(|l| !blank(l) && b.iter().any(|m| content(m) == content(l)));
-        let unsure = among(a, b) || among(b, a) || moved(fs, a) || moved(ss, b) || splits || (shared && loose);
+        let blank_only = self.blank_runs_open && (a.iter().all(|l| blank(l)) || b.iter().all(|l| blank(l)));
+        let unsure = among(a, b) || among(b, a) || blank_only;
         // `long` of side `ls` holds `short` of the other side at offset `at`.
         let once = |ls: usize, long: &Range<usize>, short: &Range<usize>, at: usize| -> Vec<Src> {
             long.clone()
@@ -771,10 +800,11 @@ impl<'a> Merger<'a> {
 
     /// `ins`, an insertion of one side beside `change` of the other side (at
     /// its end where `at_end`, else at its start), taken once with it: where
-    /// one holds the other as a whole prefix or suffix, as two runs at one
-    /// point are, the longer's lines with the shorter's marked as shared. The
-    /// change's base lines stay replaced.
-    fn absorb(&self, change: &[Src], ins: &[Src], at_end: bool) -> Option<Vec<Src>> {
+    /// the change's lines hold the insertion's as a whole prefix or suffix,
+    /// the change's lines with the insertion's marked as shared. The change's
+    /// base lines stay replaced. Where the insertion holds the change and the
+    /// change `replaced` base lines, not (see below).
+    fn absorb(&self, change: &[Src], ins: &[Src], at_end: bool, replaced: bool) -> Option<Vec<Src>> {
         let text = |v: &[Src]| -> Vec<&str> { v.iter().map(|l| self.text(*l)).collect() };
         let (c, i) = (text(change), text(ins));
         let mark = |long: &[Src], short: &[Src], at: usize| -> Option<Vec<Src>> {
@@ -792,6 +822,14 @@ impl<'a> Merger<'a> {
         }
         if let Some(at) = held(&c, &i, at_end) {
             return mark(change, ins, at);
+        }
+        // An insertion that holds the whole change beside it, where the
+        // change replaced base lines: the inserting side may have made the
+        // same change and typed the old lines again (L ticked the task and
+        // added it anew), or only inserted; which, decides whether the old
+        // lines stay. Open.
+        if replaced {
+            return None;
         }
         let at = held(&i, &c, !at_end)?;
         mark(ins, change, at)
@@ -923,7 +961,7 @@ impl<'a> Merger<'a> {
                 let (Piece::Clean(c), Piece::Clean(i)) = (&units[chg].piece, &units[ins].piece) else {
                     unreachable!()
                 };
-                if let Some(once) = self.absorb(c, i, at_end) {
+                if let Some(once) = self.absorb(c, i, at_end, !units[chg].at.is_empty()) {
                     units[chg].piece = Piece::Clean(once);
                     // Its lines are no longer one side's alone: an insertion
                     // at its other end is not taken into it as well.
@@ -965,9 +1003,8 @@ impl<'a> Merger<'a> {
 ///   whole change.
 /// - Two insertions at one point: taken once where they are the same, or one
 ///   holds the other as a whole prefix or suffix (then the longer); otherwise
-///   both whole, the older side's first, or a conflict where both whole would
-///   put a shared line in twice and the runs are likely one (see
-///   [`Merger::runs`]).
+///   both whole, the older side's first, or a conflict where the runs are
+///   likely one (see [`Merger::runs`]).
 /// - An insertion beside the other side's change (at its start or end) is
 ///   taken once where the change's lines begin or end with exactly those
 ///   lines.
@@ -979,8 +1016,8 @@ impl<'a> Merger<'a> {
 ///   a conflict hunk covering the base lines involved, and so are two pieces
 ///   of the two sides that meet at one point and share a line otherwise.
 /// - A result that would join a line without its newline to the next one is
-///   one whole-file conflict, and so is a result whose line counts no right
-///   merge can have ([`counts_hold`]).
+///   one whole-file conflict. A result that fails [`crate::check`] has a
+///   conflict hunk for each stretch that failed.
 ///
 /// Out of budget: the diffs or the merge would do more work than `budget`.
 pub(crate) fn walk(
@@ -990,29 +1027,141 @@ pub(crate) fn walk(
     ours_first: bool,
     budget: &mut Budget,
 ) -> Result<Walk, OutOfBudget> {
-    let base_lines: Vec<&str> = pieces(base).collect();
-    let nb = base_lines.len();
     let (dl, dr) = (
         dmp::line_diff(base, ours, budget)?,
         dmp::line_diff(base, theirs, budget)?,
     );
-    let mut sides = [side_diff(&dl, nb, ours), side_diff(&dr, nb, theirs)];
+    let Made { mut w, ev, whole } = make(base, ours, theirs, &dl, &dr, ours_first, true, budget)?;
+    if whole {
+        if w.glued {
+            let up = upstream_from(dl, dr, ours_first);
+            if up.text.is_some() {
+                w.note(if up.glued {
+                    Deviation::GluedLines
+                } else {
+                    Deviation::RunOrder
+                });
+            }
+        }
+        return Ok(w);
+    }
+    // Every clean merge is checked by what no alignment enters (see
+    // [`crate::check`]); where it fails, the view marks what is in doubt.
+    if w.is_clean() {
+        fn lines(s: &str) -> Vec<&str> {
+            pieces(s).collect()
+        }
+        let (b, o, t) = (lines(base), lines(ours), lines(theirs));
+        let text = w.text().expect("clean");
+        let m = lines(&text);
+        if let Some(view) = crate::check::check([&b, &o, &t], &m, ours_first, budget)? {
+            let align = std::mem::take(&mut w.align);
+            w = view;
+            w.align = align;
+        }
+    }
+
+    let up = upstream_from(dl, dr, ours_first);
+    let mine = w.text();
+    if mine != up.text {
+        match mine {
+            None if up.glued => w.note(Deviation::GluedLines),
+            None => {}
+            Some(_) => {
+                if ev.trailing {
+                    w.note(Deviation::TrailingDeletion);
+                }
+                if ev.once || ev.absorbed {
+                    w.note(Deviation::SameInsertionOnce);
+                }
+                if ev.runs {
+                    w.note(Deviation::RunOrder);
+                }
+                if up.glued {
+                    w.note(Deviation::GluedLines);
+                }
+                if ev.placed || w.deviations.is_empty() {
+                    w.note(Deviation::PositionOrder);
+                }
+            }
+        }
+    }
+    Ok(w)
+}
+
+/// [`walk`] without the check: for merges where which line is which does not
+/// decide what is kept (the frontmatter's key order, whose keys are decided
+/// by their values).
+pub(crate) fn walk_unchecked(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    ours_first: bool,
+    budget: &mut Budget,
+) -> Result<Walk, OutOfBudget> {
+    let (dl, dr) = (
+        dmp::line_diff(base, ours, budget)?,
+        dmp::line_diff(base, theirs, budget)?,
+    );
+    Ok(make(base, ours, theirs, &dl, &dr, ours_first, true, budget)?.w)
+}
+
+/// The clean text of the merge of `base`, `ours` and `theirs` with these
+/// alignments of each side with the base (`dl`, `dr`, as line diffs), with
+/// where each line comes from; or `None` where it is not clean. No check, no
+/// labels: for [`crate::check`], which merges with other alignments than the
+/// diff's (`other`: one of those, where a run of blank lines only goes in
+/// whole).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn merge_with(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    dl: &[(Op, String)],
+    dr: &[(Op, String)],
+    ours_first: bool,
+    other: bool,
+    budget: &mut Budget,
+) -> Result<Option<(String, Vec<Src>)>, OutOfBudget> {
+    let made = make(base, ours, theirs, dl, dr, ours_first, !other, budget)?;
+    Ok(match made.w.text() {
+        Some(t) if !made.whole => Some((t, made.w.trace)),
+        _ => None,
+    })
+}
+
+/// A merge made with given alignments, before it is checked and labelled.
+struct Made {
+    w: Walk,
+    ev: Events,
+    /// One group made the whole file a conflict (`w.glued` says why).
+    whole: bool,
+}
+
+/// The merge with these alignments (see [`walk`] and [`merge_with`]).
+#[allow(clippy::too_many_arguments)]
+fn make(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    dl: &[(Op, String)],
+    dr: &[(Op, String)],
+    ours_first: bool,
+    blank_runs_open: bool,
+    budget: &mut Budget,
+) -> Result<Made, OutOfBudget> {
+    let base_lines: Vec<&str> = pieces(base).collect();
+    let nb = base_lines.len();
+    let mut sides = [side_diff(dl, nb, ours), side_diff(dr, nb, theirs)];
     for side in &mut sides {
         keep_unterminated_last(&base_lines, side);
     }
     peel(&base_lines, &mut sides, budget)?;
-    budget.spend(2 * nb)?;
-    let deleted = [0, 1].map(|s| {
-        (0..nb)
-            .filter(|&i| sides[s].equal_at[i].is_none() && !blank(base_lines[i]))
-            .map(|i| content(base_lines[i]))
-            .collect()
-    });
     let m = Merger {
         base: base_lines,
         sides,
         ours_first,
-        deleted,
+        blank_runs_open,
     };
     let (no, nt) = (m.sides[0].changes.len(), m.sides[1].changes.len());
     budget.spend(m.sides[0].lines.len() + m.sides[1].lines.len() + nb + no + nt)?;
@@ -1027,10 +1176,10 @@ pub(crate) fn walk(
             j += 1;
         }
     }
-    let whole = |glued: bool| -> Result<Walk, OutOfBudget> {
+    let whole = |glued: bool, ev: Events| -> Made {
         let mut w = Walk::whole(base, ours, theirs);
         w.glued = glued;
-        Ok(w)
+        Made { w, ev, whole: true }
     };
     // Pieces in base order, until no seam joins two groups.
     let (units, ev) = loop {
@@ -1040,20 +1189,7 @@ pub(crate) fn walk(
             budget.spend(g.len())?;
             match m.unit(&g, &mut ev) {
                 Ok(u) => units.push(u),
-                Err(WholeFile { glued }) => {
-                    let mut w = whole(glued)?;
-                    if glued {
-                        let up = upstream_from(dl, dr, ours_first);
-                        if up.text.is_some() {
-                            w.note(if up.glued {
-                                Deviation::GluedLines
-                            } else {
-                                Deviation::RunOrder
-                            });
-                        }
-                    }
-                    return Ok(w);
-                }
+                Err(WholeFile { glued }) => return Ok(whole(glued, ev)),
             }
         }
         // An insertion at a point goes before a change starting there.
@@ -1117,153 +1253,16 @@ pub(crate) fn walk(
     if w.is_clean() {
         w.trace = trace;
     }
-
     // Safety net: a line emitted right after a line without its newline would
     // be glued to it. The whole file is then one conflict.
     if w.glued {
-        let align = w.align;
-        w = whole(true)?;
-        w.align = align;
+        let align = std::mem::take(&mut w.align);
+        let mut made = whole(true, ev);
+        made.w.align = align;
+        made.whole = false;
+        return Ok(made);
     }
-    // Safety net: a clean merge whose line counts no right merge can have
-    // (see [`counts_hold`]) is one conflict.
-    if w.is_clean() {
-        budget.spend(m.base.len() + m.sides[0].lines.len() + m.sides[1].lines.len() + w.trace.len())?;
-        let merged: Vec<&str> = w.trace.iter().map(|l| m.text(*l)).collect();
-        let texts = [&m.base[..], &m.sides[0].lines[..], &m.sides[1].lines[..], &merged[..]];
-        let pairs: Vec<[(usize, Range<usize>); 2]> = ev
-            .whole
-            .iter()
-            .map(|[(a, r), (b, q)]| [(a + 1, r.clone()), (b + 1, q.clone())])
-            .collect();
-        if !counts_hold(texts, &pairs) {
-            let align = w.align;
-            w = whole(false)?;
-            w.align = align;
-        }
-    }
-
-    let up = upstream_from(dl, dr, ours_first);
-    let mine = w.text();
-    if mine != up.text {
-        match mine {
-            None if up.glued => w.note(Deviation::GluedLines),
-            None => {}
-            Some(_) => {
-                if ev.trailing {
-                    w.note(Deviation::TrailingDeletion);
-                }
-                if ev.once || ev.absorbed {
-                    w.note(Deviation::SameInsertionOnce);
-                }
-                if ev.runs {
-                    w.note(Deviation::RunOrder);
-                }
-                if up.glued {
-                    w.note(Deviation::GluedLines);
-                }
-                if ev.placed || w.deviations.is_empty() {
-                    w.note(Deviation::PositionOrder);
-                }
-            }
-        }
-    }
-    Ok(w)
-}
-
-/// Whether a clean merge's line counts are ones a right merge can have.
-/// `texts` are the base `B`, ours `O`, theirs `T` and the merge `M`, as
-/// lines; `whole` the runs (by text and lines) that went in whole in pairs.
-///
-/// This knows nothing of how the merge was made: not how each side's diff
-/// aligned its lines with the base, which is where repeated lines go wrong
-/// (a line taken twice because the two diffs put it at different points, a
-/// deleted line come back because a diff kept another copy of it). It counts
-/// how often each line that is not blank is in each text, by content, and
-/// asks what a right merge can have. A right merge takes each side's added
-/// lines and drops each side's deleted ones; it cannot tell whether a line
-/// both sides added (or deleted) is one line or two, so where that decides
-/// the count, the merge stays open:
-///
-/// - `M <= max(O, T)`: more than either side has means both sides added the
-///   line, each its own copy. Two runs at one point that went in whole are
-///   the one exception, by design: their shared lines are there twice.
-/// - Where neither side has the line more often than the base, `M <=
-///   min(O, T)`: more is a deleted line come back (one side moved it, the
-///   other deleted it: open).
-/// - `M >= min(O, T)`: fewer means each side deleted another copy. Counted
-///   over the whole file, two copies far apart (each side ticking another of
-///   two tasks with the same text) would look like that. So for this one the
-///   texts are cut at anchors, lines that are not blank and are in each of
-///   the four texts exactly once, in the same order (as patience diff's), and
-///   each stretch between anchors is counted on its own; the rule above is
-///   checked per stretch too.
-fn counts_hold(texts: [&[&str]; 4], whole: &[[(usize, Range<usize>); 2]]) -> bool {
-    let c: [Vec<&str>; 4] = texts.map(|t| t.iter().map(|l| content(l)).collect());
-    let mut total: HashMap<&str, [usize; 4]> = HashMap::new();
-    for (k, t) in c.iter().enumerate() {
-        for l in t.iter().filter(|l| !blank(l)) {
-            total.entry(l).or_insert([0; 4])[k] += 1;
-        }
-    }
-    let mut twice: HashMap<&str, usize> = HashMap::new();
-    for [(a, r), (b, q)] in whole {
-        let tally = |k: usize, r: &Range<usize>| {
-            let mut h: HashMap<&str, usize> = HashMap::new();
-            for l in c[k][r.clone()].iter().filter(|l| !blank(l)) {
-                *h.entry(l).or_insert(0) += 1;
-            }
-            h
-        };
-        let (x, y) = (tally(*a, r), tally(*b, q));
-        for (l, m) in x {
-            *twice.entry(l).or_insert(0) += m.min(y.get(l).copied().unwrap_or(0));
-        }
-    }
-    let come_back = |[nb, no, nt, nm]: [usize; 4]| no <= nb && nt <= nb && nm > no.min(nt);
-    let whole_file = total.iter().all(|(l, &n)| {
-        let [_, no, nt, nm] = n;
-        nm <= no.max(nt) + twice.get(l).copied().unwrap_or(0) && !come_back(n)
-    });
-    if !whole_file {
-        return false;
-    }
-    // Where each line that is once in all four texts is in each.
-    let mut pos: HashMap<&str, [usize; 4]> = HashMap::new();
-    for (k, t) in c.iter().enumerate() {
-        for (i, l) in t.iter().enumerate() {
-            if total.get(l) == Some(&[1; 4]) {
-                pos.entry(l).or_insert([0; 4])[k] = i;
-            }
-        }
-    }
-    // In base order, an anchor where it comes after the last in every text.
-    let mut anchors: Vec<[usize; 4]> = Vec::new();
-    for l in &c[0] {
-        if let Some(p) = pos.get(l) {
-            if anchors.last().is_none_or(|a| (0..4).all(|k| p[k] > a[k])) {
-                anchors.push(*p);
-            }
-        }
-    }
-    // Each text's lines by stretch: (stretch, content) -> count per text.
-    let mut n: HashMap<(usize, &str), [usize; 4]> = HashMap::new();
-    for (k, t) in c.iter().enumerate() {
-        let mut at = 0;
-        for (i, l) in t.iter().enumerate() {
-            while at < anchors.len() && anchors[at][k] < i {
-                at += 1;
-            }
-            if blank(l) || anchors.get(at).is_some_and(|a| a[k] == i) {
-                continue;
-            }
-            n.entry((at, l)).or_insert([0; 4])[k] += 1;
-        }
-    }
-    n.values().all(|&x| {
-        let [_, no, nt, nm] = x;
-        nm >= no.min(nt) && !come_back(x)
-    })
+    Ok(Made { w, ev, whole: false })
 }
 
 /// The walk's result as it is put together.

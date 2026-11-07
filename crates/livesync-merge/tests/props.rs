@@ -286,8 +286,10 @@ fn passes_oracle(c: &Case, ours_mtime: i64, theirs_mtime: i64) -> Result<(), Tes
     if let Err(e) = oracle::check(&c.base, &c.ours, &c.theirs, ours_first, &t) {
         prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, written);
     }
-    if let Err(e) = oracle::counts(&c.base, &c.ours, &c.theirs, &t) {
-        prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, written);
+    if let Some(m) = &written {
+        if let Err(e) = oracle::independent(&c.base, &c.ours, &c.theirs, m) {
+            prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, written);
+        }
     }
     Ok(())
 }
@@ -442,7 +444,8 @@ proptest! {
     /// a whole prefix or suffix (or the same run) once. Where one run has all
     /// the other's lines that are not blank (at least one), in any order, it
     /// is open: likely one run with lines put in it, and both whole would put
-    /// them in twice.
+    /// them in twice. So it is where one run is only blank lines: the other
+    /// side may have typed its lines onto them.
     #[test]
     fn inserted_runs_stay_whole_older_first(r in runs_case()) {
         let c = Case {
@@ -464,7 +467,10 @@ proptest! {
                     None => false,
                 })
         };
-        let open = !holds(newer, older) && !holds(older, newer) && (within(newer, older) || within(older, newer));
+        let blank_only = |v: &[String]| solid(v).is_empty();
+        let open = !holds(newer, older)
+            && !holds(older, newer)
+            && (within(newer, older) || within(older, newer) || blank_only(newer) || blank_only(older));
         let want = if holds(newer, older) {
             r.side(newer, r.ours_change, &[], r.theirs_change)
         } else if holds(older, newer) {
@@ -490,7 +496,8 @@ proptest! {
 /// Changes at distinct base positions on each side: per base line, kept or
 /// replaced (with zero to two lines) by one side; per gap between lines,
 /// lines inserted by one side, both, or none. Never two changes touching the
-/// same base lines, so the merge is clean and its order is known.
+/// same base lines, nor a line one side deleted next to the other side's
+/// change (open by design), so the merge is clean and its order is known.
 #[derive(Clone, Debug)]
 struct Positions {
     n: usize,
@@ -511,7 +518,23 @@ fn positions_case() -> impl Strategy<Value = Positions> {
                 Just(ours_newer),
             )
         })
-        .prop_map(|(n, lines, mut gaps, ours_newer)| {
+        .prop_map(|(n, mut lines, mut gaps, ours_newer)| {
+            // A line one side deleted, next to the other side's change: that
+            // side may have typed the line back, which stays open. Keep the
+            // line instead.
+            for i in 0..n {
+                let side = lines[i].0;
+                if side == 0 || lines[i].1 != 0 {
+                    continue;
+                }
+                let other = |s: u8| s != 0 && s != side;
+                let next_to = [i.wrapping_sub(1), i + 1].iter().any(|&j| j < n && other(lines[j].0))
+                    || other(gaps[i].0)
+                    || other(gaps[i + 1].0);
+                if next_to {
+                    lines[i].0 = 0;
+                }
+            }
             for g in 0..=n {
                 let before = if g > 0 { lines[g - 1].0 } else { 0 };
                 let after = if g < n { lines[g].0 } else { 0 };
@@ -1002,126 +1025,172 @@ proptest! {
     }
 }
 
-/// A lost-update guard's case where lines repeat: blank lines, `---`, a
-/// list item, copies of lines already there, edited blank lines (` r`). R2
-/// is R1 with a remote's inserts (copies too), deletes of R1's lines and
-/// edits; L is R2 with a writer's inserts (copies too), and deletes and edits
-/// of R1's lines that are blank or that R2 has once. L already holds R2.
-/// (Where the writer deletes or edits one of two copies R2 has, no merge can
-/// tell which: base `X`, L `X`, R2 `X X` is a side that changed nothing
-/// against one that added a copy.)
-fn guard_repeats_case() -> impl Strategy<Value = (Case, bool)> {
-    const POOL: &[&str] = &["", "", "", "---", "- x", "u", "u", "u", "u", "u"];
+/// Which of the reviewers' guard streams (`/tmp/rev4-probe`'s order_guard
+/// and `/tmp/rev3-probe`'s guard3): plain lines, blank lines and `---`; also
+/// `- x` and copies of lines already there; also copies of R1's lines (a
+/// writer typing back text R2 removed or changed).
+#[derive(Clone, Copy, Debug)]
+enum Stream {
+    Plain,
+    Copies,
+    Orig,
+}
+
+/// A lost-update guard's case from one of the streams: R2 is R1 with a
+/// remote's inserts (copies too), deletes of R1's lines and edits; L is R2
+/// with a writer's inserts (copies of L's lines, or of R1's for `Orig`), and
+/// deletes and edits of R1's lines. L holds R2.
+///
+/// Three things no merge can see are left out, as the texts would show
+/// another history: the writer changing a line R2 has more than once (which
+/// copy?), the writer copying a line and changing the original (a move that
+/// reads as two separate edits), and an R1 ending in an empty line without a
+/// final newline (the text has no such line).
+fn guard_stream(stream: Stream) -> impl Strategy<Value = (Case, bool)> {
+    const PLAIN: &[&str] = &["", "", "", "---", "u", "u", "u", "u", "u", "u", "u", "u"];
+    const COPIES: &[&str] = &["", "", "", "---", "- x", "u", "u", "u", "u", "u"];
+    let (pool, ops, len) = match stream {
+        Stream::Plain => (PLAIN, 3u8, 4),
+        Stream::Copies | Stream::Orig => (COPIES, 4u8, 5),
+    };
     type Edits = Vec<(u8, prop::sample::Index, &'static str, prop::sample::Index)>;
-    let edits = || {
+    let edits = move || {
         prop::collection::vec(
             (
-                0..4u8,
+                0..ops,
                 any::<prop::sample::Index>(),
-                prop::sample::select(POOL),
+                prop::sample::select(pool),
                 any::<prop::sample::Index>(),
             ),
-            0..5,
+            0..len,
         )
     };
     (
-        prop::collection::vec(prop::sample::select(POOL), 0..12),
+        prop::collection::vec(prop::sample::select(pool), 0..12),
         edits(),
         edits(),
         any::<bool>(),
         any::<bool>(),
     )
-        .prop_map(|(r1, remote, writer, l_newer, fin)| {
-            let mut fresh = 0;
-            let mut word = |w: &str| {
-                if w == "u" {
-                    fresh += 1;
-                    format!("line {fresh}")
-                } else {
-                    w.to_string()
-                }
-            };
-            // Each line with whether it is R1's, untouched.
-            let r1: Vec<(String, bool)> = r1.iter().map(|w| (word(w), true)).collect();
-            let mut edit =
-                |v: &mut Vec<(String, bool)>, edits: &Edits, mark: &str, may: &dyn Fn(&(String, bool)) -> bool| {
-                    for (op, i, w, j) in edits {
-                        match op {
-                            0 => {
-                                let at = i.index(v.len() + 1);
-                                v.insert(at, (word(w), false));
-                            }
-                            3 if !v.is_empty() => {
-                                let copy = v[j.index(v.len())].0.clone();
-                                v.insert(i.index(v.len() + 1), (copy, false));
-                            }
-                            1 if !v.is_empty() => {
-                                let at = i.index(v.len());
-                                if may(&v[at]) {
-                                    v.remove(at);
-                                }
-                            }
-                            2 if !v.is_empty() => {
-                                let at = i.index(v.len());
-                                if may(&v[at]) {
-                                    v[at] = (format!("{} {mark}", v[at].0), false);
-                                }
-                            }
-                            _ => {}
-                        }
+        .prop_map(
+            move |(r1, remote, writer, l_newer, fin): (Vec<&str>, Edits, Edits, bool, bool)| {
+                let mut fresh = 0;
+                let mut word = |w: &str| {
+                    if w == "u" {
+                        fresh += 1;
+                        format!("line {fresh}")
+                    } else {
+                        w.to_string()
                     }
                 };
-            let mut r2 = r1.clone();
-            edit(&mut r2, &remote, "r", &|l| l.1);
-            let once: Vec<String> = r2
-                .iter()
-                .filter(|l| r2.iter().filter(|m| m.0 == l.0).count() == 1)
-                .map(|l| l.0.clone())
-                .collect();
-            let mut l = r2.clone();
-            edit(&mut l, &writer, "w", &|x| {
-                x.1 && (x.0.trim().is_empty() || once.contains(&x.0))
-            });
-            let text =
-                |v: &[(String, bool)], f: bool| join(&v.iter().map(|x| x.0.clone()).collect::<Vec<_>>(), "\n", f);
-            let c = Case {
-                base: text(&r1, fin),
-                ours: text(&l, true),
-                theirs: text(&r2, true),
-            };
-            (c, l_newer)
-        })
+                let r1: Vec<String> = r1.iter().map(|w| word(w)).collect();
+                // Each line with whether it is R1's, untouched.
+                let mut r2: Vec<(String, bool)> = r1.iter().map(|l| (l.clone(), true)).collect();
+                for (op, i, w, j) in &remote {
+                    match op {
+                        0 => {
+                            let at = i.index(r2.len() + 1);
+                            r2.insert(at, (word(w), false));
+                        }
+                        3 if !r2.is_empty() => {
+                            let copy = r2[j.index(r2.len())].0.clone();
+                            r2.insert(i.index(r2.len() + 1), (copy, false));
+                        }
+                        1 if !r2.is_empty() => {
+                            let at = i.index(r2.len());
+                            if r2[at].1 {
+                                r2.remove(at);
+                            }
+                        }
+                        2 if !r2.is_empty() => {
+                            let at = i.index(r2.len());
+                            if r2[at].1 || matches!(stream, Stream::Plain) {
+                                r2[at] = (format!("{} r", r2[at].0), false);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let once: Vec<String> = r2
+                    .iter()
+                    .filter(|l| r2.iter().filter(|m| m.0 == l.0).count() == 1)
+                    .map(|l| l.0.clone())
+                    .collect();
+                let (mut copied, mut changed): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+                let mut l = r2.clone();
+                for (op, i, w, j) in &writer {
+                    match op {
+                        0 => {
+                            let at = i.index(l.len() + 1);
+                            l.insert(at, (word(w), false));
+                        }
+                        3 => {
+                            let copy = match stream {
+                                Stream::Orig if !r1.is_empty() => r1[j.index(r1.len())].clone(),
+                                Stream::Copies if !l.is_empty() => l[j.index(l.len())].0.clone(),
+                                _ => continue,
+                            };
+                            if !changed.contains(&copy) {
+                                copied.push(copy.clone());
+                                l.insert(i.index(l.len() + 1), (copy, false));
+                            }
+                        }
+                        1 | 2 if !l.is_empty() => {
+                            let at = i.index(l.len());
+                            let x = l[at].clone();
+                            if !x.1 || !once.contains(&x.0) || copied.contains(&x.0) {
+                                continue;
+                            }
+                            changed.push(x.0.clone());
+                            if *op == 1 {
+                                l.remove(at);
+                            } else {
+                                l[at] = (format!("{} w", x.0), false);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let fin = fin || r1.last().is_some_and(|l| l.is_empty());
+                let text =
+                    |v: &[(String, bool)], f: bool| join(&v.iter().map(|x| x.0.clone()).collect::<Vec<_>>(), "\n", f);
+                let c = Case {
+                    base: join(&r1, "\n", fin),
+                    ours: text(&l, true),
+                    theirs: text(&r2, true),
+                };
+                (c, l_newer)
+            },
+        )
+}
+
+fn guard_streams() -> impl Strategy<Value = (Case, bool)> {
+    prop_oneof![
+        guard_stream(Stream::Plain),
+        guard_stream(Stream::Copies),
+        guard_stream(Stream::Orig)
+    ]
 }
 
 proptest! {
     #![proptest_config(config())]
 
-    /// The lost-update guard where lines repeat, checked by counts alone (no
-    /// alignment): a clean merge of base R1, ours L and theirs R2 never has a
-    /// line that is not blank more often than L, so it never takes a line
-    /// twice nor brings back one the writer deleted or changed.
+    /// The lost-update guard, where L holds R2, on the reviewers' streams:
+    /// a clean merge of base R1, ours L and theirs R2 is L, in both
+    /// directions (no line more often than L, none of L's lines dropped), in
+    /// L's order, with L's paragraph breaks; except where the texts cannot
+    /// show that L holds R2 (see `oracle::guard`). It also passes the
+    /// placement oracle and the one no alignment enters.
     #[test]
-    fn a_guard_merge_never_has_a_line_more_often_than_the_writer((c, l_newer) in guard_repeats_case()) {
+    fn a_guard_merge_is_the_writers_file((c, l_newer) in guard_streams()) {
         let (mo, mt) = if l_newer { (3000, 2000) } else { (2000, 3000) };
         passes_oracle(&c, mo, mt)?;
-        let solid = |s: &str| -> HashMap<String, usize> {
-            let mut n = HashMap::new();
-            for l in s.lines().filter(|l| !l.trim().is_empty()) {
-                *n.entry(l.to_string()).or_default() += 1;
-            }
-            n
-        };
         for kind in [Kind::Text, Kind::Markdown] {
             match run(kind, &c, mo, mt).outcome {
                 Outcome::Write(out) => {
-                    let (m, l) = (solid(std::str::from_utf8(&out).unwrap()), solid(&c.ours));
-                    for (line, n) in &m {
-                        let want = l.get(line).copied().unwrap_or(0);
-                        prop_assert!(
-                            *n <= want,
-                            "{line:?} {n}x, L has it {want}x\n{c:?}\nmerged {:?}",
-                            String::from_utf8_lossy(&out)
-                        );
+                    let out = String::from_utf8(out).unwrap();
+                    if let Err(e) = oracle::guard(&c.base, &c.ours, &c.theirs, &out, mo <= mt) {
+                        prop_assert!(false, "{}\n{:?}", e, c);
                     }
                 }
                 Outcome::Keep(_) => prop_assert!(false),
@@ -1352,16 +1421,17 @@ fn the_oracle_rejects_wrong_merges() {
     .is_some());
 }
 
-/// The count oracle needs no alignment: it rejects the wrong merges an
-/// earlier version made where the two diffs aligned repeated lines
-/// differently (each with the merge's own alignments, which the placement
-/// rules of `oracle::check` take on trust), and the merge now leaves each
-/// open.
+/// The oracles that no alignment of the merge's enters reject the wrong
+/// merges earlier versions made (each found by a review, each from two diffs
+/// that lined up repeated lines differently, or a line one side typed again),
+/// and the merge now leaves each open. Base R1, L (which saw R2), R2, and the
+/// wrong merge.
 #[test]
-fn the_count_oracle_rejects_what_alignments_hide() {
-    // base, ours, theirs, the wrong merge.
+fn the_independent_oracles_reject_what_alignments_hide() {
     let cases = [
-        // A line both inserted, put at two points across blank lines.
+        // Review 3: a line both inserted, put at two points across blank
+        // lines; a line ours changed, back as theirs' "moved" copy; a copy
+        // inserted next to the line it copies.
         (
             "# Day\n- a\n- b\n\n\n",
             "# Day\n- a done\n\n- c\n- d\n",
@@ -1374,7 +1444,6 @@ fn the_count_oracle_rejects_what_alignments_hide() {
             "line 1\n\nline 4\nline 2\n\nline 3 r\n",
             "line 1\n\nline 4\n\nline 4\n\n\nline 3 r\n",
         ),
-        // A line ours changed, back as theirs' "moved" copy.
         (
             "\n\nline 1\nline 2",
             "line 1 w\n\n",
@@ -1387,7 +1456,6 @@ fn the_count_oracle_rejects_what_alignments_hide() {
             "line 2\nline 3\n",
             "line 2\nline 3\nline 4\nline 3\n",
         ),
-        // A copy both inserted beside a line it copies, at either end of it.
         (
             "A\n- x\nB\n",
             "A'\n- x\n- x\nB\n",
@@ -1395,15 +1463,53 @@ fn the_count_oracle_rejects_what_alignments_hide() {
             "A'\n- x\n- x\n- x\nB\n",
         ),
         ("B\nC\nB\n", "B\nC r\nB\nC\n", "B\nC r\nB\n", "B\nC r\nB\nC r\n"),
+        // Review 4: the writer's new line dropped where it repeats a line
+        // the other side edited or deleted; a paragraph break lost; lines
+        // out of the writer's order.
+        (
+            "# Today\n- [ ] water plants\n- [ ] call mom\n",
+            "# Today\n- [x] water plants\n- [ ] water plants\n- [ ] call mom\n",
+            "# Today\n- [x] water plants\n- [ ] call mom\n",
+            "# Today\n- [x] water plants\n- [ ] call mom\n",
+        ),
+        (
+            "Call Bob\nAgenda\n",
+            "Called Bob\nAgenda\nCall Bob\n",
+            "Called Bob\nAgenda\n",
+            "Called Bob\nAgenda\n",
+        ),
+        ("line 1\nline 2\n", "line 2\nline 1\n- x\n", "line 2\n", "line 2\n- x\n"),
+        (
+            "Intro\n\nPara A\nPara B\n",
+            "Intro\nmore intro\nPara A\n\nPara B\n",
+            "Intro\nmore intro\nPara A\nPara B\n",
+            "Intro\nmore intro\nPara A\nPara B\n",
+        ),
+        ("A\nB\n", "X\nY\nA\nB\n", "X\nB\n", "X\nY\nB\n"),
+        (
+            "# N\n```\n```",
+            "# N\nintro\n```\nprint(1)\n```\n",
+            "# N\nintro\n```\n```\n",
+            "# N\nintro\n```\n```\nprint(1)\n",
+        ),
+        (
+            "line 1\nline 2\n---\n---",
+            "line 1\nline 2\nline 3\n---\nline 4\n---\n",
+            "line 1\nline 2\nline 3\n---\n---\n",
+            "line 1\nline 2\nline 3\n---\n---\nline 4\n",
+        ),
     ];
-    for (b, o, t, wrong) in cases {
-        for ours_first in [true, false] {
-            let mut tr = line_merge_trace(b, o, t, ours_first).unwrap();
-            assert_eq!(tr.merged, None, "open now: {b:?} {o:?} {t:?}");
-            tr.text = Some(wrong.to_string());
+    for (b, l, r2, wrong) in cases {
+        for l_first in [true, false] {
+            let t = line_merge_trace(b, l, r2, l_first).unwrap();
+            assert_eq!(t.merged, None, "open now: {b:?} {l:?} {r2:?}");
             assert!(
-                oracle::counts(b, o, t, &tr).is_err(),
-                "{wrong:?} passes the count oracle"
+                oracle::independent(b, l, r2, wrong).is_err() || oracle::guard(b, l, r2, wrong, l_first).is_err(),
+                "{wrong:?} passes both oracles"
+            );
+            assert!(
+                oracle::guard(b, l, r2, wrong, l_first).is_err(),
+                "{wrong:?} passes the guard oracle"
             );
         }
     }
@@ -1440,8 +1546,8 @@ fn generators_reach_merges() {
     );
     share("json", json_case().boxed(), Kind::Object, Rule::Object, 0.3);
     share(
-        "guard with repeated lines",
-        guard_repeats_case().prop_map(|(c, _)| c).boxed(),
+        "guard streams",
+        guard_streams().prop_map(|(c, _)| c).boxed(),
         Kind::Text,
         Rule::Lines,
         0.3,

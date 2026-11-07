@@ -327,9 +327,14 @@ fn replacements_are_compared_whole() {
 }
 
 #[test]
-fn overlapping_deletions_delete_every_line() {
+fn overlapping_deletions_stay_open() {
+    // Each side keeps, beside its own deletion, a line the other deleted: it
+    // may have typed that line back, which no merge can tell from keeping it
+    // (upstream and earlier versions dropped both, `a e`).
     let m = md("a\nb\nc\nd\ne\n", "a\nd\ne\n", "a\nb\ne\n");
-    assert_eq!(written(&m), "a\ne\n");
+    assert!(m.outcome.is_open(), "{m:?}");
+    // The same deletion on both sides is one change.
+    assert_eq!(written(&md("a\nb\nc\nd\n", "a\nd\n", "a\nd\nx\n")), "a\nd\nx\n");
 }
 
 #[test]
@@ -547,11 +552,11 @@ fn two_lines_glued_together_stay_open() {
     let m = md("a\nb", "a\nb\nleft", "a\nb\nright");
     assert_eq!(m.deviations, [Deviation::GluedLines]);
     assert!(m.outcome.is_open());
-    // Found by the property test: upstream gives "alphaalpha". Theirs' whole
-    // file is the line ours appended, so it is taken once, unglued.
+    // Found by the property test: upstream gives "alphaalpha". Which of
+    // three copies each side kept cannot be told: open.
     let m = md("alpha\nalpha\n", "alpha\nalpha\nalpha", "alpha");
-    assert_eq!(m.deviations, [Deviation::SameInsertionOnce, Deviation::GluedLines]);
-    assert_eq!(written(&m), "alpha");
+    assert_eq!(m.deviations, [Deviation::GluedLines]);
+    assert!(m.outcome.is_open());
 }
 
 #[test]
@@ -561,9 +566,20 @@ fn the_closing_fence_keeps_its_line_end() {
     let m = md(
         "---\n---\n\n- [ ] task\n",
         "---\nstatus: v0\n---\n# Heading\n\n- [ ] task\n",
+        "---\ntitle: v0\n---\n\n- [ ] task\n",
+    );
+    assert_eq!(
+        written(&m),
+        "---\nstatus: v0\ntitle: v0\n---\n# Heading\n\n- [ ] task\n"
+    );
+    // Theirs also removed the blank line ours put the heading before: ours
+    // may have typed it back, so the body is open.
+    let m = md(
+        "---\n---\n\n- [ ] task\n",
+        "---\nstatus: v0\n---\n# Heading\n\n- [ ] task\n",
         "---\ntitle: v0\n---\n- [ ] task\n",
     );
-    assert_eq!(written(&m), "---\nstatus: v0\ntitle: v0\n---\n# Heading\n- [ ] task\n");
+    assert!(m.outcome.is_open(), "{m:?}");
 }
 
 #[test]
@@ -571,8 +587,10 @@ fn empty_files() {
     assert_eq!(written(&md("", "ours\n", "theirs\n")), "ours\ntheirs\n");
     assert_eq!(md("", "same\n", "same\n").outcome, Outcome::Identical);
     assert_eq!(written(&md("", "", "new\n")), "new\n");
-    // Whitespace only in the base is no content to lose.
-    assert_eq!(written(&md("\n", "", "\nnew\n")), "new\n");
+    // Whitespace only in the base is no content to lose; but theirs kept the
+    // blank line ours removed, beside its own line: open.
+    assert!(md("\n", "", "\nnew\n").outcome.is_open());
+    assert_eq!(written(&md("\n", "\n", "\nnew\n")), "\nnew\n");
 }
 
 fn emptied(m: &Merge) -> Which {
@@ -634,10 +652,13 @@ fn a_deleted_leaf_is_not_emptied() {
 
 #[test]
 fn a_trailing_deletion_is_carried() {
-    // Upstream gives a B c: ours' deletion of c is lost.
-    let m = md("a\nb\nc\n", "a\nb\n", "a\nB\nc\n");
-    assert_eq!(written(&m), "a\nB\n");
+    // Upstream gives a B c d: ours' deletion of d is lost.
+    let m = md("a\nb\nc\nd\n", "a\nb\nc\n", "a\nB\nc\nd\n");
+    assert_eq!(written(&m), "a\nB\nc\n");
     assert_eq!(m.deviations, [Deviation::TrailingDeletion]);
+    // Right beside the other side's change it is open, never lost: theirs
+    // may have typed c back while editing b (upstream gives a B c).
+    assert!(md("a\nb\nc\n", "a\nb\n", "a\nB\nc\n").outcome.is_open());
     // Even against an unchanged other side, upstream brings c back.
     let m = md("a\nb\nc\nd\n", "a\nb\n", "a\nb\nc\nd\n");
     assert_eq!(written(&m), "a\nb\n");
@@ -652,9 +673,12 @@ fn a_trailing_deletion_is_carried() {
     // The same trailing deletion on both sides.
     let m = md("a\nb\nc\n", "A\nb\n", "a\nb\n");
     assert_eq!(written(&m), "A\nb\n");
-    // A trailing deletion and an append after it: both carried.
-    let m = md("a\nb\nc\n", "a\nb\n", "a\nb\nc\nd\n");
-    assert_eq!(written(&m), "a\nb\nd\n");
+    // A trailing deletion and an append right after the deleted line: the
+    // appending side may have typed `c` back with `d` (it saw the deletion), or
+    // kept it; open. With a line both kept between, both are carried.
+    assert!(md("a\nb\nc\n", "a\nb\n", "a\nb\nc\nd\n").outcome.is_open());
+    let m = md("a\nb\nc\n", "b\nc\n", "a\nb\nc\nd\n");
+    assert_eq!(written(&m), "b\nc\nd\n");
     // Without a final newline.
     let m = md("a\nb\nc", "a\nb\n", "A\nb\nc");
     assert_eq!(written(&m), "A\nb\n");
@@ -744,12 +768,13 @@ fn a_line_both_inserted_beside_a_change_is_taken_once() {
         assert_eq!(written(&m), l);
         assert_eq!(m.deviations, [Deviation::SameInsertionOnce]);
     }
-    // L deleted the line above instead; upstream gets this one right too.
+    // L deleted the line above instead. R2 keeps that line beside its own
+    // and holds L's whole change, so R2 may as well be L with the line typed
+    // back: open (upstream gives L).
     let l = "# Log\n- 10 call\n";
-    assert_eq!(guard(r1, l, r2).as_deref(), Some(l));
+    assert_eq!(guard(r1, l, r2), None);
     for m in both_ways(r1, l, r2) {
-        assert_eq!(written(&m), l);
-        assert!(m.deviations.is_empty(), "upstream's result");
+        assert!(m.outcome.is_open(), "{m:?}");
     }
     // One side ticked the task and added the note, the other only added the
     // note (upstream takes the note twice, above the task).
@@ -775,11 +800,21 @@ fn a_change_takes_one_insertion_beside_it_at_most() {
 }
 
 #[test]
-fn an_insertion_that_holds_the_change_beside_it_is_taken_once() {
-    // Ours deleted line a and added X after it; theirs added X and Y there.
-    // As two runs at one point, the longer holds the shorter: once.
+fn an_insertion_that_holds_the_change_beside_it_stays_open() {
+    // Ours replaced line a with X; theirs kept a and added X and Y after it.
+    // Theirs may have made ours' change and typed `a` back (it holds all of
+    // ours' new lines), or only inserted: the first keeps `a`. Open (earlier
+    // versions gave `X Y b`).
     let m = md("a\nb\n", "X\nb\n", "a\nX\nY\nb\n");
-    assert_eq!(written(&m), "X\nY\nb\n");
+    assert!(m.outcome.is_open(), "{m:?}");
+    // Review 4: L ticked the task and added it anew; R2 only ticked it.
+    // Upstream's merge, and earlier versions', drop the new task.
+    let r1 = "# Today\n- [ ] water plants\n- [ ] call mom\n";
+    let l = "# Today\n- [x] water plants\n- [ ] water plants\n- [ ] call mom\n";
+    let r2 = "# Today\n- [x] water plants\n- [ ] call mom\n";
+    for m in both_ways(r1, l, r2) {
+        assert!(m.outcome.is_open(), "{m:?}");
+    }
 }
 
 #[test]
@@ -820,9 +855,10 @@ fn the_same_change_inside_a_larger_one_is_taken_once() {
     assert_eq!(written(&md("a\nb\n", "a\nX\n", "a\nX\nb!\n")), "a\nX\nb!\n");
     // A deletion holds nothing: deleted against changed stays open.
     assert!(md("a\nb\nc\n", "a\nc\n", "a\nB\nX\nc\n").outcome.is_open());
-    // Theirs kept b and inserted X before it, ours replaced b with X: X is
-    // taken once, and ours' replacement of b carried.
-    assert_eq!(written(&md("a\nb\n", "a\nX\n", "a\nX\nb\n")), "a\nX\n");
+    // Theirs kept b and inserted X before it, ours replaced b with X. Theirs
+    // may have made the same change and typed b back: open (earlier versions
+    // gave `a X`).
+    assert!(md("a\nb\n", "a\nX\n", "a\nX\nb\n").outcome.is_open());
 }
 
 #[test]
@@ -833,6 +869,324 @@ fn insertions_either_side_of_a_kept_blank_line_are_taken_once() {
     let r2 = "\n\n- 00 entry\n";
     let l = "\n\n- writer\n- 00 entry\n";
     assert_eq!(guard(r1, l, r2).as_deref(), Some(l));
+}
+
+/// Review 4's inputs, base R1, L (which saw R2), R2: each merged clean
+/// without L's line, or with a line or a paragraph break out of L's order.
+/// The guard must get L or open, and every other order of the sides open or
+/// the same text.
+#[test]
+fn a_line_the_writer_typed_again_is_never_dropped() {
+    let cases = [
+        // The writer re-added a line the other side edited or deleted.
+        (
+            "# Today\n- [ ] water plants\n- [ ] call mom\n",
+            "# Today\n- [x] water plants\n- [ ] water plants\n- [ ] call mom\n",
+            "# Today\n- [x] water plants\n- [ ] call mom\n",
+        ),
+        (
+            "# Today\n- [ ] water plants\n- [ ] call mom\n",
+            "# Today\n- [ ] water plants\n- [x] water plants\n- [ ] call mom\n",
+            "# Today\n- [x] water plants\n- [ ] call mom\n",
+        ),
+        (
+            "Call Bob\nAgenda\n",
+            "Called Bob\nAgenda\nCall Bob\n",
+            "Called Bob\nAgenda\n",
+        ),
+        ("line 1\nline 2\n", "line 2\nline 1\n- x\n", "line 2\n"),
+        ("A\nB\n", "X\nY\nA\nB\n", "X\nB\n"),
+        // A paragraph break the writer kept; with `---`, a setext heading.
+        (
+            "Intro\n\nPara A\nPara B\n",
+            "Intro\nmore intro\nPara A\n\nPara B\n",
+            "Intro\nmore intro\nPara A\nPara B\n",
+        ),
+        (
+            "Intro\n\nPara A\n---\n",
+            "Intro\nmore intro\nPara A\n\n---\n",
+            "Intro\nmore intro\nPara A\n---\n",
+        ),
+        // Lines out of the writer's order: code outside its block.
+        (
+            "# N\n```\n```",
+            "# N\nintro\n```\nprint(1)\n```\n",
+            "# N\nintro\n```\n```\n",
+        ),
+        (
+            "line 1\nline 2\n---\n---",
+            "line 1\nline 2\nline 3\n---\nline 4\n---\n",
+            "line 1\nline 2\nline 3\n---\n---\n",
+        ),
+    ];
+    for (r1, l, r2) in cases {
+        assert!(guard(r1, l, r2).is_none_or(|m| m == l), "{r1:?} {l:?} {r2:?}");
+        for m in both_ways(r1, l, r2) {
+            if let Outcome::Write(w) = &m.outcome {
+                assert_eq!(w, l.as_bytes(), "{r1:?} {l:?} {r2:?}");
+            }
+        }
+    }
+}
+
+/// A line one side deleted (adding nothing), next to the other side's change
+/// with only blank lines between: the other side may have typed it back,
+/// which no text shows. Open, as git's merge leaves it; the lost-update guard
+/// (where it would be the writer typing back what arrived) must never drop it.
+#[test]
+fn a_deletion_beside_the_other_sides_change_stays_open() {
+    let cases = [
+        // A paragraph deleted, the next edited.
+        ("P1\n\nP2\n\nP3\n", "P2\n\nP3\n", "P1\n\nP2 edited\n\nP3\n"),
+        // The reviewers' ORIG stream: R2 deleted a line, L typed it back and
+        // edited the line after the blank line.
+        (
+            "\n\nline 1\n\nline 2\n",
+            "\n\nline 2\n",
+            "- x\n\n\nline 1\n\nline 2 w\n",
+        ),
+        (
+            "\n---\n\nline 1\nline 2\n",
+            "\n\nline 1\nline 2 r\n",
+            "\n---\n\nline 1 w\nline 2 r\n",
+        ),
+        // A last item deleted, another appended after it.
+        ("- a\n- b\n", "- a\n", "- a\n- b\n- c\n"),
+    ];
+    for (base, a, b) in cases {
+        for m in both_ways(base, a, b) {
+            assert!(m.outcome.is_open(), "{base:?} {a:?} {b:?}: {m:?}");
+        }
+    }
+    // Edits to two paragraphs, one blank line apart, merge.
+    let m = md("P1\n\nP2\n", "P1 edited\n\nP2\n", "P1\n\nP2 edited\n");
+    assert_eq!(written(&m), "P1 edited\n\nP2 edited\n");
+}
+
+/// Ordinary notes, changed in ordinary ways on two devices: these merge, in
+/// either order of the sides and of the mtimes, to the one right text.
+/// Opening them would be a regression, not safety (review 4).
+#[test]
+fn ordinary_notes_merge() {
+    // (what, base, ours, theirs, merged); `ours` is the older side, which
+    // matters only for two runs at one point.
+    let cases = [
+        (
+            "each side ticks another copy of a recurring task",
+            "## Mon\n- [ ] gym\n## Tue\n- [ ] gym\n",
+            "## Mon\n- [x] gym\n## Tue\n- [ ] gym\n",
+            "## Mon\n- [ ] gym\n## Tue\n- [x] gym\n",
+            "## Mon\n- [x] gym\n## Tue\n- [x] gym\n",
+        ),
+        (
+            "the same edit to different copies",
+            "a\nx\nb\nx\nc\n",
+            "a\ny\nb\nx\nc\n",
+            "a\nx\nb\ny\nc\n",
+            "a\ny\nb\ny\nc\n",
+        ),
+        (
+            "code fences in two paragraphs",
+            "Intro\n```\nprint(1)\n```\n\nMore\n```\nprint(2)\n```\n",
+            "Intro\n```\nprint(10)\n```\n\nMore\n```\nprint(2)\n```\n",
+            "Intro\n```\nprint(1)\n```\n\nMore\n```\nprint(20)\n```\n",
+            "Intro\n```\nprint(10)\n```\n\nMore\n```\nprint(20)\n```\n",
+        ),
+        (
+            "`---` in two places",
+            "# A\ntext a\n---\n# B\ntext b\n---\n# C\ntext c\n",
+            "# A\ntext a!\n---\n# B\ntext b\n---\n# C\ntext c\n",
+            "# A\ntext a\n---\n# B\ntext b\n---\n# C\ntext c!\n",
+            "# A\ntext a!\n---\n# B\ntext b\n---\n# C\ntext c!\n",
+        ),
+        (
+            "rows added to two tables",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n\n| c | d |\n|---|---|\n| 3 | 4 |\n",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n| 5 | 6 |\n\n| c | d |\n|---|---|\n| 3 | 4 |\n",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n\n| c | d |\n|---|---|\n| 3 | 4 |\n| 7 | 8 |\n",
+            "| a | b |\n|---|---|\n| 1 | 2 |\n| 5 | 6 |\n\n| c | d |\n|---|---|\n| 3 | 4 |\n| 7 | 8 |\n",
+        ),
+        (
+            "`- [ ] ` filled in two sections",
+            "## Work\n- [ ] \n## Home\n- [ ] \n",
+            "## Work\n- [ ] email\n## Home\n- [ ] \n",
+            "## Work\n- [ ] \n## Home\n- [ ] dishes\n",
+            "## Work\n- [ ] email\n## Home\n- [ ] dishes\n",
+        ),
+        (
+            "`- [ ] ` added in two sections",
+            "## A\nx\n## B\ny\n",
+            "## A\nx\n- [ ] \n## B\ny\n",
+            "## A\nx\n## B\ny\n- [ ] \n",
+            "## A\nx\n- [ ] \n## B\ny\n- [ ] \n",
+        ),
+        (
+            "`### Notes` in two sections",
+            "## Mon\n### Notes\nm1\n## Tue\n### Notes\nt1\n",
+            "## Mon\n### Notes\nm1\nm2\n## Tue\n### Notes\nt1\n",
+            "## Mon\n### Notes\nm1\n## Tue\n### Notes\nt1\nt2\n",
+            "## Mon\n### Notes\nm1\nm2\n## Tue\n### Notes\nt1\nt2\n",
+        ),
+        (
+            "`### Notes` added in two sections",
+            "## Mon\nm1\n## Tue\nt1\n",
+            "## Mon\nm1\n### Notes\nm2\n## Tue\nt1\n",
+            "## Mon\nm1\n## Tue\nt1\n### Notes\nt2\n",
+            "## Mon\nm1\n### Notes\nm2\n## Tue\nt1\n### Notes\nt2\n",
+        ),
+        (
+            "callouts in two places",
+            "> [!note]\n> one\n\ntext\n\n> [!note]\n> two\n",
+            "> [!note]\n> one!\n\ntext\n\n> [!note]\n> two\n",
+            "> [!note]\n> one\n\ntext\n\n> [!note]\n> two!\n",
+            "> [!note]\n> one!\n\ntext\n\n> [!note]\n> two!\n",
+        ),
+        (
+            "callouts added in two places",
+            "a\n\nb\n",
+            "> [!note]\n> x\n\na\n\nb\n",
+            "a\n\nb\n\n> [!note]\n> y\n",
+            "> [!note]\n> x\n\na\n\nb\n\n> [!note]\n> y\n",
+        ),
+        (
+            "`#done` in two places",
+            "task a\n\ntask b\n",
+            "task a\n#done\n\ntask b\n",
+            "task a\n\ntask b\n#done\n",
+            "task a\n#done\n\ntask b\n#done\n",
+        ),
+        (
+            "both append under the same new heading, the base ending blank",
+            "# Log\n- x\n\n",
+            "# Log\n- x\n\n## 11-07\n- a\n",
+            "# Log\n- x\n\n## 11-07\n- b\n",
+            "# Log\n- x\n\n## 11-07\n- a\n## 11-07\n- b\n",
+        ),
+        (
+            "both append under the same date heading",
+            "# Log\n## 11-07\n\n",
+            "# Log\n## 11-07\n- a\n\n",
+            "# Log\n## 11-07\n- b\n\n",
+            "# Log\n## 11-07\n- a\n- b\n\n",
+        ),
+        (
+            "two appends to a log",
+            "# Log\n- 1\n",
+            "# Log\n- 1\n- 2a\n",
+            "# Log\n- 1\n- 2b\n",
+            "# Log\n- 1\n- 2a\n- 2b\n",
+        ),
+        (
+            "different paragraphs",
+            "P1\n\nP2\n\nP3\n",
+            "P1 edited\n\nP2\n\nP3\n",
+            "P1\n\nP2\n\nP3 edited\n",
+            "P1 edited\n\nP2\n\nP3 edited\n",
+        ),
+        (
+            "adjacent paragraphs",
+            "P1\n\nP2\n",
+            "P1 edited\n\nP2\n",
+            "P1\n\nP2 edited\n",
+            "P1 edited\n\nP2 edited\n",
+        ),
+        (
+            "a task ticked, another added",
+            "- [ ] a\n- [ ] b\n",
+            "- [x] a\n- [ ] b\n",
+            "- [ ] a\n- [ ] b\n- [ ] c\n",
+            "- [x] a\n- [ ] b\n- [ ] c\n",
+        ),
+        (
+            "two ticks",
+            "- [ ] a\n- [ ] b\n",
+            "- [x] a\n- [ ] b\n",
+            "- [ ] a\n- [x] b\n",
+            "- [x] a\n- [x] b\n",
+        ),
+        (
+            "appends under two headings",
+            "## A\na1\n\n## B\nb1\n",
+            "## A\na1\na2\n\n## B\nb1\n",
+            "## A\na1\n\n## B\nb1\nb2\n",
+            "## A\na1\na2\n\n## B\nb1\nb2\n",
+        ),
+        (
+            "an edit, and an insertion after it",
+            "a\nb\nc\n",
+            "a\nB\nc\n",
+            "a\nb\nd\nc\n",
+            "a\nB\nd\nc\n",
+        ),
+        (
+            "two code blocks appended",
+            "text\n",
+            "text\n```\nx\n```\n",
+            "text\n```\ny\n```\n",
+            "text\n```\nx\n```\n```\ny\n```\n",
+        ),
+        (
+            "an entry marked done and the line the other appended",
+            "# Log\n- 09 start\n",
+            "# Log\n- 09 start (done)\n- 10 call\n",
+            "# Log\n- 09 start\n- 10 call\n",
+            "# Log\n- 09 start (done)\n- 10 call\n",
+        ),
+        (
+            "a task ticked with a note, the same note",
+            "- [ ] a\n",
+            "- [x] a\n- note\n",
+            "- [ ] a\n- note\n",
+            "- [x] a\n- note\n",
+        ),
+        (
+            "a sub-item under a ticked task",
+            "- [ ] a\n- [ ] b\n",
+            "- [x] a\n- [ ] b\n",
+            "- [ ] a\n  - sub\n- [ ] b\n",
+            "- [x] a\n  - sub\n- [ ] b\n",
+        ),
+        (
+            "a run that ends with the other's",
+            "a\n",
+            "a\nX\n",
+            "a\nY\nX\n",
+            "a\nY\nX\n",
+        ),
+        (
+            "only a final newline added on one side",
+            "a\nb\nc",
+            "a\nc",
+            "a\nb\nc\n",
+            "a\nc\n",
+        ),
+    ];
+    // Two runs inserted at one point go in whole, the older first: with the
+    // other side older, these.
+    let swapped = [
+        (
+            "# Log\n- x\n\n## 11-07\n- a\n",
+            "# Log\n- x\n\n## 11-07\n- b\n## 11-07\n- a\n",
+        ),
+        ("# Log\n## 11-07\n- a\n\n", "# Log\n## 11-07\n- b\n- a\n\n"),
+        ("# Log\n- 1\n- 2a\n", "# Log\n- 1\n- 2b\n- 2a\n"),
+        ("text\n```\nx\n```\n", "text\n```\ny\n```\n```\nx\n```\n"),
+    ];
+    for (what, base, a, b, a_older) in cases {
+        let b_older = swapped.iter().find(|(o, _)| *o == a).map_or(a_older, |(_, w)| *w);
+        for ours_newer in [false, true] {
+            for (ours, theirs) in [(a, b), (b, a)] {
+                let m = run(Kind::Markdown, Some(base), ours, theirs, ours_newer);
+                let got = match &m.outcome {
+                    Outcome::Write(w) => String::from_utf8(w.clone()).unwrap(),
+                    Outcome::Identical => ours.to_string(),
+                    other => panic!("{what}: {other:?}"),
+                };
+                let a_is_older = (ours == a) != ours_newer;
+                assert_eq!(got, if a_is_older { a_older } else { b_older }, "{what}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -884,8 +1238,11 @@ fn a_newline_added_to_an_unterminated_last_line_is_no_edit() {
     // Both appended a line after a last line without newline: two runs.
     let m = md("a\nb", "a\nb\nc\n", "a\nb\nd\n");
     assert_eq!(written(&m), "a\nb\nc\nd\n");
-    // One side deleted it, the other only appended after it.
-    assert_eq!(written(&md("a\nb", "a\n", "a\nb\nc\n")), "a\nc\n");
+    // One side deleted it, the other appended right after it: the appending
+    // side may have typed it back. Open.
+    assert!(md("a\nb", "a\n", "a\nb\nc\n").outcome.is_open());
+    // Only the newline added on one side, a line deleted on the other.
+    assert_eq!(written(&md("a\nb\nc", "a\nc", "a\nb\nc\n")), "a\nc\n");
     // Appended lines without newline still stay open (they would glue).
     assert!(md("a\nb", "a\nb\nc", "a\nb\nd").outcome.is_open());
 }
