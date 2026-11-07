@@ -1552,6 +1552,33 @@ fn a_long_log_with_an_append_on_each_side_merges() {
 }
 
 #[test]
+fn the_frontmatter_label_does_not_spend_the_merges_budget() {
+    // A 30 000-line log of about 4.9 MB merges as plain lines; with a key
+    // changed on each side it must merge too. Working out the
+    // frontmatter_by_key label (upstream's line merge of the whole file)
+    // used to come out of the merge's own budget and left it too large.
+    let pad = "x".repeat(150);
+    let body: String = (0..30_000).map(|i| format!("- entry {i} {pad}\n")).collect();
+    let plain = run(
+        Kind::Markdown,
+        Some(&body),
+        &format!("{body}- ours\n"),
+        &format!("{body}- theirs\n"),
+        true,
+    );
+    assert_eq!(written(&plain), format!("{body}- theirs\n- ours\n"));
+    let fm = run(
+        Kind::Markdown,
+        Some(&format!("---\na: 1\nb: 1\n---\n{body}")),
+        &format!("---\na: 2\nb: 1\n---\n{body}- ours\n"),
+        &format!("---\na: 1\nb: 2\n---\n{body}- theirs\n"),
+        true,
+    );
+    assert_eq!(fm.rule, Rule::Frontmatter);
+    assert_eq!(written(&fm), format!("---\na: 2\nb: 2\n---\n{body}- theirs\n- ours\n"));
+}
+
+#[test]
 fn work_is_bounded_by_the_budget_not_the_size() {
     let side = |w: &str, n: usize| -> String { (0..n).map(|i| format!("{w} {i}\n")).collect() };
     // Both sides rewritten: a few thousand lines is past the budget, the

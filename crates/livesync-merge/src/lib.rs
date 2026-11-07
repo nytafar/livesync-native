@@ -163,7 +163,9 @@
 //! - **Frontmatter** merges key by key (rule 7), which upstream does not do at
 //!   all ([`Rule::Frontmatter`]); where its result differs from upstream's line
 //!   merge of the file, merged or open, that is
-//!   [`Deviation::FrontmatterByKey`]. Both sides changing the block with
+//!   [`Deviation::FrontmatterByKey`]. (Upstream's merge for the label has a
+//!   budget of its own, so the label never makes a merge too large; where it
+//!   does not fit, there is no label.) Both sides changing the block with
 //!   fences that end their lines differently stays open
 //!   ([`Reason::FrontmatterFences`]): the line merge would put one block in
 //!   the body. A line merge that would leave a frontmatter block the YAML
@@ -763,15 +765,19 @@ fn merge_frontmatter(
     let ours_first = ours.mtime <= theirs.mtime;
     let ours_newer = (ours.mtime != theirs.mtime).then_some(ours.mtime > theirs.mtime);
     // Upstream merges the whole file by lines: where this rule's result is
-    // another, it is a deviation.
-    let decided = |mut m: Merge, view: View, budget: &mut Budget| -> Result<Option<(Merge, View)>, OutOfBudget> {
+    // another, it is a deviation. The label is a report, not part of the
+    // decision, so it has a budget of its own: it never makes the merge open
+    // (too large), and where upstream's merge would not fit in it, there is no
+    // label (whether upstream differs is not known).
+    let decided = |mut m: Merge, view: View| -> Result<Option<(Merge, View)>, OutOfBudget> {
         let written = match &m.outcome {
             Outcome::Write(w) => Some(std::str::from_utf8(w).expect("merged from UTF-8")),
             _ => None,
         };
-        let up = lines::upstream_within(b, o, t, ours_first, budget)?;
-        if written != up.text.as_deref() && !(written.is_none() && up.text.is_none()) {
-            m.deviations.push(Deviation::FrontmatterByKey);
+        if let Ok(up) = lines::upstream_within(b, o, t, ours_first, &mut Budget::new(MAX_COST)) {
+            if written != up.text.as_deref() && !(written.is_none() && up.text.is_none()) {
+                m.deviations.push(Deviation::FrontmatterByKey);
+            }
         }
         Ok(Some((m, view)))
     };
@@ -782,18 +788,18 @@ fn merge_frontmatter(
     let changed = d_o.block != db.block && dt.block != db.block && d_o.block != dt.block;
     if changed && (d_o.open != dt.open || (synthetic == 0 && (db.open != d_o.open || db.open != dt.open))) {
         let (m, v) = fm(vec![Overlap::Whole(Reason::FrontmatterFences)]);
-        return decided(m, v, budget);
+        return decided(m, v);
     }
     let block = frontmatter::merge_block(&db, &d_o, &dt, ours_first, ours_newer, &settings.newest_keys, budget)?;
     match block {
         frontmatter::FmOutcome::NotApplicable => Ok(None),
         frontmatter::FmOutcome::Unparsable(w) => {
             let (m, v) = fm(vec![Overlap::Whole(Reason::InvalidFrontmatter(w))]);
-            decided(m, v, budget)
+            decided(m, v)
         }
         frontmatter::FmOutcome::Order => {
             let (m, v) = fm(vec![Overlap::FrontmatterOrder]);
-            decided(m, v, budget)
+            decided(m, v)
         }
         frontmatter::FmOutcome::Block { parts, newest_taken } => {
             let mut overlaps = Vec::new();
@@ -853,7 +859,7 @@ fn merge_frontmatter(
             };
             if w.glued {
                 m.outcome = Outcome::Open(vec![Overlap::Whole(Reason::GluedLines)]);
-                return decided(m, View::Whole, budget);
+                return decided(m, View::Whole);
             }
             // A body after a fence without a line end would be glued to it,
             // in the merge and in its view alike.
@@ -862,15 +868,15 @@ fn merge_frontmatter(
             if !overlaps.is_empty() {
                 m.outcome = Outcome::Open(overlaps);
                 if body_after_open_fence {
-                    return decided(m, View::Whole, budget);
+                    return decided(m, View::Whole);
                 }
                 view.segs.push(lines::Seg::Clean(fence.to_string()));
                 view.segs.extend(w.segs);
-                return decided(m, View::Walk(view), budget);
+                return decided(m, View::Walk(view));
             }
             if !frontmatter::understood(&block) {
                 m.outcome = Outcome::Open(vec![Overlap::Whole(Reason::MergedFrontmatterInvalid)]);
-                return decided(m, View::Whole, budget);
+                return decided(m, View::Whole);
             }
             let Some(close) = close else {
                 m.outcome = Outcome::Open(vec![Overlap::Lines(LineOverlap {
@@ -878,17 +884,17 @@ fn merge_frontmatter(
                     ours: oo - 1..oo,
                     theirs: ot - 1..ot,
                 })]);
-                return decided(m, View::Whole, budget);
+                return decided(m, View::Whole);
             };
             if body_after_open_fence {
                 m.deviations.push(Deviation::GluedLines);
                 m.outcome = Outcome::Open(vec![Overlap::Whole(Reason::GluedLines)]);
-                return decided(m, View::Whole, budget);
+                return decided(m, View::Whole);
             }
             let body = w.text().expect("clean walk");
             let text = format!("{}{}{}{}", d_o.open, block, close, body);
             m.outcome = Outcome::Write(text.clone().into_bytes());
-            decided(m, View::Text(text), budget)
+            decided(m, View::Text(text))
         }
     }
 }
