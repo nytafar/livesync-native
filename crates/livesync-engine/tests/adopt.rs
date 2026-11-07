@@ -7,7 +7,7 @@
 mod common;
 
 use common::{Mock, DB};
-use livesync_engine::{AdoptReport, Engine, EngineConfig, Index, State};
+use livesync_engine::{AdoptOptions, AdoptReport, Engine, EngineConfig, Index, State};
 use livesync_model::path::path_to_id;
 use livesync_model::splitter::{chunk_file, SplitParams};
 use livesync_remote::{Couch, RemoteConfig};
@@ -34,6 +34,9 @@ impl Env {
         self.dir.path().join("state/index.sqlite")
     }
     fn engine(&self) -> Engine {
+        self.engine_with(|_| {})
+    }
+    fn engine_with(&self, f: impl FnOnce(&mut EngineConfig)) -> Engine {
         let couch = Couch::new(&RemoteConfig {
             url: self.mock.url.clone(),
             database: DB.into(),
@@ -44,6 +47,7 @@ impl Env {
         let mut cfg = EngineConfig::new(self.vault(), self.index_path());
         cfg.batch_limit = 50;
         cfg.rebuild_quiet = Duration::ZERO;
+        f(&mut cfg);
         Engine::open(couch, cfg).unwrap()
     }
     fn write(&self, rel: &str, bytes: &[u8]) {
@@ -101,12 +105,12 @@ async fn a_matching_folder_is_adopted_without_fetching_or_writing_anything() {
     env.both("Notes/Short.md", b"short");
     env.both("img/pic.png", &binary(200_000, 1));
     env.both("empty.md", b"");
-    let rep: AdoptReport = env.engine().adopt(false).await.unwrap();
+    let rep: AdoptReport = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
     assert_eq!((rep.identical, rep.identical_by_content), (4, 0), "{rep:#?}");
     assert_eq!((rep.local_files, rep.remote_files), (4, 4));
     assert!(rep.differing.is_empty() && rep.only_local.is_empty() && rep.only_remote.is_empty());
     assert_eq!(rep.chunks_fetched, 0, "identical chunk lists need no chunk");
-    assert!(rep.refusal().is_none());
+    assert!(rep.refusal(false).is_none());
     assert!(!rep.applied);
     // A dry run records nothing.
     let ix = Index::open(&env.index_path()).unwrap();
@@ -114,7 +118,7 @@ async fn a_matching_folder_is_adopted_without_fetching_or_writing_anything() {
     drop(ix);
 
     let writes_before = env.mock.writes().len();
-    let rep = env.engine().adopt(true).await.unwrap();
+    let rep = env.engine().adopt(AdoptOptions::apply()).await.unwrap();
     assert!(rep.applied);
     assert_eq!(
         env.mock.writes().len(),
@@ -192,7 +196,7 @@ async fn the_report_is_what_the_first_sync_does() {
     env.both("tombstoned.md", b"gone");
     env.mock.tombstone("tombstoned.md");
 
-    let rep = env.engine().adopt(false).await.unwrap();
+    let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
     assert_eq!(rep.identical, 3, "{rep:#?}");
     assert_eq!(rep.identical_by_content, 1);
     assert!(rep.chunks_fetched > 0);
@@ -212,9 +216,9 @@ async fn the_report_is_what_the_first_sync_does() {
         .as_deref()
         .unwrap()
         .contains("removed here"));
-    assert!(rep.refusal().is_none());
+    assert!(rep.refusal(false).is_none());
 
-    let rep = env.engine().adopt(true).await.unwrap();
+    let rep = env.engine().adopt(AdoptOptions::apply()).await.unwrap();
     assert_eq!(rep.identical, 3);
     let s = env.engine().sync_once().await.unwrap();
     // Only the remote-only file is written; nothing identical is fetched again.
@@ -253,7 +257,12 @@ async fn a_folder_with_an_index_already_is_refused() {
     let env = Env::new().await;
     env.both("a.md", b"a");
     env.engine().sync_once().await.unwrap();
-    let e = env.engine().adopt(false).await.unwrap_err().to_string();
+    let e = env
+        .engine()
+        .adopt(AdoptOptions::dry_run())
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("already tracks 1 files"), "{e}");
 }
 
@@ -262,10 +271,10 @@ async fn a_folder_that_matches_nothing_is_refused() {
     let env = Env::new().await;
     env.put_file("theirs.md", b"theirs");
     env.write("mine.md", b"mine");
-    let rep = env.engine().adopt(false).await.unwrap();
-    assert!(rep.refusal().unwrap().contains("right folder"), "{rep:?}");
-    let rep = env.engine().adopt(true).await.unwrap();
-    assert!(!rep.applied && rep.refusal().is_some());
+    let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
+    assert!(rep.refusal(false).unwrap().contains("right folder"), "{rep:?}");
+    let rep = env.engine().adopt(AdoptOptions::apply()).await.unwrap();
+    assert!(!rep.applied && rep.refusal(false).is_some());
     assert!(Index::open(&env.index_path()).unwrap().all_rows().unwrap().is_empty());
 }
 
@@ -277,11 +286,11 @@ async fn a_name_that_differs_only_in_case_is_refused() {
     env.both("same.md", b"same");
     env.put_file("Notes/Case.md", b"case");
     env.write("notes/case.md", b"case");
-    let rep = env.engine().adopt(false).await.unwrap();
+    let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
     assert_eq!(paths(&rep.name_case), ["Notes/Case.md"]);
     assert_eq!(rep.name_case[0].local_path.as_deref(), Some("notes/case.md"));
-    assert!(rep.refusal().unwrap().contains("only in case"));
-    assert!(!env.engine().adopt(true).await.unwrap().applied);
+    assert!(rep.refusal(false).unwrap().contains("only in case"));
+    assert!(!env.engine().adopt(AdoptOptions::apply()).await.unwrap().applied);
     assert!(Index::open(&env.index_path()).unwrap().all_rows().unwrap().is_empty());
 }
 
@@ -296,10 +305,182 @@ async fn files_outside_the_vaults_filters_are_left_out() {
         m["tweak_values"]["PREFERRED"]["syncMaxSizeInMB"] = json!(1);
     });
     env.both("huge.png", &binary(1_200_000, 3));
-    let rep = env.engine().adopt(false).await.unwrap();
+    let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
     assert_eq!(rep.identical, 1, "{rep:#?}");
     assert_eq!(paths(&rep.only_remote), ["big.bin"]);
     assert_eq!(rep.skipped_remote.get("too-large"), Some(&1));
     assert_eq!(paths(&rep.not_synced), ["huge.png"]);
     assert!(rep.only_local.is_empty(), "dot-paths are not synced: {rep:#?}");
+}
+
+#[tokio::test]
+async fn an_identical_file_whose_chunks_are_missing_on_the_remote_is_not_adopted() {
+    let env = Env::new().await;
+    env.both("kept.md", b"kept as it is");
+    env.both("also.md", b"another one");
+    env.both("gone.md", b"its chunk was compacted away");
+    let gone_id = path_to_id("gone.md", true);
+    let chunk = env.mock.doc(&gone_id).unwrap()["children"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    env.mock.remove_doc(&chunk);
+    let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
+    assert_eq!(rep.identical, 2, "{rep:#?}");
+    assert_eq!(paths(&rep.undecided), ["gone.md"]);
+    let note = rep.undecided[0].note.as_deref().unwrap();
+    assert!(note.contains("1 of 1 chunks missing"), "{note}");
+    assert!(rep.refusal(false).is_none());
+
+    let rep = env.engine().adopt(AdoptOptions::apply()).await.unwrap();
+    assert!(rep.applied);
+    let ix = Index::open(&env.index_path()).unwrap();
+    assert!(ix.by_doc(&gone_id).unwrap().is_none(), "not recorded as synced");
+    assert!(ix.by_doc(&path_to_id("kept.md", true)).unwrap().is_some());
+    drop(ix);
+    // The first sync is free to put the chunk back: nothing claims the
+    // remote has it.
+    env.engine().sync_once().await.unwrap();
+    assert!(env.mock.doc(&chunk).is_some(), "the missing chunk is uploaded again");
+    assert_eq!(env.read("gone.md").unwrap(), b"its chunk was compacted away");
+}
+
+#[tokio::test]
+async fn a_weak_match_is_taken_over_only_when_accepted() {
+    let env = Env::new().await;
+    env.both("same.md", b"the one file that matches");
+    for i in 0..3 {
+        env.put_file(&format!("n{i}.md"), format!("theirs {i}").as_bytes());
+        env.write(&format!("n{i}.md"), format!("mine {i}").as_bytes());
+    }
+    let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
+    assert_eq!((rep.identical, rep.differing.len()), (1, 3), "{rep:#?}");
+    assert!(
+        rep.weak_match.as_deref().unwrap().contains("only 1 of the 4 local"),
+        "{rep:#?}"
+    );
+    let why = rep.refusal(false).unwrap();
+    assert!(why.contains("--accept-weak-match"), "{why}");
+    assert!(rep.refusal(true).is_none());
+    let rep = env.engine().adopt(AdoptOptions::apply()).await.unwrap();
+    assert!(!rep.applied);
+    assert!(Index::open(&env.index_path()).unwrap().all_rows().unwrap().is_empty());
+    let rep = env
+        .engine()
+        .adopt(AdoptOptions {
+            apply: true,
+            accept_weak_match: true,
+            ..AdoptOptions::default()
+        })
+        .await
+        .unwrap();
+    assert!(rep.applied);
+    assert_eq!(Index::open(&env.index_path()).unwrap().all_rows().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn empty_files_alone_are_a_weak_match() {
+    let env = Env::new().await;
+    env.both("empty.md", b"");
+    env.put_file("theirs.md", b"theirs");
+    env.write("mine.md", b"mine");
+    let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
+    assert_eq!((rep.identical, rep.identical_empty), (1, 1), "{rep:#?}");
+    assert!(rep.refusal(false).unwrap().contains("accept-weak-match"), "{rep:#?}");
+    // A match that is not weak.
+    let env = Env::new().await;
+    env.both("a.md", b"a");
+    env.both("b.md", b"b");
+    env.write("mine.md", b"mine");
+    let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
+    assert!(rep.weak_match.is_none() && rep.refusal(false).is_none(), "{rep:#?}");
+}
+
+#[tokio::test]
+async fn a_name_in_another_unicode_normalisation_is_refused() {
+    let env = Env::new().await;
+    env.both("a.md", b"a");
+    env.both("b.md", b"b");
+    env.put_file("caf\u{e9}.md", b"coffee");
+    env.write("cafe\u{301}.md", b"coffee");
+    // A filesystem that normalises names (or folds them) has one file here.
+    let names: Vec<String> = std::fs::read_dir(env.vault())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    if !names.iter().any(|n| n == "cafe\u{301}.md") {
+        eprintln!("SKIPPED: this filesystem normalises names");
+        return;
+    }
+    let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
+    assert_eq!(paths(&rep.name_case), ["caf\u{e9}.md"], "{rep:#?}");
+    assert_eq!(rep.name_case[0].local_path.as_deref(), Some("cafe\u{301}.md"));
+    assert!(rep.only_local.is_empty() && rep.only_remote.is_empty(), "{rep:#?}");
+    assert!(rep.refusal(false).unwrap().contains("Unicode normalisation"));
+    assert!(!env.engine().adopt(AdoptOptions::apply()).await.unwrap().applied);
+}
+
+#[tokio::test]
+async fn a_pull_only_vault_gets_pull_notes() {
+    let env = Env::new().await;
+    env.both("same.md", b"same");
+    env.both("deleted.md", b"deleted elsewhere");
+    env.mock.soft_delete("deleted.md");
+    env.both("tombstoned.md", b"gone");
+    env.mock.tombstone("tombstoned.md");
+    let opts = AdoptOptions {
+        pull_only: true,
+        ..AdoptOptions::default()
+    };
+    let rep = env.engine().adopt(opts).await.unwrap();
+    assert_eq!(paths(&rep.deleted_remotely), ["deleted.md"]);
+    let note = rep.deleted_remotely[0].note.as_deref().unwrap();
+    assert!(note.contains("kept here") && note.contains("pull-only"), "{note}");
+    let note = rep.only_local[0].note.as_deref().unwrap();
+    assert!(note.contains("kept here") && !note.contains("pushed"), "{note}");
+    // And the first pull does keep them.
+    let mut opts = opts;
+    opts.apply = true;
+    opts.accept_weak_match = true;
+    let engine = env.engine();
+    assert!(engine.adopt(opts).await.unwrap().applied);
+    engine.pull_once().await.unwrap();
+    assert!(env.read("deleted.md").is_some() && env.read("tombstoned.md").is_some());
+}
+
+#[tokio::test]
+async fn a_local_file_over_the_size_limit_is_listed_once() {
+    let env = Env::new().await;
+    env.both("kept.md", b"kept");
+    env.mock.update_milestone(|m| {
+        m["tweak_values"]["PREFERRED"]["syncMaxSizeInMB"] = json!(1);
+    });
+    env.put_file("big.png", &binary(1000, 4));
+    env.write("big.png", &binary(1_200_000, 5));
+    let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
+    assert_eq!(paths(&rep.not_synced), ["big.png"], "{rep:#?}");
+    assert!(rep.only_remote.is_empty(), "{rep:#?}");
+    let note = rep.not_synced[0].note.as_deref().unwrap();
+    assert!(note.contains("not applied"), "{note}");
+}
+
+#[tokio::test]
+async fn a_real_adopt_beside_the_plugin_in_any_config_folder_is_refused() {
+    let env = Env::new().await;
+    env.both("a.md", b"a");
+    let cfg = env.vault().join(".obsidian-mobile");
+    std::fs::create_dir_all(cfg.join("plugins/obsidian-livesync")).unwrap();
+    std::fs::write(cfg.join("community-plugins.json"), r#"["obsidian-livesync"]"#).unwrap();
+    // A dry run only compares.
+    assert_eq!(env.engine().adopt(AdoptOptions::dry_run()).await.unwrap().identical, 1);
+    let e = env.engine().adopt(AdoptOptions::apply()).await.unwrap_err();
+    assert!(e.to_string().contains(".obsidian-mobile"), "{e}");
+    assert!(Index::open(&env.index_path()).unwrap().all_rows().unwrap().is_empty());
+    // A deliberate handover.
+    let rep = env
+        .engine_with(|c| c.allow_plugin = true)
+        .adopt(AdoptOptions::apply())
+        .await
+        .unwrap();
+    assert!(rep.applied);
 }

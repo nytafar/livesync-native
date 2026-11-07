@@ -4,12 +4,16 @@
 //! A dry run works on a throwaway index, so the vault's own state folder is
 //! not created or touched; it refuses, as a real run does, a vault whose
 //! index already tracks files. A real run records the identical files and
-//! then runs the first sync (a pull for a pull-only vault).
+//! then runs the first sync (a pull for a pull-only vault). It refuses, as
+//! two-way sync does, a folder whose LiveSync plugin is enabled in any config
+//! folder, unless `--allow-plugin` or the vault's `allow_plugin` says it is a
+//! deliberate handover; and a weak match unless `--accept-weak-match`.
 
 use crate::config::{FileConfig, Selected};
 use crate::PushOpts;
 use anyhow::{bail, Result};
-use livesync_engine::{AdoptEntry, AdoptReport, EngineError, Index};
+use livesync_engine::folderkind::{check_livesync_plugin, PluginCheck};
+use livesync_engine::{AdoptEntry, AdoptOptions, AdoptReport, EngineError, Index};
 use livesync_host::config::{Dirs, Mode};
 use serde_json::json;
 use std::path::PathBuf;
@@ -18,7 +22,7 @@ use std::time::Instant;
 pub struct Opts {
     pub dry_run: bool,
     pub json: bool,
-    pub allow_plugin: bool,
+    pub accept_weak_match: bool,
     pub push: PushOpts,
 }
 
@@ -43,12 +47,11 @@ pub async fn run(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, o: Opts) -> Resu
             folder.display()
         );
     }
-    let plugin = crate::probe::livesync_enabled(&folder);
-    if let (Some(why), false, false) = (&plugin, o.dry_run, o.allow_plugin) {
-        bail!(
-            "the LiveSync plugin is still enabled in this folder ({why}); two clients would sync it. Disable the plugin on this device, or give --allow-plugin for a deliberate handover"
-        );
-    }
+    // The real run refuses it in the engine (the plugin guard), with the
+    // vault's `allow_plugin` and `--allow-plugin` as two-way sync does; a
+    // dry run only warns.
+    let plugin = check_livesync_plugin(&folder);
+    let plugin_allowed = o.push.allow_plugin || sel.tuning.allow_plugin;
     let index_path = r.state_dir.join("index.sqlite");
     if index_path.exists() {
         let tracked = Index::open(&index_path)?.all_rows()?.len();
@@ -75,7 +78,12 @@ pub async fn run(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, o: Opts) -> Resu
         &o.push,
         scratch.as_ref().map(|s| s.0.join("index.sqlite")),
     )?;
-    let rep = match engine.adopt(!o.dry_run).await {
+    let opts = AdoptOptions {
+        apply: !o.dry_run,
+        accept_weak_match: o.accept_weak_match,
+        pull_only,
+    };
+    let rep = match engine.adopt(opts).await {
         Ok(r) => r,
         Err(EngineError::Refused(r)) => {
             eprintln!("adopt refused: {r}");
@@ -83,20 +91,40 @@ pub async fn run(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, o: Opts) -> Resu
         }
         Err(e) => return Err(e.into()),
     };
-    let refusal = rep.refusal();
+    let refusal = rep.refusal(o.accept_weak_match);
     if o.dry_run || !rep.applied {
         drop(engine);
         if o.json {
             let mut v = serde_json::to_value(&rep)?;
             v["dry_run"] = o.dry_run.into();
             v["refusal"] = refusal.clone().into();
-            v["plugin_enabled"] = plugin.clone().into();
+            let (enabled, unchecked) = match &plugin {
+                PluginCheck::Clear => (None, None),
+                PluginCheck::Enabled(why) => (Some(why.clone()), None),
+                PluginCheck::Unchecked { folder, why } => (None, Some(format!("{folder}: {why}"))),
+            };
+            v["plugin_enabled"] = enabled.into();
+            v["plugin_unchecked"] = unchecked.into();
+            v["plugin_allowed"] = plugin_allowed.into();
             v["pull_only"] = pull_only.into();
             println!("{}", serde_json::to_string_pretty(&v)?);
         } else {
             print_report(&rep, &folder, o.dry_run, pull_only);
-            if let Some(why) = &plugin {
-                println!("WARNING: the LiveSync plugin is still enabled here ({why}); disable it on this device before the real adopt");
+            let handover = livesync_engine::engine::PLUGIN_HANDOVER_CLI;
+            match &plugin {
+                PluginCheck::Clear => {}
+                PluginCheck::Enabled(why) if plugin_allowed => println!(
+                    "WARNING: the LiveSync plugin is still enabled here ({why}); allowed as a deliberate handover: make sure it does not sync at the same time"
+                ),
+                PluginCheck::Enabled(why) => println!(
+                    "WARNING: the LiveSync plugin is still enabled here ({why}); a real adopt stops on it. Disable it on this device, or {handover}"
+                ),
+                PluginCheck::Unchecked { folder, why } if plugin_allowed => println!(
+                    "WARNING: {folder} could not be checked for the LiveSync plugin ({why}); allowed as a deliberate handover"
+                ),
+                PluginCheck::Unchecked { folder, why } => println!(
+                    "WARNING: {folder} could not be checked for the LiveSync plugin ({why}); a real adopt stops on it. Make it readable to this user, or move it out of the folder; if you know the plugin does not run here, {handover}"
+                ),
             }
             match &refusal {
                 Some(why) if o.dry_run => println!("a real adopt would stop: {why}"),
@@ -108,14 +136,17 @@ pub async fn run(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, o: Opts) -> Resu
     }
     // Taken over: the first sync, with the engine that holds the folder.
     let first = if pull_only {
-        engine.pull_once().await.map(|p| json!({ "pull": p }))
+        engine
+            .pull_once()
+            .await
+            .map(|p| (crate::pull_exit_code(&p), json!({ "pull": p })))
     } else {
         engine
             .sync_once()
             .await
-            .map(|s| serde_json::to_value(s).unwrap_or_default())
+            .map(|s| (crate::sync_exit_code(&s), serde_json::to_value(s).unwrap_or_default()))
     };
-    let first = match first {
+    let (code, first) = match first {
         Ok(v) => v,
         Err(EngineError::Refused(r)) => {
             eprintln!("adopted {} files, but the first sync was refused: {r}", rep.identical);
@@ -136,7 +167,8 @@ pub async fn run(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, o: Opts) -> Resu
         v["first_sync"] = first;
         v["wall_ms"] = (wall.as_millis() as u64).into();
         println!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(0);
+        // As `sync --json` (or `pull --json`): 3 when the sync needs attention.
+        return Ok(code);
     }
     print_report(&rep, &folder, false, pull_only);
     println!("adopted {} files; the first sync:", rep.identical);
@@ -216,6 +248,9 @@ fn print_report(rep: &AdoptReport, folder: &std::path::Path, dry_run: bool, pull
     }
     if !rep.not_synced.is_empty() {
         println!("  not synced        {}", rep.not_synced.len());
+    }
+    if let Some(w) = &rep.weak_match {
+        println!("  WEAK MATCH        {w}");
     }
     if !rep.skipped_remote.is_empty() {
         let s: Vec<String> = rep.skipped_remote.iter().map(|(k, v)| format!("{k} {v}")).collect();

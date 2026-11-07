@@ -265,9 +265,11 @@ fn hard_refusals(s: &Map<String, Value>) -> Vec<String> {
         tweaks.remove("encryptInternalMetadata");
     }
     tweaks.remove("encrypt");
-    if let Err(e) = livesync_model::gate::assess_supported_tweaks(&tweaks) {
-        out.push(e.to_string());
-    }
+    out.extend(
+        livesync_model::gate::unsupported_tweaks(&tweaks)
+            .into_iter()
+            .map(|e| e.to_string()),
+    );
     out
 }
 
@@ -486,6 +488,11 @@ pub fn parse(v: &Value, config_passphrase: Option<&str>, accept: &[String]) -> s
     );
     note(
         &mut not_used,
+        "disableMarkdownAutoMerge",
+        "lsync never merges a conflict on its own; both versions are kept for you to resolve (`lsync status`)",
+    );
+    note(
+        &mut not_used,
         "trashInsteadDelete",
         "files deleted elsewhere go to the folder's .trash/ (the vault's trash setting)",
     );
@@ -666,10 +673,21 @@ pub fn run(ctx: &Setup, a: ImportArgs, given: &Given) -> Result<u8> {
         ),
         (Some(pw), Some(_)) => {
             if secret_ref.kind != StoreKind::File {
-                format!(
-                    "comes from the {}; lsync does not store it (check it holds the imported one)",
-                    stores.describe(&secret_ref)
-                )
+                // lsync cannot write these stores: the password must be the
+                // imported one already, and readable here to tell.
+                let where_ = stores.describe(&secret_ref);
+                match stores.get(&secret_ref) {
+                    Ok(Some(old)) if old == *pw => format!("{where_} (unchanged; lsync does not store it)"),
+                    Ok(Some(_)) => bail!(
+                        "account {account} takes its password from the {where_}, which holds another password than the file; check which is right and change it there before importing"
+                    ),
+                    Ok(None) => bail!(
+                        "account {account} takes its password from the {where_}, which is not set here, so lsync cannot check it is the file's; import where it is set, or give --account for a new account"
+                    ),
+                    Err(e) => bail!(
+                        "account {account} takes its password from the {where_}, which cannot be read here ({e}), so lsync cannot check it is the file's; import where it can be read, or give --account for a new account"
+                    ),
+                }
             } else {
                 match stores.get(&secret_ref)? {
                     Some(old) if old == *pw => format!("{} (unchanged)", stores.describe(&secret_ref)),

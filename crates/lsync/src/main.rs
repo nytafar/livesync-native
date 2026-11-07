@@ -213,10 +213,11 @@ enum Cmd {
         dry_run: bool,
         #[arg(long)]
         json: bool,
-        /// Take over a folder whose LiveSync plugin is still enabled (a
-        /// deliberate handover; disable it on this device first)
+        /// Take the folder over although fewer than half of the files on
+        /// the smaller side (server or folder) match: you checked it is the
+        /// right folder and database
         #[arg(long)]
-        allow_plugin: bool,
+        accept_weak_match: bool,
         #[command(flatten)]
         push: PushOpts,
     },
@@ -522,7 +523,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         Cmd::Adopt {
             dry_run,
             json,
-            allow_plugin,
+            accept_weak_match,
             push,
         } => {
             if let Some((client, vault, _)) = routed(&sel, &cfg, &ctx.dirs, "adopt")? {
@@ -538,7 +539,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
                 adopt::Opts {
                     dry_run,
                     json,
-                    allow_plugin,
+                    accept_weak_match,
                     push,
                 },
             ))
@@ -1012,13 +1013,31 @@ fn print_sync(rep: &SyncReport, wall: Duration, rss: Option<u64>, json: bool) ->
             println!("  SAFETY STOP      too many files missing; nothing deleted (see `lsync status`)");
         }
     }
+    Ok(sync_exit_code(rep))
+}
+
+/// `sync`'s exit code: 3 when something needs attention.
+pub(crate) fn sync_exit_code(rep: &SyncReport) -> u8 {
     let attention = rep.pull.dirty > 0
         || rep.pull.pending > 0
         || rep.push.issues > 0
         || rep.push.safety_stops > 0
         || rep.push.failed > 0
         || rep.push.orphans_pushed > 0;
-    Ok(if attention { 3 } else { 0 })
+    if attention {
+        3
+    } else {
+        0
+    }
+}
+
+/// `pull`'s exit code: 3 when something needs attention.
+pub(crate) fn pull_exit_code(rep: &PullReport) -> u8 {
+    if rep.dirty > 0 || rep.pending > 0 {
+        3
+    } else {
+        0
+    }
 }
 
 fn print_pull(rep: &PullReport, wall: Duration, rss: Option<u64>, json: bool) -> Result<u8> {
@@ -1054,7 +1073,7 @@ fn print_pull(rep: &PullReport, wall: Duration, rss: Option<u64>, json: bool) ->
             println!("  peak RSS         {:.1} MB", k as f64 / 1024.0);
         }
     }
-    Ok(if rep.dirty > 0 || rep.pending > 0 { 3 } else { 0 })
+    Ok(pull_exit_code(rep))
 }
 
 async fn folders(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, json: bool) -> Result<u8> {

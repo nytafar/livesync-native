@@ -22,13 +22,22 @@
 //! - **deleted on the remote** while the file is still here: put back,
 //!   removed locally, or kept as a conflict, by the reconcile rules of the
 //!   first full pass (`write_unknown_ancestry`);
-//! - **name case differs** from the remote's spelling on a case-sensitive
-//!   filesystem: refused, since the two names would become two files;
+//! - **name differs** from the remote's spelling only in case or in Unicode
+//!   normalisation (NFD here, NFC on the remote): refused, since the two
+//!   names would become two files;
 //! - what neither side syncs (too large, unwritable names, collisions).
 //!
 //! With `apply`, the identical files are recorded in the index as synced at
 //! the remote's revision. Nothing is written to the remote or to the folder;
 //! the first sync then finds them unchanged and fetches nothing for them.
+//! A file is only recorded when every chunk of the remote's revision is on
+//! the remote (or in the document's eden): a later push uploads only the
+//! chunks its base lacks, so a missing one would never be put back.
+//!
+//! A real take-over fails closed: it refuses the plugin still enabled in the
+//! folder (unless allowed, as two-way sync does), a folder that matches
+//! nothing, and a weak match (see [`AdoptReport::weak_match`]) unless
+//! [`AdoptOptions::accept_weak_match`] says the folder is the right one.
 
 use crate::engine::{conflict_note, Engine, EngineError};
 use crate::filters::IgnoreState;
@@ -47,6 +56,33 @@ use std::time::Instant;
 use tracing::info;
 
 type Result<T> = std::result::Result<T, EngineError>;
+
+/// How `Engine::adopt` runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdoptOptions {
+    /// Record the identical files as synced (otherwise only compare).
+    pub apply: bool,
+    /// Take the folder over although few of its files match the remote's.
+    pub accept_weak_match: bool,
+    /// The vault only pulls: the first sync is a pull, which pushes nothing
+    /// and applies no deletion to a file it never synced (the notes say so).
+    pub pull_only: bool,
+}
+
+impl AdoptOptions {
+    /// Compare and report only.
+    pub fn dry_run() -> AdoptOptions {
+        AdoptOptions::default()
+    }
+
+    /// Record the identical files, unless the report refuses.
+    pub fn apply() -> AdoptOptions {
+        AdoptOptions {
+            apply: true,
+            ..AdoptOptions::default()
+        }
+    }
+}
 
 /// One file in an adopt report.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -81,6 +117,13 @@ pub struct AdoptReport {
     /// Of `identical`, those whose chunk lists differed (another splitter),
     /// so their chunks were fetched to compare the content.
     pub identical_by_content: u64,
+    /// Of `identical`, the empty files (they say nothing about the folder).
+    pub identical_empty: u64,
+    /// Why the match is too weak to take for granted that this is the
+    /// remote's folder, if it is: a real adopt then needs
+    /// `accept_weak_match`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weak_match: Option<String>,
     /// Different content on both sides: conflicts with no common ancestor.
     pub differing: Vec<AdoptEntry>,
     /// Only here: pushed as new.
@@ -92,11 +135,12 @@ pub struct AdoptReport {
     /// The remote's document has conflicting revisions already (whatever
     /// list the file is in).
     pub conflicted_remotely: Vec<String>,
-    /// Same document, but the local name differs from the remote's in case
-    /// on a filesystem that tells them apart.
+    /// The local name differs from the remote's only in case (same document,
+    /// on a filesystem that tells them apart) or in Unicode normalisation.
     pub name_case: Vec<AdoptEntry>,
-    /// The remote's content could not be read to compare (missing chunks):
-    /// the first sync keeps the local file and retries the remote.
+    /// The remote's content could not be read to compare, or a chunk of an
+    /// identical file is missing on the remote: not adopted; the first sync
+    /// keeps the local file and retries the remote.
     pub undecided: Vec<AdoptEntry>,
     /// Neither side syncs these (too large, a name this filesystem cannot
     /// hold, two local names for one document).
@@ -114,11 +158,12 @@ pub struct AdoptReport {
 }
 
 impl AdoptReport {
-    /// Why taking the folder over must not go ahead, if it must not.
-    pub fn refusal(&self) -> Option<String> {
+    /// Why taking the folder over must not go ahead, if it must not. A weak
+    /// match refuses unless `accept_weak_match`.
+    pub fn refusal(&self, accept_weak_match: bool) -> Option<String> {
         if !self.name_case.is_empty() {
             return Some(format!(
-                "{} local file(s) differ from the remote's name only in case (first: {} here, {} on the remote); rename them to the remote's spelling, or move them out of the folder",
+                "{} local file(s) differ from the remote's name only in case or Unicode normalisation (first: {} here, {} on the remote); rename them to the remote's spelling, or move them out of the folder",
                 self.name_case.len(),
                 self.name_case[0].local_path.as_deref().unwrap_or_default(),
                 self.name_case[0].path
@@ -138,7 +183,25 @@ impl AdoptReport {
                 self.local_files, self.remote_files
             ));
         }
-        None
+        match &self.weak_match {
+            Some(why) if !accept_weak_match => Some(format!(
+                "{why}; is this the right folder and database? If it is, take it over with --accept-weak-match"
+            )),
+            _ => None,
+        }
+    }
+
+    /// Whether the match is weak: fewer than half of the files on the
+    /// smaller side are identical, empty files not counted.
+    fn assess_match(&mut self) {
+        let matched = self.identical - self.identical_empty;
+        let smaller = self.local_files.min(self.remote_files);
+        self.weak_match = (smaller > 0 && matched * 2 < smaller).then(|| {
+            format!(
+                "only {matched} of the {} local and {} remote files match ({} identical, {} of them empty)",
+                self.local_files, self.remote_files, self.identical, self.identical_empty
+            )
+        });
     }
 }
 
@@ -170,9 +233,14 @@ impl Engine {
     /// the module docs); with `apply`, record the identical files as synced,
     /// unless `AdoptReport::refusal` says the take-over must not go ahead.
     /// Runs the gate (which never writes to the remote) and refuses an index
-    /// that tracks files already. Writes nothing to the remote or the folder.
-    pub async fn adopt(&self, apply: bool) -> Result<AdoptReport> {
+    /// that tracks files already, and with `apply` a folder whose LiveSync
+    /// plugin is enabled (the plugin guard). Writes nothing to the remote or
+    /// the folder.
+    pub async fn adopt(&self, opts: AdoptOptions) -> Result<AdoptReport> {
         let start = Instant::now();
+        if opts.apply {
+            self.check_plugin_guard()?;
+        }
         self.reset_report();
         self.connect_gate(false).await?;
         let tracked = self.with_index(|ix| ix.all_rows())?.len();
@@ -339,10 +407,24 @@ impl Engine {
                 continue;
             }
             if max.is_some_and(|m| found.size > m) {
+                // Not pushed; a remote version under the limit is fetched,
+                // but the local file differs, so it is kept (dirty).
+                let remote = live.get(&id);
+                if remote.is_some() {
+                    seen_remote.insert(id.clone());
+                }
                 rep.not_synced.push(AdoptEntry {
                     path: found.rel.clone(),
                     local_size: Some(found.size),
-                    note: Some("over the size limit; not synced".into()),
+                    remote_size: remote.map(|d| d.size),
+                    remote_rev: remote.map(|d| d.rev.clone()),
+                    note: Some(match remote {
+                        Some(_) => {
+                            "over the size limit here: not pushed, and the server's version is not applied over it"
+                                .into()
+                        }
+                        None => "over the size limit; not synced".into(),
+                    }),
                     ..Default::default()
                 });
                 continue;
@@ -397,10 +479,13 @@ impl Engine {
                         continue;
                     }
                 };
-                // As the reconcile pass of the first sync decides.
+                // As the reconcile pass of the first sync decides; a pull
+                // applies a deletion only to a file it tracks.
                 let local = json!({"children": read.children, "type": kind_name(read.kind)});
                 let remote = json!({"children": doc.children, "type": kind_name(doc.kind)});
-                let note = if found.mtime_ms > doc.mtime {
+                let note = if opts.pull_only {
+                    "kept here: a pull-only vault does not apply the deletion to a file it never synced"
+                } else if found.mtime_ms > doc.mtime {
                     "changed here after the deletion: pushed back as a new version"
                 } else if crate::push::same_content(&local, &remote) {
                     "the very version that was deleted: removed here (a copy is kept in the state folder)"
@@ -419,6 +504,34 @@ impl Engine {
                 only_local.push((id, found));
             }
         }
+
+        // A local name that differs from an unmatched remote one only in case
+        // or Unicode normalisation (another ID, e.g. NFD here and NFC on the
+        // remote) would become a second file beside it: refused, as above.
+        let mut unmatched: HashMap<String, &FileDoc> = HashMap::new();
+        for (id, d) in &live {
+            if !seen_remote.contains(id) {
+                unmatched.entry(crate::index::fold_key(&d.path)).or_insert(d);
+            }
+        }
+        let mut rest = Vec::with_capacity(only_local.len());
+        for (id, found) in only_local {
+            match unmatched.get(&crate::index::fold_key(&found.rel)) {
+                Some(doc) => {
+                    seen_remote.insert(doc.id.clone());
+                    rep.name_case.push(AdoptEntry {
+                        path: doc.path.clone(),
+                        local_path: Some(found.rel.clone()),
+                        local_size: Some(found.size),
+                        remote_size: Some(doc.size),
+                        remote_rev: Some(doc.rev.clone()),
+                        note: None,
+                    });
+                }
+                None => rest.push((id, found)),
+            }
+        }
+        let only_local = rest;
 
         // Documents deleted outright (CouchDB tombstones) are not listed by
         // `_all_docs`: ask for the local-only ones by ID.
@@ -441,9 +554,13 @@ impl Engine {
             rep.only_local.push(AdoptEntry {
                 path: found.rel.clone(),
                 local_size: Some(found.size),
-                note: tombstoned
-                    .contains(&id)
-                    .then(|| "deleted on the remote (its document is gone): pushed back as new".into()),
+                note: tombstoned.contains(&id).then(|| {
+                    if opts.pull_only {
+                        "deleted on the remote (its document is gone): kept here".into()
+                    } else {
+                        "deleted on the remote (its document is gone): pushed back as new".into()
+                    }
+                }),
                 ..Default::default()
             });
         }
@@ -466,8 +583,15 @@ impl Engine {
         }
 
         // Different chunks: compare the content, as the first pull would.
-        self.compare_content(candidates, &mut identical, &mut rep).await?;
+        let mut on_remote: HashSet<String> = HashSet::new();
+        self.compare_content(candidates, &mut identical, &mut on_remote, &mut rep)
+            .await?;
+        // Every chunk of an identical file must be on the remote before the
+        // file is recorded as synced with it.
+        let identical = self.check_chunks(identical, on_remote, &mut rep).await?;
         rep.identical = identical.len() as u64;
+        rep.identical_empty = identical.iter().filter(|(_, d)| d.size == 0).count() as u64;
+        rep.assess_match();
         rep.conflicted_remotely.sort();
         for list in [
             &mut rep.differing,
@@ -488,7 +612,7 @@ impl Engine {
         rep.bytes_fetched = couch.bytes_received() - rx0;
 
         // A refused take-over records nothing (`applied` stays false).
-        if apply && rep.refusal().is_none() {
+        if opts.apply && rep.refusal(opts.accept_weak_match).is_none() {
             let now = vaultfs::now_ms();
             self.with_index(|ix| {
                 ix.atomically(|ix| {
@@ -575,6 +699,7 @@ impl Engine {
         &self,
         candidates: Vec<Candidate>,
         identical: &mut Vec<(FileDoc, DiskState)>,
+        on_remote: &mut HashSet<String>,
         rep: &mut AdoptReport,
     ) -> Result<()> {
         const MAX_CHUNKS: usize = 100;
@@ -612,6 +737,7 @@ impl Engine {
                 }
             }
             let fetched = self.fetch_chunks(wanted).await?;
+            on_remote.extend(fetched.keys().cloned());
             for c in unit {
                 let entry = AdoptEntry {
                     path: c.doc.path.clone(),
@@ -635,6 +761,63 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Keep the identical files whose every chunk is on the remote (in
+    /// `on_remote`, the document's eden, or listed live by `_all_docs`);
+    /// the others go to `undecided`. Reads revisions only, no bodies.
+    async fn check_chunks(
+        &self,
+        identical: Vec<(FileDoc, DiskState)>,
+        mut on_remote: HashSet<String>,
+        rep: &mut AdoptReport,
+    ) -> Result<Vec<(FileDoc, DiskState)>> {
+        const KEYS: usize = 100;
+        let mut ask: Vec<String> = Vec::new();
+        let mut asked: HashSet<&str> = HashSet::new();
+        for (doc, _) in &identical {
+            for c in &doc.children {
+                if !doc.eden.contains_key(c) && !on_remote.contains(c) && asked.insert(c.as_str()) {
+                    ask.push(c.clone());
+                }
+            }
+        }
+        for keys in ask.chunks(KEYS) {
+            for r in self.inner.couch.all_docs_revs(keys).await? {
+                let live = r.error.is_none()
+                    && r.value.as_ref().is_some_and(|v| {
+                        v.get("rev").and_then(|x| x.as_str()).is_some()
+                            && !v.get("deleted").and_then(|d| d.as_bool()).unwrap_or(false)
+                    });
+                if let (true, Some(k)) = (live, r.key) {
+                    on_remote.insert(k);
+                }
+            }
+        }
+        let mut kept = Vec::with_capacity(identical.len());
+        for (doc, disk) in identical {
+            let missing = doc
+                .children
+                .iter()
+                .filter(|c| !doc.eden.contains_key(*c) && !on_remote.contains(*c))
+                .count();
+            if missing == 0 {
+                kept.push((doc, disk));
+                continue;
+            }
+            rep.undecided.push(AdoptEntry {
+                path: doc.path.clone(),
+                local_size: Some(disk.size),
+                remote_size: Some(doc.size),
+                remote_rev: Some(doc.rev.clone()),
+                note: Some(format!(
+                    "same content, but {missing} of {} chunks missing on the remote: not adopted; the first sync keeps the local file and retries",
+                    doc.children.len()
+                )),
+                ..Default::default()
+            });
+        }
+        Ok(kept)
     }
 }
 

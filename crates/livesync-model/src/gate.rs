@@ -569,41 +569,52 @@ fn version_key(v: &str) -> Vec<u64> {
 }
 
 /// The settings this client can read. Absent keys take upstream's defaults.
+/// Refuses with the first setting [`unsupported_tweaks`] finds.
 pub fn assess_supported_tweaks(p: &Map<String, Value>) -> Result<(), Refusal> {
-    let unsupported = |m: String| Err(Refusal::UnsupportedSetting(m));
+    match unsupported_tweaks(p).into_iter().next() {
+        Some(r) => Err(r),
+        None => Ok(()),
+    }
+}
+
+/// Every setting in `p` this client cannot read, in a fixed order (empty when
+/// it can read them all).
+pub fn unsupported_tweaks(p: &Map<String, Value>) -> Vec<Refusal> {
+    let mut out = Vec::new();
+    let mut unsupported = |m: String| out.push(Refusal::UnsupportedSetting(m));
     let b = |k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
     if b("encrypt") {
-        return unsupported("encrypt=true (end-to-end encryption arrives in M3)".into());
+        unsupported("encrypt=true (end-to-end encryption arrives in M3)".into());
     }
     if b("usePathObfuscation") {
-        return unsupported("usePathObfuscation=true".into());
+        unsupported("usePathObfuscation=true".into());
     }
     if b("useDynamicIterationCount") {
-        return unsupported("useDynamicIterationCount=true".into());
+        unsupported("useDynamicIterationCount=true".into());
     }
     if b("encryptInternalMetadata") {
-        return unsupported("encryptInternalMetadata=true".into());
+        unsupported("encryptInternalMetadata=true".into());
     }
     match p.get("pathNormalizationVersion") {
         None | Some(Value::Null) => {}
         Some(v) if v.as_i64() == Some(0) => {}
-        Some(v) => return unsupported(format!("pathNormalizationVersion={v}")),
+        Some(v) => unsupported(format!("pathNormalizationVersion={v}")),
     }
     match p.get("idDerivationVersion") {
         None | Some(Value::Null) => {}
         Some(v) if v.as_i64() == Some(0) => {}
-        Some(v) => return unsupported(format!("idDerivationVersion={v}")),
+        Some(v) => unsupported(format!("idDerivationVersion={v}")),
     }
     match p.get("hashAlg") {
         None | Some(Value::Null) => {}
         Some(Value::String(s)) if s == "xxhash64" => {}
-        Some(v) => return unsupported(format!("hashAlg={v} (only xxhash64)")),
+        Some(v) => unsupported(format!("hashAlg={v} (only xxhash64)")),
     }
     match p.get("handleFilenameCaseSensitive") {
         None | Some(Value::Null) | Some(Value::Bool(_)) => {}
-        Some(v) => return unsupported(format!("handleFilenameCaseSensitive={v}")),
+        Some(v) => unsupported(format!("handleFilenameCaseSensitive={v}")),
     }
-    Ok(())
+    out
 }
 
 /// `syncMaxSizeInMB` from the tweaks (0 or absent means "no limit" upstream;
@@ -706,6 +717,12 @@ mod tests {
         ] {
             assert!(assess_supported_tweaks(bad.as_object().unwrap()).is_err(), "{bad}");
         }
+        // All of them at once, the first one also refusing alone.
+        let all = json!({"usePathObfuscation":true,"hashAlg":"sha1","pathNormalizationVersion":1});
+        let found = unsupported_tweaks(all.as_object().unwrap());
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(assess_supported_tweaks(all.as_object().unwrap()), Err(found[0].clone()));
+        assert!(unsupported_tweaks(ok.as_object().unwrap()).is_empty());
         let a = json!({"customChunkSize":60,"hashAlg":"xxhash64"});
         let b = json!({"customChunkSize":50,"hashAlg":"xxhash64","newKey":1});
         let diff = compare_tweaks(a.as_object().unwrap(), b.as_object().unwrap());

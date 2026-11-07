@@ -22,7 +22,7 @@ mod scopesync;
 pub mod vaultfs;
 pub mod watcher;
 
-pub use adopt::{AdoptEntry, AdoptReport};
+pub use adopt::{AdoptEntry, AdoptOptions, AdoptReport};
 pub use engine::{
     AccessCheck, Alerts, Engine, EngineConfig, EngineError, GateReport, PullReport, Status, SyncReport, WallClock,
 };

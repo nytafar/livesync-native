@@ -169,19 +169,39 @@ async fn import_then_adopt_takes_the_folder_over_without_transfers() {
     );
     assert_eq!(v["dry_run"], true);
 
-    // The plugin still enabled here stops the real thing.
+    // The plugin still enabled here stops the real thing, also when
+    // another config folder enables it.
     let (code, _, err) = m.code(&["--vault", "notes", "adopt"]);
-    assert_ne!(code, 0);
+    assert_eq!(code, 2, "{err}");
     assert!(
-        err.contains("plugin is still enabled") && err.contains("--allow-plugin"),
+        err.contains("adopt refused") && err.contains("LiveSync plugin enabled") && err.contains("--allow-plugin"),
         "{err}"
     );
     std::fs::write(m.vault().join(".obsidian/community-plugins.json"), "[]").unwrap();
+    let mobile = m.vault().join(".obsidian-mobile");
+    std::fs::create_dir_all(mobile.join("plugins/obsidian-livesync")).unwrap();
+    std::fs::write(mobile.join("community-plugins.json"), r#"["obsidian-livesync"]"#).unwrap();
+    let (code, _, err) = m.code(&["--vault", "notes", "adopt"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains(".obsidian-mobile"), "{err}");
+    assert!(
+        livesync_engine::Index::open(&m.index())
+            .unwrap()
+            .all_rows()
+            .unwrap()
+            .is_empty(),
+        "nothing recorded"
+    );
+    std::fs::remove_dir_all(&mobile).unwrap();
 
     let writes_before = mock.writes().len();
-    let v: Value = serde_json::from_str(&m.ok(&["--vault", "notes", "adopt", "--json"])).unwrap();
+    // Exit 3, as `sync --json`: the differing file is kept here (dirty).
+    let (code, out, err) = m.code(&["--vault", "notes", "adopt", "--json"]);
+    assert_eq!(code, 3, "{out}\n{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["applied"], true, "{v}");
     assert_eq!(v["identical"], 12);
+    assert_eq!(v["first_sync"]["pull"]["dirty"], 1, "{v}");
     let first = &v["first_sync"];
     assert_eq!(first["pull"]["written"], 1, "only the server-only file: {first}");
     assert_eq!(first["pull"]["chunks_fetched"].as_u64(), Some(2), "{first}");
@@ -231,4 +251,119 @@ async fn a_missing_folder_is_refused() {
     let (code, _, err) = m.code(&["--vault", "notes", "adopt", "--dry-run"]);
     assert_ne!(code, 0);
     assert!(err.contains("does not exist"), "{err}");
+}
+
+/// The machine's lsync.toml, with `f` applied to the vault `notes`.
+fn edit_vault(m: &Machine, f: impl FnOnce(&mut toml::Table)) {
+    let p = m.root.join("config/lsync/lsync.toml");
+    let mut t: toml::Table = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    f(t["vault"]["notes"].as_table_mut().unwrap());
+    std::fs::write(&p, toml::to_string(&t).unwrap()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deliberate_handover_takes_the_flag_or_the_vaults_setting() {
+    for how in ["flag", "vault"] {
+        let mock = Mock::start().await;
+        let m = Machine::new();
+        both(&m, &mock, "a.md", "a");
+        m.import(&mock, true);
+        let mut args = vec!["--vault", "notes", "adopt", "--json"];
+        match how {
+            "flag" => args.push("--allow-plugin"),
+            _ => edit_vault(&m, |v| {
+                v.insert("allow_plugin".into(), true.into());
+            }),
+        }
+        let v: Value = serde_json::from_str(&m.ok(&args)).unwrap();
+        assert_eq!(v["applied"], true, "{how}: {v}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_weak_match_needs_to_be_accepted() {
+    let mock = Mock::start().await;
+    let m = Machine::new();
+    both(&m, &mock, "same.md", "the one that matches");
+    for i in 0..3 {
+        put_file(&mock, &format!("n{i}.md"), format!("theirs {i}").as_bytes());
+        m.write(&format!("n{i}.md"), format!("mine {i}").as_bytes());
+    }
+    m.import(&mock, false);
+    let (code, out, _) = m.code(&["--vault", "notes", "adopt", "--dry-run"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(
+        out.contains("WEAK MATCH") && out.contains("--accept-weak-match"),
+        "{out}"
+    );
+    let (code, out, _) = m.code(&["--vault", "notes", "adopt"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("NOT ADOPTED"), "{out}");
+    assert!(mock.writes().is_empty(), "nothing written to the server");
+    // Applied; exit 3 for the three differing files the first sync keeps.
+    let (code, out, err) = m.code(&["--vault", "notes", "adopt", "--accept-weak-match", "--json"]);
+    assert_eq!(code, 3, "{out}\n{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["applied"], true, "{v}");
+    assert!(v["weak_match"].is_string(), "{v}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn adopt_exits_as_sync_does_when_the_first_sync_needs_attention() {
+    for json in [true, false] {
+        let mock = Mock::start().await;
+        mock.update_milestone(|m| {
+            m["tweak_values"]["PREFERRED"]["syncMaxSizeInMB"] = json!(1);
+        });
+        let m = Machine::new();
+        both(&m, &mock, "a.md", "a");
+        both(&m, &mock, "b.md", "b");
+        // Over the size limit: a local issue of the first sync.
+        m.write("big.md", &vec![b'x'; 1_200_000]);
+        m.import(&mock, false);
+        let mut args = vec!["--vault", "notes", "adopt"];
+        if json {
+            args.push("--json");
+        }
+        let (code, out, err) = m.code(&args);
+        assert_eq!(code, 3, "json {json}:\n{out}\n{err}");
+        if json {
+            let v: Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["applied"], true, "{v}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dot_folder_that_cannot_be_checked_stops_a_real_adopt_without_blaming_the_plugin() {
+    use std::os::unix::fs::PermissionsExt;
+    let mock = Mock::start().await;
+    let m = Machine::new();
+    both(&m, &mock, "a.md", "a");
+    m.import(&mock, false);
+    let snap = m.vault().join(".snapshots");
+    std::fs::create_dir_all(snap.join("1")).unwrap();
+    let mode = |mode: u32| std::fs::set_permissions(&snap, std::fs::Permissions::from_mode(mode)).unwrap();
+    mode(0o000);
+    // Root reads anything; the check is moot there.
+    if std::fs::read_dir(&snap).is_ok() {
+        mode(0o755);
+        return;
+    }
+    let (code, out, err) = m.code(&["--vault", "notes", "adopt", "--dry-run"]);
+    let (real, _, real_err) = m.code(&["--vault", "notes", "adopt"]);
+    mode(0o755);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("could not be checked for the LiveSync plugin") && !out.contains("still enabled"),
+        "{out}"
+    );
+    assert_eq!(real, 2, "{real_err}");
+    assert!(real_err.contains("could not be checked"), "{real_err}");
+    assert!(livesync_engine::Index::open(&m.index())
+        .unwrap()
+        .all_rows()
+        .unwrap()
+        .is_empty());
 }

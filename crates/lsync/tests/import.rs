@@ -67,8 +67,13 @@ impl Machine {
     }
 
     fn run(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        self.run_env(args, stdin, &[])
+    }
+
+    fn run_env(&self, args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> Output {
         let mut c = Command::new(env!("CARGO_BIN_EXE_lsync"));
         c.env_clear()
+            .envs(env.iter().copied())
             .env("HOME", self.root.join("home"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_STATE_HOME", self.root.join("state"))
@@ -370,4 +375,64 @@ fn the_import_takes_no_connection_settings_from_the_command_line() {
     assert!(e.contains("--db is read from the file"), "{e}");
     let e = m.fails(&["--vault", "x", "import", s(&f)], None);
     assert!(e.contains("--name"), "{e}");
+}
+
+#[test]
+fn an_account_whose_password_lsync_cannot_store_is_reused_only_when_it_matches() {
+    // An account for the same server and user that takes its password from
+    // the environment: lsync cannot write it, so it must hold the file's.
+    let m = Machine::new();
+    std::fs::create_dir_all(m.root.join("config/lsync")).unwrap();
+    std::fs::write(
+        m.root.join("config/lsync/lsync.toml"),
+        "[account.home]\nurl = \"https://couch.example.invalid\"\nusername = \"synthetic-user\"\nsecret = \"env:LSYNC_TEST_IMPORT_PW\"\n",
+    )
+    .unwrap();
+    let before = m.config();
+    let f = m.plugin_file("vault", &case("plugin-default"));
+    let fails = |env: &[(&str, &str)]| {
+        let out = m.run_env(&["import", s(&f)], None, env);
+        assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        assert_eq!(m.config(), before, "nothing is written");
+        assert!(m.secrets().is_empty());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let e = fails(&[]);
+    assert!(
+        e.contains("environment variable LSYNC_TEST_IMPORT_PW") && e.contains("not set here"),
+        "{e}"
+    );
+    let e = fails(&[("LSYNC_TEST_IMPORT_PW", "synthetic-password-other")]);
+    assert!(e.contains("holds another password"), "{e}");
+    let out = m.run_env(
+        &["import", s(&f)],
+        None,
+        &[("LSYNC_TEST_IMPORT_PW", "synthetic-password-1")],
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        text.contains("uses account home") && text.contains("unchanged"),
+        "{text}"
+    );
+    assert!(m.secrets().is_empty(), "nothing goes to secrets.toml");
+    assert!(!m.config().contains("synthetic-password-1"));
+}
+
+#[test]
+fn every_unsupported_setting_is_listed_and_markdown_merge_is_noted() {
+    let mut d = case("plugin-default");
+    d["usePathObfuscation"] = true.into();
+    d["hashAlg"] = "sha1".into();
+    d["pathNormalizationVersion"] = 1.into();
+    let m = Machine::new();
+    let e = m.fails(&["import", s(&m.plugin_file("vault", &d))], None);
+    for want in ["usePathObfuscation", "hashAlg", "pathNormalizationVersion"] {
+        assert!(e.contains(want), "{want}: {e}");
+    }
+    let mut d = case("plugin-default");
+    d["disableMarkdownAutoMerge"] = true.into();
+    let m = Machine::new();
+    let out = m.ok(&["import", s(&m.plugin_file("vault", &d))], None);
+    assert!(out.contains("disableMarkdownAutoMerge"), "{out}");
 }
