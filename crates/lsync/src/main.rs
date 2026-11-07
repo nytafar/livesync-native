@@ -354,7 +354,6 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         Cmd::SyncNow { json } => return service_verb(named?, method::SYNC_NOW, "syncing now", json),
         Cmd::Reload { json } => return reload(json),
         Cmd::Events { json } => return events(named?, json),
-        Cmd::Status { json, all: true, .. } => return status_all(json),
         Cmd::Status {
             follow,
             waybar,
@@ -369,6 +368,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             };
             return bar::run(named?, format, follow);
         }
+        Cmd::Status { json, all: true, .. } => return status_all(json),
         Cmd::Serve { opts } => {
             let only = named?;
             return serve::serve(&ctx, only, &opts, VERSION);
