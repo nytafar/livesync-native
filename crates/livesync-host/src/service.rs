@@ -440,6 +440,20 @@ impl Service {
         lock(&self.vaults).keys().cloned().collect()
     }
 
+    /// Whether an enabled vault waits for a locked keyring (its password
+    /// could not be read yet): the caller reloads now and then, and the
+    /// vault starts once the keyring is unlocked.
+    pub fn waiting_for_secrets(&self) -> bool {
+        lock(&self.vaults).values().any(|e| {
+            let p = e.view().planned;
+            p.enabled
+                && p.run
+                    .as_ref()
+                    .err()
+                    .is_some_and(|m| m.contains(crate::keyring::WAITING))
+        })
+    }
+
     fn entry(&self, name: &str) -> Result<Arc<Entry>, CtlError> {
         // The map's lock is let go before `unknown` takes it again.
         let found = lock(&self.vaults).get(name).cloned();

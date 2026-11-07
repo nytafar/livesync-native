@@ -138,6 +138,29 @@ fn spawn_watchdog(notify: &Option<Arc<Notifier>>) -> Option<tokio::task::JoinHan
     }))
 }
 
+/// How often a vault waiting for a locked keyring is tried again.
+const KEYRING_RETRY: Duration = Duration::from_secs(20);
+
+/// Reread the config while a vault waits for the keyring (spec D13): once
+/// it is unlocked, the vault starts. Vaults that did not change are left
+/// alone by a reload.
+fn spawn_keyring_retry(svc: &Arc<Service>) -> tokio::task::JoinHandle<()> {
+    let svc = svc.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(KEYRING_RETRY);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if svc.waiting_for_secrets() {
+                info!("a vault waits for the keyring; trying again");
+                if let Err(e) = svc.reload().await {
+                    warn!("reload: {e}");
+                }
+            }
+        }
+    })
+}
+
 /// Serve the socket (when bound) and the vaults until a stop signal.
 async fn run(
     svc: Arc<Service>,
@@ -147,6 +170,7 @@ async fn run(
 ) {
     let notify = Notifier::from_env().map(Arc::new);
     let watchdog = spawn_watchdog(&notify);
+    let keyring = spawn_keyring_retry(&svc);
     let activity = svc.spawn_activity();
     let notifications = match notifier {
         Some(n) => {
@@ -181,6 +205,7 @@ async fn run(
     if let Some(n) = &notify {
         n.stopping();
     }
+    keyring.abort();
     let _ = stop_tx.send(true);
     if let Some(s) = server {
         let _ = s.await;

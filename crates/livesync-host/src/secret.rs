@@ -3,13 +3,17 @@
 //! An account names its secret with a reference, `STORE:KEY`:
 //!
 //! - `file:KEY`: the key in `secrets.toml` beside `lsync.toml` (mode 0600).
+//! - `keyring:KEY`: the system keyring, the macOS Keychain or the Secret
+//!   Service (see [`crate::keyring`]).
 //! - `credential:NAME`: a systemd credential, the file `NAME` in
 //!   `$CREDENTIALS_DIRECTORY` (`LoadCredential=`, `LoadCredentialEncrypted=`).
+//!   Root can write one for the system service (`systemd-creds encrypt`
+//!   into `/etc/credstore.encrypted`), through a [`CredentialTool`].
 //! - `env:VAR`: the environment variable `VAR`.
 //!
-//! Later backends (the macOS Keychain, the Secret Service) can be locked or
-//! missing when a service starts; [`Availability::Locked`] and
-//! [`SecretError::Locked`] say "wait and ask again", as opposed to an error.
+//! A keyring can be locked when a service starts; [`Availability::Locked`]
+//! and [`SecretError::Locked`] say "wait and ask again", as opposed to an
+//! error.
 //!
 //! A secret never reaches `Debug` output, logs or error messages: [`Secret`]
 //! shows as `***`, and errors name the store and key, never the value.
@@ -44,6 +48,7 @@ impl std::fmt::Debug for Secret {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum StoreKind {
     File,
+    Keyring,
     Credential,
     Env,
 }
@@ -52,6 +57,7 @@ impl StoreKind {
     pub fn prefix(self) -> &'static str {
         match self {
             StoreKind::File => "file",
+            StoreKind::Keyring => "keyring",
             StoreKind::Credential => "credential",
             StoreKind::Env => "env",
         }
@@ -77,18 +83,19 @@ impl SecretRef {
     /// mistake must not come back in a message.
     pub fn parse(s: &str) -> Result<SecretRef, String> {
         const FORM: &str =
-            "secret must be STORE:KEY: file:KEY (secrets.toml), credential:NAME (systemd credentials) or env:VAR";
+            "secret must be STORE:KEY: file:KEY (secrets.toml), keyring:KEY (the macOS Keychain or the Secret Service), credential:NAME (systemd credentials) or env:VAR";
         let Some((store, key)) = s.split_once(':') else {
             return Err(FORM.into());
         };
         let kind = match store {
             "file" => StoreKind::File,
+            "keyring" => StoreKind::Keyring,
             "credential" => StoreKind::Credential,
             "env" => StoreKind::Env,
             _ => return Err(format!("unknown secret store; {FORM}")),
         };
         let (ok, form) = match kind {
-            StoreKind::File => (
+            StoreKind::File | StoreKind::Keyring => (
                 !key.is_empty() && !key.chars().any(|c| c.is_control()),
                 "a key that is not empty",
             ),
@@ -297,14 +304,46 @@ impl SecretStore for FileStore {
     }
 }
 
+/// Encrypts and decrypts systemd credentials (`systemd-creds`); injected,
+/// so the tests never need root or the host key.
+pub trait CredentialTool: Send + Sync {
+    /// Encrypt `value` as the credential `name` into the file `out`.
+    fn encrypt(&self, name: &str, value: &Secret, out: &Path) -> Result<(), String>;
+    /// Decrypt the credential `name` in the file `path`.
+    fn decrypt(&self, name: &str, path: &Path) -> Result<Secret, String>;
+}
+
+/// Where root keeps the system service's credentials, and how.
+pub struct CredentialWriter {
+    /// `/etc/credstore.encrypted`, where `LoadCredentialEncrypted=` reads.
+    pub dir: PathBuf,
+    pub tool: Arc<dyn CredentialTool>,
+}
+
 /// systemd credentials: one file per secret in `$CREDENTIALS_DIRECTORY`.
+/// With a [`CredentialWriter`] (root, for the system service), outside a
+/// unit they are read from and written to its folder instead.
 pub struct CredentialStore {
     dir: Option<PathBuf>,
+    writer: Option<CredentialWriter>,
 }
 
 impl CredentialStore {
     pub fn new(dir: Option<PathBuf>) -> CredentialStore {
-        CredentialStore { dir }
+        CredentialStore { dir, writer: None }
+    }
+
+    pub fn with_writer(dir: Option<PathBuf>, writer: CredentialWriter) -> CredentialStore {
+        CredentialStore {
+            dir,
+            writer: Some(writer),
+        }
+    }
+
+    /// The writer, when this process reads credentials from its folder
+    /// (not from inside a unit).
+    fn stored(&self) -> Option<&CredentialWriter> {
+        self.writer.as_ref().filter(|_| self.dir.is_none())
     }
 }
 
@@ -314,13 +353,17 @@ impl SecretStore for CredentialStore {
     }
 
     fn location(&self) -> String {
-        match &self.dir {
-            Some(d) => d.display().to_string(),
-            None => "$CREDENTIALS_DIRECTORY (not set)".into(),
+        match (&self.dir, self.stored()) {
+            (Some(d), _) => d.display().to_string(),
+            (None, Some(w)) => w.dir.display().to_string(),
+            (None, None) => "$CREDENTIALS_DIRECTORY (not set)".into(),
         }
     }
 
     fn availability(&self) -> Availability {
+        if self.stored().is_some() {
+            return Availability::Ready;
+        }
         match &self.dir {
             Some(d) if d.is_dir() => Availability::Ready,
             Some(d) => Availability::Unavailable(format!("the credentials folder {} does not exist", d.display())),
@@ -331,6 +374,17 @@ impl SecretStore for CredentialStore {
     }
 
     fn get(&self, key: &str) -> Result<Option<Secret>, SecretError> {
+        if let Some(w) = self.stored() {
+            let path = w.dir.join(key);
+            if !path.exists() {
+                return Ok(None);
+            }
+            return w
+                .tool
+                .decrypt(key, &path)
+                .map(Some)
+                .map_err(|e| SecretError::Failed(format!("decrypting the credential {key:?}: {e}")));
+        }
         let Some(dir) = &self.dir else {
             return Err(SecretError::Unavailable(format!(
                 "the password is the systemd credential {key:?}, but CREDENTIALS_DIRECTORY is not set (run lsync from a unit with LoadCredential={key}:... or LoadCredentialEncrypted={key}:...)"
@@ -345,18 +399,45 @@ impl SecretStore for CredentialStore {
     }
 
     fn writable(&self) -> bool {
-        false
+        self.stored().is_some()
     }
 
-    fn set(&self, key: &str, _value: &Secret) -> Result<(), SecretError> {
-        Err(SecretError::ReadOnly(format!(
-            "systemd credential {key:?} is set in the service unit (systemd-creds encrypt), not by lsync"
-        )))
+    fn set(&self, key: &str, value: &Secret) -> Result<(), SecretError> {
+        let Some(w) = self.stored() else {
+            return Err(SecretError::ReadOnly(format!(
+                "systemd credential {key:?} is set in the service unit (systemd-creds encrypt), or by root with `sudo lsync --system account passwd`"
+            )));
+        };
+        std::fs::create_dir_all(&w.dir)
+            .map_err(|e| SecretError::Failed(format!("creating {}: {e}", w.dir.display())))?;
+        // Into a new file first: a failed encryption leaves the old one.
+        let path = w.dir.join(key);
+        let tmp = w.dir.join(format!(".{key}.tmp-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let done = w
+            .tool
+            .encrypt(key, value, &tmp)
+            .map_err(|e| SecretError::Failed(format!("encrypting the credential {key:?}: {e}")))
+            .and_then(|()| {
+                std::fs::rename(&tmp, &path)
+                    .map_err(|e| SecretError::Failed(format!("writing {}: {e}", path.display())))
+            });
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        done
     }
 
     fn delete(&self, key: &str) -> Result<bool, SecretError> {
-        self.set(key, &Secret::new(""))?;
-        Ok(false)
+        let Some(w) = self.stored() else {
+            self.set(key, &Secret::new(""))?;
+            return Ok(false);
+        };
+        match std::fs::remove_file(w.dir.join(key)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(SecretError::Failed(format!("removing the credential {key:?}: {e}"))),
+        }
     }
 }
 
@@ -423,15 +504,25 @@ impl SecretStores {
         }
     }
 
-    /// The stores of this process: `secrets_file` beside the config,
-    /// `$CREDENTIALS_DIRECTORY`, and the environment.
+    /// The stores of this process: `secrets_file` beside the config, the
+    /// system keyring, `$CREDENTIALS_DIRECTORY`, and the environment.
     pub fn standard(secrets_file: PathBuf) -> SecretStores {
+        SecretStores::with_credentials(secrets_file, None)
+    }
+
+    /// As [`SecretStores::standard`], with credentials root can write.
+    pub fn with_credentials(secrets_file: PathBuf, writer: Option<CredentialWriter>) -> SecretStores {
         let creds = std::env::var_os("CREDENTIALS_DIRECTORY")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
+        let creds = match writer {
+            Some(w) => CredentialStore::with_writer(creds, w),
+            None => CredentialStore::new(creds),
+        };
         SecretStores::new(vec![
             Box::new(FileStore::new(secrets_file)),
-            Box::new(CredentialStore::new(creds)),
+            Box::new(crate::keyring::KeyringStore::new()),
+            Box::new(creds),
             Box::new(EnvStore::process()),
         ])
     }
@@ -467,6 +558,7 @@ impl SecretStores {
         match (r.kind, self.store(r.kind)) {
             (StoreKind::Env, _) => format!("environment variable {}", r.key),
             (StoreKind::File, Ok(s)) => format!("key {:?} in {}", r.key, s.location()),
+            (StoreKind::Keyring, Ok(s)) => format!("key {:?} in {}", r.key, s.location()),
             (StoreKind::Credential, Ok(s)) => format!("systemd credential {:?} in {}", r.key, s.location()),
             (_, Err(e)) => e.to_string(),
         }
@@ -485,6 +577,8 @@ mod tests {
             SecretRef::parse("credential:lsync-home").unwrap().kind,
             StoreKind::Credential
         );
+        assert_eq!(SecretRef::parse("keyring:home").unwrap().kind, StoreKind::Keyring);
+        assert!(SecretRef::parse("keyring:").is_err());
         assert!(SecretRef::parse("home").is_err());
         assert!(SecretRef::parse("keychain:x")
             .unwrap_err()
@@ -565,6 +659,63 @@ mod tests {
         assert_eq!(e.get("PW").unwrap().unwrap().expose(), "from-env");
         assert_eq!(e.get("NOPE").unwrap(), None);
         assert!(!e.writable());
+    }
+
+    /// "Encrypts" by reversing, and records the names it was given.
+    struct FakeCreds;
+    impl CredentialTool for FakeCreds {
+        fn encrypt(&self, name: &str, value: &Secret, out: &Path) -> Result<(), String> {
+            if value.expose() == "fail" {
+                return Err("no host key".into());
+            }
+            let text: String = value.expose().chars().rev().collect();
+            std::fs::write(out, format!("{name}\n{text}")).map_err(|e| e.to_string())
+        }
+        fn decrypt(&self, name: &str, path: &Path) -> Result<Secret, String> {
+            let t = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let (n, v) = t.split_once('\n').unwrap();
+            assert_eq!(n, name, "the name is checked at decryption");
+            Ok(Secret::new(v.chars().rev().collect::<String>()))
+        }
+    }
+
+    #[test]
+    fn root_writes_the_system_services_credentials_through_the_tool() {
+        let d = tempfile::tempdir().unwrap();
+        let w = CredentialWriter {
+            dir: d.path().join("credstore.encrypted"),
+            tool: Arc::new(FakeCreds),
+        };
+        let c = CredentialStore::with_writer(None, w);
+        assert!(c.writable());
+        assert_eq!(c.availability(), Availability::Ready);
+        assert_eq!(c.get("lsync-home").unwrap(), None);
+        c.set("lsync-home", &Secret::new("pw1")).unwrap();
+        let file = d.path().join("credstore.encrypted/lsync-home");
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("pw1"));
+        assert_eq!(c.get("lsync-home").unwrap().unwrap().expose(), "pw1");
+        // A failed encryption keeps the old credential and leaves no temp file.
+        assert!(c.set("lsync-home", &Secret::new("fail")).is_err());
+        assert_eq!(c.get("lsync-home").unwrap().unwrap().expose(), "pw1");
+        assert_eq!(
+            std::fs::read_dir(d.path().join("credstore.encrypted")).unwrap().count(),
+            1
+        );
+        assert!(c.delete("lsync-home").unwrap());
+        assert!(!c.delete("lsync-home").unwrap());
+
+        // Inside a unit, the credentials folder is what counts, read-only.
+        let unit = tempfile::tempdir().unwrap();
+        std::fs::write(unit.path().join("lsync-home"), "from-unit\n").unwrap();
+        let inside = CredentialStore::with_writer(
+            Some(unit.path().to_path_buf()),
+            CredentialWriter {
+                dir: d.path().join("credstore.encrypted"),
+                tool: Arc::new(FakeCreds),
+            },
+        );
+        assert!(!inside.writable());
+        assert_eq!(inside.get("lsync-home").unwrap().unwrap().expose(), "from-unit");
     }
 
     struct LockedStore;

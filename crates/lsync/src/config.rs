@@ -243,7 +243,14 @@ impl Setup {
     }
 
     pub fn secrets(&self) -> SecretStores {
-        SecretStores::standard(self.dirs.config.join(SECRETS_FILE))
+        // Root, for the system service: credentials go to /etc/credstore.encrypted.
+        let writer = (self.system && cfg!(target_os = "linux") && crate::install::geteuid() == 0).then(|| {
+            livesync_host::secret::CredentialWriter {
+                dir: std::path::PathBuf::from(crate::install::CREDSTORE_ENCRYPTED),
+                tool: std::sync::Arc::new(crate::install::SystemdCreds),
+            }
+        });
+        SecretStores::with_credentials(self.dirs.config.join(SECRETS_FILE), writer)
     }
 
     /// Migrate the profile files on the first run (never for `--config`).

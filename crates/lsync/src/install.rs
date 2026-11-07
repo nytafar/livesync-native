@@ -272,6 +272,44 @@ pub fn carried_env(home: Option<&Path>, var: &dyn Fn(&str) -> Option<String>) ->
     out
 }
 
+/// Where root writes the system service's encrypted credentials.
+pub const CREDSTORE_ENCRYPTED: &str = "/etc/credstore.encrypted";
+
+/// `systemd-creds`, with the secret on stdin or stdout, never on a command line.
+pub struct SystemdCreds;
+
+impl livesync_host::secret::CredentialTool for SystemdCreds {
+    fn encrypt(&self, name: &str, value: &livesync_host::secret::Secret, out: &Path) -> Result<(), String> {
+        let name_arg = format!("--name={name}");
+        let out_arg = out.display().to_string();
+        let r = System
+            .run(
+                "systemd-creds",
+                &["encrypt", &name_arg, "-", &out_arg],
+                Some(value.expose().as_bytes()),
+            )
+            .map_err(|e| format!("running systemd-creds: {e}"))?;
+        if !r.ok {
+            return Err(r.stderr.trim().to_string());
+        }
+        Ok(())
+    }
+
+    fn decrypt(&self, name: &str, path: &Path) -> Result<livesync_host::secret::Secret, String> {
+        let name_arg = format!("--name={name}");
+        let path_arg = path.display().to_string();
+        let r = System
+            .run("systemd-creds", &["decrypt", &name_arg, &path_arg, "-"], None)
+            .map_err(|e| format!("running systemd-creds: {e}"))?;
+        if !r.ok {
+            return Err(r.stderr.trim().to_string());
+        }
+        Ok(livesync_host::secret::Secret::new(
+            r.stdout.trim_end_matches(['\n', '\r']),
+        ))
+    }
+}
+
 pub fn geteuid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
@@ -495,7 +533,7 @@ pub fn dropin_for(ctx: &Ctx, cfg: &Config, home: Option<&Path>) -> (String, Vec<
         match credential_file(&ctx.etc, &r) {
             Some(c) => creds.push(c),
             None => missing.push(format!(
-                "account {name}: no credential {key:?} in {etc}/credstore.encrypted or {etc}/credstore; make it with `systemd-creds encrypt --name={key} - {etc}/credstore.encrypted/{key}`, then run `sudo lsync service install --system` again",
+                "account {name}: no credential {key:?} in {etc}/credstore.encrypted or {etc}/credstore; set it with `sudo lsync --system account passwd {name}` (or `systemd-creds encrypt --name={key} - {etc}/credstore.encrypted/{key}`), then run `sudo lsync service install --system` again",
                 key = r.key,
                 etc = ctx.etc.display()
             )),

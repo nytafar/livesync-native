@@ -180,6 +180,7 @@ A reverse proxy that buffers responses holds the heartbeats back, and the daemon
 lsync account add home --url https://couch.example.net --user me   # asks for the password
 printf '%s' "$PASSWORD" | lsync account add home --url ... --user me --password-stdin
 lsync account add ci --url ... --user me --secret env:LSYNC_CI_PASSWORD   # read from the environment
+lsync account add home --url ... --user me --secret keyring:home       # the Keychain or the Secret Service
 lsync account ls [--json]       # every account, where its password is kept, whether it is set
 lsync account passwd home       # asks; or --password-stdin
 lsync account rm home           # only when no vault uses it
@@ -202,12 +203,15 @@ These commands edit the file in place and keep its comments and layout; a change
 | `secret` | Where the password is |
 |---|---|
 | `file:KEY` (the default, `file:<account>`) | `secrets.toml` beside `lsync.toml`, mode 0600, `"KEY" = "password"` per line; refused while others can read it |
-| `credential:NAME` | a systemd credential: the file `NAME` in `$CREDENTIALS_DIRECTORY` (`LoadCredential=` or `LoadCredentialEncrypted=` in the unit) |
+| `keyring:KEY` | the system keyring: the macOS Keychain (a generic password, service `lsync`, account `KEY`), or on Linux the Secret Service of the desktop session (gnome-keyring, KWallet, KeePassXC), in the default keyring with `service=lsync` and `username=KEY` (`secret-tool lookup service lsync username KEY` finds it) |
+| `credential:NAME` | a systemd credential: the file `NAME` in `$CREDENTIALS_DIRECTORY` (`LoadCredential=` or `LoadCredentialEncrypted=` in the unit). For the system service, root sets it with `sudo lsync --system account add|passwd`, which runs `systemd-creds encrypt` into `/etc/credstore.encrypted/NAME` (the password on its stdin) |
 | `env:VAR` | the environment variable `VAR` |
 
 An account without `--user` is a server without authentication: it has no password and is not asked for one. The server URL holds no user or password (`https://me:pw@...` is refused: give `--user`, and the password when asked). `account add` never takes over a `file:` key that another account uses or that already holds a password, unless given `--replace-secret`.
 
-`--password` and `LSYNC_PASSWORD` still override the store for one run. The macOS Keychain and the Linux Secret Service come later as more stores.
+`--password` and `LSYNC_PASSWORD` still override the store for one run.
+
+A keyring that is still locked (a desktop service that starts before the login unlocks it) is not an error: the vault shows "waiting for the keyring" in `lsync status --all`, and the service tries again every 20 s, so the vault starts once the keyring is unlocked. lsync never shows an unlock prompt itself. Without a desktop session (a server, an SSH login) there is no Secret Service: use `file:` or, for the system service, `credential:`. `file:` stays the default; `--secret keyring:NAME` puts an account's password in the keyring.
 
 **Selecting a vault.** `--vault NAME` (or `--profile NAME`, or `LSYNC_PROFILE`) picks a vault. Without one, a vault named `default` is used, or else a `default.toml` that was not migrated, or else the only vault; with several, the command asks for `--vault`. When a run gives its own folder (`--folder` or `LSYNC_VAULT`) without naming a vault, it uses only flags and the environment, never another vault's index; a vault named `default` stands in for the old default profile and is still merged with them. `--vault` used to name the folder: a value that is clearly a path (with a `/`, or starting with `~` or `.`) is still read as `--folder`, with a warning.
 

@@ -21,6 +21,7 @@ pub mod config;
 #[cfg(unix)]
 pub mod control;
 pub mod edit;
+pub mod keyring;
 pub mod legacy;
 pub mod migrate;
 pub mod notify;

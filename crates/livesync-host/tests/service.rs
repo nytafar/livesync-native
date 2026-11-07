@@ -237,6 +237,79 @@ fn the_socket_speaks_the_protocol_and_streams_events() {
     assert!(f.mock.writes().is_empty(), "pull-only vaults never write");
 }
 
+/// A keyring that is locked until the test unlocks it.
+struct TestKeyring(Arc<AtomicBool>);
+
+impl livesync_host::secret::SecretStore for TestKeyring {
+    fn kind(&self) -> livesync_host::secret::StoreKind {
+        livesync_host::secret::StoreKind::Keyring
+    }
+    fn location(&self) -> String {
+        "a test keyring".into()
+    }
+    fn availability(&self) -> livesync_host::secret::Availability {
+        if self.0.load(Ordering::SeqCst) {
+            livesync_host::secret::Availability::Ready
+        } else {
+            livesync_host::secret::Availability::Locked(format!(
+                "{}: locked in the test",
+                livesync_host::keyring::WAITING
+            ))
+        }
+    }
+    fn get(&self, _key: &str) -> Result<Option<livesync_host::secret::Secret>, livesync_host::secret::SecretError> {
+        Ok(Some(livesync_host::secret::Secret::new("pw")))
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn set(&self, _: &str, _: &livesync_host::secret::Secret) -> Result<(), livesync_host::secret::SecretError> {
+        unreachable!()
+    }
+    fn delete(&self, _: &str) -> Result<bool, livesync_host::secret::SecretError> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn a_vault_waits_for_a_locked_keyring_and_starts_once_it_is_unlocked() {
+    let f = Fixture::new();
+    let text = format!(
+        "[account.dev]\nurl = \"{}\"\nusername = \"u\"\nsecret = \"keyring:dev\"\n\n{}",
+        f.mock.url,
+        vault("notes", "dev", "notes", "")
+    );
+    std::fs::write(f.dirs.config_file(), text).unwrap();
+    let unlocked = Arc::new(AtomicBool::new(false));
+    let host = Arc::new(Host::on_runtime(f.rt.handle().clone()));
+    let source = ConfigSource {
+        path: f.dirs.config_file(),
+        dirs: f.dirs.clone(),
+        secrets: SecretStores::new(vec![Box::new(TestKeyring(unlocked.clone()))]),
+        only: None,
+    };
+    let svc = {
+        let _rt = f.rt.enter();
+        Service::new(host, Box::new(source), "test")
+    };
+    let r = f.reload(&svc);
+    assert!(r.failed[0].message.contains("waiting for the keyring"), "{r:?}");
+    assert!(svc.waiting_for_secrets());
+    let v = &svc.status(Some("notes")).unwrap().vaults[0];
+    assert!(
+        v.message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("waiting for the keyring"),
+        "{v:?}"
+    );
+    unlocked.store(true, Ordering::SeqCst);
+    f.reload(&svc);
+    assert!(!svc.waiting_for_secrets());
+    wait_until("notes running", || state_of(&svc, "notes") == "running");
+    f.rt.block_on(svc.shutdown());
+}
+
 #[test]
 fn a_connection_from_another_user_is_refused() {
     let f = Fixture::new();

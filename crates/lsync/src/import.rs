@@ -32,7 +32,7 @@ use anyhow::{anyhow, bail, Result};
 use livesync_host::config::{check_name, server_key, Account, Vault};
 use livesync_host::migrate;
 use livesync_host::run::split_userinfo;
-use livesync_host::secret::{Secret, SecretRef, StoreKind};
+use livesync_host::secret::{Secret, SecretRef};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -672,7 +672,7 @@ pub fn run(ctx: &Setup, a: ImportArgs, given: &Given) -> Result<u8> {
             stores.describe(&secret_ref)
         ),
         (Some(pw), Some(_)) => {
-            if secret_ref.kind != StoreKind::File {
+            if !stores.writable(&secret_ref) {
                 // lsync cannot write these stores: the password must be the
                 // imported one already, and readable here to tell.
                 let where_ = stores.describe(&secret_ref);

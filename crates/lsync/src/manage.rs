@@ -11,7 +11,7 @@ use livesync_host::config::{check_name, server_key, Account, Config, Mode, Vault
 use livesync_host::edit::{string_array, ConfigFile};
 use livesync_host::migrate;
 use livesync_host::run::split_userinfo;
-use livesync_host::secret::{Availability, Secret, SecretRef, SecretStores, StoreKind};
+use livesync_host::secret::{Availability, Secret, SecretRef, SecretStores};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -23,7 +23,8 @@ pub enum AccountCmd {
     Add {
         name: String,
         /// Where the password is: file:KEY (secrets.toml, the default,
-        /// file:NAME), credential:NAME (systemd credentials) or env:VAR
+        /// file:NAME), keyring:KEY (the macOS Keychain or the Secret
+        /// Service), credential:NAME (systemd credentials) or env:VAR
         #[arg(long)]
         secret: Option<String>,
         /// Read the password from stdin instead of asking
@@ -50,7 +51,7 @@ pub enum AccountCmd {
         #[arg(long)]
         password_stdin: bool,
     },
-    /// Remove an account no vault uses, and its password in secrets.toml
+    /// Remove an account no vault uses, and the password lsync stored for it
     Rm { name: String },
 }
 
@@ -189,10 +190,13 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
             // Checked before any password is stored.
             let cfg = file.config(&ctx.dirs).map_err(|e| anyhow!(e))?;
             let stores = ctx.secrets();
+            // Stores lsync writes to (secrets.toml, the keyring, root's
+            // credentials) take the password; the others are read only.
+            let writable = stores.writable(&r);
             if username.is_none() && password_stdin {
                 bail!("account {name} has no user, so no password (a server without authentication); give --user USER for an account with one");
             }
-            if r.kind != StoreKind::File && password_stdin {
+            if !writable && password_stdin {
                 bail!(
                     "account {name}'s password comes from the {}; lsync does not store it",
                     stores.describe(&r)
@@ -201,7 +205,7 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
             // A file: key another account uses, or one that already holds a
             // password, is never taken over unasked.
             let mut previous = None;
-            if r.kind == StoreKind::File && username.is_some() {
+            if writable && username.is_some() {
                 let others: Vec<&str> = cfg
                     .account
                     .iter()
@@ -228,7 +232,7 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
                 }
             }
             let mut stored = false;
-            if r.kind == StoreKind::File && username.is_some() && !no_password {
+            if writable && username.is_some() && !no_password {
                 let pw = prompt::new_password(password_stdin, &format!("password for {name}"))?;
                 stores.set(&r, &pw)?;
                 stored = true;
@@ -246,7 +250,7 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
                 println!("  password  none (no user: a server without authentication)");
             } else {
                 println!("  password  {}", stores.describe(&r));
-                if r.kind != StoreKind::File {
+                if !writable {
                     println!("            (lsync reads it from there; it does not store it)");
                 }
             }
@@ -351,7 +355,7 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
                 .account
                 .iter()
                 .any(|(n, o)| n != &name && o.secret_ref(n).ok().as_ref() == Some(&r));
-            if r.kind == StoreKind::File && !shared {
+            if ctx.secrets().writable(&r) && !shared {
                 ctx.secrets().delete(&r)?;
             }
             println!("removed account {name}");

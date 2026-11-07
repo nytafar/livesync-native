@@ -21,6 +21,14 @@ tracing = "0.1.44"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The keyring store: the Secret Service over D-Bus (pure Rust, so the static
+# musl builds keep working), and the macOS Keychain.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5.2", default-features = false, features = ["rt-tokio-crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", default-features = false }
+
 [dev-dependencies]
 axum = "0.8.9"
 futures = "0.3.34"
