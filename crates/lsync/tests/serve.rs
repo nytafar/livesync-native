@@ -825,3 +825,74 @@ fn an_older_service_without_a_method_still_lets_other_vaults_run_here() {
         "{err}"
     );
 }
+
+/// The messages a `Type=notify` unit's manager gets, from a fake
+/// `NOTIFY_SOCKET` (a datagram socket in the machine's temp folder).
+struct FakeManager {
+    sock: std::os::unix::net::UnixDatagram,
+    path: PathBuf,
+}
+
+impl FakeManager {
+    fn new(m: &Machine) -> FakeManager {
+        let path = m.root.join("notify");
+        let sock = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        FakeManager { sock, path }
+    }
+
+    /// Messages until one that starts with `prefix`; panics after 30 s.
+    fn until(&self, prefix: &str) -> Vec<String> {
+        let end = Instant::now() + Duration::from_secs(30);
+        let mut got = vec![];
+        let mut buf = [0u8; 4096];
+        while Instant::now() < end {
+            if let Ok(n) = self.sock.recv(&mut buf) {
+                let msg = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let done = msg.starts_with(prefix);
+                got.push(msg);
+                if done {
+                    return got;
+                }
+            }
+        }
+        panic!("no {prefix} message; got {got:?}");
+    }
+}
+
+#[test]
+fn serve_tells_a_notify_unit_ready_reloading_watchdog_and_stopping() {
+    let rt = runtime();
+    let mock = rt.block_on(Mock::start());
+    mock.put_text("Notes/a.md", &["note a"]);
+    let mut m = Machine::with_vault(&mock);
+    let manager = FakeManager::new(&m);
+    m.env.push(("NOTIFY_SOCKET".into(), manager.path.display().to_string()));
+    // 200 ms: a ping every 100 ms.
+    m.env.push(("WATCHDOG_USEC".into(), "200000".into()));
+    let svc = m.spawn(&["serve"], "serve.log");
+    let first = manager.until("READY=1");
+    let ready = first.last().unwrap();
+    assert!(ready.contains("STATUS=1 of 1 vault(s) running: notes"), "{ready}");
+    // READY comes once the vault has started, not before.
+    assert_eq!(m.served_state("notes").as_deref(), Some("running"));
+    let pings = manager.until("WATCHDOG=1");
+    assert_eq!(pings.last().unwrap(), "WATCHDOG=1");
+    // SIGHUP, as `ExecReload=` sends it: RELOADING=1, then READY=1 again.
+    // SAFETY: kill has no memory preconditions.
+    unsafe { libc::kill(svc.child.id() as i32, libc::SIGHUP) };
+    let reload = manager.until("RELOADING=1");
+    let reloading = reload.last().unwrap();
+    assert!(reloading.contains("\nMONOTONIC_USEC="), "{reloading}");
+    let after: Vec<String> = manager
+        .until("READY=1")
+        .into_iter()
+        .filter(|x| x != "WATCHDOG=1")
+        .collect();
+    assert_eq!(after.len(), 1, "{after:?}");
+    let log = svc.log();
+    let code = svc.stop();
+    assert_eq!(code, Some(0), "{log}");
+    let stopping = manager.until("STOPPING=1");
+    assert!(stopping.last().unwrap().starts_with("STOPPING=1"));
+}

@@ -9,6 +9,7 @@ mod manage;
 mod probe;
 mod prompt;
 mod route;
+mod sdnotify;
 mod serve;
 mod service;
 

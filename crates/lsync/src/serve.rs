@@ -6,12 +6,14 @@
 //! SIGUSR1 is "sync now" for every vault, SIGTERM and SIGINT stop.
 
 use crate::config::Setup;
+use crate::sdnotify::{self, Notifier};
 use anyhow::{anyhow, bail, Result};
 use livesync_host::control::{self, BindError, Kind, Policy};
-use livesync_host::notify::{self, Notifier};
+use livesync_host::notify::{self, Notifier as DesktopNotifier};
 use livesync_host::service::{ConfigSource, FixedSource, Planned, Service, Source};
 use livesync_host::{Host, RunConfig};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 use tracing::{info, warn};
 
@@ -42,7 +44,7 @@ pub struct ServeOpts {
 
 impl ServeOpts {
     /// The notifier asked for, if any.
-    fn notifier(&self) -> Option<Arc<dyn Notifier>> {
+    fn notifier(&self) -> Option<Arc<dyn DesktopNotifier>> {
         match &self.notify_command {
             Some(p) => Some(Arc::new(notify::Program::new(p.clone()))),
             None if self.notify => Some(Arc::new(notify::Desktop::new())),
@@ -68,8 +70,24 @@ async fn recv(s: &mut Option<Signal>) {
     }
 }
 
+/// The status line the service manager shows ("2 of 3 vault(s) running").
+fn status_line(svc: &Service) -> String {
+    let running = svc.host().active();
+    let all = svc.names();
+    if running.is_empty() {
+        format!("0 of {} vault(s) running", all.len())
+    } else {
+        format!(
+            "{} of {} vault(s) running: {}",
+            running.len(),
+            all.len(),
+            running.join(", ")
+        )
+    }
+}
+
 /// Run until SIGTERM or SIGINT, reloading on SIGHUP and nudging on SIGUSR1.
-async fn signals(svc: &Arc<Service>) {
+async fn signals(svc: &Arc<Service>, notify: &Option<Arc<Notifier>>) {
     let mut term = signal(SignalKind::terminate()).ok();
     let mut hup = signal(SignalKind::hangup()).ok();
     let mut usr1 = signal(SignalKind::user_defined1()).ok();
@@ -80,10 +98,19 @@ async fn signals(svc: &Arc<Service>) {
             _ = recv(&mut hup) => {
                 info!("SIGHUP: rereading the config");
                 let s = svc.clone();
+                let n = notify.clone();
                 // On its own task: a reload may wait for a running command.
+                // A unit's `systemctl reload` lasts from RELOADING=1 to the
+                // READY=1 after it.
                 tokio::spawn(async move {
+                    if let Some(n) = &n {
+                        n.reloading();
+                    }
                     if let Err(e) = s.reload().await {
                         warn!("reload: {e}");
+                    }
+                    if let Some(n) = &n {
+                        n.ready(&status_line(&s));
                     }
                 });
             }
@@ -96,8 +123,34 @@ async fn signals(svc: &Arc<Service>) {
     info!("shutting down");
 }
 
+/// How long READY=1 waits for the vaults' first starts: below systemd's
+/// default start timeout (90 s), so a slow disk never fails the unit.
+const READY_WAIT: Duration = Duration::from_secs(60);
+
+/// `WATCHDOG=1` from the runtime, at half the unit's `WatchdogSec=`: a
+/// runtime that stops scheduling tasks gets the service restarted.
+fn spawn_watchdog(notify: &Option<Arc<Notifier>>) -> Option<tokio::task::JoinHandle<()>> {
+    let n = notify.clone()?;
+    let every = sdnotify::watchdog_interval()?;
+    info!("watchdog: pinging the service manager every {every:?}");
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        loop {
+            tick.tick().await;
+            n.watchdog();
+        }
+    }))
+}
+
 /// Serve the socket (when bound) and the vaults until a stop signal.
-async fn run(svc: Arc<Service>, bound: Option<control::Bound>, policy: Policy, notifier: Option<Arc<dyn Notifier>>) {
+async fn run(
+    svc: Arc<Service>,
+    bound: Option<control::Bound>,
+    policy: Policy,
+    notifier: Option<Arc<dyn DesktopNotifier>>,
+) {
+    let notify = Notifier::from_env().map(Arc::new);
+    let watchdog = spawn_watchdog(&notify);
     let activity = svc.spawn_activity();
     let notifications = match notifier {
         Some(n) => {
@@ -118,16 +171,20 @@ async fn run(svc: Arc<Service>, bound: Option<control::Bound>, policy: Policy, n
     };
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let server = bound.map(|b| tokio::spawn(control::serve(b, svc.clone(), policy, stop_rx)));
-    // Where a `Type=notify` unit gets READY=1 (P1): every vault is started
-    // and the socket accepts.
-    let running = svc.host().active();
-    info!(
-        "ready: {} of {} vault(s) started: {}",
-        running.len(),
-        svc.names().len(),
-        running.join(", ")
-    );
-    signals(&svc).await;
+    // READY=1 for a `Type=notify` unit: every vault's first start is
+    // decided (it runs, or its supervisor retries it) and the socket accepts.
+    if !svc.wait_settled(READY_WAIT).await {
+        warn!("some vaults are still starting after {READY_WAIT:?}; ready anyway");
+    }
+    let status = status_line(&svc);
+    info!("ready: {status}");
+    if let Some(n) = &notify {
+        n.ready(&status);
+    }
+    signals(&svc, &notify).await;
+    if let Some(n) = &notify {
+        n.stopping();
+    }
     let _ = stop_tx.send(true);
     if let Some(s) = server {
         let _ = s.await;
@@ -136,6 +193,9 @@ async fn run(svc: Arc<Service>, bound: Option<control::Bound>, policy: Policy, n
     activity.abort();
     if let Some(n) = notifications {
         n.abort();
+    }
+    if let Some(w) = watchdog {
+        w.abort();
     }
 }
 

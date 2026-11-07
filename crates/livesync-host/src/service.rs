@@ -1238,6 +1238,26 @@ impl Service {
         *lock(&self.command_hook) = hook;
     }
 
+    /// Wait until no vault is still starting (each one runs, or failed its
+    /// first start and is retried by its supervisor), or `timeout` passed.
+    /// Whether every vault got that far. Nothing is stopped either way.
+    pub async fn wait_settled(self: &Arc<Self>, timeout: Duration) -> bool {
+        let end = tokio::time::Instant::now() + timeout;
+        loop {
+            let starting = self
+                .names()
+                .iter()
+                .any(|n| matches!(self.host.state(n), Some((RunState::Starting, _))));
+            if !starting {
+                return true;
+            }
+            if tokio::time::Instant::now() >= end {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// For `lsync daemon`: wait until a vault's first start is decided.
     /// `Err` with the reason when it did not start (it is then stopped, so
     /// the caller can exit as a one-shot `lsync daemon` always did).
