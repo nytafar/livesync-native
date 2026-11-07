@@ -657,6 +657,9 @@ enum NoBase {
     Reset,
 }
 
+/// The local issue of a file whose push failed (tried again at the next pass).
+pub(crate) const PUSH_FAILED: &str = "push-failed";
+
 /// Whether an error ends the whole pass rather than just this document.
 fn pass_fatal(e: &EngineError) -> bool {
     match e {
@@ -1046,7 +1049,7 @@ impl Engine {
         }
         let note = format!("{what} failed: {e}; retried at the next pass");
         warn!("{rel}: {note}");
-        self.with_index(|ix| ix.set_issue(rel, "push-failed", &note, vaultfs::now_ms()))?;
+        self.with_index(|ix| ix.set_issue(rel, PUSH_FAILED, &note, vaultfs::now_ms()))?;
         rep.failed += 1;
         if issues_seen.insert(rel.to_string()) {
             rep.issues += 1;
@@ -2947,6 +2950,8 @@ impl Engine {
             if !watched.contains(&dir) {
                 if let Err(e) = w.watch_dir(&dir) {
                     warn!("cannot watch {}: {e}; relying on periodic rescans there", dir.display());
+                    // `wait --idle` then needs a full pass to see changes here.
+                    self.set_activity(|a| a.unwatched = true);
                     continue;
                 }
                 watched.insert(dir.clone());
@@ -3037,17 +3042,27 @@ impl Engine {
     /// rescans feed passes, once pushes are enabled.
     pub(crate) async fn push_loop(self, mut shutdown: watch::Receiver<bool>) -> Result<PushReport> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut unwatched = false;
         let mut watcher: Box<dyn Watcher> = if self.inner.cfg.watch {
             match crate::platform::default_watcher(tx) {
                 Ok(w) => w,
                 Err(e) => {
                     warn!("file watcher unavailable ({e}); using periodic rescans only");
+                    unwatched = true;
                     Box::new(NoWatcher)
                 }
             }
         } else {
+            unwatched = true;
             Box::new(NoWatcher)
         };
+        // Full passes begun, for `wait --idle` where folders are unwatched.
+        let mut full_begun: u64 = 0;
+        self.set_activity(|a| {
+            a.unwatched = unwatched;
+            a.full_passes = 0;
+            a.full_pass_done = 0;
+        });
         let root = self.inner.cfg.vault.clone();
         let settle = self.inner.cfg.settle;
         let mut watched: HashSet<PathBuf> = HashSet::new();
@@ -3162,9 +3177,12 @@ impl Engine {
                 next_rescan = Instant::now() + self.inner.cfg.rescan_interval;
                 // A flush of everything pushes what was written moments ago too.
                 let defer_recent = !flushes.wants_all();
+                full_begun += 1;
+                self.set_activity(|a| a.full_passes = full_begun);
                 match self.full_pass(&hints, Some(&mut hold), defer_recent).await {
                     Ok(Some((rep, deferred))) => {
                         full_due = false;
+                        self.set_activity(|a| a.full_pass_done = full_begun);
                         flushes.passed(true, !deferred.is_empty() || rep.deferred > 0);
                         for p in deferred {
                             queue.entry(p).or_insert_with(Settling::new);

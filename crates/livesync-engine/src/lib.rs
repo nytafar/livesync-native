@@ -24,7 +24,10 @@ mod scopesync;
 pub mod vaultfs;
 pub mod watcher;
 
-pub use activity::{Activity, EngineEvent, Idle, PullPhase, Reached, RevisionEvent, Target, WaitFor, WaitOutcome};
+pub use activity::{
+    parse_rev, Activity, EngineEvent, Idle, PullPhase, Reached, RevisionEvent, Target, WaitFor, WaitOutcome,
+    WeakEngine, CONFLICTS_LISTED,
+};
 pub use adopt::{AdoptEntry, AdoptOptions, AdoptReport};
 pub use engine::{
     AccessCheck, Alerts, Engine, EngineConfig, EngineError, GateReport, PullReport, Status, SyncReport, WallClock,

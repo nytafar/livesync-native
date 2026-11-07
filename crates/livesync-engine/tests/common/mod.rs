@@ -97,6 +97,12 @@ pub struct MockState {
     /// Store the next `PUT`, then answer 500 as if the response was lost.
     pub lose_next_put_response: bool,
     pub db_missing: bool,
+    /// Hold every document write (PUT and `_bulk_docs`) this long before
+    /// answering it: a slow server, with a push pass in flight meanwhile.
+    pub write_delay: Option<Duration>,
+    /// Answer `GET /{db}/{id}?rev=…&revs=true` with a 404 `missing`, as
+    /// CouchDB does for a revision compaction removed.
+    pub forget_rev_bodies: bool,
     /// IDs whose bodies a ranged `GET _all_docs?include_docs=true` returned.
     pub served_bodies: Vec<String>,
     /// After the next full page of a ranged `_all_docs` read, drop the last
@@ -362,6 +368,17 @@ impl Mock {
     }
 
     /// A text file split into the given pieces.
+    /// A note document's body for `path` (no `_rev`), its chunk stored:
+    /// for `put_branch` and `put`.
+    pub fn text_doc(&self, path: &str, text: &str) -> Value {
+        let children = self.put_chunks(&[text]);
+        json!({
+            "_id": livesync_model::path::path_to_id(path, true), "path": path, "type": "plain",
+            "children": children, "ctime": 1_700_000_000_000i64, "mtime": 1_700_000_100_000i64,
+            "size": text.len(), "eden": {}
+        })
+    }
+
     pub fn put_text(&self, path: &str, pieces: &[&str]) -> String {
         let children = self.put_chunks(pieces);
         let size: usize = pieces.iter().map(|p| p.len()).sum();
@@ -581,6 +598,21 @@ async fn get_doc(State((st, _)): S, Path(id): Path<String>, Query(q): Query<Hash
         if node.deleted {
             body["_deleted"] = json!(true);
         }
+        if q.get("revs").map(String::as_str) == Some("true") {
+            if s.forget_rev_bodies {
+                return not_found("missing");
+            }
+            // The revision's path to the root, newest first, as CouchDB's
+            // `_revisions`.
+            let tree = &s.trees[&id];
+            let mut ids = Vec::new();
+            let mut at = Some(rev.clone());
+            while let Some(r) = at {
+                ids.push(rev_key(&r).1);
+                at = tree.revs.get(&r).and_then(|n| n.parent.clone());
+            }
+            body["_revisions"] = json!({"start": rev_key(rev).0, "ids": ids});
+        }
         return Json(body).into_response();
     }
     let conflicts = q.get("conflicts").map(String::as_str) == Some("true");
@@ -593,8 +625,16 @@ async fn get_doc(State((st, _)): S, Path(id): Path<String>, Query(q): Query<Hash
     }
 }
 
+async fn slow_write(st: &Arc<Mutex<MockState>>) {
+    let delay = st.lock().unwrap().write_delay;
+    if let Some(d) = delay {
+        tokio::time::sleep(d).await;
+    }
+}
+
 async fn put_doc(State((st, notify)): S, Path(id): Path<String>, Json(mut body): Json<Value>) -> Response {
     record(&st, "PUT", &format!("/db/{id}"));
+    slow_write(&st).await;
     let mut s = st.lock().unwrap();
     if s.fail_writes > 0 {
         s.fail_writes -= 1;
@@ -630,6 +670,7 @@ async fn put_doc(State((st, notify)): S, Path(id): Path<String>, Json(mut body):
 
 async fn bulk_docs(State((st, notify)): S, Json(body): Json<Value>) -> Response {
     record(&st, "POST", "/db/_bulk_docs");
+    slow_write(&st).await;
     let new_edits = body.get("new_edits").and_then(Value::as_bool).unwrap_or(true);
     let mut s = st.lock().unwrap();
     if s.fail_writes > 0 {

@@ -19,12 +19,14 @@
 //! nothing would be pushed until a person acts. Anything else (the network,
 //! an owed fetch) is waited out; the caller bounds the wait.
 
+use crate::activity::RevisionEvent;
 use crate::engine::{meta_keys as meta, Engine, EngineError};
 use crate::index::{FileRow, LocalIssue, State};
 use crate::push::Found;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use tokio::sync::{broadcast, oneshot};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 
 type Result<T> = std::result::Result<T, EngineError>;
 
@@ -82,6 +84,24 @@ pub enum FlushOutcome {
     Blocked(String),
     /// The daemon ended before the flush was answered.
     Stopped,
+}
+
+/// Where the index sends every stored revision for the flushes running:
+/// unbounded, so a flush that stored many never misses one (the engine's
+/// broadcast drops the oldest for a slow reader).
+pub(crate) type StoredTaps = Arc<Mutex<Vec<mpsc::UnboundedSender<RevisionEvent>>>>;
+
+/// What a flush stored, by path, once its pass is over.
+struct Tap(mpsc::UnboundedReceiver<RevisionEvent>);
+
+impl Tap {
+    fn drain(mut self) -> BTreeMap<String, RevisionEvent> {
+        let mut stored = BTreeMap::new();
+        while let Ok(e) = self.0.try_recv() {
+            stored.insert(e.path.clone(), e);
+        }
+        stored
+    }
 }
 
 /// A flush waiting in the push loop.
@@ -238,6 +258,13 @@ impl Flushes {
 }
 
 impl Engine {
+    /// Every revision stored from now on, until the tap is drained.
+    fn tap_stored(&self) -> Tap {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner.stored_taps.lock().unwrap().push(tx);
+        Tap(rx)
+    }
+
     /// A gate's stop, which keeps everything from being pushed.
     fn gate_stop(&self) -> Result<Option<String>> {
         let a = self.alerts()?;
@@ -248,11 +275,23 @@ impl Engine {
     }
 
     /// The paths a flush of `given` covers: a folder stands for the files
-    /// under it and the tracked files that were in it.
+    /// under it and the tracked files that were in it. A path through a
+    /// symbolic link is refused: what it points at may lie outside the
+    /// vault, and passes never follow links.
     fn flush_paths(&self, given: &[String]) -> Result<Vec<String>> {
         let mut out: BTreeSet<String> = BTreeSet::new();
         for p in given {
             let p = p.trim_matches('/').to_string();
+            let mut at = self.inner.cfg.vault.clone();
+            for seg in p.split('/') {
+                at.push(seg);
+                if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+                    return Err(EngineError::Other(format!(
+                        "{p}: {} is a symbolic link; flush does not follow links (they may lead out of the vault, and are never synced)",
+                        at.strip_prefix(&self.inner.cfg.vault).unwrap_or(&at).display()
+                    )));
+                }
+            }
             if self.inner.cfg.vault.join(&p).is_dir() {
                 for f in self.walk_visible(&p).found {
                     out.insert(f.rel);
@@ -289,7 +328,7 @@ impl Engine {
             Some(p) => Some(self.flush_paths(&p)?),
             None => None,
         };
-        let mut events = self.subscribe();
+        let tap = self.tap_stored();
         let (tx, rx) = oneshot::channel();
         self.inner.flushes.lock().unwrap().push(FlushWaiter {
             paths: paths.clone(),
@@ -309,18 +348,9 @@ impl Engine {
             Answer::Blocked(why) => return Ok(FlushOutcome::Blocked(why)),
             Answer::Done(d) => d,
         };
-        // What this flush stored: every event is in the channel by now (they
+        // What this flush stored: every revision is in the tap by now (they
         // are sent at the commit, before the answer).
-        let mut stored: BTreeMap<String, crate::activity::RevisionEvent> = BTreeMap::new();
-        loop {
-            match events.try_recv() {
-                Ok(crate::activity::EngineEvent::Stored(e)) => {
-                    stored.insert(e.path.clone(), e);
-                }
-                Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(_) => break,
-            }
-        }
+        let stored = tap.drain();
         Ok(FlushOutcome::Done(self.flush_report(
             paths.is_none(),
             &mut done,
@@ -337,18 +367,9 @@ impl Engine {
             Some(p) => Some(self.flush_paths(&p)?),
             None => None,
         };
-        let mut events = self.subscribe();
+        let tap = self.tap_stored();
         self.sync_once().await?;
-        let mut stored: BTreeMap<String, crate::activity::RevisionEvent> = BTreeMap::new();
-        loop {
-            match events.try_recv() {
-                Ok(crate::activity::EngineEvent::Stored(e)) => {
-                    stored.insert(e.path.clone(), e);
-                }
-                Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(_) => break,
-            }
-        }
+        let stored = tap.drain();
         let mut done = Vec::new();
         for p in paths.iter().flatten() {
             done.push(match self.flushed_path(p)? {
@@ -371,7 +392,7 @@ impl Engine {
         &self,
         all: bool,
         done: &mut Vec<FlushedPath>,
-        stored: BTreeMap<String, crate::activity::RevisionEvent>,
+        stored: BTreeMap<String, RevisionEvent>,
     ) -> Result<FlushReport> {
         let safety_stop = self
             .safety_stop_shown()?
@@ -389,7 +410,7 @@ impl Engine {
                 })
                 .collect();
             let issues = self.with_index(|ix| ix.issues())?;
-            let conflicts = self.open_conflicts(100)?;
+            let conflicts = self.open_conflicts(crate::activity::CONFLICTS_LISTED)?;
             return Ok(FlushReport {
                 all,
                 complete: safety_stop.is_none() && issues.is_empty(),
@@ -444,6 +465,9 @@ impl Engine {
                 // issue is why it was not.
                 let note = issue.as_ref().map(|i| i.note.clone());
                 Ok(match row {
+                    // Passes never push a skipped file (a name collision, an
+                    // unwritable server document): changed or not.
+                    Some(r) if r.state == State::Skipped => out("not-synced", None, r.note),
                     Some(r) if self.unchanged(&r, &found) => match r.state {
                         State::Clean => out("stored", r.base_rev, note),
                         State::Conflicted => out("conflict", r.base_rev, r.note.or(note)),

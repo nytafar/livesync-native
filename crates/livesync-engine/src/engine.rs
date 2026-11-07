@@ -680,6 +680,8 @@ pub(crate) struct Inner {
     /// `flush` requests for the push loop (`Engine::flush`), and its wake-up.
     pub(crate) flushes: Mutex<Vec<crate::flush::FlushWaiter>>,
     pub(crate) flush_wake: Notify,
+    /// Every stored revision, for each running flush (`Engine::flush`).
+    pub(crate) stored_taps: crate::flush::StoredTaps,
     /// Held while materialising on a filesystem that folds names, so the
     /// collision check and the write cannot interleave across units.
     fold_lock: Mutex<()>,
@@ -796,8 +798,15 @@ impl Engine {
         index.set_meta(meta::VAULT_LOCK, vault_lock.mode())?;
         let (events, _) = tokio::sync::broadcast::channel(crate::activity::EVENT_BUFFER);
         let sink = events.clone();
+        let stored_taps: crate::flush::StoredTaps = Default::default();
+        let taps = stored_taps.clone();
         index.set_applied_sink(Box::new(move |r| {
-            let _ = sink.send(crate::activity::EngineEvent::of(r));
+            let ev = crate::activity::EngineEvent::of(r);
+            if let crate::activity::EngineEvent::Stored(e) = &ev {
+                // Each flush's own copy, which never lags; a gone one is dropped.
+                taps.lock().unwrap().retain(|t| t.send(e.clone()).is_ok());
+            }
+            let _ = sink.send(ev);
         }));
         let probed = FsRules::probe(&canon);
         let probe_ok = probed.is_ok();
@@ -884,6 +893,7 @@ impl Engine {
                 activity: watch::Sender::new(crate::activity::Activity::default()),
                 flushes: Mutex::new(Vec::new()),
                 flush_wake: Notify::new(),
+                stored_taps,
                 fold_lock: Mutex::new(()),
                 last_milestone: Mutex::new(None),
                 _vault_lock: vault_lock,
@@ -3003,7 +3013,13 @@ impl Engine {
                             | Refusal::LockedWithoutRebuild { .. }
                             | Refusal::MissingVersionDoc,
                         ) => Duration::from_secs(30),
-                        EngineError::Refused(_) => self.inner.cfg.regate_interval,
+                        EngineError::Refused(_) => {
+                            // Only a person clears this one: `wait` says so
+                            // instead of waiting it out.
+                            let why = e.to_string();
+                            self.set_activity(|a| a.refused = Some(why));
+                            self.inner.cfg.regate_interval
+                        }
                         EngineError::Remote(_) => backoff.next_delay(),
                         _ => return Err(e),
                     };
@@ -3020,7 +3036,10 @@ impl Engine {
                 }
             };
             let session = Instant::now();
-            self.set_pull_phase(PullPhase::CatchingUp);
+            self.set_activity(|a| {
+                a.refused = None;
+                a.pull = PullPhase::CatchingUp;
+            });
             // Catch up without longpoll first, so we know when we are current.
             let caught = match self.catch_up(session).await {
                 Ok(()) => {
@@ -3364,7 +3383,7 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
         rebuild_detected_ms: num(meta::REBUILD_AT)?,
         counts: ix.counts_by_state()?.into_iter().collect(),
         dirty: ix.list_state(State::Dirty, 50)?,
-        conflicted: ix.list_state(State::Conflicted, 50)?,
+        conflicted: ix.list_state(State::Conflicted, crate::activity::CONFLICTS_LISTED)?,
         pending: ix.pending(None)?,
         unwritable: ix.list_state_with_note(State::Skipped, UNWRITABLE_NOTE, 200)?,
         collisions: ix.list_state_with_note(State::Skipped, COLLISION_NOTE, 200)?,

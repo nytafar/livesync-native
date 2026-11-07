@@ -135,6 +135,8 @@ pub fn vault_line(v: &VaultView) -> Option<VaultLine> {
             line("offline", why.map_or("offline".into(), |w| format!("offline: {w}")))
         }
         Starting | Stopped => line("syncing", "connecting".into()),
+        // A newer service's phase.
+        Unknown => line("syncing", "busy".into()),
         CatchingUp | Applying => line("syncing", "pulling".into()),
         Live => {
             let pushing =

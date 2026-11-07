@@ -468,6 +468,46 @@ impl Couch {
         self.fetch_url(id, url).await
     }
 
+    /// The ancestry of one revision (`GET /{db}/{id}?rev=…&revs=true`): the
+    /// revision and every one before it, newest first, as `<gen>-<hash>`.
+    /// `None` when the server no longer has that revision's body (a 404:
+    /// compacted away, or never there), so its ancestry cannot be read.
+    pub async fn rev_history(&self, id: &str, rev: &str) -> Result<Option<Vec<String>>> {
+        let mut url = self.id_url(id);
+        url.query_pairs_mut()
+            .append_pair("rev", rev)
+            .append_pair("revs", "true");
+        let doc = match self.fetch_url(id, url).await? {
+            DocFetch::Found(d) => d,
+            DocFetch::Deleted | DocFetch::Missing(_) => return Ok(None),
+        };
+        let bad = |msg: &str| RemoteError::Decode {
+            what: format!("GET {id}?revs=true"),
+            msg: msg.into(),
+        };
+        let revs = doc
+            .get("_revisions")
+            .ok_or_else(|| bad("no _revisions in the answer"))?;
+        let start = revs
+            .get("start")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| bad("_revisions without start"))?;
+        let ids = revs
+            .get("ids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| bad("_revisions without ids"))?;
+        let mut out = Vec::with_capacity(ids.len());
+        for (i, h) in ids.iter().enumerate() {
+            let h = h.as_str().ok_or_else(|| bad("a revision ID that is not a string"))?;
+            let generation = start
+                .checked_sub(i as u64)
+                .filter(|g| *g > 0)
+                .ok_or_else(|| bad("more ids than generations"))?;
+            out.push(format!("{generation}-{h}"));
+        }
+        Ok(Some(out))
+    }
+
     /// `PUT /{db}/{id}` with the body's `_rev` (absent for a new document).
     /// Works for `_local/` IDs too.
     pub async fn put_doc(&self, doc: &Value) -> Result<PutOutcome> {

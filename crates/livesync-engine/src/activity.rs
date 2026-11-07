@@ -16,6 +16,7 @@
 
 use crate::engine::{meta_keys as meta, Engine, EngineError};
 use crate::index::{FileRow, Origin, RevisionRow, State};
+use crate::push::PUSH_FAILED;
 use livesync_remote::DocFetch;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
@@ -27,6 +28,10 @@ type Result<T> = std::result::Result<T, EngineError>;
 /// Events kept for a subscriber that is slow to read; one that falls
 /// further behind is told so (`Lagged`) and reads the state instead.
 pub(crate) const EVENT_BUFFER: usize = 1024;
+
+/// How many files in conflict a list names (`status`, the service's
+/// `conflict` events, a flush's report), so lists compare alike.
+pub const CONFLICTS_LISTED: usize = 50;
 
 /// How long the engine must stay idle before [`Engine::wait_for`] calls it
 /// idle: a save the watcher has not reported yet is not missed, and a pull
@@ -96,6 +101,9 @@ pub enum PullPhase {
     /// Waiting before it tries again: the server cannot be reached, or a
     /// gate refused (`last_error` says which).
     Retrying,
+    /// A phase this build does not know (a newer service's).
+    #[serde(other)]
+    Unknown,
 }
 
 impl PullPhase {
@@ -107,6 +115,7 @@ impl PullPhase {
             PullPhase::Live => "live",
             PullPhase::Applying => "applying",
             PullPhase::Retrying => "retrying",
+            PullPhase::Unknown => "unknown",
         }
     }
 
@@ -139,6 +148,17 @@ pub struct Activity {
     pub deletes_waiting: u64,
     /// `flush` requests waiting for their changes to be stored.
     pub flushes: u64,
+    /// Some local folders are not watched (watching is off, the watcher is
+    /// unavailable, or the system's watch limit was reached): a change
+    /// there is only seen by a full pass.
+    pub unwatched: bool,
+    /// Full push passes begun since the daemon started, and the number of
+    /// the last one that completed (0: none yet).
+    pub full_passes: u64,
+    pub full_pass_done: u64,
+    /// The gate refused for a reason a person must deal with, and the pull
+    /// side waits it out: why. Cleared once the gate passes.
+    pub refused: Option<String>,
 }
 
 /// Whether nothing is pending or settling ([`Engine::idle`]).
@@ -200,18 +220,48 @@ pub enum WaitOutcome {
     TimedOut(String),
 }
 
+/// An engine, without keeping it alive ([`Engine::downgrade`]).
+#[derive(Clone)]
+pub struct WeakEngine(std::sync::Weak<crate::engine::Inner>);
+
 /// One check of a condition.
 enum Check {
     Holds(Reached),
     Blocked(String),
     NotYet(String),
+    /// `want` was never in the local file, which is clean at the later
+    /// generation `current`: it passed only if it is an ancestor of
+    /// `current`, which only the server's revision tree can tell.
+    Ancestry {
+        want: String,
+        current: String,
+    },
 }
 
-fn generation(rev: &str) -> Option<u64> {
-    rev.split_once('-').and_then(|(g, _)| g.parse().ok())
+/// A CouchDB revision, `<generation>-<hash>`: its generation, or `None`
+/// when `rev` is not one (no hash, a generation that is not a number of
+/// at most 64 bits, or 0).
+pub fn parse_rev(rev: &str) -> Option<u64> {
+    let (g, h) = rev.split_once('-')?;
+    if h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric()) || !g.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    g.parse().ok().filter(|g| *g > 0)
 }
 
 impl Engine {
+    /// A handle that tells this engine apart from any other without
+    /// keeping it (or its locks) alive.
+    pub fn downgrade(&self) -> WeakEngine {
+        WeakEngine(std::sync::Arc::downgrade(&self.inner))
+    }
+
+    /// Whether `other` is a handle of this very engine (not just one on the
+    /// same vault).
+    pub fn same_as(&self, other: &WeakEngine) -> bool {
+        std::ptr::eq(std::sync::Arc::as_ptr(&self.inner), other.0.as_ptr())
+    }
+
     /// Every revision the index takes as a file's synced version from now
     /// on ([`EngineEvent`]).
     pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
@@ -249,7 +299,11 @@ impl Engine {
     /// again. Reads the index's pending count.
     pub fn idle(&self) -> Result<Idle> {
         let a = self.activity();
-        let pending = self.with_index(|ix| ix.pending(None))?.len() as u64;
+        let (pending, failed) = self.with_index(|ix| {
+            let pending = ix.pending(None)?.len() as u64;
+            let failed = ix.issues()?.iter().filter(|i| i.kind == PUSH_FAILED).count();
+            Ok((pending, failed))
+        })?;
         let mut busy = Vec::new();
         if !a.running {
             busy.push("the engine is not running".to_string());
@@ -260,6 +314,7 @@ impl Engine {
                 PullPhase::CatchingUp => busy.push("catching up with the server".into()),
                 PullPhase::Applying => busy.push("applying changes from the server".into()),
                 PullPhase::Retrying => busy.push("waiting to retry the server (see last_error)".into()),
+                PullPhase::Unknown => busy.push("in a state this lsync does not know".into()),
             }
             if a.two_way {
                 if !a.pushes {
@@ -277,6 +332,11 @@ impl Engine {
                     busy.push(format!(
                         "{} deletion(s) held until their burst is over",
                         a.deletes_waiting
+                    ));
+                }
+                if failed > 0 {
+                    busy.push(format!(
+                        "{failed} file(s) whose push failed, tried again at the next pass (see `lsync status`)"
                     ));
                 }
             }
@@ -336,6 +396,13 @@ impl Engine {
 
     /// Whether a revision of `path` is in the local file.
     fn check_applied(&self, path: &str, target: &Target) -> Result<Check> {
+        if !self.local_visible(path) {
+            // Ignored, a dot-path, out of the folder scope: it never arrives.
+            return Ok(Check::Blocked(format!(
+                "{path} is not synced here: {}",
+                self.explain(path).detail
+            )));
+        }
         let id = self.doc_id_for(path);
         let (row, seen): (Option<FileRow>, Option<RevisionRow>) = self.with_index(|ix| {
             let row = match ix.by_doc(&id)? {
@@ -400,12 +467,17 @@ impl Engine {
                 } else if let Some(why) = seen.as_ref().and(row.as_ref()).and_then(held) {
                     // Seen, and held back: a local edit, a conflict, a skip.
                     Check::Blocked(why)
-                } else if row.as_ref().is_some_and(|r| r.state == State::Clean)
-                    && current.as_deref().and_then(generation) > generation(want)
+                } else if let Some(cur) = current
+                    .as_ref()
+                    .filter(|c| row.as_ref().is_some_and(|r| r.state == State::Clean) && parse_rev(c) > parse_rev(want))
                 {
-                    // Not seen here: a later revision came first (the changes
-                    // feed gives only the newest).
-                    holds(Some(want.clone()), true)
+                    // Not seen here, and the file is at a later generation:
+                    // passed if it came before (the changes feed gives only
+                    // the newest), or on another branch that never arrives.
+                    Check::Ancestry {
+                        want: want.clone(),
+                        current: cur.clone(),
+                    }
                 } else {
                     Check::NotYet(format!("revision {want} of {path} has not arrived"))
                 }
@@ -436,24 +508,79 @@ impl Engine {
         })
     }
 
+    /// Whether `want` is an ancestor of `current` (the local file's clean
+    /// revision), by the server's revision tree. Anything but a clear yes
+    /// or no is `Blocked`: a wait never succeeds on a guess.
+    async fn check_ancestry(&self, path: &str, want: &str, current: &str) -> Check {
+        let id = self.doc_id_for(path);
+        let unknown = |why: String| {
+            Check::Blocked(format!(
+                "{path} is at {current} here, and {want} was never here; whether {want} is in the history of {current} cannot be told: {why}"
+            ))
+        };
+        match self.inner.couch.rev_history(&id, current).await {
+            Ok(Some(history)) if history.iter().any(|r| r == want) => Check::Holds(Reached {
+                path: Some(path.to_string()),
+                rev: Some(want.to_string()),
+                current_rev: Some(current.to_string()),
+                deleted: false,
+                superseded: true,
+            }),
+            Ok(Some(_)) => Check::Blocked(format!(
+                "revision {want} of {path} is not in the history of {current}, the revision here: it is on another branch (the losing side of a conflict?) and will not arrive"
+            )),
+            Ok(None) => unknown(format!("the server no longer has the history of {current}")),
+            Err(e) => unknown(format!("reading the history from the server failed: {e}")),
+        }
+    }
+
     /// Wait until `cond` holds on this engine (see the module docs). A
     /// stop that keeps it from holding ends the wait at once (`Blocked`), as
-    /// does a revision held back by a local edit or a conflict.
+    /// does a revision held back by a local edit or a conflict, a gate's
+    /// refusal, or a path this vault does not sync. A revision that is not
+    /// one (`<generation>-<hash>`) is an error.
     pub async fn wait_for(&self, cond: &WaitFor, deadline: Instant) -> Result<WaitOutcome> {
+        if let WaitFor::Applied {
+            target: Target::Rev(r), ..
+        } = cond
+        {
+            if parse_rev(r).is_none() {
+                return Err(EngineError::Other(format!(
+                    "{r:?} is not a revision (<generation>-<hash>, as `lsync flush` prints it)"
+                )));
+            }
+        }
         let mut events = self.subscribe();
         let mut activity = self.watch_activity();
         let mut idle_since: Option<Instant> = None;
+        // With folders unwatched, idle needs a full pass begun after the
+        // wait did: a change there is seen by nothing else.
+        let passes_at_start = self.activity().full_passes;
+        let mut rescan_asked = false;
         loop {
             let a = self.activity();
             if a.ended {
                 return Ok(WaitOutcome::Stopped);
             }
+            // A gate's refusal that waits for a person: nothing more comes.
+            let refused = a.refused.as_ref().map(|why| format!("the server refused: {why}"));
             let check = match cond {
                 WaitFor::Idle => {
-                    if let Some(stop) = self.blocking_stop(false)? {
+                    if let Some(stop) = self.blocking_stop(false)?.or(refused) {
                         Check::Blocked(stop)
                     } else {
-                        let idle = self.idle()?;
+                        let mut idle = self.idle()?;
+                        if a.two_way && a.unwatched {
+                            if !rescan_asked {
+                                rescan_asked = true;
+                                self.rescan_now();
+                            }
+                            if a.full_pass_done <= passes_at_start {
+                                idle.idle = false;
+                                idle.busy
+                                    .push("a full pass over the folders that are not watched".into());
+                            }
+                        }
                         if idle.idle {
                             let since = *idle_since.get_or_insert_with(Instant::now);
                             if since.elapsed() >= IDLE_GRACE {
@@ -468,10 +595,11 @@ impl Engine {
                     }
                 }
                 WaitFor::Applied { path, target } => match self.check_applied(path, target)? {
-                    Check::NotYet(why) => match self.blocking_stop(true)? {
+                    Check::NotYet(why) => match self.blocking_stop(true)?.or(refused) {
                         Some(stop) => Check::Blocked(stop),
                         None => Check::NotYet(why),
                     },
+                    Check::Ancestry { want, current } => self.check_ancestry(path, &want, &current).await,
                     other => other,
                 },
             };
@@ -479,6 +607,7 @@ impl Engine {
                 Check::Holds(r) => return Ok(WaitOutcome::Reached(r)),
                 Check::Blocked(why) => return Ok(WaitOutcome::Blocked(why)),
                 Check::NotYet(why) => why,
+                Check::Ancestry { .. } => unreachable!("resolved above"),
             };
             let now = Instant::now();
             if now >= deadline {
@@ -518,6 +647,7 @@ impl Running {
             a.ended = false;
             a.two_way = two_way;
             a.pull = PullPhase::Starting;
+            a.refused = None;
         });
         Running(engine.clone())
     }
@@ -541,11 +671,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generations_compare() {
-        assert_eq!(generation("3-abc"), Some(3));
-        assert_eq!(generation("x"), None);
-        assert!(Some(4) > generation("3-a"));
-        assert!(generation("nope") < Some(1), "an unreadable revision is never later");
+    fn revisions_parse_strictly() {
+        assert_eq!(parse_rev("3-abc"), Some(3));
+        assert_eq!(parse_rev("18446744073709551615-a"), Some(u64::MAX));
+        for bad in [
+            "x",
+            "3-",
+            "-a",
+            "0-a",
+            "3-a.b",
+            "a-b",
+            "18446744073709551616-a",
+            "99999999999999999999999-abc",
+        ] {
+            assert_eq!(parse_rev(bad), None, "{bad}");
+        }
+        assert!(parse_rev("nope") < Some(1), "an unreadable revision is never later");
+    }
+
+    #[test]
+    fn an_unknown_pull_phase_from_a_newer_service_is_read() {
+        let a: Activity = serde_json::from_str(r#"{"running": true, "pull": "re-syncing"}"#).unwrap();
+        assert_eq!(a.pull, PullPhase::Unknown);
+        assert!(!a.pull.connected());
+        let p: PullPhase = serde_json::from_str(r#""live""#).unwrap();
+        assert_eq!(p, PullPhase::Live);
     }
 
     #[test]

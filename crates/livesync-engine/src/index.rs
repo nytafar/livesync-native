@@ -472,9 +472,6 @@ impl Index {
         }
     }
 
-    /// Record a revision in the history. Seen again, it keeps when it was
-    /// first seen, becomes applied once it is, and stays `local` once this
-    /// device is known to have written it.
     /// Hand every applied revision ([`RevisionRow::applied`]) to `sink` once
     /// it is committed: at once outside a transaction, at the commit of the
     /// outermost [`Index::atomically`] inside one, never when it is rolled
@@ -493,6 +490,9 @@ impl Index {
         }
     }
 
+    /// Record a revision in the history. Seen again, it keeps when it was
+    /// first seen, becomes applied once it is, and stays `local` once this
+    /// device is known to have written it.
     pub fn record_revision(&self, r: &RevisionRow) -> rusqlite::Result<()> {
         let eden = (!r.eden.is_empty()).then(|| serde_json::to_string(&r.eden).unwrap());
         self.conn.execute(

@@ -418,3 +418,201 @@ async fn idle_means_nothing_settling_or_pending_and_deleted_files_arrive_as_dele
     }
     a.stop().await;
 }
+
+fn applied(path: &str, rev: &str) -> WaitFor {
+    WaitFor::Applied {
+        path: path.into(),
+        target: Target::Rev(rev.into()),
+    }
+}
+
+#[tokio::test]
+async fn a_revision_on_a_losing_branch_is_never_reported_as_arrived() {
+    let mock = Mock::start().await;
+    // 1-a, then two edits of it: the loser (a low hash) is deleted, as a
+    // conflict's resolution does, and the winner edited once more. This
+    // node never sees the loser: the changes feed gives the winner only.
+    let first = mock.put_text("h.md", &["one"]);
+    let loser = mock.put_branch_with(mock.text_doc("h.md", "lost"), &first, "0000aaaa");
+    let kept = mock.put_branch_with(mock.text_doc("h.md", "kept"), &first, "ffffbbbb");
+    mock.put_branch(serde_json::json!({"_id": "h.md", "_deleted": true}), &loser);
+    let last = mock.put(mock.text_doc("h.md", "kept, edited"));
+    assert_eq!(rev_of(&mock, "h.md"), last);
+    let b = Node::start(&mock, true, |_| {}).await;
+    b.until("pulled", |n| n.vault().join("h.md").exists()).await;
+    assert!(b.index().revision("h.md", &loser).unwrap().is_none(), "never seen here");
+
+    // The loser is a later generation than nothing here but an earlier one
+    // than the local file: only the server's history tells it apart.
+    match b.engine.wait_for(&applied("h.md", &loser), soon()).await.unwrap() {
+        WaitOutcome::Blocked(why) => assert!(why.contains(&loser) && why.contains("history"), "{why}"),
+        other => panic!("a losing revision must not count as arrived: {other:?}"),
+    }
+    // Ancestors of the local revision, never seen here either: passed.
+    for old in [&kept, &first] {
+        match b.engine.wait_for(&applied("h.md", old), soon()).await.unwrap() {
+            WaitOutcome::Reached(r) => {
+                assert!(r.superseded, "{r:?}");
+                assert_eq!(r.current_rev.as_deref(), Some(last.as_str()));
+            }
+            other => panic!("{old}: {other:?}"),
+        }
+    }
+    // Without the server's history there is no telling: blocked, never success.
+    mock.state.lock().unwrap().forget_rev_bodies = true;
+    match b.engine.wait_for(&applied("h.md", &kept), soon()).await.unwrap() {
+        WaitOutcome::Blocked(why) => assert!(why.contains("history"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // A revision that is not one is a mistake of the caller's.
+    for bad in ["nope", "3-", "-abc", "99999999999999999999999-abc"] {
+        let e = b.engine.wait_for(&applied("h.md", bad), soon()).await.unwrap_err();
+        assert!(e.to_string().contains("not a revision"), "{bad}: {e}");
+    }
+    b.stop().await;
+}
+
+#[tokio::test]
+async fn idle_waits_for_a_pass_over_unwatched_folders_and_for_failed_pushes() {
+    let mock = Mock::start().await;
+    // No watcher: a change is seen only by a full pass, and the next
+    // periodic one is an hour away.
+    let a = Node::start(&mock, false, |c| {
+        c.watch = false;
+        c.settle = Duration::from_millis(100);
+    })
+    .await;
+    assert!(a.engine.activity().unwatched);
+    a.write("unseen.md", b"written where nothing watches");
+    match a.engine.wait_for(&WaitFor::Idle, soon()).await.unwrap() {
+        WaitOutcome::Reached(_) => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        mock.doc("unseen.md").is_some(),
+        "idle only once the unwatched change is on the server"
+    );
+    a.stop().await;
+
+    // A push the server refuses: retried at the next pass, so not idle.
+    let a = Node::start(&mock, false, |c| c.settle = Duration::from_millis(100)).await;
+    assert!(!a.engine.activity().unwatched);
+    mock.state.lock().unwrap().reject_puts.insert("refused.md".into());
+    a.write("refused.md", b"the server says no");
+    a.until("the push failed", |n| {
+        n.index().issues().unwrap().iter().any(|i| i.path == "refused.md")
+    })
+    .await;
+    match a
+        .engine
+        .wait_for(&WaitFor::Idle, Instant::now() + Duration::from_millis(1500))
+        .await
+        .unwrap()
+    {
+        WaitOutcome::TimedOut(why) => assert!(why.contains("push failed"), "{why}"),
+        other => panic!("a failed push is not idle: {other:?}"),
+    }
+    mock.state.lock().unwrap().reject_puts.clear();
+    a.engine.rescan_now();
+    assert!(matches!(
+        a.engine.wait_for(&WaitFor::Idle, soon()).await.unwrap(),
+        WaitOutcome::Reached(_)
+    ));
+    assert!(mock.doc("refused.md").is_some());
+    a.stop().await;
+}
+
+#[tokio::test]
+async fn a_wait_ends_at_a_gate_refusal_and_for_a_path_this_vault_does_not_sync() {
+    let mock = Mock::start().await;
+    let a = Node::start(&mock, false, |c| c.ignore_regex = Some("^private/".into())).await;
+    let t0 = Instant::now();
+    match a
+        .engine
+        .wait_for(
+            &WaitFor::Applied {
+                path: "private/x.md".into(),
+                target: Target::Any,
+            },
+            soon(),
+        )
+        .await
+        .unwrap()
+    {
+        WaitOutcome::Blocked(why) => assert!(why.contains("not synced here"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(t0.elapsed() < Duration::from_secs(2));
+
+    // The milestone loses its preferred settings: the gate refuses (with no
+    // stop recorded for it) until a person sets the remote up again, so a
+    // wait says so at once instead of running into its timeout.
+    mock.update_milestone(|m| {
+        m["tweak_values"].as_object_mut().unwrap().remove("PREFERRED");
+    });
+    a.engine.network_changed(true);
+    a.until("the gate refused", |n| n.engine.activity().refused.is_some())
+        .await;
+    assert!(a.engine.alerts().unwrap().upstream_stop.is_none());
+    let t0 = Instant::now();
+    for cond in [WaitFor::Idle, applied("n.md", "3-abc")] {
+        match a.engine.wait_for(&cond, soon()).await.unwrap() {
+            WaitOutcome::Blocked(why) => assert!(why.contains("refused") && why.contains("PREFERRED"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(t0.elapsed() < Duration::from_secs(2));
+    a.stop().await;
+}
+
+#[tokio::test]
+async fn a_flush_refuses_symlinks_and_answers_for_a_skipped_file() {
+    let mock = Mock::start().await;
+    let a = Node::start(&mock, false, |c| c.settle = Duration::from_secs(60)).await;
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.md"), "not the vault's").unwrap();
+    std::os::unix::fs::symlink(outside.path(), a.vault().join("link")).unwrap();
+    std::fs::create_dir_all(a.vault().join("real")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret.md"), a.vault().join("real/file.md")).unwrap();
+    for p in ["link", "link/secret.md", "real/file.md"] {
+        let e = a.engine.flush(Some(vec![p.into()])).await.unwrap_err();
+        assert!(e.to_string().contains("symbolic link"), "{p}: {e}");
+    }
+    assert!(mock.doc("link/secret.md").is_none() && mock.doc("real/file.md").is_none());
+
+    // A file this index skips (a server document it does not write here):
+    // never pushed, so not stored, and said at once.
+    a.index()
+        .upsert(&livesync_engine::FileRow {
+            path: "skipped.md".into(),
+            doc_id: "skipped.md".into(),
+            state: livesync_engine::State::Skipped,
+            note: Some("a name collision".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    a.write("skipped.md", b"here only");
+    let rep = tokio::time::timeout(Duration::from_secs(10), a.engine.flush(Some(vec!["skipped.md".into()])))
+        .await
+        .expect("a flush of a skipped file is answered")
+        .unwrap();
+    let rep = done(rep);
+    assert_eq!(rep.paths[0].outcome, "not-synced", "{rep:?}");
+    assert!(!rep.complete);
+    a.stop().await;
+}
+
+#[tokio::test]
+async fn a_flush_of_many_files_lists_every_revision_it_stored() {
+    let mock = Mock::start().await;
+    let a = Node::start(&mock, false, |c| c.settle = Duration::from_secs(60)).await;
+    // More than the engine's event buffer, which a report must not depend on.
+    let n = 1100;
+    for i in 0..n {
+        a.write(&format!("many/{i:04}.md"), format!("note {i}").as_bytes());
+    }
+    let rep = done(a.engine.flush(None).await.unwrap());
+    assert!(rep.complete, "{:?}", rep.issues);
+    assert_eq!(rep.paths.len(), n);
+    a.stop().await;
+}
