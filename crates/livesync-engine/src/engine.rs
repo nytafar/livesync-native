@@ -95,6 +95,10 @@ pub(crate) mod meta_keys {
     /// feature or setting this client does not know (`<ms> <message>`). Set
     /// by the refusal, cleared by the next gate that passes.
     pub const UPSTREAM_STOP: &str = "upstream_stop";
+    /// The remote is locked against this device without a rebuild
+    /// (`<ms> <message>`). Set by that refusal, cleared by the next gate that
+    /// passes.
+    pub const REMOTE_LOCKED: &str = "remote_locked";
 }
 
 /// Aborts a spawned task when dropped.
@@ -505,6 +509,10 @@ pub struct Status {
     /// version known to work), `<ms> <message>`. Syncing resumes by itself
     /// once the remote is compatible again.
     pub upstream_stop: Option<String>,
+    /// The remote is locked against this device, but was not rebuilt: who
+    /// holds the lock and the ways out, `<ms> <message>`. Never unlocked
+    /// automatically; cleared by the next gate that passes.
+    pub remote_locked: Option<String>,
     /// After a rebuild: the refetch is waiting (or owes a wait) for the
     /// remote to stop changing. `<ms> <description>`.
     pub rebuild_wait: Option<String>,
@@ -831,6 +839,14 @@ impl Engine {
             if r.is_upstream_change() {
                 self.record_upstream_stop(r, now);
             }
+            if matches!(r, Refusal::LockedWithoutRebuild { .. }) {
+                let msg = r.to_string();
+                let before = self.with_index(|ix| ix.get_meta(meta::REMOTE_LOCKED)).ok().flatten();
+                if before.as_deref().and_then(|b| b.split_once(' ')).map(|(_, m)| m) != Some(msg.as_str()) {
+                    warn!("{}: {msg}", self.inner.vault_canon);
+                }
+                let _ = self.with_index(|ix| ix.set_meta(meta::REMOTE_LOCKED, &format!("{now} {msg}")));
+            }
         }
     }
 
@@ -893,6 +909,10 @@ impl Engine {
                 if ix.get_meta(meta::UPSTREAM_STOP)?.is_some() {
                     info!("upstream guard: the remote is compatible again; syncing resumes");
                     ix.delete_meta(meta::UPSTREAM_STOP)?;
+                }
+                if ix.get_meta(meta::REMOTE_LOCKED)?.is_some() {
+                    info!("the remote no longer refuses this device with a lock; syncing resumes");
+                    ix.delete_meta(meta::REMOTE_LOCKED)?;
                 }
             }
             Ok(())
@@ -959,6 +979,14 @@ impl Engine {
         match gate::assess_milestone(&milestone, &node_id) {
             Ok(()) => lets_us_in = true,
             Err(Refusal::Locked | Refusal::Cleaned) if fresh || rebuilt || owed => fetch_to_resolve = true,
+            // This device synced with this very database (`created`), and
+            // it was locked without being rebuilt: a person's call, so the
+            // refusal says who holds the lock and what the ways out are.
+            Err(Refusal::Locked) => {
+                let raw = self.inner.last_milestone.lock().unwrap().clone().unwrap_or_default();
+                let holders = gate::lock_holders(&raw, vaultfs::now_ms());
+                return Err(Refusal::LockedWithoutRebuild { holders }.into());
+            }
             Err(e) => return Err(e.into()),
         }
         let preferred = milestone.preferred().ok_or(Refusal::MissingPreferredTweaks)?.clone();
@@ -2735,7 +2763,10 @@ impl Engine {
                     let wait = match &e {
                         // Mid-rebuild states clear within seconds to minutes.
                         EngineError::Refused(
-                            Refusal::MissingMilestone | Refusal::Locked | Refusal::MissingVersionDoc,
+                            Refusal::MissingMilestone
+                            | Refusal::Locked
+                            | Refusal::LockedWithoutRebuild { .. }
+                            | Refusal::MissingVersionDoc,
                         ) => Duration::from_secs(30),
                         EngineError::Refused(_) => self.inner.cfg.regate_interval,
                         EngineError::Remote(_) => backoff.next_delay(),
@@ -2973,12 +3004,17 @@ impl Engine {
     // Status
     // ------------------------------------------------------------------
 
-    /// The safety stop and the last error recorded (as in [`Engine::status`]),
-    /// and nothing else: two reads of the index's meta table, for watchers
+    /// The stops and the last error recorded (as in [`Engine::status`]),
+    /// and nothing else: a few reads of the index's meta table, for watchers
     /// that look often.
-    pub fn alerts(&self) -> Result<(Option<String>, Option<String>)> {
+    pub fn alerts(&self) -> Result<Alerts> {
         let ix = self.inner.index.lock().unwrap();
-        Ok((ix.get_meta(meta::SAFETY_STOP)?, ix.get_meta(meta::LAST_ERROR)?))
+        Ok(Alerts {
+            safety_stop: ix.get_meta(meta::SAFETY_STOP)?,
+            last_error: ix.get_meta(meta::LAST_ERROR)?,
+            upstream_stop: ix.get_meta(meta::UPSTREAM_STOP)?,
+            remote_locked: ix.get_meta(meta::REMOTE_LOCKED)?,
+        })
     }
 
     pub fn status(&self) -> Result<Status> {
@@ -2988,6 +3024,15 @@ impl Engine {
             &self.inner.cfg.index_path,
         )
     }
+}
+
+/// What [`Engine::alerts`] reads: the fields of [`Status`] of that name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Alerts {
+    pub safety_stop: Option<String>,
+    pub last_error: Option<String>,
+    pub upstream_stop: Option<String>,
+    pub remote_locked: Option<String>,
 }
 
 /// Tells sleep from the clocks (spec D8): the monotonic clock stops while
@@ -3066,6 +3111,7 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
         resolve_owed: ix.get_meta(meta::RESOLVE_OWED)?.is_some(),
         safety_stop: ix.get_meta(meta::SAFETY_STOP)?,
         upstream_stop: ix.get_meta(meta::UPSTREAM_STOP)?,
+        remote_locked: ix.get_meta(meta::REMOTE_LOCKED)?,
         rebuild_wait: ix.get_meta(meta::REBUILD_WAIT)?,
         rebuild_orphans: ix
             .get_meta(meta::ORPHANS)?

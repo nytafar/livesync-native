@@ -331,7 +331,10 @@ async fn gates_fail_closed() {
     let env = Env::new().await;
     env.engine().pull_once().await.unwrap();
     env.mock.update_milestone(|m| m["locked"] = json!(true));
-    assert_eq!(refused(env.engine().connect_gate(false).await), Refusal::Locked);
+    assert!(matches!(
+        refused(env.engine().connect_gate(false).await),
+        Refusal::LockedWithoutRebuild { .. }
+    ));
     // ... while a fresh index may fetch, and is marked resolved afterwards.
     let env = Env::new().await;
     env.mock.update_milestone(|m| m["locked"] = json!(true));

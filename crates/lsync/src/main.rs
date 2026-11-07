@@ -624,6 +624,13 @@ fn status_all(json: bool) -> Result<u8> {
                     .as_ref()
                     .and_then(|s| s.upstream_stop.as_ref().map(|t| format!("UPSTREAM STOP {t}")))
             })
+            .or_else(|| {
+                v.status.as_ref().and_then(|s| {
+                    s.remote_locked
+                        .as_ref()
+                        .map(|t| format!("LOCKED BY ANOTHER DEVICE {t}"))
+                })
+            })
             // A running engine's message is its mode, shown already.
             .or_else(|| v.message.clone().filter(|m| m != mode))
             .unwrap_or_default();
@@ -1192,6 +1199,9 @@ fn print_status(s: &livesync_engine::Status) {
         println!(
             "                (syncing resumes by itself once the remote is compatible again; see COMPATIBILITY.md)"
         );
+    }
+    if let Some(lock) = &s.remote_locked {
+        println!("REMOTE LOCKED   {lock}");
     }
     println!("last error      {}", s.last_error.as_deref().unwrap_or("-"));
     println!("files           {:?}", s.counts);

@@ -123,7 +123,7 @@ This is an independent client, not affiliated with the Self-hosted LiveSync proj
 - **Fails closed.** It refuses to sync when it meets any of these:
   - a server that is not CouchDB;
   - a version document that is missing, above 13 or invalid, or that has unknown `used_features`;
-  - a missing milestone, or one that is locked and doesn't list us;
+  - a missing milestone, or one that is locked and doesn't list us. When the database was not rebuilt (its `created` is the one this device synced with), the message says so and names the device that holds the lock and when it last connected; `lsync status` shows it as `REMOTE LOCKED`. lsync never unlocks it by itself: unlock it from an official client if the rebuild was not meant, or run `lsync fetch` to start over from the remote;
   - incompatible chunk-version ranges;
   - encryption, path obfuscation, a `hashAlg` other than xxhash64, or `pathNormalizationVersion=1`;
   - PREFERRED tweaks that changed since setup, or that it doesn't know (a setting a newer plugin added), until adopted with `lsync connect --adopt-tweaks`;
@@ -276,7 +276,7 @@ lsync reload                  # reread lsync.toml; only the vaults that changed 
 
 A vault's `state` is `starting`, `running`, `failed` (retrying), `stopped`, `paused`, `busy` (running a command for a client), `disabled` or `invalid` (its settings cannot be used, for example a missing password; `message` says why).
 
-Events: `state` (`state`, `message`), `paused` (`paused`), `pulled` (`written`, `deleted`, `adopted`, `dirty`, `conflicted`, `restored_edits`, `bytes_written`), `pushed` (`pushed`, `created`, `deleted`, `conflicts`, `chunks_uploaded`, `chunk_bytes`), `conflict` (`pulled`, `pushed`), `safety-stop` (`stop`: the text, or `null` once cleared), `error` (`message`), `command` (`command`, `phase`: `started` or `finished`, `ok`, `message`), `reload` (the reload's result) and `lagged` (`missed`: events a slow reader lost). Counts are what happened since the vault's previous event of that kind, read from the engines about twice a second; `status` is the source of truth.
+Events: `state` (`state`, `message`), `paused` (`paused`), `pulled` (`written`, `deleted`, `adopted`, `dirty`, `conflicted`, `restored_edits`, `bytes_written`), `pushed` (`pushed`, `created`, `deleted`, `conflicts`, `chunks_uploaded`, `chunk_bytes`), `conflict` (`pulled`, `pushed`), `safety-stop` (`stop`: the text, or `null` once cleared), `upstream-stop` (`stop`: what changed upstream, or `null` once the remote is compatible again), `remote-locked` (`lock`: who holds a lock that came without a rebuild, or `null` once it no longer refuses this device), `error` (`message`), `command` (`command`, `phase`: `started` or `finished`, `ok`, `message`), `reload` (the reload's result) and `lagged` (`missed`: events a slow reader lost). Counts are what happened since the vault's previous event of that kind, read from the engines about twice a second; `status` is the source of truth.
 
 Error codes: `bad_request`, `unsupported_version`, `unknown_method`, `unknown_vault`, `not_running`, `paused`, `busy`, `refused` (a gate refused; the message is the refusal), `invalid_config`, `failed`, `forbidden`, `shutting_down`, `changed`.
 

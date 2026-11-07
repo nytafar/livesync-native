@@ -589,17 +589,35 @@ async fn a_lock_without_a_rebuild_needs_an_explicit_fetch() {
     env.mock.update_milestone(|m| {
         m["locked"] = json!(true);
         m["accepted_nodes"] = json!(["someone"]);
+        m["node_info"]["someone"] = json!({"device_name": "laptop", "last_connected": 1});
     });
-    assert!(matches!(
-        env.engine().sync_once().await,
-        Err(EngineError::Refused(livesync_model::Refusal::Locked))
-    ));
+    // The refusal says it is a lock without a rebuild, and who holds it; it
+    // is a state of its own in status, and nothing is unlocked.
+    let msg = match env.engine().sync_once().await {
+        Err(EngineError::Refused(r @ livesync_model::Refusal::LockedWithoutRebuild { .. })) => r.to_string(),
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        msg.contains("not rebuilt") && msg.contains("\"laptop\" (node someone)"),
+        "{msg}"
+    );
+    let st = env.engine().status().unwrap();
+    assert!(
+        st.remote_locked.as_deref().is_some_and(|l| l.contains("laptop")),
+        "{st:?}"
+    );
+    assert_eq!(env.engine().alerts().unwrap().remote_locked, st.remote_locked);
+    let m = env.mock.local("obsydian_livesync_milestone").unwrap();
+    assert_eq!(m["locked"], json!(true));
+    assert_eq!(m["accepted_nodes"], json!(["someone"]));
+    // `lsync fetch` is the way out from this device.
     let e = env.engine();
     e.request_full_fetch().unwrap();
     e.sync_once().await.unwrap();
     let node = e.node_id();
     let m = env.mock.local("obsydian_livesync_milestone").unwrap();
     assert!(m["accepted_nodes"].as_array().unwrap().contains(&json!(node)));
+    assert!(e.status().unwrap().remote_locked.is_none());
 }
 
 #[tokio::test]
@@ -989,7 +1007,9 @@ async fn a_lingering_lock_bypass_is_tied_to_its_lock() {
     env.mock.update_milestone(|m| m["locked"] = json!(true));
     assert!(matches!(
         env.engine().sync_once().await,
-        Err(EngineError::Refused(livesync_model::Refusal::Locked))
+        Err(EngineError::Refused(
+            livesync_model::Refusal::LockedWithoutRebuild { .. }
+        ))
     ));
 }
 

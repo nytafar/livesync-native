@@ -48,6 +48,8 @@ The vault stops syncing: nothing is pulled or pushed, local edits stay on disk, 
 4. **Or keep it, if lsync supports it.** For a changed or new tweak that does not change what is stored (check the upstream release notes), adopt it on each lsync device: `lsync connect --adopt-tweaks`. A new generation or feature needs a newer lsync: check this file in the latest release.
 5. **Pin the plugin** on devices that come back, at the version above, until lsync lists a newer one.
 
+**A lock without a rebuild.** When another device locked the database (upstream's "rebuild" or "lock") and its `created` is still the one this device synced with, no rebuild came of the lock: it may have failed (a plugin whose database delete was refused, for example), or still be under way. lsync refuses with a message naming the device that holds the lock and when it last connected, shows `REMOTE LOCKED` in `lsync status` (`remote_locked` in `--json`, the `remote-locked` event in the service) and checks again every 30 s. It never unlocks the database itself. If the rebuild was not meant, unlock the database from an official client; if this device should start over from the remote as it is, run `lsync fetch`, which marks it accepted once it completes. A lock that comes with a rebuild (a new `created`) is followed by a refetch without asking.
+
 **The plugin guard** stops two-way sync before anything is read or written. Disable the plugin on this device (Obsidian, Settings, Community plugins), or, for a deliberate handover where you make sure the plugin does not sync at the same time, run with `--allow-plugin` or set `allow_plugin = true` for the vault in `lsync.toml`.
 
 ## Reporting a break

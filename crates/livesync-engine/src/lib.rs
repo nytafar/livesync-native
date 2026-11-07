@@ -22,7 +22,7 @@ pub mod vaultfs;
 pub mod watcher;
 
 pub use engine::{
-    AccessCheck, Engine, EngineConfig, EngineError, GateReport, PullReport, Status, SyncReport, WallClock,
+    AccessCheck, Alerts, Engine, EngineConfig, EngineError, GateReport, PullReport, Status, SyncReport, WallClock,
 };
 pub use folders::{list_remote_folders, local_top_folders, FolderEntry, FolderListing};
 pub use index::{FileRow, Index, LocalIssue, Origin, RevisionRow, State};

@@ -1028,8 +1028,8 @@ impl Service {
         let (pull, push) = (engine.report(), engine.push_report());
         let moved = s.counters(self, name, &pull, &push);
         if moved || final_read || s.status_at.is_none_or(|t| t.elapsed() >= STATUS_POLL) {
-            if let Ok((stop, error)) = engine.alerts() {
-                s.status(self, name, stop, error);
+            if let Ok(a) = engine.alerts() {
+                s.status(self, name, a);
             }
             s.status_at = Some(Instant::now());
         }
@@ -1045,6 +1045,8 @@ struct Seen {
     /// `None` until the first read (which only sets the baseline).
     stop: Option<Option<String>>,
     error: Option<Option<String>>,
+    upstream: Option<Option<String>>,
+    locked: Option<Option<String>>,
 }
 
 /// `cur - prev`, where a smaller `cur` means the counters were reset (the
@@ -1107,12 +1109,34 @@ impl Seen {
         moved
     }
 
-    fn status(&mut self, svc: &Service, name: &str, stop: Option<String>, error: Option<String>) {
+    fn status(&mut self, svc: &Service, name: &str, a: livesync_engine::Alerts) {
+        let (stop, error) = (a.safety_stop, a.last_error);
         if let Some(before) = &self.stop {
             if *before != stop {
                 svc.emit(event::SAFETY_STOP, Some(name), json!({"stop": stop}));
             }
         }
+        // The guards' stops, as recorded ("<ms> <message>"): the message.
+        let text = |s: &Option<String>| {
+            s.as_deref()
+                .map(|s| s.split_once(' ').map_or(s, |(_, m)| m).to_string())
+        };
+        if self.upstream.as_ref().is_some_and(|b| *b != a.upstream_stop) {
+            svc.emit(
+                event::UPSTREAM_STOP,
+                Some(name),
+                json!({"stop": text(&a.upstream_stop)}),
+            );
+        }
+        if self.locked.as_ref().is_some_and(|b| *b != a.remote_locked) {
+            svc.emit(
+                event::REMOTE_LOCKED,
+                Some(name),
+                json!({"lock": text(&a.remote_locked)}),
+            );
+        }
+        self.upstream = Some(a.upstream_stop);
+        self.locked = Some(a.remote_locked);
         if let Some(before) = &self.error {
             if *before != error {
                 if let Some(e) = &error {

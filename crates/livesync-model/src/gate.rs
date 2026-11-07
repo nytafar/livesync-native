@@ -94,6 +94,11 @@ pub enum Refusal {
     IncompatibleChunkVersion(i64, i64),
     #[error("the remote database is locked (a rebuild is in progress or was done elsewhere) and this node is not accepted; fetch again with an official client or unlock the remote")]
     Locked,
+    /// Locked against this device while its `created` is still the one this
+    /// device synced with: no rebuild came of the lock (yet). Only a person
+    /// can tell whether one was meant, so it is never unlocked automatically.
+    #[error("the remote database is locked against this device, but it was not rebuilt (its `created` is still the one this device synced with){holders}: another device locked it for a rebuild that has not happened (it may have failed, or still be under way). lsync never unlocks it by itself, because only you can tell whether the rebuild was meant. If it was not, unlock the database from an official client (the plugin's or the CLI's \"unlock\"); if you want this device to start over from the remote as it is, run `lsync fetch`, which marks it accepted once it completes. Syncing resumes by itself after an unlock or once the rebuild is done")]
+    LockedWithoutRebuild { holders: String },
     #[error("the remote database was cleaned and is locked against this node")]
     Cleaned,
     #[error("the milestone has no PREFERRED tweak values")]
@@ -412,6 +417,52 @@ pub fn newest_remote_plugin(milestone: &Value, our_node: &str) -> Option<String>
     best.map(|(_, v, device)| format!("Self-hosted LiveSync {v} on {device:?}"))
 }
 
+/// Who holds a lock, for [`Refusal::LockedWithoutRebuild`]: the nodes the
+/// milestone accepts (the device that locked it), each with its device name
+/// and when it last connected, as `"; locked by ..."`; empty when the
+/// milestone names none.
+pub fn lock_holders(milestone: &Value, now_ms: i64) -> String {
+    let accepted: Vec<&str> = milestone
+        .get("accepted_nodes")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if accepted.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = accepted
+        .iter()
+        .map(|node| {
+            let info = milestone.get("node_info").and_then(|i| i.get(*node));
+            let name = info.and_then(|i| i.get("device_name")).and_then(Value::as_str);
+            let who = match name {
+                Some(n) if !n.is_empty() && n != *node => format!("{n:?} (node {node})"),
+                _ => format!("node {node}"),
+            };
+            match info
+                .and_then(|i| i.get("last_connected"))
+                .and_then(Value::as_i64)
+                .filter(|t| *t > 0)
+            {
+                Some(t) => format!("{who}, last connected {} ago", ago(now_ms - t)),
+                None => who,
+            }
+        })
+        .collect();
+    format!("; locked by {}", parts.join(" and "))
+}
+
+/// A span of milliseconds, roughly: `40 s`, `12 min`, `5 h`, `3 days`.
+fn ago(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    match s {
+        0..=119 => format!("{s} s"),
+        120..=7199 => format!("{} min", s / 60),
+        7200..=172_799 => format!("{} h", s / 3600),
+        _ => format!("{} days", s / 86_400),
+    }
+}
+
 /// `1.0.46` -> `[1, 0, 46]`; anything after the numbers is ignored.
 fn version_key(v: &str) -> Vec<u64> {
     v.split(['.', '-', '+']).map_while(|p| p.parse::<u64>().ok()).collect()
@@ -615,6 +666,24 @@ mod tests {
         }
         assert!(!Refusal::Locked.is_upstream_change());
         assert!(!Refusal::NotCouchDb.is_upstream_change());
+    }
+
+    #[test]
+    fn a_lock_without_a_rebuild_names_who_holds_it() {
+        let m = json!({"accepted_nodes": ["n1", "n2"], "node_info": {
+            "n1": {"device_name": "laptop", "last_connected": 1_000_000},
+            "n2": {"device_name": "", "last_connected": 0}
+        }});
+        let h = lock_holders(&m, 1_000_000 + 3 * 3_600_000);
+        assert_eq!(
+            h,
+            "; locked by \"laptop\" (node n1), last connected 3 h ago and node n2"
+        );
+        assert_eq!(lock_holders(&json!({"accepted_nodes": []}), 0), "");
+        let msg = Refusal::LockedWithoutRebuild { holders: h }.to_string();
+        assert!(msg.contains("not rebuilt") && msg.contains("laptop"), "{msg}");
+        assert!(msg.contains("lsync fetch") && msg.contains("never unlocks"), "{msg}");
+        assert!(!Refusal::LockedWithoutRebuild { holders: String::new() }.is_upstream_change());
     }
 
     #[test]

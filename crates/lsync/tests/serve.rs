@@ -548,7 +548,7 @@ fn the_plugin_guard_holds_in_the_service_and_a_routed_command_can_hand_over() {
 }
 
 #[test]
-fn an_upstream_change_shows_as_a_stop_in_the_service() {
+fn the_guards_stops_show_in_the_service_status_and_events() {
     let rt = runtime();
     let mock = rt.block_on(Mock::start());
     mock.put_text("Notes/a.md", &["note a"]);
@@ -562,6 +562,7 @@ fn an_upstream_change_shows_as_a_stop_in_the_service() {
     wait_until("the vault running in the service", || {
         m.served_state("notes").as_deref() == Some("running") && m.folder("notes/Notes/a.md").exists()
     });
+    let events = Events::follow(&m);
     mock.put(serde_json::json!({"_id": "obsydian_livesync_version", "type": "versioninfo", "version": 13, "used_features": ["teleport-v1"]}));
     wait_until("the upstream stop in status --all", || {
         let t = m.ok(&["status", "--all"]);
@@ -570,12 +571,88 @@ fn an_upstream_change_shows_as_a_stop_in_the_service() {
     let st = m.json(&["--vault", "notes", "status", "--json"]);
     let stop = st["upstream_stop"].as_str().unwrap_or_default().to_string();
     assert!(stop.contains("is the newest version known to work"), "{stop}");
+    let e = events.wait_for("upstream-stop", |d| d["stop"].as_str().is_some());
+    assert!(e["stop"].as_str().unwrap().contains("teleport-v1"), "{e}");
     // Back to what lsync knows: the vault resumes by itself.
     mock.put(serde_json::json!({"_id": "obsydian_livesync_version", "type": "versioninfo", "version": 12}));
     wait_until("the stop cleared", || {
         m.json(&["--vault", "notes", "status", "--json"])["upstream_stop"].is_null()
     });
+    events.wait_for("upstream-stop", |d| d["stop"].is_null());
     mock.put_text("Notes/b.md", &["note b"]);
     wait_until("syncing again", || m.folder("notes/Notes/b.md").exists());
+
+    // Another device locks the database without rebuilding it: a state of
+    // its own, naming that device, and nothing is unlocked.
+    mock.update_milestone(|ms| {
+        ms["locked"] = serde_json::json!(true);
+        ms["accepted_nodes"] = serde_json::json!(["other"]);
+        ms["node_info"]["other"] = serde_json::json!({"device_name": "laptop", "last_connected": 1});
+    });
+    wait_until("the lock in status --all", || {
+        let t = m.ok(&["status", "--all"]);
+        t.contains("LOCKED BY ANOTHER DEVICE") && t.contains("laptop")
+    });
+    let e = events.wait_for("remote-locked", |d| d["lock"].as_str().is_some());
+    assert!(e["lock"].as_str().unwrap().contains("not rebuilt"), "{e}");
+    assert_eq!(
+        mock.local("obsydian_livesync_milestone").unwrap()["accepted_nodes"],
+        serde_json::json!(["other"])
+    );
+    drop(events);
     assert_eq!(svc.stop(), Some(0));
+}
+
+/// `lsync events --json`, read on a thread of its own.
+struct Events {
+    child: Child,
+    rx: std::sync::mpsc::Receiver<Value>,
+}
+
+impl Events {
+    fn follow(m: &Machine) -> Events {
+        let mut child = m
+            .cmd(&["events", "--json"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let lines = BufReader::new(child.stdout.take().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for l in lines.lines().map_while(Result::ok) {
+                if let Ok(v) = serde_json::from_str::<Value>(&l) {
+                    if tx.send(v).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        // Subscribed before the caller makes anything happen.
+        std::thread::sleep(Duration::from_millis(500));
+        Events { child, rx }
+    }
+
+    /// The data of the next `kind` event that `f` accepts.
+    fn wait_for(&self, kind: &str, f: impl Fn(&Value) -> bool) -> Value {
+        let end = Instant::now() + Duration::from_secs(30);
+        let mut seen = Vec::new();
+        while Instant::now() < end {
+            if let Ok(v) = self.rx.recv_timeout(Duration::from_millis(200)) {
+                if v["event"] == kind && f(&v["data"]) {
+                    return v["data"].clone();
+                }
+                seen.push(v["event"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        panic!("no {kind} event; saw {seen:?}");
+    }
+}
+
+impl Drop for Events {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }

@@ -129,6 +129,14 @@ pub mod event {
     /// The mass-delete safety stop: `{"stop": text}`, or `{"stop": null}`
     /// once it is cleared.
     pub const SAFETY_STOP: &str = "safety-stop";
+    /// The upstream guard stopped the vault: `{"stop": text}` (what changed
+    /// on the remote and the newest plugin version known to work), or
+    /// `{"stop": null}` once the remote is compatible again.
+    pub const UPSTREAM_STOP: &str = "upstream-stop";
+    /// The remote is locked against this device without a rebuild:
+    /// `{"lock": text}` (who holds it, the ways out), or `{"lock": null}`
+    /// once it no longer refuses this device.
+    pub const REMOTE_LOCKED: &str = "remote-locked";
     /// A new error recorded by the engine: `{"message"}`.
     pub const ERROR: &str = "error";
     /// A command run for a client: `{"command","phase":"started"|"finished","ok","message"}`.
