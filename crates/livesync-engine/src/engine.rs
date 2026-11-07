@@ -3206,10 +3206,18 @@ impl Engine {
     }
 
     /// Sleep, waking early on a nudge. Returns true on shutdown.
+    ///
+    /// A nudge is a network change, as in the longpoll: the pooled
+    /// connections went out over the old link, so the regate that follows
+    /// runs on fresh ones.
     async fn sleep_or_shutdown(&self, d: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
         tokio::select! {
             _ = tokio::time::sleep(d) => false,
-            _ = self.inner.nudge.notified() => false,
+            _ = self.inner.nudge.notified() => {
+                debug!("nudged during a wait: reconnecting and checking the remote again");
+                self.inner.couch.reset_connections();
+                false
+            }
             _ = shutdown.changed() => true,
         }
     }

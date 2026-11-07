@@ -207,3 +207,38 @@ async fn a_network_change_reconnects_on_fresh_connections() {
     );
     d.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_network_change_during_a_wait_reconnects_on_fresh_connections() {
+    let env = Env::new().await;
+    env.mock.put_text("a.md", &["a"]);
+    let (engine, couch) = env.engine_and_couch(|c| c.regate_interval = Duration::from_secs(3600));
+    engine.sync_once().await.unwrap();
+    // Locked by another node: the gate refuses and the daemon waits 30 s.
+    env.mock.update_milestone(|m| {
+        m["locked"] = serde_json::json!(true);
+        m["accepted_nodes"] = serde_json::json!(["someone"]);
+    });
+    let d = Daemon::two_way(&engine);
+    until("the refused gate", 10, || {
+        engine.alerts().unwrap().remote_locked.is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    couch.server_root().await.unwrap();
+    let old = env.mock.peers();
+    let seen = env.mock.state.lock().unwrap().conns.len();
+    let before = env.gates();
+    engine.network_changed(true);
+    until("the gate after the nudge", 5, || env.gates() > before).await;
+    let conns = env.mock.state.lock().unwrap().conns.clone();
+    let (_, _, peer) = conns[seen..]
+        .iter()
+        .find(|(m, p, _)| m == "GET" && p == "/")
+        .expect("the gate asked the server root");
+    assert!(
+        !old.contains(peer),
+        "the gate after a nudge during a wait went out on a pooled connection ({peer})"
+    );
+    d.stop().await.unwrap();
+}
