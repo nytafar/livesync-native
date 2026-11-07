@@ -353,7 +353,7 @@ impl Trash {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 fn device_of(p: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     // The nearest existing ancestor (the trash may not exist yet).
