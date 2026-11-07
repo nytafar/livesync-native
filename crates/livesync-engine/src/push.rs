@@ -591,19 +591,19 @@ fn allowed_note(them: &str, undestined: u64, hidden: u64) -> String {
 
 /// A file found on disk.
 #[derive(Debug, Clone)]
-struct Found {
-    rel: String,
-    size: u64,
-    mtime_ms: i64,
+pub(crate) struct Found {
+    pub(crate) rel: String,
+    pub(crate) size: u64,
+    pub(crate) mtime_ms: i64,
 }
 
 /// The result of walking (part of) the vault.
 #[derive(Debug, Default)]
-struct Walk {
-    found: Vec<Found>,
+pub(crate) struct Walk {
+    pub(crate) found: Vec<Found>,
     /// Folders and entries that could not be read: vault-relative path ("" is
     /// the root) and why. Nothing under them counts as deleted.
-    unreadable: Vec<(String, String)>,
+    pub(crate) unreadable: Vec<(String, String)>,
 }
 
 /// Whether `path` is `prefix` or lies under it ("" covers everything).
@@ -715,7 +715,7 @@ fn is_tracked(s: State) -> bool {
     matches!(s, State::Clean | State::Dirty | State::Conflicted)
 }
 
-fn same_content(a: &Value, b: &Value) -> bool {
+pub(crate) fn same_content(a: &Value, b: &Value) -> bool {
     a.get("children") == b.get("children") && a.get("type") == b.get("type")
 }
 
@@ -850,7 +850,7 @@ impl Engine {
         !self.inner.runtime.lock().unwrap().case_sensitive_ids
     }
 
-    fn doc_id_for(&self, rel: &str) -> String {
+    pub(crate) fn doc_id_for(&self, rel: &str) -> String {
         path_to_id(rel, self.ids_case_insensitive())
     }
 
@@ -885,7 +885,7 @@ impl Engine {
 
     /// All visible files under `start` (a vault-relative folder, "" for the
     /// root), and what could not be read on the way.
-    fn walk_visible(&self, start: &str) -> Walk {
+    pub(crate) fn walk_visible(&self, start: &str) -> Walk {
         use std::io::ErrorKind::NotFound;
         let root = self.inner.cfg.vault.clone();
         let mut w = Walk::default();

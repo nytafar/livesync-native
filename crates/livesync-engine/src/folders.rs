@@ -27,7 +27,7 @@ use std::time::Instant;
 type Result<T> = std::result::Result<T, EngineError>;
 
 /// Documents per `_all_docs` page.
-const PAGE: usize = 2000;
+pub(crate) const PAGE: usize = 2000;
 
 /// One top-level folder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -67,7 +67,7 @@ pub struct FolderListing {
 /// Each excluded prefix `p:` is the half-open range `[p:, p;)`; `";"` follows
 /// `":"`, so an inclusive end at `"p:"` and a start at `"p;"` leave out
 /// exactly the IDs starting with `p:` (plus `"p:"` itself, which nothing uses).
-fn ranges() -> Vec<(Option<&'static str>, Option<&'static str>)> {
+pub(crate) fn ranges() -> Vec<(Option<&'static str>, Option<&'static str>)> {
     vec![
         (None, Some("h:")),
         (Some("h;"), Some("i:")),

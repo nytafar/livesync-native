@@ -690,7 +690,7 @@ pub struct Engine {
 
 /// Why a file document is not materialised.
 #[derive(Debug, Clone)]
-enum Skip {
+pub(crate) enum Skip {
     Path(PathSkip),
     Ignored,
     /// Not matched by `syncOnlyRegEx`.
@@ -705,7 +705,7 @@ enum Skip {
 }
 
 impl Skip {
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Skip::Path(p) => p.as_str(),
             Skip::Ignored => "ignore-regex",
@@ -738,7 +738,7 @@ fn random_node_id() -> String {
     (0..10).map(|_| A[r.gen_range(0..A.len())] as char).collect()
 }
 
-fn conflict_note(doc: &FileDoc) -> String {
+pub(crate) fn conflict_note(doc: &FileDoc) -> String {
     format!(
         "{} conflicting revision(s); resolve with an official client",
         doc.conflicts.len()
@@ -936,7 +936,7 @@ impl Engine {
         self.inner.report.lock().unwrap().clone()
     }
 
-    fn reset_report(&self) {
+    pub(crate) fn reset_report(&self) {
         *self.inner.report.lock().unwrap() = PullReport::default();
     }
 
@@ -1677,7 +1677,7 @@ impl Engine {
         Ok(())
     }
 
-    fn skip_reason(&self, f: &FileDoc) -> Option<Skip> {
+    pub(crate) fn skip_reason(&self, f: &FileDoc) -> Option<Skip> {
         let filters = self.filters();
         if let Some(p) = filters.path_skip(&f.path) {
             return Some(Skip::Path(p));
@@ -2193,7 +2193,7 @@ impl Engine {
 
     /// Fetch chunks with `POST _all_docs {keys}`: at most 100 keys and about
     /// 16 MB of expected data per request. Missing chunks are left out.
-    async fn fetch_chunks(&self, wanted: Vec<(String, u64)>) -> Result<HashMap<String, String>> {
+    pub(crate) async fn fetch_chunks(&self, wanted: Vec<(String, u64)>) -> Result<HashMap<String, String>> {
         const MAX_KEYS: usize = 100;
         const MAX_BYTES: u64 = 16 * 1024 * 1024;
         let mut out = HashMap::with_capacity(wanted.len());
@@ -2260,7 +2260,11 @@ impl Engine {
     }
 
     /// Concatenate a document's chunks. `Err` carries a reason to defer.
-    fn assemble(&self, doc: &FileDoc, chunks: &HashMap<String, String>) -> std::result::Result<Vec<u8>, String> {
+    pub(crate) fn assemble(
+        &self,
+        doc: &FileDoc,
+        chunks: &HashMap<String, String>,
+    ) -> std::result::Result<Vec<u8>, String> {
         let mut out = Vec::with_capacity(doc.size as usize);
         let mut missing = 0usize;
         let mut id_mismatch = 0u64;

@@ -8,6 +8,7 @@
 //! index (spec D2). `Engine::pull_once` and `Engine::daemon_pull_only` never
 //! write to the remote.
 
+pub mod adopt;
 pub mod engine;
 pub mod filters;
 pub mod folderkind;
@@ -21,6 +22,7 @@ mod scopesync;
 pub mod vaultfs;
 pub mod watcher;
 
+pub use adopt::{AdoptEntry, AdoptReport};
 pub use engine::{
     AccessCheck, Alerts, Engine, EngineConfig, EngineError, GateReport, PullReport, Status, SyncReport, WallClock,
 };
