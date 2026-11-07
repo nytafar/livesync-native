@@ -432,20 +432,13 @@ fn group_members(gid: u32) -> Vec<String> {
             buf.resize(buf.len() * 4, 0);
             continue;
         }
-        if rc != 0 || out.is_null() || gr.gr_mem.is_null() {
+        if rc != 0 || out.is_null() {
             return vec![];
         }
-        let mut names = vec![];
-        // SAFETY: gr_mem is a NULL-terminated array of NUL-terminated
-        // strings in `buf`.
-        unsafe {
-            let mut p = gr.gr_mem;
-            while !(*p).is_null() {
-                names.push(std::ffi::CStr::from_ptr(*p).to_string_lossy().into_owned());
-                p = p.add(1);
-            }
-        }
-        return names;
+        // SAFETY: the call succeeded, so gr_mem is NULL or a NULL-terminated
+        // array of NUL-terminated strings in `buf` (unaligned on macOS,
+        // which the helper allows for).
+        return unsafe { livesync_host::control::group_members_of(gr.gr_mem) };
     }
 }
 

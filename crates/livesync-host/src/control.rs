@@ -248,16 +248,39 @@ fn group_entry(name: Option<&str>, gid: u32) -> Option<(u32, Vec<String>)> {
         if rc != 0 || out.is_null() {
             return None;
         }
-        let mut members = Vec::new();
-        let mut p = gr.gr_mem;
-        // SAFETY: gr_mem is a NULL-terminated array of C strings in `buf`.
-        unsafe {
-            while !p.is_null() && !(*p).is_null() {
-                members.push(std::ffi::CStr::from_ptr(*p).to_string_lossy().into_owned());
-                p = p.add(1);
-            }
-        }
+        // SAFETY: the call succeeded, so gr_mem is NULL or a
+        // NULL-terminated array of C strings in `buf`.
+        let members = unsafe { group_members_of(gr.gr_mem) };
         return Some((gr.gr_gid, members));
+    }
+}
+
+/// The names in a group entry's `gr_mem`.
+///
+/// macOS's `getgrgid_r`/`getgrnam_r` place the `gr_mem` array in the
+/// caller's buffer right after the strings, without aligning it, so its
+/// pointers are read unaligned (a plain dereference is undefined behaviour
+/// there, and aborts a debug build).
+///
+/// # Safety
+///
+/// `mem` is NULL or points to a NULL-terminated array of pointers to
+/// NUL-terminated strings, all valid for the call.
+pub unsafe fn group_members_of(mem: *mut *mut libc::c_char) -> Vec<String> {
+    let mut names = Vec::new();
+    if mem.is_null() {
+        return names;
+    }
+    let mut p = mem;
+    loop {
+        // SAFETY: per the contract, `p` is within the array; read without
+        // assuming alignment.
+        let name = unsafe { p.read_unaligned() };
+        if name.is_null() {
+            return names;
+        }
+        names.push(unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned());
+        p = p.wrapping_add(1);
     }
 }
 
@@ -1101,6 +1124,23 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `gr_mem` array at an odd address, as macOS's getgrgid_r leaves it
+    /// in the buffer: read, not an abort (a debug build checks alignment).
+    #[test]
+    fn a_group_member_list_need_not_be_aligned() {
+        let names = [c"anna", c"bob"];
+        let ptrs: Vec<*const libc::c_char> = names.iter().map(|n| n.as_ptr()).chain([std::ptr::null()]).collect();
+        let size = std::mem::size_of::<*const libc::c_char>();
+        let mut buf = vec![0u8; 1 + ptrs.len() * size];
+        for (i, p) in ptrs.iter().enumerate() {
+            buf[1 + i * size..1 + (i + 1) * size].copy_from_slice(&(*p as usize).to_ne_bytes());
+        }
+        let mem = buf[1..].as_mut_ptr().cast::<*mut libc::c_char>();
+        // SAFETY: a NULL-terminated array of pointers to `names`, which outlive the call.
+        assert_eq!(unsafe { group_members_of(mem) }, ["anna", "bob"]);
+        assert!(unsafe { group_members_of(std::ptr::null_mut()) }.is_empty());
+    }
 
     #[test]
     fn only_the_own_user_and_the_group_are_admitted() {
