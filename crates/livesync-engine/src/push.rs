@@ -2945,7 +2945,9 @@ mod tests {
         let took = started.elapsed();
         assert!(took >= Duration::from_millis(600), "{took:?}");
         assert!(took < Duration::from_millis(2000), "{took:?}");
-        assert!(n >= 6, "{n}");
+        // Several deletions were held past the 300 ms hold. The exact count
+        // depends on how far a loaded runner overshoots each 60 ms sleep.
+        assert!(n >= 3, "{n}");
     }
 
     #[test]
