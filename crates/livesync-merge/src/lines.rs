@@ -15,13 +15,14 @@
 //! 3. **Seams.** Where pieces of the two sides meet at one base point with no
 //!    base line between them, a line both sides inserted there could sit in
 //!    both pieces. A side's insertion is taken once where the other side's
-//!    change there begins or ends with exactly those lines; any other line the
-//!    two pieces share leaves them one conflict, never a line taken twice.
+//!    change ends (or begins) with exactly those lines at the end where they
+//!    meet; any other line the two pieces share leaves them one conflict,
+//!    never a line taken twice.
 //!
 //! Each step trusts the two diffs' alignments with the base, and where lines
 //! repeat (blank lines, `---`, copies) the two diffs can line up the same
-//! lines differently. So a clean result is checked last ([`crate::check`])
-//! against what the three files say, and is open where it fails.
+//! lines differently. So the walk only proposes: a clean result is decided by
+//! [`crate::check`], on what the three files say, and is open where it fails.
 //!
 //! Every merged line records where it comes from ([`Src`]), which lets the
 //! tests check a merge against an oracle that knows nothing of how it was
@@ -321,60 +322,6 @@ fn keep_unterminated_last(base: &[&str], d: &mut SideDiff) {
     d.base_of[x] = Some(nb - 1);
 }
 
-/// For each base line, the line of `side` that keeps it by the line diff `d`
-/// (the base's last line without its newline as the merge counts it), and whether
-/// a change of the side is next to it (it removed the line before or after,
-/// or inserted lines right before or after it; blank lines between count as
-/// next to it).
-pub(crate) fn kept(base: &[&str], side: &str, d: &[(Op, String)]) -> (Vec<Option<usize>>, Vec<bool>) {
-    let mut s = side_diff(d, base.len(), side);
-    keep_unterminated_last(base, &mut s);
-    let n = base.len();
-    let k: Vec<bool> = s.equal_at.iter().map(Option::is_some).collect();
-    // Insertions at each gap (gap i is before base line i).
-    let mut ins = vec![false; n + 1];
-    for c in &s.changes {
-        if !c.side.is_empty() {
-            ins[c.base.start] = true;
-            ins[c.base.end] = true;
-        }
-    }
-    // Next to it: up to the nearest base lines around it that are not blank,
-    // those included (blank lines between do not part a line from a change).
-    let beside = (0..n)
-        .map(|i| {
-            // Lines `lo..=hi` and the gaps between them (with the file's
-            // start or end where no such line is).
-            let lo = (0..i).rev().find(|&j| !blank(base[j]));
-            let hi = (i + 1..n).find(|&j| !blank(base[j]));
-            let lines = lo.unwrap_or(0)..=hi.unwrap_or(n - 1);
-            let gaps = lo.map_or(0, |l| l + 1)..=hi.unwrap_or(n);
-            lines.into_iter().any(|j| j != i && !k[j]) || gaps.into_iter().any(|g| ins[g])
-        })
-        .collect();
-    (s.equal_at, beside)
-}
-
-/// For each line of `side`, where it stands in the base by the line diff
-/// `d`: `2 i + 1` for base line `i` it keeps or begins a replacement of,
-/// `2 g` for lines it inserted at gap `g` (before base line `g`).
-pub(crate) fn positions(base: &[&str], side: &str, d: &[(Op, String)]) -> Vec<usize> {
-    let mut s = side_diff(d, base.len(), side);
-    keep_unterminated_last(base, &mut s);
-    let mut at: Vec<usize> = s.base_of.iter().map(|b| b.map_or(0, |i| 2 * i + 1)).collect();
-    for c in &s.changes {
-        let p = if c.inserts() {
-            2 * c.base.start
-        } else {
-            2 * c.base.start + 1
-        };
-        for x in c.side.clone() {
-            at[x] = p;
-        }
-    }
-    at
-}
-
 /// Whether two changes of different sides touch the same base lines: two
 /// replacements of overlapping ranges, an insertion strictly inside a
 /// replaced range, or two insertions at one point.
@@ -385,110 +332,6 @@ fn interferes(a: &Change, b: &Change) -> bool {
         (false, true) => a.base.start < b.base.start && b.base.start < a.base.end,
         (true, true) => a.base.start == b.base.start,
     }
-}
-
-/// Split changes where they hold the other side's change of the lines at one
-/// of their ends: a change of base lines `a..b` into `S`, against the other
-/// side's change of `a..d` (or `c..b`) into `T`, where `S` begins (or ends)
-/// with exactly `T`, becomes `a..d` into `T` and `d..b` into the rest. The
-/// first part is then the same change on both sides, taken once; the rest
-/// goes on as a change of its own. Both ticked the second task, one also the
-/// first: one change each of the second, and one side's of the first.
-fn peel(base: &[&str], sides: &mut [SideDiff; 2], budget: &mut Budget) -> Result<(), OutOfBudget> {
-    loop {
-        let mut any = false;
-        for s in 0..2 {
-            let (mine, other) = if s == 0 {
-                let (a, b) = sides.split_at_mut(1);
-                (&mut a[0], &b[0])
-            } else {
-                let (a, b) = sides.split_at_mut(1);
-                (&mut b[0], &a[0])
-            };
-            let mut out = Vec::with_capacity(mine.changes.len());
-            for c in std::mem::take(&mut mine.changes) {
-                let lo = other.changes.partition_point(|d| d.base.end < c.base.start);
-                let hi = lo + other.changes[lo..].partition_point(|d| d.base.start <= c.base.end);
-                budget.spend(hi - lo + c.side.len())?;
-                let hits: Vec<&Change> = other.changes[lo..hi].iter().filter(|d| interferes(&c, d)).collect();
-                let mut rest = c;
-                // At the start: the first change of the other side there.
-                if let Some(d) = hits.first() {
-                    if let Some(x) = held_at(base, &mine.lines, &rest, &other.lines, d, false) {
-                        out.push(Change {
-                            base: rest.base.start..d.base.end,
-                            side: rest.side.start..x,
-                        });
-                        rest = Change {
-                            base: d.base.end..rest.base.end,
-                            side: x..rest.side.end,
-                        };
-                        any = true;
-                    }
-                }
-                // At the end: the last.
-                let mut tail = None;
-                if let Some(d) = hits.last() {
-                    if let Some(x) = held_at(base, &mine.lines, &rest, &other.lines, d, true) {
-                        tail = Some(Change {
-                            base: d.base.start..rest.base.end,
-                            side: x..rest.side.end,
-                        });
-                        rest = Change {
-                            base: rest.base.start..d.base.start,
-                            side: rest.side.start..x,
-                        };
-                        any = true;
-                    }
-                }
-                if !rest.base.is_empty() || !rest.side.is_empty() {
-                    out.push(rest);
-                }
-                out.extend(tail);
-            }
-            mine.changes = out;
-        }
-        if !any {
-            return Ok(());
-        }
-    }
-}
-
-/// Where `c` (of lines `cl`) can be split so that its part at its start (or
-/// end) is exactly `d` (of the other side's lines `dl`): `d` replaces lines at
-/// that end of `c`'s, and `c`'s lines begin (or end) with `d`'s (at least
-/// one), with something left over. The split's line in `c`'s side.
-///
-/// Not where the rest holds a base line `d` replaced (by its content): that
-/// is one side keeping (or editing) a line the other removed, which stays
-/// open.
-fn held_at(base: &[&str], cl: &[&str], c: &Change, dl: &[&str], d: &Change, end: bool) -> Option<usize> {
-    let nested = d.base.start >= c.base.start && d.base.end <= c.base.end;
-    let at_end = if end {
-        d.base.end == c.base.end
-    } else {
-        d.base.start == c.base.start
-    };
-    // A deletion holds nothing: against a change of its lines it stays open.
-    if !nested || !at_end || d.inserts() || d.side.is_empty() || d.side.len() > c.side.len() {
-        return None;
-    }
-    if c.base.len() == d.base.len() && c.side.len() == d.side.len() {
-        return None;
-    }
-    let x = if end { c.side.end - d.side.len() } else { c.side.start };
-    let same = cl[x..x + d.side.len()]
-        .iter()
-        .zip(&dl[d.side.clone()])
-        .all(|(a, b)| same_line(a, b));
-    let rest = if end {
-        c.side.start..x
-    } else {
-        x + d.side.len()..c.side.end
-    };
-    let replaced: HashSet<&str> = base[d.base.clone()].iter().map(|l| content(l)).collect();
-    let keeps_replaced = cl[rest].iter().any(|l| replaced.contains(content(l)));
-    (same && !keeps_replaced).then_some(if end { x } else { x + d.side.len() })
 }
 
 /// Union-find over the changes of both sides (ours first).
@@ -562,10 +405,6 @@ struct Merger<'a> {
     base: Vec<&'a str>,
     sides: [SideDiff<'a>; 2],
     ours_first: bool,
-    /// Two runs at one point where one is blank lines only stay open (see
-    /// [`Merger::runs`]); off for [`crate::check`]'s other alignments, where
-    /// which blank line is new is arbitrary.
-    blank_runs_open: bool,
 }
 
 /// The side lines of one side's piece.
@@ -760,7 +599,7 @@ impl<'a> Merger<'a> {
     fn runs(&self, fs: usize, first: Range<usize>, ss: usize, second: Range<usize>) -> Runs {
         let lines = |s: usize, r: &Range<usize>| &self.sides[s].lines[r.clone()];
         let (a, b) = (lines(fs, &first), lines(ss, &second));
-        let blank_only = self.blank_runs_open && (a.iter().all(|l| blank(l)) || b.iter().all(|l| blank(l)));
+        let blank_only = a.iter().all(|l| blank(l)) || b.iter().all(|l| blank(l));
         let unsure = among(a, b) || among(b, a) || blank_only;
         // `long` of side `ls` holds `short` of the other side at offset `at`.
         let once = |ls: usize, long: &Range<usize>, short: &Range<usize>, at: usize| -> Vec<Src> {
@@ -800,39 +639,32 @@ impl<'a> Merger<'a> {
 
     /// `ins`, an insertion of one side beside `change` of the other side (at
     /// its end where `at_end`, else at its start), taken once with it: where
-    /// the change's lines hold the insertion's as a whole prefix or suffix,
-    /// the change's lines with the insertion's marked as shared. The change's
-    /// base lines stay replaced. Where the insertion holds the change and the
-    /// change `replaced` base lines, not (see below).
-    fn absorb(&self, change: &[Src], ins: &[Src], at_end: bool, replaced: bool) -> Option<Vec<Src>> {
+    /// the change's lines end (or begin) with exactly the insertion's, at the
+    /// end where they meet, the change's lines with the insertion's marked as
+    /// shared. Not at the change's far end: that would put the insertion's
+    /// lines where its side did not (a paragraph break both added, one at the
+    /// start of an edited line and one after it, is two breaks). Nor where the
+    /// insertion holds the change: the inserting side may have made the same
+    /// change and typed the old lines again (L ticked the task and added it
+    /// anew), or only inserted; which, decides whether the old lines stay.
+    fn absorb(&self, change: &[Src], ins: &[Src], at_end: bool) -> Option<Vec<Src>> {
         let text = |v: &[Src]| -> Vec<&str> { v.iter().map(|l| self.text(*l)).collect() };
         let (c, i) = (text(change), text(ins));
-        let mark = |long: &[Src], short: &[Src], at: usize| -> Option<Vec<Src>> {
-            let mut out = long.to_vec();
-            for (x, l) in short.iter().enumerate() {
-                out[at + x] = match (out[at + x], *l) {
-                    (Src::Ours(j), Src::Theirs(k)) | (Src::Theirs(k), Src::Ours(j)) => Src::Both(j, k),
-                    _ => return None,
-                };
-            }
-            Some(out)
-        };
-        if change.is_empty() {
+        if change.is_empty() || i.is_empty() || i.len() > c.len() {
             return None;
         }
-        if let Some(at) = held(&c, &i, at_end) {
-            return mark(change, ins, at);
-        }
-        // An insertion that holds the whole change beside it, where the
-        // change replaced base lines: the inserting side may have made the
-        // same change and typed the old lines again (L ticked the task and
-        // added it anew), or only inserted; which, decides whether the old
-        // lines stay. Open.
-        if replaced {
+        let at = if at_end { c.len() - i.len() } else { 0 };
+        if !c[at..at + i.len()].iter().zip(&i).all(|(a, b)| same_line(a, b)) {
             return None;
         }
-        let at = held(&i, &c, !at_end)?;
-        mark(ins, change, at)
+        let mut out = change.to_vec();
+        for (x, l) in ins.iter().enumerate() {
+            out[at + x] = match (out[at + x], *l) {
+                (Src::Ours(j), Src::Theirs(k)) | (Src::Theirs(k), Src::Ours(j)) => Src::Both(j, k),
+                _ => return None,
+            };
+        }
+        Some(out)
     }
 
     /// Two insertions of the two sides at different points with only base
@@ -961,7 +793,7 @@ impl<'a> Merger<'a> {
                 let (Piece::Clean(c), Piece::Clean(i)) = (&units[chg].piece, &units[ins].piece) else {
                     unreachable!()
                 };
-                if let Some(once) = self.absorb(c, i, at_end, !units[chg].at.is_empty()) {
+                if let Some(once) = self.absorb(c, i, at_end) {
                     units[chg].piece = Piece::Clean(once);
                     // Its lines are no longer one side's alone: an insertion
                     // at its other end is not taken into it as well.
@@ -1006,8 +838,8 @@ impl<'a> Merger<'a> {
 ///   both whole, the older side's first, or a conflict where the runs are
 ///   likely one (see [`Merger::runs`]).
 /// - An insertion beside the other side's change (at its start or end) is
-///   taken once where the change's lines begin or end with exactly those
-///   lines.
+///   taken once where the change's lines end (or begin) with exactly those
+///   lines, at the end where they meet.
 /// - Deletions of overlapping lines on both sides: every line either deleted
 ///   is gone.
 /// - Anything else where the two sides' changes touch the same base lines (two
@@ -1031,7 +863,7 @@ pub(crate) fn walk(
         dmp::line_diff(base, ours, budget)?,
         dmp::line_diff(base, theirs, budget)?,
     );
-    let Made { mut w, ev, whole } = make(base, ours, theirs, &dl, &dr, ours_first, true, budget)?;
+    let Made { mut w, ev, whole } = make(base, ours, theirs, &dl, &dr, ours_first, budget)?;
     if whole {
         if w.glued {
             let up = upstream_from(dl, dr, ours_first);
@@ -1103,31 +935,7 @@ pub(crate) fn walk_unchecked(
         dmp::line_diff(base, ours, budget)?,
         dmp::line_diff(base, theirs, budget)?,
     );
-    Ok(make(base, ours, theirs, &dl, &dr, ours_first, true, budget)?.w)
-}
-
-/// The clean text of the merge of `base`, `ours` and `theirs` with these
-/// alignments of each side with the base (`dl`, `dr`, as line diffs), with
-/// where each line comes from; or `None` where it is not clean. No check, no
-/// labels: for [`crate::check`], which merges with other alignments than the
-/// diff's (`other`: one of those, where a run of blank lines only goes in
-/// whole).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn merge_with(
-    base: &str,
-    ours: &str,
-    theirs: &str,
-    dl: &[(Op, String)],
-    dr: &[(Op, String)],
-    ours_first: bool,
-    other: bool,
-    budget: &mut Budget,
-) -> Result<Option<(String, Vec<Src>)>, OutOfBudget> {
-    let made = make(base, ours, theirs, dl, dr, ours_first, !other, budget)?;
-    Ok(match made.w.text() {
-        Some(t) if !made.whole => Some((t, made.w.trace)),
-        _ => None,
-    })
+    Ok(make(base, ours, theirs, &dl, &dr, ours_first, budget)?.w)
 }
 
 /// A merge made with given alignments, before it is checked and labelled.
@@ -1138,7 +946,7 @@ struct Made {
     whole: bool,
 }
 
-/// The merge with these alignments (see [`walk`] and [`merge_with`]).
+/// The merge with these alignments (see [`walk`]).
 #[allow(clippy::too_many_arguments)]
 fn make(
     base: &str,
@@ -1147,7 +955,6 @@ fn make(
     dl: &[(Op, String)],
     dr: &[(Op, String)],
     ours_first: bool,
-    blank_runs_open: bool,
     budget: &mut Budget,
 ) -> Result<Made, OutOfBudget> {
     let base_lines: Vec<&str> = pieces(base).collect();
@@ -1156,12 +963,10 @@ fn make(
     for side in &mut sides {
         keep_unterminated_last(&base_lines, side);
     }
-    peel(&base_lines, &mut sides, budget)?;
     let m = Merger {
         base: base_lines,
         sides,
         ours_first,
-        blank_runs_open,
     };
     let (no, nt) = (m.sides[0].changes.len(), m.sides[1].changes.len());
     budget.spend(m.sides[0].lines.len() + m.sides[1].lines.len() + nb + no + nt)?;

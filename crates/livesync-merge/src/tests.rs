@@ -587,9 +587,10 @@ fn empty_files() {
     assert_eq!(written(&md("", "ours\n", "theirs\n")), "ours\ntheirs\n");
     assert_eq!(md("", "same\n", "same\n").outcome, Outcome::Identical);
     assert_eq!(written(&md("", "", "new\n")), "new\n");
-    // Whitespace only in the base is no content to lose; but theirs kept the
-    // blank line ours removed, beside its own line: open.
-    assert!(md("\n", "", "\nnew\n").outcome.is_open());
+    // Whitespace only in the base is no content to lose. Theirs kept the
+    // blank line ours removed, beside its own line; typed back, it would part
+    // nothing (no line above it), so ours' deletion is taken.
+    assert_eq!(written(&md("\n", "", "\nnew\n")), "new\n");
     assert_eq!(written(&md("\n", "\n", "\nnew\n")), "\nnew\n");
 }
 
@@ -834,41 +835,111 @@ fn pieces_that_share_a_line_at_a_seam_stay_open() {
 }
 
 #[test]
-fn the_same_change_inside_a_larger_one_is_taken_once() {
-    // Both ticked the second task; ours also the first.
+fn the_same_change_inside_a_larger_one_stays_open() {
+    // Both ticked the second task; ours also the first. Ours' change of the
+    // two lines is one block, and no text says which of its lines is which
+    // base line's: ours may have deleted the second task and edited the
+    // first into it. Different changes of the same lines stay open, as in
+    // ef5a400 (review 5's finding 2: splitting the block let an edit of a
+    // line the other side deleted merge).
     let base = "- [ ] one\n- [ ] two\n- [ ] three\n";
     let both = "- [x] one\n- [x] two\n- [ ] three\n";
     let second = "- [ ] one\n- [x] two\n- [ ] three\n";
     for m in both_ways(base, both, second) {
-        assert_eq!(written(&m), both);
+        assert!(m.outcome.is_open());
     }
-    // A replacement whose lines begin with the other side's replacement of
-    // the same line: the longer.
-    let m = md(
-        "# M\nMeeting TBD\nend\n",
-        "# M\nMeeting at 10\nend\n",
-        "# M\nMeeting at 10\nRoom 2\nend\n",
+    for (b, o, t) in [
+        (
+            "# M\nMeeting TBD\nend\n",
+            "# M\nMeeting at 10\nend\n",
+            "# M\nMeeting at 10\nRoom 2\nend\n",
+        ),
+        ("a\nb\n", "a\nX\n", "a\nX\nb!\n"),
+        ("a\nb\nc\n", "a\nc\n", "a\nB\nX\nc\n"),
+        ("a\nb\n", "a\nX\n", "a\nX\nb\n"),
+        // Review 5's finding 2: an edit of a line the other side deleted.
+        (
+            "# Day\n- [ ] call Bob\n- [ ] buy milk\n",
+            "# Day\n- [x] call Bob\n- [ ] buy oat milk\n",
+            "# Day\n- [x] call Bob\n",
+        ),
+        (
+            "Para\n\n## Notes\n",
+            "Para\n\n- [ ] gym\n## Notes (ours)\n",
+            "Para\n\n- [ ] gym\n",
+        ),
+    ] {
+        for m in both_ways(b, o, t) {
+            assert!(m.outcome.is_open(), "{b:?} {o:?} {t:?}");
+        }
+    }
+}
+
+/// Review 5's inputs. Finding 1: a paragraph break, `---` or line the other
+/// side added, absorbed at the far end of a change (M was one side's file);
+/// now open, as git's merge is. Finding 6: a last line that lost its newline
+/// taken as new, dropping an appended copy. Finding 3: changes the old check
+/// opened that merge.
+#[test]
+fn review_5s_inputs() {
+    // A paragraph break (or `---`) both added, one before a line and one
+    // around the other's edit of it: two breaks, or the writer's own break
+    // moved past the line, cannot be told; open, never one of them dropped.
+    // And finding 6.
+    for (b, o, t) in [
+        (
+            "First line of para.\nSecond line.\nThird line.\n",
+            "First line of para.\nSecond line, edited.\n\nThird line.\n",
+            "First line of para.\n\nSecond line.\nThird line.\n",
+        ),
+        ("x\nA\ny\n", "x\nA edited\n\ny\n", "x\n\nA\ny\n"),
+        ("line 1\n---\n", "\nline 1 e\n---\n---\n", "line 1\n\n---\n"),
+        ("Intro\n\nA\nB\n", "Intro\n\nA\nB edited\n---\n", "Intro\n\nA\n---\nB\n"),
+        (
+            "- [ ] gym\n- [ ] gym\nline 1",
+            "- [ ] gym\n- [ ] gym\nline 1\n- [ ] gym",
+            "t 2\nt 1\n- [ ] gym",
+        ),
+    ] {
+        for m in both_ways(b, o, t) {
+            assert!(m.outcome.is_open(), "{b:?} {o:?} {t:?}: {m:?}");
+        }
+    }
+    // Finding 3: each side ticks a different copy (a blank line between).
+    let (b, o, t) = (
+        "- [ ] gym\n- [ ] read\n\n- [ ] gym\n- [ ] read\n",
+        "- [x] gym\n- [ ] read\n\n- [ ] gym\n- [ ] read\n",
+        "- [ ] gym\n- [ ] read\n\n- [x] gym\n- [ ] read\n",
     );
-    assert_eq!(written(&m), "# M\nMeeting at 10\nRoom 2\nend\n");
-    // As with two runs, the rest of the longer is taken as it is, whatever
-    // it was made from.
-    assert_eq!(written(&md("a\nb\n", "a\nX\n", "a\nX\nb!\n")), "a\nX\nb!\n");
-    // A deletion holds nothing: deleted against changed stays open.
-    assert!(md("a\nb\nc\n", "a\nc\n", "a\nB\nX\nc\n").outcome.is_open());
-    // Theirs kept b and inserted X before it, ours replaced b with X. Theirs
-    // may have made the same change and typed b back: open (earlier versions
-    // gave `a X`).
-    assert!(md("a\nb\n", "a\nX\n", "a\nX\nb\n").outcome.is_open());
+    for m in both_ways(b, o, t) {
+        assert_eq!(written(&m), "- [x] gym\n- [ ] read\n\n- [x] gym\n- [ ] read\n");
+    }
+    // Finding 3: both add a paragraph break, one also deletes a line between.
+    let base: Vec<String> = (0..40).map(|i| format!("Sentence number {i}.")).collect();
+    let (mut o, mut t) = (base.clone(), base.clone());
+    o.insert(4, String::new());
+    o.remove(21);
+    t.insert(36, String::new());
+    let mut want = base.clone();
+    want.insert(36, String::new());
+    want.remove(20);
+    want.insert(4, String::new());
+    let j = |v: &[String]| v.join("\n") + "\n";
+    for m in both_ways(&j(&base), &j(&o), &j(&t)) {
+        assert_eq!(written(&m), j(&want));
+    }
 }
 
 #[test]
-fn insertions_either_side_of_a_kept_blank_line_are_taken_once() {
+fn insertions_either_side_of_a_kept_blank_line_are_never_taken_twice() {
     // R2 added a blank line, which the diff puts before the base's blank
     // line; L (which saw R2) added it and a line, after it.
     let r1 = "\n- 00 entry\n";
     let r2 = "\n\n- 00 entry\n";
     let l = "\n\n- writer\n- 00 entry\n";
-    assert_eq!(guard(r1, l, r2).as_deref(), Some(l));
+    // R2's blank line may be the first or the second of L's: read one way the
+    // merge has two blank lines, the other three. Open, never a third one.
+    assert!(matches!(guard(r1, l, r2).as_deref(), Some(x) if x == l) || guard(r1, l, r2).is_none());
 }
 
 /// Review 4's inputs, base R1, L (which saw R2), R2: each merged clean

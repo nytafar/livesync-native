@@ -217,7 +217,7 @@ fn merges_match_upstream() {
             let t = line_merge_trace(b, l, rt, ours_first(c)).expect("within the budget");
             assert_eq!(t.text, r.ours, "{name}: the trace is not the merge");
             let independent = |t: &livesync_merge::LineTrace| match &t.text {
-                Some(m) => oracle::independent(b, l, rt, m),
+                Some(m) => oracle::independent(b, l, rt, m, ours_first(c)),
                 None => Ok(()),
             };
             if let Err(e) = oracle::check(b, l, rt, ours_first(c), &t).and_then(|_| independent(&t)) {

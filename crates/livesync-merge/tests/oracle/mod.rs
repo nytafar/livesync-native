@@ -352,8 +352,10 @@ pub fn shape(s: &str) -> Vec<(bool, String)> {
 }
 
 /// Lines (not blank) that base, ours and theirs each have once, with the same
-/// text: their line numbers in each, the longest run in the same order in all
-/// three.
+/// text: their line numbers in each. Of those, the ones in every longest run
+/// (of lines each has once, a missing final line end aside) rising in ours'
+/// order and in every one rising in theirs': where two lines swapped places,
+/// neither is taken.
 fn anchors(t: [&[&str]; 3]) -> Vec<[usize; 3]> {
     let mut n: HashMap<&str, [(u32, usize); 3]> = HashMap::new();
     for (k, text) in t.iter().enumerate() {
@@ -368,28 +370,54 @@ fn anchors(t: [&[&str]; 3]) -> Vec<[usize; 3]> {
         .filter(|(_, l)| !blank(l))
         .filter_map(|(i, l)| {
             let e = n.get(content(l))?;
-            (e.iter().all(|x| x.0 == 1) && t[1][e[1].1] == *l && t[2][e[2].1] == *l).then_some([i, e[1].1, e[2].1])
+            e.iter().all(|x| x.0 == 1).then_some([i, e[1].1, e[2].1])
         })
         .collect();
-    // The longest chain rising in all three (quadratic: test inputs are small).
-    let k = cand.len();
-    let (mut best, mut prev) = (vec![1usize; k], vec![usize::MAX; k]);
-    for i in 0..k {
+    let theirs = firm(&cand, 2);
+    firm(&cand, 1)
+        .into_iter()
+        .filter(|a| theirs.contains(a) && t[1][a[1]] == t[0][a[0]] && t[2][a[2]] == t[0][a[0]])
+        .collect()
+}
+
+/// The elements of `v` in every longest run whose `k`th field rises, counted
+/// by brute force (test inputs are small): the number of longest runs through
+/// an element equals the number of longest runs.
+fn firm(v: &[[usize; 3]], k: usize) -> Vec<[usize; 3]> {
+    let n = v.len();
+    // Longest run (and how many) ending at each element, and starting at it.
+    let (mut end, mut ways_end) = (vec![1usize; n], vec![1u128; n]);
+    for i in 0..n {
         for j in 0..i {
-            if cand[j][1] < cand[i][1] && cand[j][2] < cand[i][2] && best[j] + 1 > best[i] {
-                best[i] = best[j] + 1;
-                prev[i] = j;
+            if v[j][k] < v[i][k] {
+                if end[j] + 1 > end[i] {
+                    end[i] = end[j] + 1;
+                    ways_end[i] = ways_end[j];
+                } else if end[j] + 1 == end[i] {
+                    ways_end[i] = ways_end[i].saturating_add(ways_end[j]);
+                }
             }
         }
     }
-    let mut out = Vec::new();
-    let mut cur = (0..k).max_by_key(|&i| best[i]);
-    while let Some(i) = cur {
-        out.push(cand[i]);
-        cur = (prev[i] != usize::MAX).then_some(prev[i]);
+    let (mut start, mut ways_start) = (vec![1usize; n], vec![1u128; n]);
+    for i in (0..n).rev() {
+        for j in i + 1..n {
+            if v[i][k] < v[j][k] {
+                if start[j] + 1 > start[i] {
+                    start[i] = start[j] + 1;
+                    ways_start[i] = ways_start[j];
+                } else if start[j] + 1 == start[i] {
+                    ways_start[i] = ways_start[i].saturating_add(ways_start[j]);
+                }
+            }
+        }
     }
-    out.reverse();
-    out
+    let longest = end.iter().copied().max().unwrap_or(0);
+    let total: u128 = (0..n).filter(|&i| end[i] == longest).map(|i| ways_end[i]).sum();
+    (0..n)
+        .filter(|&i| end[i] + start[i] - 1 == longest && ways_end[i].saturating_mul(ways_start[i]) == total)
+        .map(|i| v[i])
+        .collect()
 }
 
 /// The stretches between anchors, as (base, ours, theirs) line ranges, with
@@ -406,18 +434,87 @@ fn stretches(t: [&[&str]; 3], an: &[[usize; 3]]) -> Vec<[Range<usize>; 3]> {
         .collect()
 }
 
-/// The checks that know nothing of the merge's alignment, for a clean line
-/// merge `merged` of `base`, `ours` and `theirs`:
+/// The anchors left once two stretches around an anchor are judged as one:
+/// where a side has fewer blank lines than the base on one side of the anchor
+/// and more on the other (the anchor may have moved across a blank line).
+fn joined(t: [&[&str]; 3], an: &[[usize; 3]]) -> Vec<[usize; 3]> {
+    let st = stretches(t, an);
+    let blanks = |g: usize, x: usize| t[x][st[g][x].clone()].iter().filter(|l| blank(l)).count() as isize;
+    (0..an.len())
+        .filter(|&k| {
+            ![1, 2].iter().any(|&x| {
+                let (a, c) = (blanks(k, x) - blanks(k, 0), blanks(k + 1, x) - blanks(k + 1, 0));
+                a * c < 0
+            })
+        })
+        .map(|k| an[k])
+        .collect()
+}
+
+/// Whether both sides made the same change somewhere: a stretch between
+/// anchors (see [`independent`]) where ours and theirs are the same text and
+/// the base's is not. The merge takes it once; no text shows whether it was
+/// one change or two (both added the same copy next to a copy, or each
+/// removed one of two copies).
+pub fn same_change(base: &str, ours: &str, theirs: &str) -> bool {
+    let (b, o, t) = (lines(base), lines(ours), lines(theirs));
+    let an = anchors([&b, &o, &t]);
+    let an = joined([&b, &o, &t], &an);
+    stretches([&b, &o, &t], &an)
+        .into_iter()
+        .any(|[rb, ro, rt]| o[ro.clone()] == t[rt] && o[ro] != b[rb])
+}
+
+/// Whether the texts read only one way, as `merged`: every pair of longest
+/// common subsequences of each whole side with the base (no anchors) merges
+/// by the placement rules to it. Where they do, no merge of these texts could
+/// tell a different history.
+pub fn every_reading_gives(base: &str, ours: &str, theirs: &str, merged: &str, ours_first: bool) -> bool {
+    let (b, o, t) = (lines(base), lines(ours), lines(theirs));
+    let (Some(ro), Some(rt)) = (all_readings(&b, &o, 64), all_readings(&b, &t, 64)) else {
+        return false;
+    };
+    ro.iter().all(|ao| {
+        rt.iter()
+            .all(|at| plain_merge(&b, [(&o, ao), (&t, at)], ours_first).as_deref() == Some(merged))
+    })
+}
+
+/// How often each line (not blank) is in `x`, by content.
+fn count(x: &[&str]) -> HashMap<String, usize> {
+    let mut n: HashMap<String, usize> = HashMap::new();
+    for l in x.iter().filter(|l| !blank(l)) {
+        *n.entry(content(l).to_string()).or_default() += 1;
+    }
+    n
+}
+
+/// The checks that take nothing from the merge, for a clean line merge
+/// `merged` of `base`, `ours` and `theirs` (`ours_first`: ours is the older
+/// side). At least as strict as the merge's own check, written apart from it:
 ///
 /// - each anchor (a line, not blank, each of the three has once with the same
-///   text, in an order all three keep) is in the merge once, in that order;
+///   text, in every longest run rising in all of them) is in the merge once,
+///   in that order;
+/// - a line (not blank) neither side has more often than the base is not in
+///   the merge more often than in both sides; one neither side has less often,
+///   not less often than in either;
+/// - a line a side has more often than the base between two anchors and less
+///   often between two others (it may have moved): the other side changed
+///   neither how often it is in those stretches nor the lines right around it
+///   where it left;
 /// - between anchors, where one side's stretch is the base's, the merge's is
 ///   the other side's (where both sides' are the same, that), byte for byte;
-/// - no line is there more often than both sides have it together;
-/// - where both sides changed a stretch differently, and no line moved
-///   between stretches: each side's lines it has once (and the base and the
-///   other side at most once) keep that side's order.
-pub fn independent(base: &str, ours: &str, theirs: &str, merged: &str) -> Result<(), String> {
+/// - where both changed it differently: every pair of longest common
+///   subsequences of each side's stretch with the base's merges by the
+///   placement rules ([`plain_merge`]) to the merge's stretch, byte for byte;
+///   no line one side moved within the stretch (removed, and has elsewhere)
+///   that the other removed;
+///   not one side's stretch with lines added unless the merge is that (where
+///   that side's change added lines, not only deleted); no
+///   base line kept by one side right beside its own change, that the other
+///   side removed, where the one has every line the other added.
+pub fn independent(base: &str, ours: &str, theirs: &str, merged: &str, ours_first: bool) -> Result<(), String> {
     let (b, o, t, m) = (lines(base), lines(ours), lines(theirs), lines(merged));
     let an = anchors([&b, &o, &t]);
     let mut at_m = Vec::new();
@@ -433,23 +530,23 @@ pub fn independent(base: &str, ours: &str, theirs: &str, merged: &str) -> Result
             }
         }
     }
-    // No line more often than both sides have it together.
-    let count = |x: &[&str]| {
-        let mut n: HashMap<String, usize> = HashMap::new();
-        for l in x.iter().filter(|l| !blank(l)) {
-            *n.entry(content(l).to_string()).or_default() += 1;
+    let (nb, no, nt, nm) = (count(&b), count(&o), count(&t), count(&m));
+    let get = |n: &HashMap<String, usize>, l: &str| n.get(l).copied().unwrap_or(0);
+    for l in nb.keys().chain(no.keys()).chain(nt.keys()).chain(nm.keys()) {
+        let (x, y, z, w) = (get(&nb, l), get(&no, l), get(&nt, l), get(&nm, l));
+        if y <= x && z <= x && w > y.max(z) {
+            return Err(format!(
+                "{l:?} is there {w}x; neither side added it, they have {y}x and {z}x"
+            ));
         }
-        n
-    };
-    let (no, nt, nm) = (count(&o), count(&t), count(&m));
-    for (l, &k) in &nm {
-        if k > no.get(l).copied().unwrap_or(0) + nt.get(l).copied().unwrap_or(0) {
-            return Err(format!("{l:?} is there {k}x, more than both sides together"));
+        if y >= x && z >= x && w < y.max(z) {
+            return Err(format!(
+                "{l:?} is there {w}x; neither side removed it, they have {y}x and {z}x"
+            ));
         }
     }
     let gaps = stretches([&b, &o, &t], &an);
-    // A line a side has more often than the base in one stretch and less
-    // often in another may have moved between them: order is not judged.
+    // Moves: per line, per stretch, how often each text has it.
     let mut per: HashMap<String, Vec<[usize; 3]>> = HashMap::new();
     for (g, r) in gaps.iter().enumerate() {
         for (k, text) in [&b, &o, &t].into_iter().enumerate() {
@@ -459,126 +556,297 @@ pub fn independent(base: &str, ours: &str, theirs: &str, merged: &str) -> Result
             }
         }
     }
-    let moved = per.values().any(|v| {
-        [1, 2]
-            .iter()
-            .any(|&k| v.iter().any(|c| c[k] > c[0]) && v.iter().any(|c| c[k] < c[0]))
-    });
+    for (l, v) in &per {
+        for k in [1, 2] {
+            let mover = v.iter().any(|c| c[k] > c[0]) && v.iter().any(|c| c[k] < c[0]);
+            if !mover {
+                continue;
+            }
+            for (g, c) in v.iter().enumerate() {
+                let other = 3 - k;
+                if c[k] == c[0] {
+                    continue;
+                }
+                // Where the other side changed the stretch: from its first
+                // to its last line that differs from the base, one more each
+                // way.
+                let r = &gaps[g];
+                let (sb, so) = (&b[r[0].clone()], &[&o, &t][other - 1][r[other].clone()]);
+                let first = (0..sb.len().max(so.len())).find(|&i| sb.get(i) != so.get(i));
+                let touched = first.is_some_and(|f| {
+                    let back = (0..sb.len().max(so.len()))
+                        .find(|&i| {
+                            sb.len().checked_sub(i + 1).map(|x| sb[x]) != so.len().checked_sub(i + 1).map(|x| so[x])
+                        })
+                        .unwrap_or(0);
+                    let last = sb.len().saturating_sub(back).max(f);
+                    (f.saturating_sub(1)..(last + 1).min(sb.len())).any(|i| content(sb[i]) == l)
+                });
+                if c[other] != c[0] || (c[k] < c[0] && touched) {
+                    return Err(format!(
+                        "{l:?} may have moved through stretch {g}, where the other side changed it"
+                    ));
+                }
+            }
+        }
+    }
+    // Stretches are judged between the anchors left once moved blank lines
+    // join two (see `joined`).
+    let firm = joined([&b, &o, &t], &an);
+    let at_m: Vec<usize> = an
+        .iter()
+        .zip(&at_m)
+        .filter(|(a, _)| firm.contains(a))
+        .map(|(_, &i)| i)
+        .collect();
+    let an = firm;
+    let gaps = stretches([&b, &o, &t], &an);
     for (g, [rb, ro, rt]) in gaps.into_iter().enumerate() {
         let (sb, so, st) = (&b[rb], &o[ro], &t[rt]);
         let rm = if g == 0 { 0 } else { at_m[g - 1] + 1 }..if g == an.len() { m.len() } else { at_m[g] };
         let sm = &m[rm];
-        let want = if so == sb {
-            Some(st)
-        } else if st == sb || so == st {
-            Some(so)
-        } else {
-            None
-        };
-        // A side that only added the newline to the base's last line is
-        // judged as the merge's own checks judge it, not here.
+        let ctx = [(g > 0).then(|| b[an[g - 1][0]]), (g < an.len()).then(|| b[an[g][0]])];
+        // A side that only added the newline to the base's last line changed
+        // nothing: the other side's stretch, with that line's newline.
         let newline_only = |x: &[&str]| {
             sb.last().is_some_and(|l| !l.ends_with('\n'))
                 && x.len() == sb.len()
-                && x.iter().zip(sb.iter()).all(|(a, c)| content(a) == content(c))
+                && x[..x.len() - 1] == sb[..sb.len() - 1]
+                && content(x[x.len() - 1]) == content(sb[sb.len() - 1])
+        };
+        let with_newline = |x: &[&'_ str], from: &[&'_ str]| -> String {
+            let mut v: Vec<&str> = x.to_vec();
+            if v.last() == sb.last() {
+                let n = v.len();
+                v[n - 1] = from[from.len() - 1];
+            }
+            v.concat()
+        };
+        // ... unless the other side gave that line another line end.
+        let clash = |x: &[&str], from: &[&str]| {
+            let last = sb.last().map(|l| content(l));
+            x.iter()
+                .any(|l| l.ends_with('\n') && Some(content(l)) == last && *l != from[from.len() - 1])
+        };
+        let want = if so == sb {
+            Some(st.concat())
+        } else if st == sb || so == st {
+            Some(so.concat())
+        } else if newline_only(so) && !clash(st, so) {
+            Some(with_newline(st, so))
+        } else if newline_only(st) && !clash(so, st) {
+            Some(with_newline(so, st))
+        } else {
+            None
         };
         match want {
-            Some(w) if w != sm => {
+            Some(w) if w != sm.concat() => {
                 return Err(format!(
                     "stretch {g}: one side changed it, but the merge has {sm:?}, not {w:?}"
                 ));
             }
             Some(_) => {}
-            None if newline_only(so) || newline_only(st) => {}
-            None if moved => {}
-            None => contested(sb, so, st, sm).map_err(|e| format!("stretch {g}: {e}"))?,
+            None => contested(ctx, sb, so, st, sm, ours_first).map_err(|e| format!("stretch {g}: {e}"))?,
         }
     }
     Ok(())
 }
 
 /// The checks of [`independent`] for a stretch both sides changed.
-fn contested(b: &[&str], o: &[&str], t: &[&str], m: &[&str]) -> Result<(), String> {
-    let count = |x: &[&str]| {
-        let mut n: HashMap<String, usize> = HashMap::new();
-        for l in x.iter().filter(|l| !blank(l)) {
-            *n.entry(content(l).to_string()).or_default() += 1;
-        }
-        n
+fn contested(
+    ctx: [Option<&str>; 2],
+    b: &[&str],
+    o: &[&str],
+    t: &[&str],
+    m: &[&str],
+    ours_first: bool,
+) -> Result<(), String> {
+    let sub = |short: &[&str], long: &[&str]| {
+        let mut it = long.iter();
+        short.iter().all(|s| it.any(|l| l == s))
     };
-    let (nb, no, nt, nm) = (count(b), count(o), count(t), count(m));
-    let get = |n: &HashMap<String, usize>, l: &str| n.get(l).copied().unwrap_or(0);
-    // A line the side has once is its own in the merge where neither the
-    // base nor the other side has it more than once.
-    for (name, side, n, other) in [("ours", o, &no, &nt), ("theirs", t, &nt, &no)] {
-        let mut order: Vec<(usize, usize)> = Vec::new();
-        for (i, l) in side.iter().enumerate().filter(|(_, l)| !blank(l)) {
-            let c = content(l);
-            if n[c] == 1 && get(&nm, c) == 1 && get(&nb, c) <= 1 && get(other, c) <= 1 {
-                order.push((i, m.iter().position(|x| content(x) == c).expect("counted")));
+    if (!sub(t, b) && sub(t, o) && m != o) || (!sub(o, b) && sub(o, t) && m != t) {
+        return Err("a side is the other's with lines added, and the merge is not that".into());
+    }
+    let (Some(ro), Some(rt)) = (all_readings(b, o, 64), all_readings(b, t, 64)) else {
+        return Err("too many readings to judge: should be open".into());
+    };
+    let holds = |other: &[&str], mine: &[&str]| {
+        let (nb, no, nm) = (count(b), count(other), count(mine));
+        no.iter()
+            .all(|(l, &k)| k <= nb.get(l).copied().unwrap_or(0) || nm.get(l).copied().unwrap_or(0) >= k)
+    };
+    let (ho, ht) = (holds(t, o), holds(o, t));
+    for ao in &ro {
+        for at in &rt {
+            if (ho && typed_back(ctx, b, o, ao, at, t, m)) || (ht && typed_back(ctx, b, t, at, ao, o, m)) {
+                return Err("a side keeps beside its change a line the other removed".into());
             }
-        }
-        if order.windows(2).any(|w| w[0].1 > w[1].1) {
-            return Err(format!("{name}'s lines out of their order"));
+            // A line one side removed and put elsewhere in the stretch, that
+            // the other side removed too: a move against a deletion.
+            let moved = |s: &[&str], al: &[Option<usize>], i: usize| {
+                al[i].is_none()
+                    && !blank(b[i])
+                    && changes(b.len(), s, al)
+                        .iter()
+                        .any(|(_, lines)| lines.iter().any(|l| content(l) == content(b[i])))
+            };
+            if (0..b.len()).any(|i| ao[i].is_none() && at[i].is_none() && (moved(o, ao, i) || moved(t, at, i))) {
+                return Err("a line one side moved, the other removed".into());
+            }
+            match plain_merge(b, [(o, ao), (t, at)], ours_first) {
+                Some(x) if x == m.concat() => {}
+                Some(x) => return Err(format!("a reading merges to {x:?}, not to the merge")),
+                None => return Err("a reading conflicts".into()),
+            }
         }
     }
     Ok(())
 }
 
-/// The longest common subsequences of `b` and `s` that match lines as early,
-/// or as late, as they can: for each base line, the side's line that keeps it.
-/// The base's last line without its newline is the side's line with one.
-fn readings(b: &[&str], s: &[&str]) -> Vec<Vec<Option<usize>>> {
-    let (n, m) = (b.len(), s.len());
-    let eq =
-        |i: usize, j: usize| b[i] == s[j] || (i + 1 == n && !b[i].ends_with('\n') && content(b[i]) == content(s[j]));
-    let w = m + 1;
-    let mut l = vec![0u32; (n + 1) * w];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            l[i * w + j] = if eq(i, j) {
-                l[(i + 1) * w + j + 1] + 1
-            } else {
-                l[(i + 1) * w + j].max(l[i * w + j + 1])
-            };
+/// Whether `mine`, by its reading `al`, keeps a base line the `other` reading
+/// of the other side's lines `theirs` deleted (removed, adding nothing but
+/// blank lines) or replaced with lines `mine` inserted right there, with a
+/// change of its own next to it (blank lines between do not
+/// part them); a blank line only where it would part two lines `m` (with the
+/// anchors `ctx` around it) has together.
+fn typed_back(
+    ctx: [Option<&str>; 2],
+    b: &[&str],
+    mine: &[&str],
+    al: &[Option<usize>],
+    other: &[Option<usize>],
+    theirs: &[&str],
+    m: &[&str],
+) -> bool {
+    let n = b.len();
+    // The side's changes, as base ranges with whether they insert lines.
+    let mut ch: Vec<(Range<usize>, bool)> = Vec::new();
+    let (mut pi, mut pj) = (0usize, 0usize);
+    for (i, j) in al
+        .iter()
+        .enumerate()
+        .filter_map(|(i, j)| j.map(|j| (i, j)))
+        .chain([(n, mine.len())])
+    {
+        if i > pi || j > pj {
+            ch.push((pi..i, j > pj));
+        }
+        pi = i + 1;
+        pj = j + 1;
+    }
+    let near = |i: usize| -> bool {
+        let lo = (0..i).rev().find(|&j| !blank(b[j]));
+        let hi = (i + 1..n).find(|&j| !blank(b[j]));
+        let first = lo.unwrap_or(0);
+        let last = hi.unwrap_or(n - 1);
+        if (first..=last).any(|j| j != i && al[j].is_none()) {
+            return true;
+        }
+        let (g0, g1) = (lo.map_or(0, |l| l + 1), hi.unwrap_or(n));
+        ch.iter()
+            .any(|(r, ins)| *ins && ((g0..=g1).contains(&r.start) || (g0..=g1).contains(&r.end)))
+    };
+    let all: Vec<&str> = ctx[0].into_iter().chain(m.iter().copied()).chain(ctx[1]).collect();
+    // For each base line the other reading removed, the lines (not blank)
+    // of the change that removed it.
+    let mut cut: Vec<Option<Vec<&str>>> = vec![None; n];
+    for (r, added) in changes(n, theirs, other) {
+        let new: Vec<&str> = added.into_iter().filter(|l| !blank(l)).collect();
+        for x in r {
+            cut[x] = Some(new.clone());
         }
     }
-    let mut out: Vec<Vec<Option<usize>>> = Vec::new();
-    for way in 0..4 {
-        let (mut i, mut j) = (0, 0);
-        let mut al = vec![None; n];
-        while i < n && j < m {
-            let here = l[i * w + j];
-            let (skip_b, skip_s) = (l[(i + 1) * w + j] == here, l[i * w + j + 1] == here);
-            let take = eq(i, j) && l[(i + 1) * w + j + 1] + 1 == here;
-            let step = match way {
-                0 if take => 0,
-                0 if skip_b => 1,
-                0 => 2,
-                1 if take => 0,
-                1 if skip_s => 2,
-                1 => 1,
-                2 if skip_b => 1,
-                2 if skip_s => 2,
-                3 if skip_s => 2,
-                3 if skip_b => 1,
-                _ => 0,
-            };
-            match step {
-                0 => {
-                    al[i] = Some(j);
-                    i += 1;
-                    j += 1;
-                }
-                1 => i += 1,
-                _ => j += 1,
+    // Whether `mine` inserted (removing nothing) all of `new` at a gap in
+    // g0..=g1.
+    let inserted_here = |new: &[&str], g0: usize, g1: usize| {
+        changes(n, mine, al).into_iter().any(|(r, lines)| {
+            let have = count(&lines);
+            r.is_empty()
+                && (g0..=g1).contains(&r.start)
+                && count(new).iter().all(|(k, v)| have.get(k).copied().unwrap_or(0) >= *v)
+        })
+    };
+    (0..n).any(|i| {
+        let Some(x) = al[i] else { return false };
+        let Some(new) = &cut[i] else { return false };
+        if !near(i) {
+            return false;
+        }
+        if !new.is_empty() {
+            let lo = (0..i).rev().find(|&j| !blank(b[j]));
+            let hi = (i + 1..n).find(|&j| !blank(b[j]));
+            if !inserted_here(new, lo.map_or(0, |l| l + 1), hi.unwrap_or(n)) {
+                return false;
             }
         }
-        if !out.contains(&al) {
-            out.push(al);
+        if !blank(b[i]) {
+            return true;
+        }
+        let p = mine[..x].iter().rev().find(|l| !blank(l)).copied().or(ctx[0]);
+        let q = mine[x + 1..].iter().find(|l| !blank(l)).copied().or(ctx[1]);
+        p.zip(q).is_some_and(|(p, q)| {
+            all.windows(2)
+                .any(|w| content(w[0]) == content(p) && content(w[1]) == content(q))
+        })
+    })
+}
+
+/// Every longest common subsequence of `b` and `s` (for each base line, the
+/// side's line that keeps it), or `None` past `cap`. Lines match where equal,
+/// or the same but for the newline one lacks.
+fn all_readings(b: &[&str], s: &[&str], cap: usize) -> Option<Vec<Vec<Option<usize>>>> {
+    let (n, m) = (b.len(), s.len());
+    let mut l = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            l[i][j] = if same_line(b[i], s[j]) {
+                l[i + 1][j + 1] + 1
+            } else {
+                l[i + 1][j].max(l[i][j + 1])
+            };
         }
     }
-    out
+    // The next matched pair, every way: any (x, y) at or after (i, j) that
+    // starts a longest common subsequence of what is left.
+    fn rec(
+        b: &[&str],
+        s: &[&str],
+        l: &[Vec<usize>],
+        (i, j): (usize, usize),
+        cur: &mut Vec<(usize, usize)>,
+        out: &mut Vec<Vec<Option<usize>>>,
+        cap: usize,
+    ) -> bool {
+        let here = l[i][j];
+        if here == 0 {
+            let mut al = vec![None; b.len()];
+            for &(x, y) in cur.iter() {
+                al[x] = Some(y);
+            }
+            out.push(al);
+            return out.len() <= cap;
+        }
+        for x in i..b.len() {
+            for y in j..s.len() {
+                // (x, y) as the first pair of a longest one of what is left.
+                if same_line(b[x], s[y]) && l[x + 1][y + 1] + 1 == here {
+                    cur.push((x, y));
+                    let ok = rec(b, s, l, (x + 1, y + 1), cur, out, cap);
+                    cur.pop();
+                    if !ok {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+    let mut out = Vec::new();
+    if !rec(b, s, &l, (0, 0), &mut Vec::new(), &mut out, cap) {
+        return None;
+    }
+    Some(out)
 }
 
 /// A side's changes by an alignment: (base range, side lines).
@@ -602,84 +870,203 @@ fn changes<'a>(n: usize, s: &[&'a str], al: &[Option<usize>]) -> Changes<'a> {
     out
 }
 
-/// The plain three-way merge of one reading: changes of the two sides placed
-/// by base position; the same change once; two insertions at one point once
-/// where one is the other or a whole prefix or suffix of it, else whole, the
-/// older first; an insertion at the edge of the other side's replacement,
-/// sharing no line with it, beside it. Anything else that touches: `None`.
+/// The plain three-way merge of one reading of each side, by the placement
+/// rules; `None` where they say conflict:
+///
+/// - changes of the two sides that touch the same base lines (overlap, an
+///   insertion strictly inside the other's lines, two insertions at one
+///   point) are one region. One change alone is taken. Two insertions at one
+///   point: one where one is the other or a whole prefix or suffix of it (the
+///   longer); a conflict where one has every line (not blank) of the other, or
+///   one is blank lines only; else both, the older side's first. Only
+///   deletions: every line either deleted goes. The same change of the same
+///   lines on both sides: once. Anything else: a conflict.
+/// - regions are placed by base position, an insertion before a change at its
+///   point. Where two meet at one point: an insertion of one side at the
+///   near end of the other's replacement, whose lines end (or begin) with
+///   exactly it, is taken once; otherwise sharing a line (a blank line too)
+///   is a conflict.
+///   Two insertions of the two sides with only blank lines between them may
+///   not share a line that is not blank.
+/// - a base line both kept is the copy whose line end a side changed (its
+///   last line), or that has one where the base's lacks it (two different
+///   ones: a conflict).
+/// - a line after a line without its newline: a conflict.
 fn plain_merge<'a>(b: &[&'a str], sides: [(&[&'a str], &[Option<usize>]); 2], ours_first: bool) -> Option<String> {
     let n = b.len();
     let mut all: Vec<(Range<usize>, Vec<&str>, usize)> = Vec::new();
     for (x, (s, al)) in sides.iter().enumerate() {
         all.extend(changes(n, s, al).into_iter().map(|(r, l)| (r, l, x)));
     }
-    all.sort_by_key(|c| (c.0.start, c.0.end, c.2));
-    let edge = |ins: &(Range<usize>, Vec<&str>, usize), rep: &(Range<usize>, Vec<&str>, usize)| {
-        ins.0.is_empty()
-            && !rep.0.is_empty()
-            && !rep.1.is_empty()
-            && (ins.0.start == rep.0.start || ins.0.start == rep.0.end)
-            && !ins.1.iter().any(|l| rep.1.iter().any(|r| content(r) == content(l)))
+    let touch = |p: &Range<usize>, q: &Range<usize>| match (p.is_empty(), q.is_empty()) {
+        (false, false) => p.start < q.end && q.start < p.end,
+        (true, false) => q.start < p.start && p.start < q.end,
+        (false, true) => p.start < q.start && q.start < p.end,
+        (true, true) => p.start == q.start,
     };
-    let mut out: Vec<&str> = Vec::new();
-    let (mut p, mut k) = (0, 0);
-    while k < all.len() {
-        let c = &all[k];
-        let next = all.get(k + 1).filter(|d| d.0.start <= c.0.end && d.2 != c.2);
-        let Some(d) = next else {
-            out.extend(&b[p..c.0.start]);
-            out.extend(c.1.iter());
-            p = c.0.end;
-            k += 1;
-            continue;
-        };
-        if all.get(k + 2).is_some_and(|e| e.0.start <= c.0.end.max(d.0.end)) {
-            return None;
+    // Regions: changes joined while any two of different sides touch.
+    let mut region: Vec<usize> = (0..all.len()).collect();
+    loop {
+        let mut again = false;
+        for x in 0..all.len() {
+            for y in 0..all.len() {
+                if all[x].2 != all[y].2 && region[x] != region[y] && touch(&all[x].0, &all[y].0) {
+                    let (keep, drop) = (region[x].min(region[y]), region[x].max(region[y]));
+                    for r in region.iter_mut().filter(|r| **r == drop) {
+                        *r = keep;
+                    }
+                    again = true;
+                }
+            }
         }
-        out.extend(&b[p..c.0.start.min(d.0.start)]);
-        if c.0 == d.0 && c.1 == d.1 {
-            out.extend(c.1.iter());
-        } else if c.0.is_empty() && d.0.is_empty() {
-            let (f, s) = if (c.2 == 0) == ours_first {
-                (&c.1, &d.1)
-            } else {
-                (&d.1, &c.1)
+        if !again {
+            break;
+        }
+    }
+    let mut ids: Vec<usize> = region.clone();
+    ids.sort();
+    ids.dedup();
+    // (base range, lines, the one side that made it alone)
+    let mut pieces: Vec<(Range<usize>, Vec<&str>, Option<usize>)> = Vec::new();
+    for id in ids {
+        let mine: Vec<&(Range<usize>, Vec<&str>, usize)> =
+            (0..all.len()).filter(|&x| region[x] == id).map(|x| &all[x]).collect();
+        let lo = mine.iter().map(|c| c.0.start).min().unwrap();
+        let hi = mine.iter().map(|c| c.0.end).max().unwrap();
+        if mine.len() == 1 {
+            pieces.push((mine[0].0.clone(), mine[0].1.clone(), Some(mine[0].2)));
+        } else if mine.len() == 2 && mine.iter().all(|c| c.0.is_empty()) {
+            let run = |s: usize| &mine.iter().find(|c| c.2 == s).unwrap().1;
+            let (f, s) = if ours_first { (run(0), run(1)) } else { (run(1), run(0)) };
+            let shared = |long: &Vec<&'a str>, short: &Vec<&'a str>| -> Option<Vec<&'a str>> {
+                if short.len() > long.len() {
+                    return None;
+                }
+                for at in [0, long.len() - short.len()] {
+                    if long[at..at + short.len()]
+                        .iter()
+                        .zip(short)
+                        .all(|(p, q)| same_line(p, q))
+                    {
+                        let mut v = long.clone();
+                        for (y, q) in short.iter().enumerate() {
+                            if !v[at + y].ends_with('\n') {
+                                v[at + y] = q;
+                            }
+                        }
+                        return Some(v);
+                    }
+                }
+                None
             };
-            let held = |long: &Vec<&str>, short: &Vec<&str>| long.starts_with(short) || long.ends_with(short);
-            if held(f, s) {
-                out.extend(f.iter());
-            } else if held(s, f) {
-                out.extend(s.iter());
+            let has_all = |long: &Vec<&str>, short: &Vec<&str>| {
+                let (cl, cs) = (count(long), count(short));
+                !cs.is_empty() && cs.iter().all(|(k, v)| cl.get(k).copied().unwrap_or(0) >= *v)
+            };
+            let v = if let Some(v) = shared(s, f).or_else(|| shared(f, s)) {
+                v
+            } else if has_all(f, s) || has_all(s, f) || f.iter().all(|l| blank(l)) || s.iter().all(|l| blank(l)) {
+                return None;
             } else {
-                out.extend(f.iter().chain(s.iter()));
-            }
-        } else if edge(c, d) || edge(d, c) {
-            let (ins, rep) = if c.0.is_empty() { (c, d) } else { (d, c) };
-            if ins.0.start == rep.0.start {
-                out.extend(ins.1.iter().chain(rep.1.iter()));
-            } else {
-                out.extend(rep.1.iter().chain(ins.1.iter()));
-            }
+                f.iter().chain(s.iter()).copied().collect()
+            };
+            pieces.push((lo..lo, v, None));
+        } else if mine.iter().all(|c| c.1.is_empty()) {
+            let gone = |p: usize| mine.iter().any(|c| c.0.contains(&p));
+            pieces.push((lo..hi, (lo..hi).filter(|&p| !gone(p)).map(|p| b[p]).collect(), None));
+        } else if mine.len() == 2
+            && mine[0].0 == mine[1].0
+            && mine[0].1.len() == mine[1].1.len()
+            && mine[0].1.iter().zip(&mine[1].1).all(|(p, q)| same_line(p, q))
+        {
+            let v = mine[0]
+                .1
+                .iter()
+                .zip(&mine[1].1)
+                .map(|(p, q)| if p.ends_with('\n') { *p } else { *q })
+                .collect();
+            pieces.push((lo..hi, v, None));
         } else {
             return None;
         }
-        p = c.0.end.max(d.0.end);
-        k += 2;
     }
-    out.extend(&b[p..]);
-    // The base's last line without its newline, kept by both: with one where
-    // a side has it.
-    if let (Some(last), Some(Some(j)), Some(Some(k))) = (b.last(), sides[0].1.last(), sides[1].1.last()) {
-        if !last.ends_with('\n') {
-            let pick = if sides[0].0[*j].ends_with('\n') {
-                sides[0].0[*j]
-            } else {
-                sides[1].0[*k]
-            };
-            if let Some(x) = out.iter().rposition(|l| std::ptr::eq(*l, *last)) {
-                out[x] = pick;
+    pieces.sort_by_key(|p| (p.0.start, p.0.end));
+    let mut k = 1;
+    while k < pieces.len() {
+        let (u, v) = (&pieces[k - 1], &pieces[k]);
+        if u.0.end != v.0.start {
+            k += 1;
+            continue;
+        }
+        if let (Some(su), Some(sv)) = (u.2, v.2) {
+            if su != sv && u.0.is_empty() != v.0.is_empty() {
+                let (ins, rep) = if u.0.is_empty() { (k - 1, k) } else { (k, k - 1) };
+                let (i, r) = (pieces[ins].1.clone(), pieces[rep].1.clone());
+                let at_end = ins == k;
+                let off = if at_end { r.len().checked_sub(i.len()) } else { Some(0) };
+                if let Some(off) = off.filter(|_| !i.is_empty() && i.len() <= r.len()) {
+                    if r[off..off + i.len()].iter().zip(&i).all(|(p, q)| same_line(p, q)) {
+                        for (y, q) in i.iter().enumerate() {
+                            if !pieces[rep].1[off + y].ends_with('\n') {
+                                pieces[rep].1[off + y] = q;
+                            }
+                        }
+                        pieces[rep].2 = None;
+                        pieces.remove(ins);
+                        continue;
+                    }
+                }
             }
         }
+        let (u, v) = (&pieces[k - 1], &pieces[k]);
+        if u.1.iter().any(|p| v.1.iter().any(|q| content(p) == content(q))) {
+            return None;
+        }
+        k += 1;
+    }
+    // Only blank lines between two insertions of the two sides: they meet
+    // too, and may not share a line that is not blank.
+    for w in pieces.windows(2) {
+        let (u, v) = (&w[0], &w[1]);
+        let two = u.0.is_empty() && v.0.is_empty() && u.2.is_some() && v.2.is_some() && u.2 != v.2;
+        if two && u.0.end < v.0.start && b[u.0.end..v.0.start].iter().all(|l| blank(l)) {
+            let shared =
+                u.1.iter()
+                    .filter(|p| !blank(p))
+                    .any(|p| v.1.iter().any(|q| content(p) == content(q)));
+            if shared {
+                return None;
+            }
+        }
+    }
+    let kept = |i: usize| -> Option<&str> {
+        let (Some(j), Some(k)) = (sides[0].1[i], sides[1].1[i]) else {
+            return Some(b[i]);
+        };
+        let (x, y) = (sides[0].0[j], sides[1].0[k]);
+        if b[i].ends_with('\n') {
+            let changed = |c: &str| !c.ends_with('\n');
+            return Some(if changed(x) { x } else { y });
+        }
+        // The base's last line, without a line end: each side may give it
+        // one; two different ones conflict.
+        match (x.ends_with('\n'), y.ends_with('\n')) {
+            (true, true) if x != y => None,
+            (true, _) => Some(x),
+            _ => Some(y),
+        }
+    };
+    let mut out: Vec<&str> = Vec::new();
+    let mut p = 0;
+    for (r, l, _) in &pieces {
+        for i in p..r.start {
+            out.push(kept(i)?);
+        }
+        out.extend(l.iter().copied());
+        p = r.end;
+    }
+    for i in p..n {
+        out.push(kept(i)?);
     }
     if out.iter().rev().skip(1).any(|l| !l.ends_with('\n')) {
         return None;
@@ -695,14 +1082,16 @@ fn plain_merge<'a>(b: &[&'a str], sides: [(&[&'a str], &[Option<usize>]); 2], ou
 ///   or blank lines before the first line or after the last);
 /// - between anchors, L's stretch is the base's (the writer's change there is
 ///   one no text shows, so R2's stretch is the only right merge);
-/// - the texts read as a stale writer's: under some longest common
-///   subsequence of each side with the base, the two sides' changes do not
-///   touch (or one is an insertion beside the other's edit, sharing no line),
-///   and their plain three-way merge is the merge, up to blank lines in a
-///   row; and no other such reading merges to anything else;
+/// - the texts read as a stale writer's: every pair of longest common
+///   subsequences of each side with the base that merges by the placement
+///   rules ([`plain_merge`]) gives the merge, up to blank lines in a row, and
+///   one does; and no stretch both changed, where R2 added lines and has
+///   them all in L's stretch, in order (L may be R2 with lines of its own),
+///   is other than L's in the merge;
 /// - L restores lines R2 removed (or a paragraph break R2 removed), in place
-///   (between the lines the base has around it): the guard undoing a revert of
-///   a change that arrived moments before is the false positive D10 accepts.
+///   (between the lines the base has around it), or removed a paragraph
+///   break R2 added: the guard undoing a revert of a change that arrived
+///   moments before is the false positive D10 accepts.
 pub fn guard(base: &str, l: &str, r2: &str, merged: &str, l_first: bool) -> Result<(), String> {
     let sm = shape(merged);
     if merged == l || sm == shape(l) {
@@ -725,9 +1114,34 @@ pub fn guard(base: &str, l: &str, r2: &str, merged: &str, l_first: bool) -> Resu
     if shape(&forced) == sm {
         return Ok(());
     }
-    let mut stale = (false, true);
-    for ao in readings(&b, &o) {
-        for at in readings(&b, &t) {
+    // R2's lines all in L, in order, in each stretch both changed: L may be
+    // R2 with the writer's lines on top, so it reads as no stale writer.
+    let in_order = |short: &[&str], long: &[&str]| {
+        let mut it = long.iter();
+        short.iter().all(|s| it.any(|l| l == s))
+    };
+    // Where each anchor is in the merge (once and in order, or no verdict).
+    let m = lines(merged);
+    let mut at_m = Vec::new();
+    for a in &an {
+        match (0..m.len()).filter(|&i| m[i] == b[a[0]]).collect::<Vec<_>>()[..] {
+            [i] if at_m.last().is_none_or(|&p| p < i) => at_m.push(i),
+            _ => break,
+        }
+    }
+    let holds_r2 = at_m.len() == an.len()
+        && stretches([&b, &o, &t], &an)
+            .into_iter()
+            .enumerate()
+            .any(|(g, [rb, ro, rt])| {
+                let rm = if g == 0 { 0 } else { at_m[g - 1] + 1 }..if g == an.len() { m.len() } else { at_m[g] };
+                let (sb, so, st) = (&b[rb], &o[ro], &t[rt]);
+                so != sb && st != sb && !in_order(st, sb) && in_order(st, so) && m[rm] != *so
+            });
+    let mut stale = (false, !holds_r2);
+    let all = |s: &[&str]| all_readings(&b, s, 64).unwrap_or_default();
+    for ao in all(&o) {
+        for at in all(&t) {
             if let Some(r) = plain_merge(&b, [(&o, &ao), (&t, &at)], l_first) {
                 let same = shape(&r) == sm;
                 stale = (stale.0 || same, stale.1 && same);
@@ -784,11 +1198,12 @@ pub fn guard(base: &str, l: &str, r2: &str, merged: &str, l_first: bool) -> Resu
     if sl.len() == sm.len()
         && sl.iter().zip(&sm).all(|(x, y)| x.1 == y.1)
         && (1..sl.len()).all(|i| {
+            let (a, c) = (&sl[i - 1].1, &sl[i].1);
             sl[i].0 == sm[i].0
-                || (sl[i].0
-                    && !sm[i].0
-                    && pair(&pb, &sl[i - 1].1, &sl[i].1, true)
-                    && pair(&pr, &sl[i - 1].1, &sl[i].1, false))
+                // L restored a paragraph break R2 removed,
+                || (sl[i].0 && !sm[i].0 && pair(&pb, a, c, true) && pair(&pr, a, c, false))
+                // or removed one R2 added.
+                || (!sl[i].0 && sm[i].0 && pair(&pr, a, c, true) && !pair(&pb, a, c, true))
         })
     {
         return Ok(());

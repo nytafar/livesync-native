@@ -287,7 +287,7 @@ fn passes_oracle(c: &Case, ours_mtime: i64, theirs_mtime: i64) -> Result<(), Tes
         prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, written);
     }
     if let Some(m) = &written {
-        if let Err(e) = oracle::independent(&c.base, &c.ours, &c.theirs, m) {
+        if let Err(e) = oracle::independent(&c.base, &c.ours, &c.theirs, m, ours_first) {
             prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, written);
         }
     }
@@ -1043,9 +1043,9 @@ enum Stream {
 ///
 /// Three things no merge can see are left out, as the texts would show
 /// another history: the writer changing a line R2 has more than once (which
-/// copy?), the writer copying a line and changing the original (a move that
-/// reads as two separate edits), and an R1 ending in an empty line without a
-/// final newline (the text has no such line).
+/// copy?), the writer copying a line (or typing it again) and changing the
+/// original (a move that reads as two separate edits), and an R1 ending in an
+/// empty line without a final newline (the text has no such line).
 fn guard_stream(stream: Stream) -> impl Strategy<Value = (Case, bool)> {
     const PLAIN: &[&str] = &["", "", "", "---", "u", "u", "u", "u", "u", "u", "u", "u"];
     const COPIES: &[&str] = &["", "", "", "---", "- x", "u", "u", "u", "u", "u"];
@@ -1121,8 +1121,15 @@ fn guard_stream(stream: Stream) -> impl Strategy<Value = (Case, bool)> {
                 for (op, i, w, j) in &writer {
                     match op {
                         0 => {
+                            // A line typed again (the text of a line the
+                            // writer changed, or will) is a copy too.
+                            let new = word(w);
+                            if changed.contains(&new) {
+                                continue;
+                            }
+                            copied.push(new.clone());
                             let at = i.index(l.len() + 1);
-                            l.insert(at, (word(w), false));
+                            l.insert(at, (new, false));
                         }
                         3 => {
                             let copy = match stream {
@@ -1195,6 +1202,689 @@ proptest! {
                 }
                 Outcome::Keep(_) => prop_assert!(false),
                 _ => {}
+            }
+        }
+    }
+}
+
+/// A stale writer: R2 and L are each R1 with edits of their own (L never saw
+/// R2). Lines from `---`, blank lines, a recurring `- x` and unique lines;
+/// each side inserts (fresh lines or copies), deletes, edits and moves lines.
+fn stale_case() -> impl Strategy<Value = (Case, bool)> {
+    const POOL: &[&str] = &["", "", "---", "- x", "- x", "u", "u", "u", "u", "u"];
+    type Edits = Vec<(u8, prop::sample::Index, &'static str, prop::sample::Index)>;
+    let edits = || {
+        prop::collection::vec(
+            (
+                0..5u8,
+                any::<prop::sample::Index>(),
+                prop::sample::select(POOL),
+                any::<prop::sample::Index>(),
+            ),
+            1..4,
+        )
+    };
+    (
+        prop::collection::vec(prop::sample::select(POOL), 0..10),
+        edits(),
+        edits(),
+        any::<bool>(),
+    )
+        .prop_map(|(r1, remote, writer, l_newer): (Vec<&str>, Edits, Edits, bool)| {
+            let mut fresh = 0;
+            let mut word = |w: &str, who: &str| {
+                if w == "u" {
+                    fresh += 1;
+                    format!("{who} {fresh}")
+                } else {
+                    w.to_string()
+                }
+            };
+            let r1: Vec<String> = r1.iter().map(|w| word(w, "line")).collect();
+            let mut side = |edits: &Edits, who: &str| -> Vec<String> {
+                let mut v = r1.clone();
+                for (op, i, w, j) in edits {
+                    match op {
+                        0 => {
+                            let at = i.index(v.len() + 1);
+                            v.insert(at, word(w, who));
+                        }
+                        1 if !v.is_empty() => {
+                            v.remove(i.index(v.len()));
+                        }
+                        2 if !v.is_empty() => {
+                            let at = i.index(v.len());
+                            if !v[at].trim().is_empty() {
+                                v[at] = format!("{} {who}", v[at]);
+                            }
+                        }
+                        3 if !v.is_empty() => {
+                            let copy = v[j.index(v.len())].clone();
+                            v.insert(i.index(v.len() + 1), copy);
+                        }
+                        4 if v.len() > 1 => {
+                            let l = v.remove(j.index(v.len()));
+                            v.insert(i.index(v.len() + 1), l);
+                        }
+                        _ => {}
+                    }
+                }
+                v
+            };
+            let r2 = side(&remote, "remote");
+            let l = side(&writer, "writer");
+            let c = Case {
+                base: join(&r1, "\n", true),
+                ours: join(&l, "\n", true),
+                theirs: join(&r2, "\n", true),
+            };
+            (c, l_newer)
+        })
+}
+
+/// Whether the writer's file `l` already has the change from `r1` to `r2`, by
+/// its text: every line (not blank) R2 has more often than R1, at least as
+/// often; every line R2 has less often, at most as often; two lines next to
+/// each other in R1 (blank lines aside, each once in every file) that R2
+/// parted with a paragraph break or joined, the same where L has them next to
+/// each other; and two lines
+/// each file has once, that R2 put in the other order, in R2's order.
+fn holds_change(r1: &str, l: &str, r2: &str) -> Result<(), String> {
+    let count = |s: &str| -> HashMap<String, usize> {
+        let mut n = HashMap::new();
+        for x in oracle::shape(s) {
+            *n.entry(x.1).or_default() += 1;
+        }
+        n
+    };
+    let (a, b, c) = (count(r1), count(l), count(r2));
+    let get = |n: &HashMap<String, usize>, k: &str| n.get(k).copied().unwrap_or(0);
+    for k in a.keys().chain(c.keys()) {
+        let (x, y, z) = (get(&a, k), get(&b, k), get(&c, k));
+        if (z > x && y < z) || (z < x && y > z) {
+            return Err(format!("the line {k:?}: R1 {x}x, R2 {z}x, L {y}x"));
+        }
+    }
+    // Two lines next to each other, each once in all three files: whether a
+    // paragraph break parts them.
+    let all = [r1, l, r2].map(count);
+    let unique = |x: &str| all.iter().all(|n| n.get(x) == Some(&1));
+    let pairs = |s: &str| -> HashMap<(String, String), bool> {
+        let sh = oracle::shape(s);
+        sh.windows(2)
+            .filter(|w| unique(&w[0].1) && unique(&w[1].1))
+            .map(|w| ((w[0].1.clone(), w[1].1.clone()), w[1].0))
+            .collect()
+    };
+    let (pa, pb, pc) = (pairs(r1), pairs(l), pairs(r2));
+    for (k, gap) in &pc {
+        if let (Some(was), Some(now)) = (pa.get(k), pb.get(k)) {
+            if was != gap && now == was {
+                return Err(format!("R2 changed the paragraph break between {k:?}; L has R1's"));
+            }
+        }
+    }
+    let once = |s: &str| -> HashMap<String, usize> {
+        let sh = oracle::shape(s);
+        let mut n: HashMap<String, (usize, usize)> = HashMap::new();
+        for (i, x) in sh.iter().enumerate() {
+            let e = n.entry(x.1.clone()).or_insert((0, i));
+            e.0 += 1;
+        }
+        n.into_iter().filter(|(_, v)| v.0 == 1).map(|(k, v)| (k, v.1)).collect()
+    };
+    let (a, b, c) = (once(r1), once(l), once(r2));
+    for (p, &pc) in &c {
+        for (q, &qc) in &c {
+            if let (Some(&pa), Some(&qa), Some(&pb), Some(&qb)) = (a.get(p), a.get(q), b.get(p), b.get(q)) {
+                if pc < qc && pa > qa && pb > qb {
+                    return Err(format!("R2 put {p:?} before {q:?}; L has R1's order"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// The lost-update guard's silent path: a writer that never saw R2. A
+    /// clean merge equal to L reads as "L already holds R2", so R2's change
+    /// would be lost without a word. It may be so only where L's text already
+    /// has R2's change (see `holds_change`). Every clean merge also passes
+    /// the oracles.
+    #[test]
+    fn a_stale_writer_is_never_taken_for_one_that_saw_the_change((c, l_newer) in stale_case()) {
+        let (mo, mt) = if l_newer { (3000, 2000) } else { (2000, 3000) };
+        passes_oracle(&c, mo, mt)?;
+        for kind in [Kind::Text, Kind::Markdown] {
+            if let Outcome::Write(out) = run(kind, &c, mo, mt).outcome {
+                if out == c.ours.as_bytes() {
+                    if let Err(e) = holds_change(&c.base, &c.ours, &c.theirs) {
+                        prop_assert!(false, "clean and L, but R2's change is lost: {}\n{:?}", e, c);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------- the reviewers' streams ----------
+
+/// A small deterministic generator (SplitMix64), so the reviewers' streams
+/// run as they were written, one proptest seed per case.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 {
+            0
+        } else {
+            (self.next() % n as u64) as usize
+        }
+    }
+    fn chance(&mut self, p: f64) -> bool {
+        (self.next() % 1_000_000) as f64 / 1e6 < p
+    }
+}
+
+/// A line with an identity, to know what really happened to it.
+#[derive(Clone, Debug)]
+struct Line {
+    id: usize,
+    text: String,
+    crlf: bool,
+}
+
+fn render(v: &[Line], fin: bool) -> String {
+    let mut s = String::new();
+    for (k, l) in v.iter().enumerate() {
+        s.push_str(&l.text);
+        if k + 1 < v.len() || fin {
+            s.push_str(if l.crlf { "\r\n" } else { "\n" });
+        }
+    }
+    s
+}
+
+/// What each side did, by identity: base lines `a..b` became `items`; `None`
+/// where a line moved.
+fn truth_changes(base: &[Line], side: &[Line]) -> Option<Vec<(usize, usize, Vec<Line>)>> {
+    let pos: HashMap<usize, usize> = base.iter().enumerate().map(|(i, l)| (l.id, i)).collect();
+    let mut out = Vec::new();
+    let (mut pb, mut items): (usize, Vec<Line>) = (0, Vec::new());
+    for l in side {
+        if let Some(&i) = pos.get(&l.id) {
+            if i < pb {
+                return None;
+            }
+            if i > pb || !items.is_empty() {
+                out.push((pb, i, std::mem::take(&mut items)));
+            }
+            pb = i + 1;
+        } else {
+            items.push(l.clone());
+        }
+    }
+    if base.len() > pb || !items.is_empty() {
+        out.push((pb, base.len(), items));
+    }
+    Some(out)
+}
+
+/// The right merge where the two sides' changes are apart (no change of one
+/// touches one of the other, nothing moved): every change in place.
+fn apart_truth(base: &[Line], o: &[Line], t: &[Line]) -> Option<Vec<Line>> {
+    let (co, ct) = (truth_changes(base, o)?, truth_changes(base, t)?);
+    if co.iter().any(|a| ct.iter().any(|b| a.0 <= b.1 && b.0 <= a.1)) {
+        return None;
+    }
+    let mut all: Vec<&(usize, usize, Vec<Line>)> = co.iter().chain(ct.iter()).collect();
+    all.sort_by_key(|c| (c.0, c.1));
+    let mut v = Vec::new();
+    let mut p = 0;
+    for c in all {
+        v.extend(base[p..c.0].iter().cloned());
+        v.extend(c.2.iter().cloned());
+        p = c.1;
+    }
+    v.extend(base[p..].iter().cloned());
+    Some(v)
+}
+
+/// Review 5's truth stream: lines from a pool (`- x`, tasks, `---`, blank
+/// lines, fences, headings, table rows) or unique; each side inserts, deletes,
+/// edits, moves and copies lines, toggles CRLF and the final newline.
+fn truth_stream(seed: u64) -> (Vec<Line>, bool, Vec<Line>, bool, Vec<Line>, bool, bool) {
+    const REP: &[&str] = &["- x", "- [ ] gym", "---", "", "", "```", "## Notes", "  ", "| a | b |"];
+    let mut r = Rng(seed);
+    let rep = [0.15, 0.45, 0.7][r.below(3)];
+    let crlf_p = if r.chance(0.25) { 0.3 } else { 0.0 };
+    let mut uq = 0;
+    let mut pool = |r: &mut Rng, tag: &str| {
+        if r.chance(rep) {
+            REP[r.below(REP.len())].to_string()
+        } else {
+            uq += 1;
+            format!("{tag}{uq}")
+        }
+    };
+    let nb = r.below(10);
+    let base: Vec<Line> = (0..nb)
+        .map(|i| Line {
+            id: i,
+            text: pool(&mut r, "line "),
+            crlf: r.chance(crlf_p),
+        })
+        .collect();
+    let fb = !r.chance(0.2);
+    let mut next = 1000;
+    let mut side = |r: &mut Rng, who: &str| -> (Vec<Line>, bool) {
+        let (mut v, mut fin) = (base.clone(), fb);
+        for _ in 0..1 + r.below(3) {
+            let n = v.len();
+            let mut fresh = |text: String, crlf: bool| {
+                next += 1;
+                Line { id: next, text, crlf }
+            };
+            match r.below(20) {
+                0..=3 => {
+                    let t = pool(r, &format!("{who} "));
+                    let c = r.chance(crlf_p);
+                    let at = r.below(n + 1);
+                    v.insert(at, fresh(t, c));
+                }
+                4 => {
+                    let t = ["new A", "new B", "- x", ""][r.below(4)].to_string();
+                    let at = r.below(n + 1);
+                    v.insert(at, fresh(t, false));
+                }
+                5..=8 if n > 0 => {
+                    v.remove(r.below(n));
+                }
+                9..=12 if n > 0 => {
+                    let at = r.below(n);
+                    if !v[at].text.trim().is_empty() {
+                        let suf = if r.chance(0.2) { " e" } else { who };
+                        let (t, c) = (format!("{} {suf}", v[at].text), v[at].crlf);
+                        v[at] = fresh(t, c);
+                    }
+                }
+                13 | 14 if n > 1 => {
+                    let a = r.below(n);
+                    if !v[a].text.trim().is_empty() {
+                        let l = v.remove(a);
+                        let b = r.below(n);
+                        v.insert(b, l);
+                    }
+                }
+                15 if n > 0 => {
+                    let a = r.below(n);
+                    let (t, c) = (v[a].text.clone(), v[a].crlf);
+                    let b = r.below(n + 1);
+                    v.insert(b, fresh(t, c));
+                }
+                16 if n > 0 && crlf_p > 0.0 => {
+                    let at = r.below(n);
+                    let (t, c) = (v[at].text.clone(), !v[at].crlf);
+                    v[at] = fresh(t, c);
+                }
+                17 => fin = !fin,
+                _ => {}
+            }
+        }
+        (v, fin)
+    };
+    let (o, fo) = side(&mut r, "o");
+    let (t, ft) = side(&mut r, "t");
+    (base, fb, o, fo, t, ft, r.chance(0.5))
+}
+
+/// Review 5's realistic notes: paragraphs, task lists (some tasks recur),
+/// headings, `---` and blank lines; each side makes one to three ordinary
+/// edits: an edit or a tick, a paragraph split or joined, a line or a
+/// paragraph added, a line deleted, a log line appended, a task added.
+fn notes_stream(seed: u64) -> (Vec<Line>, Vec<Line>, Vec<Line>, bool) {
+    let mut r = Rng(seed);
+    let flavour = r.below(4);
+    let mut ids = 0;
+    let mut base = Vec::new();
+    let mut push = |v: &mut Vec<Line>, t: String| {
+        ids += 1;
+        v.push(Line {
+            id: ids,
+            text: t,
+            crlf: false,
+        });
+    };
+    let mut pc = 0;
+    for b in 0..2 + r.below(4) {
+        if b > 0 {
+            push(&mut base, String::new());
+        }
+        let kind = match flavour {
+            3 => 0,
+            1 => [0, 1, 1, 1, 2][r.below(5)],
+            2 => [0, 0, 0, 3, 2][r.below(5)],
+            _ => r.below(5),
+        };
+        match if b == 0 && kind == 4 { 0 } else { kind } {
+            0 | 3 => {
+                pc += 1;
+                for k in 0..1 + r.below(3) {
+                    push(&mut base, format!("Para {pc} sentence {k}."));
+                }
+            }
+            1 => {
+                for k in 0..1 + r.below(4) {
+                    let t = ["- [ ] gym", "- [ ] water plants", "- [ ] call mom"];
+                    let line = if r.chance(0.5) {
+                        t[r.below(3)].to_string()
+                    } else {
+                        format!("- [ ] task {pc}{k}")
+                    };
+                    push(&mut base, line);
+                }
+            }
+            2 => {
+                let h = if r.chance(0.5) {
+                    "## Notes".to_string()
+                } else {
+                    format!("## Heading {b}")
+                };
+                push(&mut base, h);
+            }
+            _ => push(&mut base, "---".into()),
+        }
+    }
+    let mut ids = 10_000;
+    let mut edit = |r: &mut Rng, v: &mut Vec<Line>, who: &str| {
+        let n = v.len();
+        let mut fresh = |t: String| {
+            ids += 1;
+            Line {
+                id: ids,
+                text: t,
+                crlf: false,
+            }
+        };
+        let at = r.below(n.max(1));
+        match r.below(10) {
+            0 | 1 if n > 0 && !v[at].text.is_empty() => {
+                let t = if v[at].text.starts_with("- [ ]") {
+                    v[at].text.replacen("- [ ]", "- [x]", 1)
+                } else {
+                    format!("{} ({who})", v[at].text)
+                };
+                v[at] = fresh(t);
+            }
+            2 if n > 0 && !v[at].text.is_empty() && at + 1 < n && !v[at + 1].text.is_empty() => {
+                v.insert(at + 1, fresh(String::new()));
+            }
+            3 if n > 0 && v[at].text.is_empty() => {
+                v.remove(at);
+            }
+            4 => v.insert((at + 1).min(n), fresh(format!("Added by {who}."))),
+            5 if n > 0 && !v[at].text.is_empty() => {
+                let p = at + 1;
+                v.insert(p, fresh(String::new()));
+                v.insert(p + 1, fresh(format!("New paragraph by {who}.")));
+                if p + 2 < v.len() && !v[p + 2].text.is_empty() {
+                    v.insert(p + 2, fresh(String::new()));
+                }
+            }
+            6 if n > 0 && !v[at].text.is_empty() => {
+                v.remove(at);
+            }
+            7 => v.push(fresh(format!("- {who} log"))),
+            8 => {
+                let t = ["- [ ] milk", "- [ ] gym", "---"][r.below(3)].to_string();
+                v.insert((at + 1).min(n), fresh(t));
+            }
+            9 if n > 0 && v[at].text.starts_with("- [") => v.insert(at + 1, fresh(format!("- [ ] task by {who}"))),
+            _ => {}
+        }
+    };
+    let (mut o, mut t) = (base.clone(), base.clone());
+    for _ in 0..1 + r.below(3) {
+        edit(&mut r, &mut o, "ours");
+    }
+    for _ in 0..1 + r.below(3) {
+        edit(&mut r, &mut t, "theirs");
+    }
+    (base, o, t, r.chance(0.5))
+}
+
+/// Whether a clean merge `m` of a stream case is right, where the truth is
+/// known (`want`, the sides' changes apart): `m` is it, or it differs only
+/// where the texts cannot show what happened: both sides made the same change
+/// at one place (taken once), a side's only change was to add the final
+/// newline (no change, by the crate's rule), or the texts read only one way
+/// and that gives `m` (the history moved repeated lines no text tells apart).
+fn right_where_apart(b: &str, o: &str, t: &str, m: &str, want: &str, ours_first: bool) -> Result<(), String> {
+    if m == want
+        || m.trim_end_matches(['\n', '\r']) == want.trim_end_matches(['\n', '\r'])
+        || oracle::same_change(b, o, t)
+        || oracle::every_reading_gives(b, o, t, m, ours_first)
+    {
+        return Ok(());
+    }
+    Err(format!("the sides' changes are apart, the merge is not {want:?}"))
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Review 5's truth stream: every clean merge passes both oracles, and
+    /// where the two sides' changes are apart it is the right merge.
+    #[test]
+    fn the_truth_stream_merges_right(seed in any::<u64>()) {
+        let (base, fb, o, fo, t, ft, ours_newer) = truth_stream(seed);
+        // A file that ends in an empty line without a final newline has no
+        // such line as text.
+        let artifact = |v: &[Line], f: bool| !f && v.last().is_some_and(|l| l.text.is_empty());
+        if artifact(&base, fb) || artifact(&o, fo) || artifact(&t, ft) {
+            return Ok(());
+        }
+        let c = Case { base: render(&base, fb), ours: render(&o, fo), theirs: render(&t, ft) };
+        if c.ours == c.theirs || c.ours == c.base || c.theirs == c.base {
+            return Ok(());
+        }
+        let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
+        passes_oracle(&c, mo, mt)?;
+        if let Outcome::Write(m) = run(Kind::Text, &c, mo, mt).outcome {
+            let m = String::from_utf8(m).unwrap();
+            if let Some(want) = apart_truth(&base, &o, &t) {
+                let fin = if fo == fb { ft } else { fo };
+                if let Err(e) = right_where_apart(&c.base, &c.ours, &c.theirs, &m, &render(&want, fin), !ours_newer) {
+                    prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, m);
+                }
+            }
+        }
+    }
+
+    /// Review 5's realistic notes stream: every clean merge passes both
+    /// oracles, and where the two sides' changes are apart it is the right
+    /// merge.
+    #[test]
+    fn the_notes_stream_merges_right(seed in any::<u64>()) {
+        let (base, o, t, ours_newer) = notes_stream(seed);
+        let c = Case { base: render(&base, true), ours: render(&o, true), theirs: render(&t, true) };
+        if c.ours == c.theirs || c.ours == c.base || c.theirs == c.base {
+            return Ok(());
+        }
+        let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
+        passes_oracle(&c, mo, mt)?;
+        if let Outcome::Write(m) = run(Kind::Markdown, &c, mo, mt).outcome {
+            let m = String::from_utf8(m).unwrap();
+            if let Some(want) = apart_truth(&base, &o, &t) {
+                if let Err(e) = right_where_apart(&c.base, &c.ours, &c.theirs, &m, &render(&want, true), !ours_newer) {
+                    prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, m);
+                }
+            }
+        }
+    }
+}
+
+/// Review 5's ordinary notes (`ordinary4`): sections with headings,
+/// paragraphs, recurring tasks, fences, tables, `---`, callouts and `#done`,
+/// with or without blank lines between them, or a daily note whose sections
+/// repeat the same lines under unique date headings. Two devices change
+/// different sections, and maybe both append to the log at the end.
+fn ordinary_case() -> impl Strategy<Value = (Case, String, bool)> {
+    fn section(kind: u8, k: usize, repeat: bool) -> Vec<String> {
+        if repeat {
+            let mut v = vec![format!("## 2026-11-{:02}", k + 1)];
+            match kind % 3 {
+                0 => v.extend(["- [ ] gym", "- [ ] water plants", "", "### Notes"].map(String::from)),
+                1 => v.extend(["### Notes", "", "---"].map(String::from)),
+                _ => v.extend(["| a | b |", "|---|---|", "", "```", "```"].map(String::from)),
+            }
+            return v;
+        }
+        let mut v = vec![format!("## Section {k}")];
+        match kind {
+            0 => v.extend([format!("Paragraph {k} line one."), format!("Paragraph {k} line two.")]),
+            1 => v.extend([
+                "- [ ] gym".into(),
+                "- [ ] water plants".into(),
+                format!("- [ ] task {k}"),
+            ]),
+            2 => v.extend([format!("Code {k}:"), "```".into(), format!("print({k})"), "```".into()]),
+            3 => v.extend(["| a | b |".into(), "|---|---|".into(), format!("| {k} | {k} |")]),
+            4 => v.extend([
+                format!("Text {k}."),
+                "---".into(),
+                "> [!note]".into(),
+                format!("> note {k}"),
+            ]),
+            _ => v.extend(["### Notes".into(), format!("note {k}"), "#done".into()]),
+        }
+        v
+    }
+    fn change(s: &mut Vec<String>, op: u8, at: prop::sample::Index, who: &str) {
+        let n = s.len();
+        let i = 1 + at.index(n - 1);
+        match op {
+            0 => s[i] = format!("{} (edited by {who})", s[i]),
+            1 => match (1..n).find(|&j| s[j].starts_with("- [ ]")) {
+                Some(j) => s[j] = s[j].replacen("- [ ]", "- [x]", 1),
+                None => s[i] = format!("{} (edited by {who})", s[i]),
+            },
+            2 => s.push(format!("added by {who}")),
+            3 => s.insert(i + 1, format!("inserted by {who}")),
+            4 if n > 2 => {
+                s.remove(i);
+            }
+            _ => s.insert(i, format!("- [ ] new {who}")),
+        }
+    }
+    type Ops = Vec<(u8, prop::sample::Index)>;
+    (
+        prop::collection::vec(0..6u8, 2..7),
+        any::<bool>(),
+        any::<bool>(),
+        prop::collection::vec((0..6u8, any::<prop::sample::Index>()), 1..3),
+        prop::collection::vec((0..6u8, any::<prop::sample::Index>()), 1..3),
+        any::<prop::sample::Index>(),
+        any::<prop::sample::Index>(),
+        0..4u8,
+        any::<bool>(),
+    )
+        .prop_filter_map(
+            "a change that changed nothing",
+            |(kinds, repeat, blanks, eo, et, so, st, appends, ours_newer): (
+                Vec<u8>,
+                bool,
+                bool,
+                Ops,
+                Ops,
+                prop::sample::Index,
+                prop::sample::Index,
+                u8,
+                bool,
+            )| {
+                let base: Vec<Vec<String>> = kinds.iter().enumerate().map(|(k, &x)| section(x, k, repeat)).collect();
+                // Two different sections.
+                let io = so.index(base.len());
+                let it = (io + 1 + st.index(base.len() - 1)) % base.len();
+                let (mut o, mut t) = (base.clone(), base.clone());
+                for (op, at) in &eo {
+                    change(&mut o[io], *op, *at, "ours");
+                }
+                for (op, at) in &et {
+                    change(&mut t[it], *op, *at, "theirs");
+                }
+                let end_o: Vec<String> = (appends & 1 == 1)
+                    .then(|| "- 18:00 ours".to_string())
+                    .into_iter()
+                    .collect();
+                let end_t: Vec<String> = (appends & 2 == 2)
+                    .then(|| "- 18:00 theirs".to_string())
+                    .into_iter()
+                    .collect();
+                let render = |secs: &[Vec<String>], end: &[String]| {
+                    let mut out = String::new();
+                    for (k, s) in secs.iter().enumerate() {
+                        if k > 0 && blanks {
+                            out.push('\n');
+                        }
+                        for l in s {
+                            out.push_str(l);
+                            out.push('\n');
+                        }
+                    }
+                    if blanks {
+                        out.push('\n');
+                    }
+                    out.push_str("## Log\n");
+                    for l in end {
+                        out.push_str(l);
+                        out.push('\n');
+                    }
+                    out
+                };
+                let c = Case {
+                    base: render(&base, &[]),
+                    ours: render(&o, &end_o),
+                    theirs: render(&t, &end_t),
+                };
+                if c.ours == c.base || c.theirs == c.base {
+                    return None;
+                }
+                let mut want = base.clone();
+                want[io] = o[io].clone();
+                want[it] = t[it].clone();
+                let end: Vec<String> = if ours_newer {
+                    end_t.iter().chain(&end_o).cloned().collect()
+                } else {
+                    end_o.iter().chain(&end_t).cloned().collect()
+                };
+                Some((c, render(&want, &end), ours_newer))
+            },
+        )
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Review 5's ordinary notes: changes in different sections always
+    /// merge, and right (ef5a400 and upstream merge every one of them).
+    #[test]
+    fn ordinary_notes_changed_in_different_sections_merge((c, want, ours_newer) in ordinary_case()) {
+        let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
+        for kind in [Kind::Text, Kind::Markdown] {
+            match run(kind, &c, mo, mt).outcome {
+                Outcome::Write(m) => prop_assert_eq!(String::from_utf8(m).unwrap(), want.clone(), "{:?}", c),
+                other => prop_assert!(false, "{:?}\n{:?}", other, c),
             }
         }
     }
@@ -1504,7 +2194,8 @@ fn the_independent_oracles_reject_what_alignments_hide() {
             let t = line_merge_trace(b, l, r2, l_first).unwrap();
             assert_eq!(t.merged, None, "open now: {b:?} {l:?} {r2:?}");
             assert!(
-                oracle::independent(b, l, r2, wrong).is_err() || oracle::guard(b, l, r2, wrong, l_first).is_err(),
+                oracle::independent(b, l, r2, wrong, l_first).is_err()
+                    || oracle::guard(b, l, r2, wrong, l_first).is_err(),
                 "{wrong:?} passes both oracles"
             );
             assert!(
@@ -1552,4 +2243,36 @@ fn generators_reach_merges() {
         Rule::Lines,
         0.3,
     );
+    share(
+        "stale writer",
+        stale_case().prop_map(|(c, _)| c).boxed(),
+        Kind::Text,
+        Rule::Lines,
+        0.3,
+    );
+    share(
+        "ordinary notes",
+        ordinary_case().prop_map(|(c, _, _)| c).boxed(),
+        Kind::Text,
+        Rule::Lines,
+        0.99,
+    );
+    let notes = any::<u64>().prop_map(|seed| {
+        let (b, o, t, _) = notes_stream(seed);
+        Case {
+            base: render(&b, true),
+            ours: render(&o, true),
+            theirs: render(&t, true),
+        }
+    });
+    share("notes stream", notes.boxed(), Kind::Markdown, Rule::Lines, 0.5);
+    let truth = any::<u64>().prop_map(|seed| {
+        let (b, fb, o, fo, t, ft, _) = truth_stream(seed);
+        Case {
+            base: render(&b, fb),
+            ours: render(&o, fo),
+            theirs: render(&t, ft),
+        }
+    });
+    share("truth stream", truth.boxed(), Kind::Text, Rule::Lines, 0.2);
 }

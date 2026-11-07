@@ -62,15 +62,18 @@
 //!   lines (a blank line both added, one above a blank line and one below it,
 //!   once).
 //! - Where a side's insertion meets the other side's change (at its start or
-//!   end), the shared lines are taken once where the change's lines hold the
-//!   insertion's as a whole prefix or suffix (L marked a log entry done and
-//!   appended the line R2 appended: L). Where the insertion holds the whole
+//!   end), the shared lines are taken once where the change's lines end (or
+//!   begin) with exactly the insertion's, at the end where they meet (L marked
+//!   a log entry done and appended the line R2 appended: L). Not at the
+//!   change's far end (a paragraph break one side added before an edited line
+//!   and the other after it are two). Where the insertion holds the whole
 //!   change instead (L ticked a task and added it anew; R2 only ticked it),
 //!   the inserting side may have made the same change and typed the old line
 //!   again: open.
-//!   Likewise a change whose lines begin or end with exactly the other side's
-//!   change of the lines at that end is split there, so that part is the same
-//!   change on both sides (both ticked the second task, one also the first).
+//! - Two different changes of overlapping lines stay open, also where one's
+//!   lines begin with the other's (both ticked the second task, one also the
+//!   first): no text says which of a changed block's lines is which base
+//!   line's, so one side may have deleted a line the other edited.
 //! - Overlapping deletions on both sides: every line either deleted goes
 //!   (where each side keeps, beside its own deletion, a line the other
 //!   deleted, the check below leaves it open).
@@ -78,31 +81,39 @@
 //!   open: two different replacements of overlapping lines (whole replacements
 //!   are compared, not their first lines), a deletion against a change, an
 //!   insertion strictly inside lines the other side replaced. So do two pieces
-//!   of the two sides that meet at one point and share any other line: which
-//!   copy is whose cannot be told (one side's note and the other's same note
-//!   plus one more, after an edited line; two code blocks sharing a fence), and
-//!   taking both would put a line in twice.
+//!   of the two sides that meet at one point and share any other line, a
+//!   blank line too: which copy is whose cannot be told (one side's note and
+//!   the other's same note plus one more, after an edited line; two code
+//!   blocks sharing a fence; a paragraph break one side added before a line
+//!   and one the other added around its edit of it), and taking both would
+//!   put a line in twice.
 //! - The base's last line without its newline is kept by a side that only
 //!   added one (that is how a line is appended after it); where both sides
 //!   keep it, the copy with the newline is used. A line a side inserted as its
 //!   file's last line without a newline is the same line as one with it.
 //! - A result that would join a line without its newline to the next stays
 //!   open.
-//! - Every clean result is checked against what the three files say, with
-//!   no alignment of the merge's: lines each file has once (anchors) are the
-//!   same line in all three, so between them a stretch only one side changed
-//!   must come out as that side's, byte for byte; a stretch both sides changed
-//!   must merge the same under every other way of lining it up. It is open
-//!   where a side may be the other side's file with lines of its own on top,
-//!   or with a line the other removed typed back right beside its own change
-//!   (both readings are plausible, and they disagree); where a line both
-//!   sides added would be there twice from two places; where a line one side
-//!   moved is one the other removed; where lines would come out of a side's
-//!   order. A lost-update guard reads "clean and equal to L" as "L holds R2",
-//!   so a line taken twice, dropped or brought back must never be clean.
-//!   The price: a line one side deleted right beside the other side's change
-//!   (an append after it, an edit of the next line) stays open, as git's
-//!   merge does.
+//! - The merge above only proposes. Every clean result is decided by a check
+//!   on what the three files say, with no alignment of the merge's: lines
+//!   each file has once (anchors) are the same line in all three, so between
+//!   them a stretch only one side changed must come out as that side's, byte
+//!   for byte. A stretch both sides changed is clean only where every way the
+//!   texts can be read (every longest common subsequence of each side with
+//!   the base) merges by the placement rules, all to the same text, blank
+//!   lines and `---` included, and the merge is that text; otherwise it is a
+//!   conflict hunk of its own. It is also open where a side may be the other
+//!   side's file with lines of its own on top, or with a line the other
+//!   deleted typed back right beside its own change (both readings are
+//!   plausible, and they disagree); where a line one side moved meets the
+//!   other side's change of it; where a line would be there more often (or
+//!   less often) than any side's change explains. A lost-update guard reads
+//!   "clean and equal to L" as "L holds R2", so a line taken twice, dropped or
+//!   brought back must never be clean. The price: a line one side deleted
+//!   right beside the other side's change (an append after it, an edit of the
+//!   next line) stays open, as git's merge does; and where the texts can be
+//!   read two ways that merge differently (a copy inserted next to its twin,
+//!   a paragraph added next to a blank line where the other side inserted),
+//!   it stays open rather than guessing.
 //!
 //! # Where this differs from upstream, and why
 //!
