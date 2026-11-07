@@ -654,6 +654,14 @@ pub(crate) struct Inner {
     pub(crate) mass_delete_waits: std::sync::atomic::AtomicBool,
     /// Deletions the daemon holds until their burst is over (`DeleteHold`).
     pub(crate) deletes_waiting: std::sync::atomic::AtomicU64,
+    /// When the command that runs on this engine began, if earlier than the
+    /// engine (`Engine::command_began_at`); taken by the next one-shot.
+    pub(crate) command_began: Mutex<Option<i64>>,
+    /// When the running one-shot `sync_once` or `push_all` began (ms since
+    /// the epoch, 0: none yet): a burst a previous run left is quiet only if
+    /// its last deletion was `delete_hold` before that, not before a
+    /// decision a slow pull or a slow daemon stop delayed.
+    pub(crate) one_shot_began: std::sync::atomic::AtomicI64,
     pub(crate) nudge: Notify,
     /// Wakes the push loop for a full rescan.
     pub(crate) rescan: Notify,
@@ -852,6 +860,8 @@ impl Engine {
                 mass_delete_once: Mutex::new(once),
                 mass_delete_waits: std::sync::atomic::AtomicBool::new(waits),
                 deletes_waiting: std::sync::atomic::AtomicU64::new(0),
+                command_began: Mutex::new(None),
+                one_shot_began: std::sync::atomic::AtomicI64::new(0),
                 nudge: Notify::new(),
                 rescan: Notify::new(),
                 ops: tokio::sync::Mutex::new(()),
@@ -2668,6 +2678,7 @@ impl Engine {
     /// owed), register, then push everything that changed locally.
     pub async fn sync_once(&self) -> Result<SyncReport> {
         self.check_plugin_guard()?;
+        self.begin_one_shot();
         let start = Instant::now();
         self.reset_report();
         let gate = self.connect_gate(false).await?;
@@ -2681,7 +2692,7 @@ impl Engine {
         self.catch_up(start).await?;
         let done = self.after_catch_up(&gate, &old_scope, None).await?;
         debug_assert!(done, "only a shutdown interrupts, and sync_once has none");
-        let push = self.push_all(false).await?;
+        let push = self.push_pass(false).await?;
         // Our own writes come back through the changes feed; take them in so
         // `since` is current.
         self.catch_up(start).await?;

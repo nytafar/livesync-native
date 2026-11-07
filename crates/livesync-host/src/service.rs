@@ -879,6 +879,11 @@ impl Service {
             json!({"command": cmd.name(), "phase": "started"}),
         );
         let had_engine = self.has_slot(&name);
+        // The command begins now, before the vault's engine is stopped: the
+        // one-shot judges whether a delete burst is over as of now.
+        let began = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
         // Stopping the engine and running the command on a task of their
         // own: a panic there ends that task, not this restore below.
         let work = {
@@ -897,7 +902,7 @@ impl Service {
                         format!("vault {name}'s engine did not let go of its folders in time; try again"),
                     ));
                 }
-                svc.run_command(cmd, run, adopt).await
+                svc.run_command(cmd, run, adopt, began).await
             })
         };
         let outcome = match work.await {
@@ -940,10 +945,17 @@ impl Service {
         outcome
     }
 
-    async fn run_command(&self, cmd: Command, cfg: RunConfig, adopt_tweaks: bool) -> Result<CommandResult, CtlError> {
+    async fn run_command(
+        &self,
+        cmd: Command,
+        cfg: RunConfig,
+        adopt_tweaks: bool,
+        began: i64,
+    ) -> Result<CommandResult, CtlError> {
         let host = self.host.clone();
         let open = cfg.clone();
         let engine = blocking(move || host.open_engine(&open)).await.map_err(host_error)?;
+        engine.command_began_at(began);
         info!("vault {}: running `{}` for a client", cfg.id, cmd.name());
         let hook = lock(&self.command_hook).clone();
         if let Some(hook) = hook {

@@ -1064,6 +1064,32 @@ impl Engine {
     /// fetch is owed or this node still has to be marked resolved.
     pub async fn push_all(&self, defer_recent: bool) -> Result<PushReport> {
         self.check_plugin_guard()?;
+        self.begin_one_shot();
+        self.push_pass(defer_recent).await
+    }
+
+    /// The command that runs on this engine (a client's `lsync sync`, which
+    /// first stops the vault's daemon) began at `ms` (since the epoch): the
+    /// next one-shot judges whether a burst is over as of then.
+    pub fn command_began_at(&self, ms: i64) {
+        *self.inner.command_began.lock().unwrap() = Some(ms);
+    }
+
+    /// A one-shot `sync_once` or `push_all` begins (see `one_shot_began`).
+    pub(crate) fn begin_one_shot(&self) {
+        let now = vaultfs::now_ms();
+        let began = self
+            .inner
+            .command_began
+            .lock()
+            .unwrap()
+            .take()
+            .map_or(now, |c| c.min(now));
+        self.inner.one_shot_began.store(began, Ordering::SeqCst);
+    }
+
+    /// `push_all` without its own start (`sync_once` began already).
+    pub(crate) async fn push_pass(&self, defer_recent: bool) -> Result<PushReport> {
         match self.full_pass(&RenameHints::default(), None, defer_recent).await? {
             Some((rep, _)) => Ok(rep),
             None => Err(EngineError::Other(format!(
@@ -2540,13 +2566,19 @@ impl Engine {
     }
 
     /// Whether a burst a previous run left open had its last deletion at
-    /// least `delete_hold` ago (`meta::DELETE_BURST_AT`; a burst saved
+    /// least `delete_hold` before this one-shot began (`one_shot_began`:
+    /// the command's start, not this decision, which a pull or the daemon's
+    /// stop may have delayed; `meta::DELETE_BURST_AT`; a burst saved
     /// without the time is as old as can be).
     fn burst_quiet(&self) -> Result<bool> {
         let at: Option<i64> = self
             .with_index(|ix| ix.get_meta(meta::DELETE_BURST_AT))?
             .and_then(|s| s.parse().ok());
-        Ok(at.is_none_or(|at| vaultfs::now_ms().saturating_sub(at) >= self.inner.cfg.delete_hold.as_millis() as i64))
+        let began = match self.inner.one_shot_began.load(Ordering::SeqCst) {
+            0 => vaultfs::now_ms(),
+            b => b,
+        };
+        Ok(at.is_none_or(|at| began.saturating_sub(at) >= self.inner.cfg.delete_hold.as_millis() as i64))
     }
 
     fn end_burst(&self) -> Result<()> {

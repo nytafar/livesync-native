@@ -2979,3 +2979,39 @@ async fn a_confirmation_survives_a_restart_and_says_when_it_waits() {
     assert!(!st.mass_delete_allowed && !st.mass_delete_waits && st.safety_stop.is_none());
     assert!(env.meta("safety_stop_allowed").is_none());
 }
+
+/// #11 review: a one-shot judges whether a burst is over as of when its
+/// command began, not when it gets to the deletions: a pull, or the
+/// daemon's stop before a routed `lsync sync`, can take longer than the
+/// quiet period. The burst's last deletion 5 s before the command began
+/// (15 s before this pass decides) is not a quiet period: what it sends
+/// joins the burst.
+#[tokio::test]
+async fn a_one_shot_judges_quiet_from_when_its_command_began() {
+    let env = Env::new().await;
+    for i in 0..55 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let sent: Vec<String> = (0..45).map(|i| format!("sent{i:02}.md")).collect();
+    let now = now_ms();
+    seed_burst(&env, &sent, now - 15_000);
+    for i in 0..2 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let hold = |c: &mut EngineConfig| c.delete_hold = Duration::from_secs(10);
+    let e = env.engine_with(hold);
+    e.command_began_at(now - 10_000);
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 2, "{:?}", rep.push);
+    assert_eq!(burst_len(&env), 47, "a slow command ended the burst");
+    // Without a command start given, the one-shot began when it ran.
+    drop(e);
+    seed_burst(&env, &sent, now_ms() - 15_000);
+    for i in 2..4 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let rep = env.engine_with(hold).sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 2, "{:?}", rep.push);
+    assert!(env.meta("delete_burst_sent").is_none());
+}
