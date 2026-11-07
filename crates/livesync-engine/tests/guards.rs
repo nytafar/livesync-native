@@ -444,3 +444,35 @@ async fn encrypted_content_stops_until_a_pull_gets_past_it_without_flapping() {
     assert!(alerts(&engine).last_error.is_none());
     d.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_lock_that_comes_and_goes_under_a_content_stop_leaves_no_stale_error() {
+    let env = Env::new().await;
+    env.mock.put_text("first.md", &["one"]);
+    let engine = env.engine_with(|c| c.regate_interval = Duration::from_millis(200));
+    let d = Daemon::two_way(&engine);
+    until("the first pull", 10, || env.read("first.md").is_some()).await;
+    env.mock
+        .put(json!({"_id": "h:abc", "type": "leaf", "data": "%=AAAA", "e_": true}));
+    env.mock.put(json!({"_id": "enc.md", "path": "enc.md", "type": "plain", "children": ["h:abc"], "mtime": 1, "ctime": 1, "size": 3, "eden": {}}));
+    until("the content stop", 10, || upstream_stop(&engine).is_some()).await;
+    let stop = upstream_stop(&engine).unwrap();
+    assert_eq!(alerts(&engine).last_error.as_deref(), Some(stop.as_str()));
+
+    env.mock.update_milestone(|m| {
+        m["locked"] = json!(true);
+        m["accepted_nodes"] = json!(["someone"]);
+    });
+    until("the lock", 10, || alerts(&engine).remote_locked.is_some()).await;
+    // While locked, the document is written again in the clear; then the
+    // lock goes. The pull gets past it and lifts the stop: no error is
+    // left, the lock's least of all.
+    env.mock.put_text("enc.md", &["clear"]);
+    env.mock.update_milestone(|m| m["locked"] = json!(false));
+    // Cut the lock's 30 s wait short.
+    engine.network_changed(true);
+    until("the stop lifted", 10, || upstream_stop(&engine).is_none()).await;
+    let a = alerts(&engine);
+    assert!(a.remote_locked.is_none() && a.last_error.is_none(), "{a:?}");
+    d.stop().await.unwrap();
+}

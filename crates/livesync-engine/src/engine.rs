@@ -1088,7 +1088,15 @@ impl Engine {
                 let content_stop = ix
                     .get_meta(meta::UPSTREAM_STOP_REASON)?
                     .is_some_and(|r| r.starts_with(CONTENT_STOP));
-                if !content_stop {
+                if content_stop {
+                    // Any other error since (a lock that came and went) is
+                    // superseded too: the error mirrors the stop again.
+                    if let Some(stop) = ix.get_meta(meta::UPSTREAM_STOP)? {
+                        if ix.get_meta(meta::LAST_ERROR)?.as_deref() != Some(stop.as_str()) {
+                            ix.set_meta(meta::LAST_ERROR, &stop)?;
+                        }
+                    }
+                } else {
                     ix.delete_meta(meta::LAST_ERROR)?;
                     if ix.get_meta(meta::UPSTREAM_STOP)?.is_some() {
                         info!("upstream guard: the remote is compatible again; syncing resumes");
