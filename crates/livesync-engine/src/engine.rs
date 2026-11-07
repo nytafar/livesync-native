@@ -1015,7 +1015,10 @@ impl Engine {
                 None => {
                     let msg = e.to_string();
                     let before = ix.get_meta(meta::LAST_ERROR)?;
-                    if matches!(e, EngineError::Refused(_)) && before.as_deref().map(meta_text) == Some(msg.as_str()) {
+                    // "Not CouchDB" is retried like a remote failure, and
+                    // re-recorded like one: a wrong URL keeps failing anew.
+                    let refusal = matches!(e, EngineError::Refused(r) if *r != Refusal::NotCouchDb);
+                    if refusal && before.as_deref().map(meta_text) == Some(msg.as_str()) {
                         return Ok(());
                     }
                     format!("{now} {msg}")

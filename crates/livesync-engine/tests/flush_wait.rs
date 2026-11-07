@@ -595,6 +595,17 @@ async fn a_server_that_briefly_is_not_couchdb_is_retried_not_refused() {
         WaitOutcome::TimedOut(_) => {}
         other => panic!("a wait rides it out: {other:?}"),
     }
+    // A server that stays so (a wrong URL) fails anew at every retry: the
+    // error is recorded again, with a new time, so "keeps failing" can
+    // be told.
+    let error = || a.engine.alerts().unwrap().last_error;
+    a.until("the error recorded", |_| {
+        error().is_some_and(|e| e.contains("not CouchDB"))
+    })
+    .await;
+    let first = error();
+    a.until("the error recorded again", |_| error() != first).await;
+    assert!(error().unwrap().contains("not CouchDB"), "{:?}", error());
     a.stop().await;
 }
 
