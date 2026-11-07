@@ -12,7 +12,31 @@ use toml_edit::{DocumentMut, Item, Table};
 
 /// Write a file atomically with mode 0600 (in a 0700 folder when it has to
 /// create it): a crash leaves the old file or the new one, never half.
+///
+/// Root writing into a folder of root's that is shared read-only with a
+/// group (0750, the system service's config folder) writes the file 0640
+/// with that group, so the service can read what `sudo lsync --system ...`
+/// wrote, and never change it (see [`shared_group`]).
 pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    write_private_as(path, text, root_uid())
+}
+
+/// `Some(0)` when this process is root (see [`shared_group`]).
+fn root_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        (unsafe { libc::geteuid() } == 0).then_some(0)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// [`write_private`], with `root` as the uid that counts as root (the
+/// tests' own uid stands in for it).
+fn write_private_as(path: &Path, text: &str, root: Option<u32>) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         if !dir.exists() {
             let mut b = std::fs::DirBuilder::new();
@@ -30,7 +54,7 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
-    write_then_rename(&tmp, path, |f| {
+    write_then_rename(&tmp, path, root, |f| {
         f.write_all(text.as_bytes())?;
         f.sync_all()
     })?;
@@ -48,6 +72,7 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 fn write_then_rename(
     tmp: &Path,
     path: &Path,
+    root: Option<u32>,
     fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     // A leftover from a crashed run with the same pid: never write into a
@@ -64,85 +89,43 @@ fn write_then_rename(
         opts.mode(0o600);
     }
     let mut f = opts.open(tmp)?;
-    #[cfg(unix)]
-    if let Some(dir) = path.parent() {
-        hand_to_folder_owner(&f, dir)?;
-    }
-    let done = fill(&mut f).and_then(|()| {
-        drop(f);
-        std::fs::rename(tmp, path)
-    });
+    let done = share_with_folder_group(&f, path.parent(), root)
+        .and_then(|()| fill(&mut f))
+        .and_then(|()| {
+            drop(f);
+            std::fs::rename(tmp, path)
+        });
     if done.is_err() {
         let _ = std::fs::remove_file(tmp);
     }
     done
 }
 
-/// The owner a file root writes into `dir` should have: the folder's owner,
-/// when that is another user. A system service's config folder belongs to
-/// the service's user (`lsync service install --system`), so a
-/// `sudo lsync --system vault add` leaves files that the service can read.
-/// `None` for everyone else, and for a folder of root's.
+/// The group that may read the files root writes in `dir`: the folder's
+/// group when the folder is root's (`root`, the uid that counts as root)
+/// and its mode is exactly `rwxr-x---` with a group other than root's. Its
+/// owner alone can change the folder, so nothing in that metadata comes
+/// from anyone but root. `None` for every other folder, and when this
+/// process is not root (`root` is `None`): a user's own files stay 0600.
 #[cfg(unix)]
-pub fn folder_owner_for_root(dir: &Path) -> Option<(u32, u32)> {
+pub fn shared_group(dir: &Path, root: Option<u32>) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    if unsafe { libc::geteuid() } != 0 {
-        return None;
-    }
-    let md = std::fs::metadata(dir).ok()?;
-    (md.uid() != 0).then(|| (md.uid(), md.gid()))
+    let root = root?;
+    let md = std::fs::symlink_metadata(dir).ok()?;
+    (md.is_dir() && md.uid() == root && md.gid() != 0 && md.mode() & 0o7777 == 0o750).then(|| md.gid())
 }
 
-/// Give the plain file `name` in `dir` to `uid:gid`, as root may safely do
-/// in a folder another user can write: the name is opened without following
-/// a symlink, and only a regular file with a single link is changed, so a
-/// hard link that user planted to a file of root's (`ln /etc/shadow x`) is
-/// left alone. `Ok(false)` when there is no such file, or it is not one to
-/// change.
-#[cfg(unix)]
-pub fn chown_plain_file(dir: &Path, name: &str, uid: u32, gid: u32) -> std::io::Result<bool> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::MetadataExt;
-    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("not a file name: {name:?}"),
-        ));
+/// The new file `f` (ours, just created) readable by the folder's group:
+/// mode 0640 and that group, when [`shared_group`] says so.
+fn share_with_folder_group(f: &std::fs::File, dir: Option<&Path>, root: Option<u32>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(gid) = dir.and_then(|d| shared_group(d, root)) {
+        use std::os::unix::fs::PermissionsExt;
+        std::os::unix::fs::fchown(f, None, Some(gid))?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o640))?;
     }
-    let cname = std::ffi::CString::new(name).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let d = std::fs::File::open(dir)?;
-    // SAFETY: a valid folder fd and a NUL-terminated name. O_NONBLOCK: a
-    // FIFO planted under the name does not block the open.
-    let fd = unsafe {
-        libc::openat(
-            d.as_raw_fd(),
-            cname.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let e = std::io::Error::last_os_error();
-        return match e.raw_os_error() {
-            Some(libc::ENOENT) | Some(libc::ELOOP) => Ok(false),
-            _ => Err(e),
-        };
-    }
-    // SAFETY: openat returned a new fd that nothing else owns.
-    let f = unsafe { std::fs::File::from_raw_fd(fd) };
-    let md = f.metadata()?;
-    if !md.file_type().is_file() || md.nlink() != 1 {
-        return Ok(false);
-    }
-    std::os::unix::fs::fchown(&f, Some(uid), Some(gid))?;
-    Ok(true)
-}
-
-#[cfg(unix)]
-fn hand_to_folder_owner(f: &std::fs::File, dir: &Path) -> std::io::Result<()> {
-    if let Some((uid, gid)) = folder_owner_for_root(dir) {
-        std::os::unix::fs::fchown(f, Some(uid), Some(gid))?;
-    }
+    #[cfg(not(unix))]
+    let _ = (f, dir, root);
     Ok(())
 }
 
@@ -171,22 +154,16 @@ impl ConfigLock {
                 write_private_dir(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
             }
         }
-        // Root hands over only a lock file it creates here, never one that
-        // was there (the folder's owner could have made it a hard link).
-        let existed = std::fs::symlink_metadata(&lock_path).is_ok();
         let end = Instant::now() + LOCK_WAIT;
         loop {
-            match LockFile::try_acquire(&lock_path) {
-                Ok(l) => {
-                    // As the files beside it (see `folder_owner_for_root`).
-                    #[cfg(unix)]
-                    if let (false, Some(dir)) = (existed, path.parent()) {
-                        if let Some((uid, gid)) = folder_owner_for_root(dir) {
-                            let _ = chown_plain_file(dir, &format!(".{name}.lock"), uid, gid);
-                        }
-                    }
-                    return Ok(ConfigLock { _lock: l });
-                }
+            // Never through a symlink, and a new lock file is created with
+            // O_EXCL: root takes this lock beside the system config.
+            #[cfg(unix)]
+            let taken = LockFile::try_acquire_no_follow(&lock_path);
+            #[cfg(not(unix))]
+            let taken = LockFile::try_acquire(&lock_path);
+            match taken {
+                Ok(l) => return Ok(ConfigLock { _lock: l }),
                 Err(LockError::Busy(_)) if Instant::now() < end => std::thread::sleep(Duration::from_millis(50)),
                 Err(LockError::Busy(_)) => {
                     return Err(format!(
@@ -527,31 +504,65 @@ mod tests {
         gs.into_iter().find(|g| *g != primary)
     }
 
+    /// A file root writes is shared with a group only in a folder of
+    /// root's that is exactly 0750 with that group: the system service's
+    /// config folder. The tests' own uid stands in for root.
     #[cfg(unix)]
     #[test]
-    fn root_hands_over_only_plain_single_link_files() {
-        use std::os::unix::fs::MetadataExt;
+    fn root_shares_a_file_only_in_its_own_folder_shared_read_only() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let d = tempfile::tempdir().unwrap();
-        let dir = d.path().join("conf");
+        let dir = d.path().join("etc-lsync");
         std::fs::create_dir(&dir).unwrap();
-        let outside = d.path().join("shadow");
-        std::fs::write(&outside, "root's").unwrap();
-        std::fs::write(dir.join("lsync.toml"), "x").unwrap();
-        // What the folder's owner could plant for root to chown.
-        std::os::unix::fs::symlink(&outside, dir.join("secrets.toml")).unwrap();
-        std::fs::hard_link(&outside, dir.join("hard")).unwrap();
-        std::fs::create_dir(dir.join("sub")).unwrap();
-        let uid = unsafe { libc::geteuid() };
-        let gid = another_group().unwrap_or_else(|| unsafe { libc::getegid() });
-        let before = std::fs::metadata(&outside).unwrap().gid();
-        assert!(chown_plain_file(&dir, "lsync.toml", uid, gid).unwrap());
-        assert!(!chown_plain_file(&dir, "secrets.toml", uid, gid).unwrap(), "a symlink");
-        assert!(!chown_plain_file(&dir, "hard", uid, gid).unwrap(), "a second link");
-        assert!(!chown_plain_file(&dir, "sub", uid, gid).unwrap(), "a folder");
-        assert!(!chown_plain_file(&dir, "missing", uid, gid).unwrap());
-        assert!(chown_plain_file(&dir, "../shadow", uid, gid).is_err());
-        assert_eq!(std::fs::metadata(dir.join("lsync.toml")).unwrap().gid(), gid);
-        assert_eq!(std::fs::metadata(&outside).unwrap().gid(), before, "untouched");
+        let me = unsafe { libc::geteuid() };
+        let mine = unsafe { libc::getegid() };
+        let gid = another_group().unwrap_or(mine);
+        std::os::unix::fs::chown(&dir, None, Some(gid)).unwrap();
+        let file = dir.join("secrets.toml");
+        let written = |mode: u32, root: Option<u32>| {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            write_private_as(&file, "\"home\" = \"pw\"\n", root).unwrap();
+            let md = std::fs::metadata(&file).unwrap();
+            (md.mode() & 0o777, md.gid())
+        };
+        if gid != mine {
+            assert_eq!(written(0o750, Some(me)), (0o640, gid), "the service's group reads it");
+        } else {
+            eprintln!("this user has one group only: the shared group was not compared");
+        }
+        // Group-writable (the group could swap files), private, open to
+        // all, another owner's, or not root at all: private, as always.
+        for (mode, root) in [
+            (0o770, Some(me)),
+            (0o700, Some(me)),
+            (0o755, Some(me)),
+            (0o750, Some(me + 1)),
+            (0o750, None),
+        ] {
+            assert_eq!(written(mode, root).0, 0o600, "{mode:o} {root:?}");
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "\"home\" = \"pw\"\n");
+    }
+
+    /// Finding C of the review: root's config lock beside the system
+    /// config never follows a symlink planted at its name, so a dangling
+    /// one (to `/etc/nologin`) does not make root create its target.
+    #[cfg(unix)]
+    #[test]
+    fn the_config_lock_never_follows_a_planted_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let dirs = dirs(d.path());
+        std::fs::create_dir_all(&dirs.config).unwrap();
+        let nologin = d.path().join("nologin");
+        std::os::unix::fs::symlink(&nologin, dirs.config.join(".lsync.toml.lock")).unwrap();
+        let e = ConfigFile::open(&dirs.config_file()).err().unwrap();
+        assert!(e.contains("symbolic link"), "{e}");
+        assert!(!nologin.exists(), "nothing created through the link");
+        assert!(!dirs.config_file().exists());
+        // Through the secret store's lock as well.
+        std::os::unix::fs::symlink(&nologin, dirs.config.join(".secrets.toml.lock")).unwrap();
+        assert!(ConfigLock::acquire(&dirs.secrets_file()).is_err());
+        assert!(!nologin.exists());
     }
 
     fn dirs(d: &Path) -> Dirs {
@@ -666,7 +677,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let tmp = d.path().join(".secrets.toml.tmp-1");
         let path = d.path().join("secrets.toml");
-        let e = write_then_rename(&tmp, &path, |f| {
+        let e = write_then_rename(&tmp, &path, None, |f| {
             f.write_all(b"a = \"secret\"\n")?;
             Err(std::io::Error::other("disk full"))
         });
@@ -674,12 +685,12 @@ mod tests {
         assert!(!tmp.exists() && !path.exists());
         // The rename fails: the target is a folder with something in it.
         std::fs::create_dir_all(path.join("x")).unwrap();
-        assert!(write_then_rename(&tmp, &path, |f| f.write_all(b"a = \"secret\"\n")).is_err());
+        assert!(write_then_rename(&tmp, &path, None, |f| f.write_all(b"a = \"secret\"\n")).is_err());
         assert!(!tmp.exists());
         // A leftover temp file is replaced, never written into.
         std::fs::remove_dir_all(&path).unwrap();
         std::fs::write(&tmp, "old").unwrap();
-        write_then_rename(&tmp, &path, |f| f.write_all(b"new")).unwrap();
+        write_then_rename(&tmp, &path, None, |f| f.write_all(b"new")).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         assert!(!tmp.exists());
     }

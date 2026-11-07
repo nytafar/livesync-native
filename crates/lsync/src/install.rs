@@ -35,12 +35,12 @@ pub enum ServiceCmd {
         print: bool,
         /// With --system (required there): the user the service runs as, a
         /// user of its own or the one whose vaults these are. The config
-        /// folder, which holds the passwords kept in secrets.toml, is
-        /// handed to this user
+        /// folder stays root's; the service reads it through its group
         #[arg(long, value_name = "USER")]
         run_as: Option<String>,
-        /// With --system: the service's group. Its members may use the
-        /// control socket, and the files the service writes are
+        /// With --system: the service's group (default: the user's own).
+        /// Its members may use the control socket and read the config
+        /// (secrets.toml too), and the files the service writes are
         /// group-writable (for vaults shared with agents)
         #[arg(long, value_name = "GROUP")]
         group: Option<String>,
@@ -269,6 +269,18 @@ pub fn carried_env(home: Option<&Path>, var: &dyn Fn(&str) -> Option<String>) ->
         out.push(("LSYNC_RUNTIME_DIR".into(), abs(v)));
     }
     out
+}
+
+/// The system unit lsync installs.
+pub const SYSTEM_UNIT: &str = "/etc/systemd/system/lsync.service";
+
+/// The user an installed system unit runs the service as (`User=`), read
+/// from the unit file at `unit` (root's). `None` without one.
+pub fn system_service_user(unit: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(unit).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("User=").map(|u| u.trim().to_string()))
+        .filter(|u| !u.is_empty())
 }
 
 /// Where root writes the system service's encrypted credentials.
@@ -516,6 +528,8 @@ pub struct Writable {
     pub path: PathBuf,
     /// A vault folder (shared with the group), not a state folder.
     pub vault: bool,
+    /// The vault it is for.
+    pub name: String,
 }
 
 /// The folders the system service may write, for `home` as `~`.
@@ -529,12 +543,14 @@ pub fn writable_for(ctx: &Ctx, cfg: &Config, home: Option<&Path>) -> Vec<Writabl
         writable.push(Writable {
             path: v.folder_path(&dirs),
             vault: true,
+            name: name.clone(),
         });
         let state = v.state_path(name, &dirs);
         if !state.starts_with(&dirs.state) {
             writable.push(Writable {
                 path: state,
                 vault: false,
+                name: name.clone(),
             });
         }
     }
@@ -555,6 +571,13 @@ pub fn dropin_for(ctx: &Ctx, cfg: &Config, home: Option<&Path>) -> (String, Vec<
         if r.kind != StoreKind::Credential {
             continue;
         }
+        // Never another service's credential, whatever the config names.
+        if let Some(why) = livesync_host::secret::foreign_credential(&r.key) {
+            missing.push(format!(
+                "account {name}: its password is not loaded into the service: {why}"
+            ));
+            continue;
+        }
         match credential_file(&ctx.etc, &r) {
             Some(c) => creds.push(c),
             None => missing.push(format!(
@@ -569,8 +592,12 @@ pub fn dropin_for(ctx: &Ctx, cfg: &Config, home: Option<&Path>) -> (String, Vec<
     (unit::system_dropin(&writable, &creds), missing)
 }
 
-/// Where systemd finds a credential: encrypted first.
+/// Where systemd finds a credential: encrypted first. Only one of lsync's
+/// (`lsync-NAME`).
 pub fn credential_file(etc: &Path, r: &SecretRef) -> Option<Credential> {
+    if livesync_host::secret::foreign_credential(&r.key).is_some() {
+        return None;
+    }
     for (dir, encrypted) in [("credstore.encrypted", true), ("credstore", false)] {
         let p = etc.join(dir).join(&r.key);
         if p.is_file() {
@@ -584,18 +611,15 @@ pub fn credential_file(etc: &Path, r: &SecretRef) -> Option<Credential> {
     None
 }
 
-/// The files of the system config folder that the service's user gets:
-/// nothing else in it is ever touched.
-pub const CONFIG_FILES: [&str; 3] = [
-    livesync_host::config::CONFIG_FILE,
-    livesync_host::config::SECRETS_FILE,
-    ".lsync.toml.lock",
-];
+/// The files of the system config folder that the service reads through
+/// its group: nothing else in it is ever touched (the config lock stays
+/// root's, 0600).
+pub const SHARED_FILES: [&str; 2] = [livesync_host::config::CONFIG_FILE, livesync_host::config::SECRETS_FILE];
 
 /// The system service's config folder (`ConfigurationDirectory=lsync`):
 /// `/etc/lsync`, and nothing else. `--config`, or a `$CONFIGURATION_DIRECTORY`
 /// that names another folder, is refused: the service would not read that
-/// config, and install would hand that folder to the service's user.
+/// config.
 fn system_config_dir(ctx: &Ctx, print: bool) -> Result<(PathBuf, Option<String>)> {
     let dir = ctx.etc.join("lsync");
     if let Some(p) = &ctx.setup.explicit {
@@ -622,77 +646,297 @@ fn system_config_dir(ctx: &Ctx, print: bool) -> Result<(PathBuf, Option<String>)
     Ok((dir, None))
 }
 
-/// Hand the system config folder (0700) and its known files ([`CONFIG_FILES`],
-/// whoever owns them now) to the service's user, who must read them. Never
-/// anything else: another file, a symlink or a hard link in the folder is
-/// left as it is. The lines to print.
-fn hand_over_config(dir: &Path, user: &User, gid: u32) -> Result<Vec<String>> {
-    use std::os::unix::fs::PermissionsExt;
-    let md = std::fs::symlink_metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
-    if !md.is_dir() {
-        bail!("{} is not a folder", dir.display());
+/// Open `name` in the folder `dir` without following a symlink there.
+/// `Ok(None)` when there is nothing by that name.
+fn open_no_follow(dir: &std::fs::File, name: &str) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let cname = std::ffi::CString::new(name).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: a valid folder fd and a NUL-terminated name. O_NONBLOCK: a
+    // FIFO under the name does not hang the open.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            cname.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            Some(libc::ELOOP) => Err(std::io::Error::other("it is a symbolic link")),
+            _ => Err(e),
+        };
     }
-    // A folder in root's /etc, so its name cannot be swapped meanwhile.
-    let d = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
-    // Taken back first (root's, 0700), so that a previous service user can
-    // no longer change its entries: a file checked to have one link keeps
-    // it (a planted hard link cannot be unlinked between the check and the
-    // chown).
-    std::os::unix::fs::fchown(&d, Some(geteuid()), None).with_context(|| format!("chown {}", dir.display()))?;
-    d.set_permissions(std::fs::Permissions::from_mode(0o700))
+    // SAFETY: openat returned a new fd that nothing else owns.
+    Ok(Some(unsafe { std::fs::File::from_raw_fd(fd) }))
+}
+
+/// A folder opened without following a symlink at its last component.
+fn open_dir(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// Let the service read the system config, and only read it: the folder
+/// stays root's, 0750 with the service's group, and its files lsync keeps
+/// there ([`SHARED_FILES`]) root's, 0640 with that group. All edits go
+/// through `sudo lsync --system ...` ([`livesync_host::edit::write_private`]
+/// keeps that layout), so root never acts on a config its service's user
+/// can change.
+///
+/// Refused, and nothing in it changed, unless the folder and those files
+/// are root's and only root can write the folder: a folder or file someone
+/// else owns or can write, a symlink or a hard link at a known name could
+/// have been planted. Anything else in the folder is
+/// left as it is. The lines to print.
+fn share_config(dir: &Path, gid: u32, group: &str) -> Result<Vec<String>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let me = geteuid();
+    let d = open_dir(dir).with_context(|| format!("opening {} (a folder, not a symlink)", dir.display()))?;
+    let md = d.metadata().with_context(|| format!("reading {}", dir.display()))?;
+    if md.uid() != me || md.mode() & 0o022 != 0 {
+        bail!(
+            "{} is not root's alone (owner uid {}, mode {:o}); the service would read a config someone other than root can change. Check what is in it, then make it root's and not writable by others (`sudo chown root: {} && sudo chmod 750 {}`), and install again",
+            dir.display(),
+            md.uid(),
+            md.mode() & 0o7777,
+            dir.display(),
+            dir.display()
+        );
+    }
+    let mut files = vec![];
+    for name in SHARED_FILES {
+        let path = dir.join(name);
+        let Some(f) = open_no_follow(&d, name).with_context(|| format!("opening {}", path.display()))? else {
+            continue;
+        };
+        let fmd = f.metadata().with_context(|| format!("reading {}", path.display()))?;
+        if !fmd.file_type().is_file() || fmd.uid() != me || fmd.nlink() != 1 {
+            bail!(
+                "{} is not a plain file of root's with one link (owner uid {}, {} link(s)); it was left alone, and nothing was installed. Check it, and replace it with a copy of root's",
+                path.display(),
+                fmd.uid(),
+                fmd.nlink()
+            );
+        }
+        files.push((path, f));
+    }
+    // Only root could change its entries, before and after.
+    d.set_permissions(std::fs::Permissions::from_mode(0o750))
         .with_context(|| format!("chmod {}", dir.display()))?;
-    let mut out = vec![];
-    for name in CONFIG_FILES {
-        let handed = livesync_host::edit::chown_plain_file(dir, name, user.uid, gid)
-            .with_context(|| format!("chown {}", dir.join(name).display()))?;
-        if !handed && std::fs::symlink_metadata(dir.join(name)).is_ok() {
-            out.push(format!(
-                "warning: {} is not a plain file with one link; it was left alone, and the service may not read it",
-                dir.join(name).display()
+    std::os::unix::fs::fchown(&d, None, Some(gid)).with_context(|| format!("chgrp {}", dir.display()))?;
+    for (path, f) in &files {
+        std::os::unix::fs::fchown(f, None, Some(gid)).with_context(|| format!("chgrp {}", path.display()))?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o640))
+            .with_context(|| format!("chmod {}", path.display()))?;
+    }
+    Ok(vec![format!(
+        "{} stays root's: group {group} (the service) reads it, only root changes it (`sudo lsync --system ...`)",
+        dir.display()
+    )])
+}
+
+/// Whether only root can change the folder `md` (`me`, root, or this
+/// process in the tests): root's, and writable by nobody else unless sticky.
+fn only_root_changes(md: &std::fs::Metadata, me: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let sticky = md.mode() & 0o1000 != 0;
+    md.is_dir() && (md.uid() == 0 || md.uid() == me) && (md.mode() & 0o022 == 0 || sticky)
+}
+
+/// The real path of the existing folder `path`, resolved by hand: every
+/// folder on the way, and every folder a symlink on the way leads through,
+/// must be one only root can change, so nobody else can have redirected
+/// it. (A symlink found in such a folder is root's choice.)
+fn resolve_root_only(path: &Path, me: u32) -> std::result::Result<PathBuf, String> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(format!("{} is not an absolute path", path.display()));
+    }
+    let mut real = PathBuf::from("/");
+    let check = |p: &Path| -> std::result::Result<(), String> {
+        let md = std::fs::symlink_metadata(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if !md.is_dir() {
+            return Err(format!("{} is not a folder", p.display()));
+        }
+        if !only_root_changes(&md, me) {
+            use std::os::unix::fs::MetadataExt;
+            return Err(format!(
+                "{} can be changed by someone other than root (owner uid {}, mode {:o})",
+                p.display(),
+                md.uid(),
+                md.mode() & 0o7777
             ));
         }
+        Ok(())
+    };
+    check(&real)?;
+    let mut pending: VecDeque<std::ffi::OsString> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_os_string()),
+            Component::ParentDir => Some("..".into()),
+            _ => None,
+        })
+        .collect();
+    let mut links = 0;
+    while let Some(c) = pending.pop_front() {
+        if c == ".." {
+            real.pop();
+            continue;
+        }
+        let next = real.join(&c);
+        let md = std::fs::symlink_metadata(&next).map_err(|e| format!("{}: {e}", next.display()))?;
+        if md.file_type().is_symlink() {
+            links += 1;
+            if links > 40 {
+                return Err(format!("{}: too many symbolic links", path.display()));
+            }
+            let target = std::fs::read_link(&next).map_err(|e| format!("{}: {e}", next.display()))?;
+            if target.is_absolute() {
+                real = PathBuf::from("/");
+            }
+            let mut rest: Vec<std::ffi::OsString> = target
+                .components()
+                .filter_map(|c| match c {
+                    Component::Normal(n) => Some(n.to_os_string()),
+                    Component::ParentDir => Some("..".into()),
+                    _ => None,
+                })
+                .collect();
+            rest.reverse();
+            for r in rest {
+                pending.push_front(r);
+            }
+            continue;
+        }
+        check(&next)?;
+        real = next;
     }
-    std::os::unix::fs::fchown(&d, Some(user.uid), Some(gid)).with_context(|| format!("chown {}", dir.display()))?;
-    Ok(out)
+    Ok(real)
+}
+
+/// Create the folder `path` for the service: owned by `uid:gid`, with
+/// `mode`; its missing parents root's, 0755. `Ok(false)` when it exists
+/// (left as it is). Only under a folder that only root can change, reached without
+/// anyone else's symlink ([`resolve_root_only`]); the new folders are made
+/// root's and handed over, by descriptor, only once they all exist.
+fn create_for_service(path: &Path, uid: u32, gid: u32, mode: u32) -> std::result::Result<bool, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::symlink_metadata(path).is_ok() {
+        return Ok(false);
+    }
+    let mut missing = vec![];
+    let mut p = path;
+    loop {
+        match std::fs::symlink_metadata(p) {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: {e}", p.display())),
+        }
+        match (p.file_name(), p.parent()) {
+            (Some(n), Some(parent))
+                if p.components()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, std::path::Component::Normal(_))) =>
+            {
+                missing.push(n.to_os_string());
+                p = parent;
+            }
+            _ => return Err(format!("{} is not a plain absolute path", path.display())),
+        }
+    }
+    let base = resolve_root_only(p, geteuid())?;
+    let mut cur = open_dir(&base).map_err(|e| format!("{}: {e}", base.display()))?;
+    let mut made = vec![];
+    for name in missing.iter().rev() {
+        let cname = std::ffi::CString::new(name.as_encoded_bytes())
+            .map_err(|_| format!("{}: a NUL in the name", path.display()))?;
+        // SAFETY: a valid folder fd and a NUL-terminated name.
+        if unsafe { libc::mkdirat(cur.as_raw_fd(), cname.as_ptr(), 0o700) } != 0 {
+            return Err(format!(
+                "creating {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: as above; O_NOFOLLOW: only the folder made just now.
+        let fd = unsafe {
+            libc::openat(
+                cur.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(format!(
+                "opening {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: openat returned a new fd that nothing else owns.
+        let next = unsafe { std::fs::File::from_raw_fd(fd) };
+        made.push(next.try_clone().map_err(|e| e.to_string())?);
+        cur = next;
+    }
+    // The parents made here stay root's (0755), as `mkdir -p` by root
+    // leaves them, so only root adds folders beside the service's.
+    let last = made.len().saturating_sub(1);
+    for (i, d) in made.iter().enumerate() {
+        if i == last {
+            std::os::unix::fs::fchown(d, Some(uid), Some(gid)).map_err(|e| format!("chown {}: {e}", path.display()))?;
+        }
+        // The umask does not narrow it.
+        let m = if i == last { mode } else { 0o755 };
+        d.set_permissions(std::fs::Permissions::from_mode(m))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
+    Ok(true)
+}
+
+/// The mode a folder the service writes gets: a vault's is shared with
+/// its group, a state folder is the service's alone.
+fn writable_mode(w: &Writable) -> u32 {
+    if w.vault {
+        0o770
+    } else {
+        0o700
+    }
 }
 
 /// Create the folders the service may write that do not exist yet (it
 /// cannot: `ProtectSystem=strict` leaves a missing path read-only), owned
-/// by the service's user and group: vault folders 0770, state folders 0700.
-/// Folders that exist are left as they are. The lines to print.
-fn create_writable(writable: &[Writable], uid: u32, gid: u32) -> Vec<String> {
-    use std::os::unix::fs::DirBuilderExt;
+/// by the service's user and group. Folders that exist are left as they
+/// are. The lines to print.
+fn create_writable(writable: &[&Writable], uid: u32, gid: u32) -> Vec<String> {
     let mut out = vec![];
     for w in writable {
-        if std::fs::symlink_metadata(&w.path).is_ok() {
-            continue;
-        }
-        // Each missing folder from the top, so the ones made here are known.
-        let mut missing = vec![];
-        let mut p = w.path.as_path();
-        while std::fs::symlink_metadata(p).is_err() {
-            missing.push(p.to_path_buf());
-            match p.parent() {
-                Some(q) => p = q,
-                None => break,
-            }
-        }
-        let mode = if w.vault { 0o770 } else { 0o700 };
-        let made = missing.iter().rev().try_for_each(|m| {
-            std::fs::DirBuilder::new().mode(mode).create(m)?;
-            std::os::unix::fs::lchown(m, Some(uid), Some(gid))?;
-            // The umask does not narrow it.
-            std::fs::set_permissions(m, std::os::unix::fs::PermissionsExt::from_mode(mode))
-        });
-        match made {
-            Ok(()) => out.push(format!("created {} for the service", w.path.display())),
+        match create_for_service(&w.path, uid, gid, writable_mode(w)) {
+            Ok(true) => out.push(format!("created {} for the service", w.path.display())),
+            Ok(false) => {}
             Err(e) => out.push(format!(
-                "warning: could not create {} ({e}); the service cannot create it itself, so that vault will not start until it exists",
-                w.path.display()
+                "warning: {} was not created ({e}); the service cannot create it itself, so vault {} will not start until it exists (create it as the service's user)",
+                w.path.display(),
+                w.name
             )),
         }
     }
     out
+}
+
+/// The folders of `writable` that do not exist yet.
+fn missing_writable(writable: &[Writable]) -> Vec<&Writable> {
+    writable
+        .iter()
+        .filter(|w| std::fs::symlink_metadata(&w.path).is_err())
+        .collect()
 }
 
 /// Vaults with `trash = "system"`, which the system service cannot run:
@@ -717,7 +961,7 @@ pub fn system_trash_message(names: &[String]) -> String {
 }
 
 /// Accounts whose password is in secrets.toml, a plain-text file in the
-/// config folder that the service's user owns.
+/// config folder that the service's group reads.
 fn file_store_accounts(cfg: &Config) -> Vec<String> {
     cfg.account
         .iter()
@@ -945,7 +1189,7 @@ fn install_system(
     let files = file_store_accounts(cfg);
     if !files.is_empty() {
         warnings.push(format!(
-            "account(s) {} keep the password in plain text in {} (the service's user owns it); systemd credentials keep it encrypted: set `secret = \"credential:lsync-NAME\"` for the account in {}, then `sudo lsync --system account passwd NAME`",
+            "account(s) {} keep the password in plain text in {}, which every member of group {group_name} can read; systemd credentials keep it encrypted, for the service alone: give the account `secret = \"credential:lsync-NAME\"` (edit {} as root), then `sudo lsync --system account passwd NAME`",
             files.join(", "),
             config_dir.join(livesync_host::config::SECRETS_FILE).display(),
             config_dir.join(livesync_host::config::CONFIG_FILE).display()
@@ -961,8 +1205,23 @@ fn install_system(
     let (dropin, missing) = dropin_for(ctx, cfg, Some(&user.home));
     warnings.extend(missing);
     let (path, dpath) = (ctx.unit_file(), ctx.dropin_file());
+    let writable = writable_for(ctx, cfg, Some(&user.home));
+    let create = missing_writable(&writable);
     let mut out = vec![];
     if o.print {
+        out.push(format!(
+            "# {}: stays root's, mode 0750, group {group_name}; {} 0640 (the service reads them, only root changes them)",
+            config_dir.display(),
+            SHARED_FILES.join(" and ")
+        ));
+        for w in &create {
+            out.push(format!(
+                "# would create {} for the service ({}:{group_name}, {:04o})",
+                w.path.display(),
+                user.name,
+                writable_mode(w)
+            ));
+        }
         out.push(format!("# {}", path.display()));
         out.push(text);
         out.push(format!("# {}", dpath.display()));
@@ -970,17 +1229,10 @@ fn install_system(
         out.extend(warnings.into_iter().map(|m| format!("# warning: {m}")));
         return Ok(out);
     }
-    out.extend(hand_over_config(&config_dir, &user, gid)?);
-    out.push(format!(
-        "{} belongs to {} now (the service reads it)",
-        config_dir.display(),
-        user.name
-    ));
-    out.extend(create_writable(
-        &writable_for(ctx, cfg, Some(&user.home)),
-        user.uid,
-        gid,
-    ));
+    out.extend(share_config(&config_dir, gid, &group_name)?);
+    // The folders the config names that do not exist yet: the config is
+    // root's, so these are root's choice (`--print` lists them).
+    out.extend(create_writable(&create, user.uid, gid));
     write_service_file(&path, &text, o.force)?;
     write_service_file(&dpath, &dropin, o.force)?;
     out.push(format!("wrote {} and {}", path.display(), dpath.display()));
@@ -1287,10 +1539,27 @@ fn logs(ctx: &Ctx, follow: bool, lines: usize) -> Result<u8> {
     Ok(u8::try_from(code).unwrap_or(1))
 }
 
+/// The folders of one vault that root named on the command line (`vault
+/// add`, `vault edit --folder/--state-dir`): the only ones a drop-in
+/// refresh creates for the service.
+#[derive(Debug, Clone, Default)]
+pub struct Named {
+    pub vault: String,
+    pub folder: bool,
+    pub state: bool,
+}
+
+impl Named {
+    fn names(&self, w: &Writable) -> bool {
+        w.name == self.vault && if w.vault { self.folder } else { self.state }
+    }
+}
+
 /// After `lsync --system vault|account ...` changed the config: rewrite the
 /// system unit's drop-in when what it lists changed (only root can; a
-/// drop-in lsync did not install is left alone). The lines to print.
-pub fn refresh_system_dropin(setup: &Setup) -> Vec<String> {
+/// drop-in lsync did not install is left alone), and create the missing
+/// folders root named on this command line. The lines to print.
+pub fn refresh_system_dropin(setup: &Setup, named: &Named) -> Vec<String> {
     if !setup.system || cfg!(target_os = "macos") {
         return vec![];
     }
@@ -1298,10 +1567,10 @@ pub fn refresh_system_dropin(setup: &Setup) -> Vec<String> {
     let Ok(ctx) = real_ctx(setup, &runner) else {
         return vec![];
     };
-    refresh_dropin(&ctx)
+    refresh_dropin(&ctx, named)
 }
 
-pub fn refresh_dropin(ctx: &Ctx) -> Vec<String> {
+pub fn refresh_dropin(ctx: &Ctx, named: &Named) -> Vec<String> {
     let dpath = ctx.dropin_file();
     let Ok(old) = std::fs::read_to_string(&dpath) else {
         return vec![];
@@ -1336,10 +1605,30 @@ pub fn refresh_dropin(ctx: &Ctx) -> Vec<String> {
     if !trash.is_empty() {
         out.push(format!("warning: {}", system_trash_message(&trash)));
     }
-    if ctx.euid == 0 {
-        if let (Some(u), Some(gid)) = (&user, gid) {
-            out.extend(create_writable(&writable_for(ctx, &cfg, home.as_deref()), u.uid, gid));
-        }
+    // Only a folder root named on this command line is created; any other
+    // that is missing is said, never created from the file alone.
+    let writable = writable_for(ctx, &cfg, home.as_deref());
+    let (create, left): (Vec<&Writable>, Vec<&Writable>) = missing_writable(&writable)
+        .into_iter()
+        .partition(|w| ctx.euid == 0 && named.names(w));
+    match (&user, gid) {
+        (Some(u), Some(gid)) => out.extend(create_writable(&create, u.uid, gid)),
+        _ => out.extend(create.iter().map(|w| {
+            format!(
+                "warning: {} was not created: the installed unit names no user or group to give it to",
+                w.path.display()
+            )
+        })),
+    }
+    for w in left {
+        out.push(format!(
+            "warning: {} does not exist, and the service cannot create it, so vault {} will not start until it does; name it for root to create (`sudo lsync --system vault edit {} --{} {}`), or create it as the service's user",
+            w.path.display(),
+            w.name,
+            w.name,
+            if w.vault { "folder" } else { "state-dir" },
+            w.path.display()
+        ));
     }
     if text == old {
         return out;
@@ -1638,14 +1927,30 @@ mod tests {
             "\n[vault.more]\naccount = \"home\"\ndatabase = \"more\"\nfolder = \"{srv}/more\"\n"
         ));
         std::fs::write(&h.setup.config_file, text).unwrap();
-        let said = refresh_dropin(&c).join("\n");
+        let said = refresh_dropin(&c, &Named::default()).join("\n");
         assert!(said.contains("restart"), "{said}");
         let dropin = std::fs::read_to_string(h.root.join("units/lsync.service.d/lsync-vaults.conf")).unwrap();
         assert!(dropin.contains(&format!("\"-{srv}/more\" ")), "{dropin}");
-        // Root made the new vault's folder, as the service cannot.
+        // Not named on this command line: said, not created.
+        assert!(
+            said.contains(&format!("warning: {srv}/more does not exist")) && said.contains("vault edit more --folder"),
+            "{said}"
+        );
+        assert!(!h.root.join("srv/more").exists());
+        // Named (`sudo lsync --system vault add more --folder ...`): root
+        // made it, as the service cannot.
+        let named = Named {
+            vault: "more".into(),
+            folder: true,
+            state: false,
+        };
+        let said = refresh_dropin(&c, &named).join("\n");
         assert!(said.contains(&format!("created {srv}/more")), "{said}");
         assert_eq!(mode(&h.root.join("srv/more")), 0o770);
-        assert!(refresh_dropin(&c).is_empty(), "nothing changed: nothing said");
+        assert!(
+            refresh_dropin(&c, &Named::default()).is_empty(),
+            "nothing changed: nothing said"
+        );
 
         let out = uninstall(&c, false).unwrap().join("\n");
         assert!(!h.root.join("units/lsync.service").exists(), "{out}");
@@ -1684,9 +1989,9 @@ mod tests {
         assert!(!h.root.join("units").exists());
     }
 
-    /// Finding 1 of the review: `install --system` hands a folder to the
-    /// service's user, so it must only ever be the system config folder,
-    /// and in it only the files lsync keeps there.
+    /// Finding 1 of the review: `install --system` changes the config
+    /// folder's group and mode, so it must only ever be the system config
+    /// folder, and in it only the files lsync keeps there.
     #[test]
     fn a_system_install_refuses_config_and_touches_only_the_known_files() {
         use std::os::unix::fs::PermissionsExt;
@@ -1750,53 +2055,75 @@ mod tests {
         assert_eq!(before, after, "nothing elsewhere changed");
         assert!(f.calls.borrow().is_empty() && !h.root.join("units").exists());
 
-        // The system config folder: its known files are handed over, hard
-        // links, symlinks and other files are not.
+        // The system config folder: a hard link or a symlink at a known
+        // name stops the install with nothing changed.
         let etc = h.setup.dirs.config.clone();
         let shadow = h.root.join("shadow");
         std::fs::write(&shadow, "root's").unwrap();
-        std::fs::hard_link(&shadow, etc.join("secrets.toml")).unwrap();
-        std::fs::write(etc.join(".lsync.toml.lock"), "").unwrap();
-        std::fs::write(etc.join("stranger"), "").unwrap();
-        std::os::unix::fs::symlink(&shadow, etc.join("link")).unwrap();
-        std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o700)).unwrap();
         let untouched = |p: &Path| (gid_of(p), mode(p));
         let shadow_was = untouched(&shadow);
-        let stranger_was = untouched(&etc.join("stranger"));
-        let link_was = untouched(&etc.join("link"));
         c.setup = &h.setup;
         let other = another_group();
         let o = InstallOpts {
             group: other.as_ref().map(|g| g.0.clone()),
             ..as_me()
         };
-        let out = install(&c, &o).unwrap().join("\n");
-        assert!(
-            out.contains(&format!(
-                "warning: {} is not a plain file",
-                etc.join("secrets.toml").display()
-            )),
-            "{out}"
-        );
-        assert_eq!(mode(&etc), 0o700);
-        assert_eq!(untouched(&shadow), shadow_was);
-        assert_eq!(untouched(&etc.join("stranger")), stranger_was);
-        assert_eq!(untouched(&etc.join("link")), link_was);
-        if let Some((_, gid)) = &other {
-            for n in ["", "lsync.toml", ".lsync.toml.lock"] {
-                assert_eq!(gid_of(&etc.join(n)), *gid, "{n} handed over");
+        for hard in [true, false] {
+            if hard {
+                std::fs::hard_link(&shadow, etc.join("secrets.toml")).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&shadow, etc.join("secrets.toml")).unwrap();
             }
-            // Again with the user's own group (finding 5: whatever the
-            // files' owner now, they follow the service's user).
+            let e = install(&c, &o).unwrap_err().to_string();
+            assert!(e.contains("secrets.toml"), "{e}");
+            assert_eq!(mode(&etc), 0o700, "{e}");
+            assert_eq!(untouched(&shadow), shadow_was);
+            assert!(!h.root.join("units").exists());
+            std::fs::remove_file(etc.join("secrets.toml")).unwrap();
+        }
+
+        // Plain files: the folder 0750 and the two files 0640, with the
+        // service's group; the lock and a stranger file are left alone.
+        std::fs::write(etc.join("secrets.toml"), "\"home\" = \"pw\"\n").unwrap();
+        std::fs::set_permissions(etc.join("secrets.toml"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(etc.join(".lsync.toml.lock"), "").unwrap();
+        std::fs::write(etc.join("stranger"), "").unwrap();
+        std::os::unix::fs::symlink(&shadow, etc.join("link")).unwrap();
+        let lock_was = untouched(&etc.join(".lsync.toml.lock"));
+        let stranger_was = untouched(&etc.join("stranger"));
+        let out = install(&c, &o).unwrap().join("\n");
+        assert!(out.contains("stays root's"), "{out}");
+        assert_eq!(mode(&etc), 0o750);
+        for n in ["lsync.toml", "secrets.toml"] {
+            assert_eq!(mode(&etc.join(n)), 0o640, "{n}");
+        }
+        assert_eq!(untouched(&etc.join(".lsync.toml.lock")), lock_was);
+        assert_eq!(untouched(&etc.join("stranger")), stranger_was);
+        assert_eq!(untouched(&shadow), shadow_was);
+        if let Some((_, gid)) = &other {
+            for n in ["", "lsync.toml", "secrets.toml"] {
+                assert_eq!(gid_of(&etc.join(n)), *gid, "{n} shared with the service's group");
+            }
+            // Again with the user's own group (finding 5: they follow the
+            // service's group).
             let primary = user_named(&me()).unwrap().gid;
             install(&c, &as_me()).unwrap();
-            for n in ["", "lsync.toml", ".lsync.toml.lock"] {
-                assert_eq!(gid_of(&etc.join(n)), primary, "{n} handed over again");
+            for n in ["", "lsync.toml", "secrets.toml"] {
+                assert_eq!(gid_of(&etc.join(n)), primary, "{n} moved to the new group");
             }
-            assert_eq!(untouched(&shadow), shadow_was);
         } else {
-            eprintln!("this user has one group only: the owners were not compared");
+            eprintln!("this user has one group only: the groups were not compared");
         }
+
+        // A config folder its group (or anyone) could write: refused, as
+        // entries could have been planted; nothing changed.
+        std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let lsync_toml_was = untouched(&etc.join("lsync.toml"));
+        let e = install(&c, &as_me()).unwrap_err().to_string();
+        assert!(e.contains("is not root's alone") && e.contains("mode 770"), "{e}");
+        assert_eq!(mode(&etc), 0o770);
+        assert_eq!(untouched(&etc.join("lsync.toml")), lsync_toml_was);
     }
 
     #[test]
@@ -1860,6 +2187,16 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .unwrap();
+        // Printed first.
+        let printed = install(&c, &InstallOpts { print: true, ..as_me() }).unwrap().join("\n");
+        assert!(
+            printed.contains(&format!(
+                "# would create {} for the service",
+                srv.join("Notes").display()
+            )),
+            "{printed}"
+        );
+        assert!(!srv.join("Notes").exists());
         let out = install(&c, &as_me()).unwrap().join("\n");
         assert!(
             out.contains(&format!("created {}", srv.join("Notes").display())),
@@ -1872,6 +2209,117 @@ mod tests {
             !out.contains(&format!("created {}", srv.join("work notes").display())),
             "{out}"
         );
+    }
+
+    /// Finding A of the review: a vault folder in the config
+    /// (`/etc/systemd/system/sshd.service.d`) must not become a folder of
+    /// the service's user, where it could drop in an `ExecStartPre=` that
+    /// runs as root. The config is root's, so the service's user cannot
+    /// write such a folder in; root's next `--system vault|account ...`
+    /// does not create it unasked; and a folder root names is created only
+    /// beneath folders nobody else can change or redirect.
+    #[test]
+    fn a_folder_root_did_not_name_is_never_created_for_the_service() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let h = home(true);
+        let f = Fake::default();
+        let c = ctx(&h, &f, Manager::SystemdSystem);
+        install(&c, &as_me()).unwrap();
+        // The service's group reads the config and cannot write it.
+        let etc = &h.setup.dirs.config;
+        for p in [etc.clone(), h.setup.config_file.clone()] {
+            let md = std::fs::metadata(&p).unwrap();
+            assert_eq!(md.uid(), geteuid(), "root's: {}", p.display());
+            assert_eq!(md.mode() & 0o022, 0, "nobody else writes {}", p.display());
+        }
+
+        let units = h.root.join("etc/systemd/system");
+        std::fs::create_dir_all(&units).unwrap();
+        let sshd_d = units.join("sshd.service.d");
+        let mut text = std::fs::read_to_string(&h.setup.config_file).unwrap();
+        text.push_str(&format!(
+            "\n[vault.evil]\naccount = \"home\"\ndatabase = \"evil\"\nfolder = \"{}\"\n",
+            sshd_d.display()
+        ));
+        std::fs::write(&h.setup.config_file, text).unwrap();
+        // Root changes another vault (`sudo lsync --system vault edit notes
+        // --folder ...`): the drop-in follows, nothing else is created.
+        let named = Named {
+            vault: "notes".into(),
+            folder: true,
+            state: false,
+        };
+        let said = refresh_dropin(&c, &named).join("\n");
+        assert!(!sshd_d.exists(), "{said}");
+        assert!(
+            said.contains(&format!("warning: {} does not exist", sshd_d.display())),
+            "{said}"
+        );
+        // A reinstall creates what the config names, printed first: the
+        // config is root's, so that is root's choice.
+        let printed = install(&c, &InstallOpts { print: true, ..as_me() }).unwrap().join("\n");
+        assert!(
+            printed.contains(&format!("# would create {}", sshd_d.display())),
+            "{printed}"
+        );
+
+        // A folder root names, under a folder someone else can write (the
+        // service's group here) or through a symlink in one: refused, and
+        // nothing is created where the link leads.
+        let shared = h.root.join("srv/shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+        std::os::unix::fs::symlink(&units, shared.join("link")).unwrap();
+        let me = geteuid();
+        let gid = unsafe { libc::getegid() };
+        for p in [shared.join("link/sshd.service.d"), shared.join("new")] {
+            let e = create_for_service(&p, me, gid, 0o770).unwrap_err();
+            assert!(e.contains("can be changed by someone other than root"), "{e}");
+        }
+        assert!(!sshd_d.exists() && !shared.join("new").exists());
+        // Through a symlink of root's, in folders only root can change: made.
+        let real = h.root.join("srv/real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, h.root.join("srv/by-root")).unwrap();
+        assert!(create_for_service(&h.root.join("srv/by-root/a/b"), me, gid, 0o770).unwrap());
+        assert_eq!(mode(&real.join("a")), 0o755, "a parent stays root's");
+        assert_eq!(mode(&real.join("a/b")), 0o770);
+        assert!(
+            !create_for_service(&real.join("a/b"), me, gid, 0o770).unwrap(),
+            "exists"
+        );
+        assert!(create_for_service(Path::new("relative/x"), me, gid, 0o770).is_err());
+    }
+
+    /// Finding B of the review: a credential that is not lsync's
+    /// (`mysql-root` in /etc/credstore.encrypted) is never loaded into the
+    /// unit, whatever key the config names.
+    #[test]
+    fn another_services_credential_is_never_loaded() {
+        let h = home(true);
+        let creds = h.root.join("etc/credstore.encrypted");
+        std::fs::create_dir_all(&creds).unwrap();
+        std::fs::write(creds.join("mysql-root"), "x").unwrap();
+        let text = std::fs::read_to_string(&h.setup.config_file).unwrap();
+        std::fs::write(
+            &h.setup.config_file,
+            text.replace("credential:lsync-home", "credential:mysql-root"),
+        )
+        .unwrap();
+        let f = Fake::default();
+        let c = ctx(&h, &f, Manager::SystemdSystem);
+        let out = install(&c, &as_me()).unwrap().join("\n");
+        let dropin = std::fs::read_to_string(h.root.join("units/lsync.service.d/lsync-vaults.conf")).unwrap();
+        assert!(
+            !dropin.contains("mysql-root") && !dropin.contains("LoadCredential"),
+            "{dropin}"
+        );
+        assert!(
+            out.contains("warning: account home: its password is not loaded") && out.contains("lsync-NAME"),
+            "{out}"
+        );
+        let r = SecretRef::parse("credential:mysql-root").unwrap();
+        assert!(credential_file(&c.etc, &r).is_none());
     }
 
     #[test]

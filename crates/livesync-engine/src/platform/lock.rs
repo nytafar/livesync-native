@@ -212,6 +212,104 @@ impl LockFile {
         })
     }
 
+    /// As [`LockFile::try_acquire`], for a lock file in a folder another
+    /// user may have prepared (root's lock beside a config): a symlink at
+    /// `path` is refused, never followed (a dangling one would otherwise
+    /// make the open create its target), only a regular file is locked, and
+    /// a missing one is created with `O_EXCL`, mode 0600, never through
+    /// anything already there. The parent folder must exist.
+    #[cfg(unix)]
+    pub fn try_acquire_no_follow(path: &Path) -> Result<LockFile, LockError> {
+        for _ in 0..3 {
+            let l = Self::try_acquire_no_follow_once(path)?;
+            if l.is_current() {
+                return Ok(l);
+            }
+        }
+        Err(LockError::Io {
+            path: path.to_path_buf(),
+            source: io::Error::other("the lock file keeps being replaced"),
+        })
+    }
+
+    #[cfg(unix)]
+    fn try_acquire_no_follow_once(path: &Path) -> Result<LockFile, LockError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let io_err = |source| LockError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        // O_NONBLOCK: a FIFO under the name does not hang the open.
+        let flags = libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        let open_existing = |write: bool| {
+            OpenOptions::new()
+                .read(true)
+                .write(write)
+                .custom_flags(flags)
+                .open(path)
+        };
+        let symlink = |e: &io::Error| e.raw_os_error() == Some(libc::ELOOP);
+        let refuse_link = || io::Error::other("it is a symbolic link; a lock file is never followed through one");
+        let mut opened = None;
+        for _ in 0..3 {
+            match open_existing(false) {
+                Ok(f) => {
+                    opened = Some((f, false));
+                    break;
+                }
+                Err(e) if symlink(&e) => return Err(io_err(refuse_link())),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    // O_CREAT|O_EXCL: fails on anything at the name, a
+                    // dangling symlink included, so nothing else is created.
+                    match OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .custom_flags(flags)
+                        .open(path)
+                    {
+                        Ok(f) => {
+                            opened = Some((f, true));
+                            break;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => return Err(io_err(e)),
+                    }
+                }
+                Err(e) => return Err(io_err(e)),
+            }
+        }
+        let Some((file, writable)) = opened else {
+            return Err(io_err(io::Error::other("the lock file keeps appearing and going")));
+        };
+        if !file.metadata().map_err(io_err)?.file_type().is_file() {
+            return Err(io_err(io::Error::other("it is not a regular file")));
+        }
+        let busy = || LockError::Busy(path.to_path_buf());
+        let file = match try_lock(&file) {
+            Ok(()) => file,
+            Err(None) => return Err(busy()),
+            Err(Some(e)) if !writable && wants_write_access(&e) => {
+                let file = match open_existing(true) {
+                    Ok(f) => f,
+                    Err(e) if symlink(&e) => return Err(io_err(refuse_link())),
+                    Err(e) => return Err(io_err(e)),
+                };
+                match try_lock(&file) {
+                    Ok(()) => file,
+                    Err(None) => return Err(busy()),
+                    Err(Some(e)) => return Err(io_err(e)),
+                }
+            }
+            Err(Some(e)) => return Err(io_err(e)),
+        };
+        Ok(LockFile {
+            _file: file,
+            path: path.to_path_buf(),
+        })
+    }
+
     /// Write the holder record (best effort; it only names the holder).
     pub fn record(&self, holder: &Holder) -> io::Result<()> {
         write_holder(&self.path, holder)
@@ -276,6 +374,36 @@ mod tests {
         fs::write(d.path().join("copy"), b"").unwrap();
         fs::rename(d.path().join("copy"), &p).unwrap();
         assert!(!held.is_current());
+    }
+
+    /// A lock file someone else prepared: a symlink (dangling or not) is
+    /// refused and its target neither created nor changed; a new lock file
+    /// is 0600; a held lock is busy as with `try_acquire`.
+    #[cfg(unix)]
+    #[test]
+    fn a_no_follow_lock_never_goes_through_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join(".lsync.toml.lock");
+        let target = d.path().join("nologin");
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+        let e = LockFile::try_acquire_no_follow(&p).unwrap_err().to_string();
+        assert!(e.contains("symbolic link"), "{e}");
+        assert!(!target.exists(), "a dangling link's target is not created");
+        fs::write(&target, "root's").unwrap();
+        assert!(LockFile::try_acquire_no_follow(&p).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "root's");
+        fs::remove_file(&p).unwrap();
+        fs::create_dir(&p).unwrap();
+        assert!(LockFile::try_acquire_no_follow(&p).is_err(), "a folder");
+        fs::remove_dir(&p).unwrap();
+
+        let held = LockFile::try_acquire_no_follow(&p).unwrap();
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(matches!(LockFile::try_acquire_no_follow(&p), Err(LockError::Busy(_))));
+        assert!(matches!(LockFile::try_acquire(&p), Err(LockError::Busy(_))));
+        drop(held);
+        LockFile::try_acquire_no_follow(&p).unwrap();
     }
 
     #[test]

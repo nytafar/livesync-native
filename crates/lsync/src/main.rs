@@ -420,14 +420,21 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         }
         Cmd::Status { json, all: true, .. } => return status_all(json),
         Cmd::Serve { opts } => {
+            if ctx.system && install::geteuid() == 0 {
+                root_serves_no_users_vaults(&install::system_service_user(std::path::Path::new(
+                    install::SYSTEM_UNIT,
+                )))?;
+            }
             let only = named?;
             return serve::serve(&ctx, only, &opts, VERSION);
         }
         other => other,
     };
-    // A member of the system service's group cannot read its config (0700:
-    // it may hold passwords). A command for one of its vaults, named with
-    // --vault, goes to the service by that name.
+    root_runs_no_system_vault(ctx.system, install::geteuid(), &cmd)?;
+    // A user outside the system service's group cannot read its config
+    // (root's, 0640 to that group: it may hold passwords). A command for one
+    // of its vaults, named with --vault, goes to the service by that name
+    // (a socket-group member who is not in the service's group).
     if ctx.system && unreadable(&ctx.config_file) {
         if let Some(vault) = cli.vault.clone().filter(|v| !config::looks_like_path(v)) {
             return by_name(cmd, &vault, &ctx, matches);
@@ -732,7 +739,18 @@ fn reload(json: bool) -> Result<u8> {
             println!("NOT RUNNING {}: {}", f.vault, f.message);
         }
     }
-    Ok(if r.failed.is_empty() { 0 } else { 3 })
+    // The new config is applied: a reload succeeded, also for
+    // `systemctl reload` (ExecReload=). A vault that is not running is
+    // said, here and in the service's status and log; an invalid config
+    // is the service's error above, and changes nothing.
+    if !r.failed.is_empty() {
+        eprintln!(
+            "warning: the config was reloaded, but {} vault(s) are not running: {}",
+            r.failed.len(),
+            r.failed.iter().map(|f| f.vault.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(0)
 }
 
 /// Local wall-clock time of a timestamp, `HH:MM:SS`.
@@ -877,6 +895,32 @@ fn service_status(client: &mut Client, vault: &str) -> Result<Option<livesync_en
 }
 
 /// Whether the config file is there but this user may not read it.
+/// Root, with `--system`, never opens one of the system service's vaults
+/// here: their folders and state belong to the service's user, who could
+/// have put links there for root to follow and write through. Only the
+/// config (root's) is root's to change.
+fn root_runs_no_system_vault(system: bool, euid: u32, cmd: &Cmd) -> Result<()> {
+    if !system || euid != 0 || matches!(cmd, Cmd::Configure { .. }) {
+        return Ok(());
+    }
+    bail!(
+        "root does not run the system service's vaults itself: their folders and state belong to the service's user, and root would act on whatever that user put there. Run it as that user, with the service's group (`sudo -u USER -g GROUP lsync --system ...`, as User= and Group= in lsync.service say), or through the service as a member of its group (`lsync --system --vault NAME status|sync|fetch|pull`, `sync-now`, `status --all`)"
+    )
+}
+
+/// `sudo lsync --system serve` by hand, while the installed unit runs the
+/// service as another user (`User=` in it, root's file): refused, for the
+/// reason [`root_runs_no_system_vault`] gives. A unit with `User=root`
+/// (`--run-as root`), or none installed, is root's own.
+fn root_serves_no_users_vaults(unit_user: &Option<String>) -> Result<()> {
+    match unit_user {
+        Some(u) if u != "root" && u != "0" => bail!(
+            "the system service runs as {u} (lsync.service); root does not run it by hand, as the vaults' folders and state are {u}'s. Start it with `sudo systemctl start lsync`, or run it as that user (`sudo -u {u} -g GROUP lsync --system serve`)"
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn unreadable(path: &std::path::Path) -> bool {
     matches!(std::fs::File::open(path), Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
 }
@@ -902,7 +946,7 @@ fn settings_given(matches: &clap::ArgMatches) -> Vec<String> {
 /// service runs it by name, with its own settings.
 fn by_name(cmd: Cmd, vault: &str, ctx: &Setup, matches: &clap::ArgMatches) -> Result<u8> {
     let cannot = format!(
-        "{} can be read only by the system service's user",
+        "{} can be read only by root and the system service's group",
         ctx.config_file.display()
     );
     let given = settings_given(matches);
@@ -1682,5 +1726,44 @@ mod tests {
         };
         assert!(!keyring_may_prompt(&serve, true), "the service never waits on a dialog");
         assert!(!livesync_host::keyring::prompts_allowed(), "off unless allowed");
+    }
+
+    /// Root under `--system` opens no vault's folder or state of the
+    /// service's user; it may change the config (root's) only.
+    #[test]
+    fn root_runs_no_system_vault_here() {
+        let status = Cmd::Status {
+            json: false,
+            all: false,
+            follow: false,
+            waybar: false,
+            format: None,
+        };
+        let folders = Cmd::Folders { json: false };
+        for cmd in [&status, &folders] {
+            let e = root_runs_no_system_vault(true, 0, cmd).unwrap_err().to_string();
+            assert!(e.contains("sudo -u USER -g GROUP"), "{e}");
+            assert!(root_runs_no_system_vault(true, 1000, cmd).is_ok(), "the service's user");
+            assert!(root_runs_no_system_vault(false, 0, cmd).is_ok(), "root's own vaults");
+        }
+        let configure = Cmd::Configure { password_stdin: false };
+        assert!(root_runs_no_system_vault(true, 0, &configure).is_ok());
+
+        // `sudo lsync --system serve` by hand: only when the unit runs it
+        // as root, or there is no unit.
+        let e = root_serves_no_users_vaults(&Some("lsync".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("runs as lsync") && e.contains("systemctl start lsync"),
+            "{e}"
+        );
+        assert!(root_serves_no_users_vaults(&Some("root".into())).is_ok());
+        assert!(root_serves_no_users_vaults(&None).is_ok());
+        let d = tempfile::tempdir().unwrap();
+        let unit = d.path().join("lsync.service");
+        std::fs::write(&unit, "[Service]\nUser=lsync\nGroup=agents\n").unwrap();
+        assert_eq!(install::system_service_user(&unit).as_deref(), Some("lsync"));
+        assert_eq!(install::system_service_user(&d.path().join("none")), None);
     }
 }

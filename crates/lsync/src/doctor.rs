@@ -76,7 +76,8 @@ pub fn folder_access(folder: &Path, system: bool) -> Check {
                 Level::Error,
                 area,
                 format!(
-                    "{} does not exist, and the system service cannot create it (ProtectSystem=strict leaves a missing folder read-only); `sudo lsync service install --system --run-as USER` creates it for the service's user",
+                    "{} does not exist, and the system service cannot create it (ProtectSystem=strict leaves a missing folder read-only); root creates it for the service's user with `sudo lsync --system vault edit NAME --folder {}` or `sudo lsync service install --system --run-as USER`",
+                    folder.display(),
                     folder.display()
                 ),
             )

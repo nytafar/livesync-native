@@ -128,7 +128,9 @@ pub fn system_unit(u: &SystemService) -> String {
         "# Files the service writes are group-writable, for vaults shared with a group,\n\
          # and not readable by other users.\n\
          UMask=0007\n\
-         ConfigurationDirectory=lsync\n\
+         # The config stays root's; the service reads it through its group (systemd\n\
+         # sets the folder's mode, never its owner).\n\
+         ConfigurationDirectory=lsync\nConfigurationDirectoryMode=0750\n\
          StateDirectory=lsync\nStateDirectoryMode=0700\n\
          RuntimeDirectory=lsync\nRuntimeDirectoryMode={}\n\
          ProtectSystem=strict\nPrivateTmp=yes\nNoNewPrivileges=yes\n\
@@ -278,6 +280,7 @@ mod tests {
             "ExecReload=/usr/local/bin/lsync --system reload",
             "UMask=0007",
             "ConfigurationDirectory=lsync",
+            "ConfigurationDirectoryMode=0750",
             "StateDirectory=lsync",
             "RuntimeDirectory=lsync",
             "RuntimeDirectoryMode=0750",

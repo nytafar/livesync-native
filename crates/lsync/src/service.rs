@@ -33,7 +33,14 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// Tell a running service to reload the config file, and with `--system`,
 /// update the folders and credentials the system unit lists.
 pub fn config_changed(ctx: &Setup, change: &Change) {
-    for line in crate::install::refresh_system_dropin(ctx) {
+    config_changed_naming(ctx, change, &crate::install::Named::default());
+}
+
+/// [`config_changed`], for a change that named a vault's folders on the
+/// command line: with `--system`, root creates them for the service when
+/// they are missing (and no other folder).
+pub fn config_changed_naming(ctx: &Setup, change: &Change, named: &crate::install::Named) {
+    for line in crate::install::refresh_system_dropin(ctx, named) {
         println!("{line}");
     }
     tell(&ctx.config_file, change);

@@ -486,6 +486,55 @@ fn serve_with_one_vault_stops_it_when_it_is_removed() {
     assert_eq!(svc.stop(), Some(0));
 }
 
+/// Finding D of the review: `lsync reload` (the units' `ExecReload=`)
+/// succeeds once the new config is applied, a vault that cannot run
+/// included (said on stdout and stderr), and fails only for a config the
+/// service cannot read, which changes nothing.
+#[test]
+fn reload_succeeds_once_the_new_config_is_applied() {
+    let rt = runtime();
+    let mock = rt.block_on(Mock::start());
+    let m = Machine::with_vault(&mock);
+    let svc = m.spawn(&["serve"], "serve.log");
+    wait_until("the vault running in the service", || {
+        m.served_state("notes").as_deref() == Some("running")
+    });
+    let cfg = m.root.join("config/lsync/lsync.toml");
+    let good = std::fs::read_to_string(&cfg).unwrap();
+    // A second vault whose account has no password stored: it cannot run.
+    std::fs::write(
+        &cfg,
+        format!(
+            "{good}\n[account.nopw]\nurl = \"{}\"\nusername = \"v\"\n\n[vault.other]\naccount = \"nopw\"\ndatabase = \"other\"\nfolder = \"{}\"\n",
+            mock.url,
+            m.folder("other").display()
+        ),
+    )
+    .unwrap();
+    let out = m.run(&["reload"]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stdout.contains("NOT RUNNING other"), "{stdout}");
+    assert!(
+        stderr.contains("the config was reloaded, but 1 vault(s) are not running: other"),
+        "{stderr}"
+    );
+    assert_eq!(m.served_state("notes").as_deref(), Some("running"));
+
+    // A config that cannot be read: refused, and the service keeps running
+    // what it ran.
+    std::fs::write(&cfg, format!("{good}\n[vault.broken\n")).unwrap();
+    let out = m.run(&["reload"]);
+    assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(m.served_state("notes").as_deref(), Some("running"));
+    std::fs::write(&cfg, &good).unwrap();
+    assert_eq!(m.run(&["reload"]).status.code(), Some(0));
+    assert_eq!(svc.stop(), Some(0));
+}
+
 /// The vault in the service's `status --all`, `Null` while there is none.
 fn served_view(m: &Machine, vault: &str) -> Value {
     let out = m.run(&["status", "--all", "--json"]);
@@ -857,10 +906,10 @@ fn the_system_service_has_its_own_config_state_and_socket() {
     );
     assert!(var.join("notes").is_dir());
 
-    // A member of the service's group may not read its config (0700): a
-    // command for one of its vaults goes to the service by name. Here the
-    // folder is made unreadable to this user instead (not as root, who
-    // reads it anyway).
+    // A socket-group member outside the service's group may not read its
+    // config (root's, 0750/0640 to that group): a command for one of its
+    // vaults goes to the service by name. Here the folder is made
+    // unreadable to this user instead (not as root, who reads it anyway).
     if unsafe { libc::geteuid() } != 0 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -889,7 +938,7 @@ fn the_system_service_has_its_own_config_state_and_socket() {
             text(&given)
         );
         assert!(
-            !other.status.success() && text(&other).contains("can be read only by the system service's user"),
+            !other.status.success() && text(&other).contains("can be read only by root and the system service's group"),
             "{}",
             text(&other)
         );

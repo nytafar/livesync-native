@@ -175,14 +175,18 @@ pub trait SecretStore: Send + Sync {
 }
 
 /// `secrets.toml`: a flat table of `"KEY" = "secret"`, mode 0600, beside
-/// `lsync.toml`. Refused while anyone else can read it.
+/// `lsync.toml`. Refused while anyone else can read it, but for the system
+/// service's: root's, 0640, in root's 0750 folder of the same group (see
+/// [`crate::edit::shared_group`]), which the service reads through that group.
 pub struct FileStore {
     path: PathBuf,
+    /// The uid that counts as root (the tests' own stands in for it).
+    root: u32,
 }
 
 impl FileStore {
     pub fn new(path: PathBuf) -> FileStore {
-        FileStore { path }
+        FileStore { path, root: 0 }
     }
 
     pub fn path(&self) -> &Path {
@@ -220,7 +224,7 @@ impl FileStore {
         let md = std::fs::metadata(&self.path)
             .map_err(|e| SecretError::Failed(format!("reading {}: {e}", self.path.display())))?;
         let mode = md.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
+        if mode & 0o077 != 0 && !self.shared_by_root(&md) {
             return Err(SecretError::Unavailable(format!(
                 "{} can be read by other users (mode {mode:o}); run `chmod 600 {}`",
                 self.path.display(),
@@ -228,6 +232,17 @@ impl FileStore {
             )));
         }
         Ok(())
+    }
+
+    /// Root's file, readable by its group only, in root's folder shared
+    /// read-only with that same group: the system service's secrets.
+    #[cfg(unix)]
+    fn shared_by_root(&self, md: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        md.uid() == self.root
+            && md.mode() & 0o777 == 0o640
+            && crate::edit::shared_group(dir, Some(self.root)) == Some(md.gid())
     }
 
     #[cfg(not(unix))]
@@ -313,6 +328,22 @@ pub trait CredentialTool: Send + Sync {
     fn decrypt(&self, name: &str, path: &Path) -> Result<Secret, String>;
 }
 
+/// The start of every systemd credential name lsync uses for the system
+/// service. Root reads, writes, removes and loads into the unit only those,
+/// never another service's credential in the same folders.
+pub const SYSTEM_CREDENTIAL_PREFIX: &str = "lsync-";
+
+/// Why root does not touch the credential `key` for the system service:
+/// it is not one of lsync's ([`SYSTEM_CREDENTIAL_PREFIX`]). `None` for one
+/// that is.
+pub fn foreign_credential(key: &str) -> Option<String> {
+    (!key.starts_with(SYSTEM_CREDENTIAL_PREFIX) || key.len() == SYSTEM_CREDENTIAL_PREFIX.len()).then(|| {
+        format!(
+            "the system service's credentials are named {SYSTEM_CREDENTIAL_PREFIX}NAME, and {key:?} is not (it may be another service's); use credential:{SYSTEM_CREDENTIAL_PREFIX}NAME"
+        )
+    })
+}
+
 /// Where root keeps the system service's credentials, and how.
 pub struct CredentialWriter {
     /// `/etc/credstore.encrypted`, where `LoadCredentialEncrypted=` reads.
@@ -345,6 +376,17 @@ impl CredentialStore {
     fn stored(&self) -> Option<&CredentialWriter> {
         self.writer.as_ref().filter(|_| self.dir.is_none())
     }
+
+    /// The writer, for a credential of lsync's only.
+    fn stored_for(&self, key: &str) -> Result<Option<&CredentialWriter>, SecretError> {
+        match self.stored() {
+            Some(w) => match foreign_credential(key) {
+                Some(why) => Err(SecretError::Failed(why)),
+                None => Ok(Some(w)),
+            },
+            None => Ok(None),
+        }
+    }
 }
 
 impl SecretStore for CredentialStore {
@@ -374,7 +416,7 @@ impl SecretStore for CredentialStore {
     }
 
     fn get(&self, key: &str) -> Result<Option<Secret>, SecretError> {
-        if let Some(w) = self.stored() {
+        if let Some(w) = self.stored_for(key)? {
             let path = w.dir.join(key);
             if !path.exists() {
                 return Ok(None);
@@ -403,7 +445,7 @@ impl SecretStore for CredentialStore {
     }
 
     fn set(&self, key: &str, value: &Secret) -> Result<(), SecretError> {
-        let Some(w) = self.stored() else {
+        let Some(w) = self.stored_for(key)? else {
             return Err(SecretError::ReadOnly(format!(
                 "systemd credential {key:?} is set in the service unit (systemd-creds encrypt), or by root with `sudo lsync --system account passwd`"
             )));
@@ -437,7 +479,7 @@ impl SecretStore for CredentialStore {
     }
 
     fn delete(&self, key: &str) -> Result<bool, SecretError> {
-        let Some(w) = self.stored() else {
+        let Some(w) = self.stored_for(key)? else {
             self.set(key, &Secret::new(""))?;
             return Ok(false);
         };
@@ -651,6 +693,54 @@ mod tests {
         );
     }
 
+    /// The system service reads root's secrets.toml (0640) through the
+    /// config folder's group; any other layout that others can read is
+    /// still refused. The tests' own uid stands in for root.
+    #[cfg(unix)]
+    #[test]
+    fn the_system_services_secrets_are_read_through_its_group() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("lsync");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("secrets.toml");
+        std::fs::write(&path, "\"home\" = \"pw\"\n").unwrap();
+        let me = unsafe { libc::geteuid() };
+        let mine = unsafe { libc::getegid() };
+        // A group of this user's other than its primary one, when it has one.
+        let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut gs = vec![0 as libc::gid_t; n.max(0) as usize];
+        let n = unsafe { libc::getgroups(gs.len() as i32, gs.as_mut_ptr()) };
+        gs.truncate(n.max(0) as usize);
+        let Some(group) = gs.into_iter().find(|g| *g != mine) else {
+            eprintln!("this user has one group only: skipped");
+            return;
+        };
+        let chmod = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        std::os::unix::fs::chown(&dir, None, Some(group)).unwrap();
+        std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
+        chmod(&dir, 0o750);
+        chmod(&path, 0o640);
+        let as_root = FileStore {
+            path: path.clone(),
+            root: me,
+        };
+        assert_eq!(as_root.get("home").unwrap().unwrap().expose(), "pw");
+        // Not root's file.
+        assert!(FileStore::new(path.clone()).get("home").is_err());
+        // A folder its group can write, a file for everyone, a file of another group.
+        for (dir_mode, file_mode, gid) in [(0o770, 0o640, group), (0o750, 0o644, group), (0o750, 0o640, mine)] {
+            chmod(&dir, dir_mode);
+            chmod(&path, file_mode);
+            std::os::unix::fs::chown(&path, None, Some(gid)).unwrap();
+            let e = as_root.get("home").unwrap_err().to_string();
+            assert!(
+                e.contains("can be read by other users"),
+                "{dir_mode:o} {file_mode:o}: {e}"
+            );
+        }
+    }
+
     #[test]
     fn credentials_and_environment_are_read_only() {
         let d = tempfile::tempdir().unwrap();
@@ -733,6 +823,44 @@ mod tests {
         );
         assert!(!inside.writable());
         assert_eq!(inside.get("lsync-home").unwrap().unwrap().expose(), "from-unit");
+    }
+
+    /// Finding B of the review: root never decrypts, overwrites or removes
+    /// a credential that is not lsync's (`mysql-root` beside lsync's in
+    /// /etc/credstore.encrypted), whatever key a config names.
+    #[test]
+    fn root_leaves_another_services_credential_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("credstore.encrypted");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("mysql-root"), "mysql-root\nterces").unwrap();
+        std::fs::write(dir.join("lsync-"), "lsync-\nx").unwrap();
+        let c = CredentialStore::with_writer(
+            None,
+            CredentialWriter {
+                dir: dir.clone(),
+                tool: Arc::new(FakeCreds),
+            },
+        );
+        for key in ["mysql-root", "lsync-"] {
+            let e = c.get(key).unwrap_err().to_string();
+            assert!(e.contains("lsync-NAME") && !e.contains("terces"), "{e}");
+            assert!(c.set(key, &Secret::new("pw")).is_err());
+            assert!(c.delete(key).is_err());
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("mysql-root")).unwrap(),
+            "mysql-root\nterces",
+            "untouched"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "no temp file left");
+        assert_eq!(foreign_credential("lsync-home"), None);
+        // Inside a unit (no writer in use), the unit decided what it loads.
+        let unit = tempfile::tempdir().unwrap();
+        std::fs::write(unit.path().join("other"), "x\n").unwrap();
+        assert!(CredentialStore::new(Some(unit.path().to_path_buf()))
+            .get("other")
+            .is_ok());
     }
 
     struct LockedStore;

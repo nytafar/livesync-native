@@ -336,3 +336,72 @@ fn doctor_for_the_system_service_wants_the_folder_and_no_system_trash() {
     assert!(vault.iter().any(|m| m.contains("cannot create it")), "{vault:?}");
     assert!(vault.iter().any(|m| m.contains("trash = \"system\"")), "{vault:?}");
 }
+
+/// Findings B and C of the review, through the binary: root's config lock
+/// never follows a symlink planted at its name (a dangling one to a file
+/// that does not exist yet, as /etc/nologin), and `--system` accounts take
+/// only lsync's own credential names (never `mysql-root`). Both are
+/// refused before the config changes.
+#[test]
+fn a_system_config_edit_never_follows_a_planted_lock_or_names_a_foreign_credential() {
+    let m = Machine::new();
+    let etc = m.root.join("etc/lsync");
+    std::fs::create_dir_all(&etc).unwrap();
+    std::fs::copy(m.root.join("config/lsync/lsync.toml"), etc.join("lsync.toml")).unwrap();
+    let before = std::fs::read_to_string(etc.join("lsync.toml")).unwrap();
+    let system = |args: &[&str]| {
+        let mut a = vec!["--system"];
+        a.extend_from_slice(args);
+        let mut c = m.cmd(&a);
+        c.env("CONFIGURATION_DIRECTORY", &etc)
+            .env("STATE_DIRECTORY", m.root.join("var/lib/lsync"));
+        let out = c.output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+
+    let nologin = m.root.join("nologin");
+    std::os::unix::fs::symlink(&nologin, etc.join(".lsync.toml.lock")).unwrap();
+    let folder = m.root.join("srv/more");
+    let (ok, err) = system(&[
+        "vault",
+        "add",
+        "more",
+        "--db",
+        "more",
+        "--folder",
+        folder.to_str().unwrap(),
+    ]);
+    assert!(!ok && err.contains("symbolic link"), "{err}");
+    assert!(!nologin.exists(), "nothing created through the link");
+    std::fs::remove_file(etc.join(".lsync.toml.lock")).unwrap();
+
+    let (ok, err) = system(&[
+        "account",
+        "add",
+        "db",
+        "--url",
+        "http://127.0.0.1:9",
+        "--user",
+        "u",
+        "--secret",
+        "credential:mysql-root",
+        "--no-password",
+    ]);
+    assert!(!ok && err.contains("lsync-NAME"), "{err}");
+    assert_eq!(std::fs::read_to_string(etc.join("lsync.toml")).unwrap(), before);
+    assert!(m.calls().is_empty(), "{:?}", m.calls());
+    // An lsync- name is taken (not root here: nothing is encrypted).
+    let (ok, err) = system(&[
+        "account",
+        "add",
+        "db",
+        "--url",
+        "http://127.0.0.1:9",
+        "--user",
+        "u",
+        "--secret",
+        "credential:lsync-db",
+        "--no-password",
+    ]);
+    assert!(ok, "{err}");
+}

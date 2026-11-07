@@ -179,6 +179,7 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
                 Some(s) => SecretRef::parse(s).map_err(|e| anyhow!("--secret: {e}"))?,
                 None => SecretRef::file(&name),
             };
+            system_credential(ctx, &r)?;
             let mut file = open(ctx)?;
             let account = Account {
                 id: Some(new_id()),
@@ -320,6 +321,7 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
                 .get(&name)
                 .ok_or_else(|| anyhow!("no account named {name:?} in {}", ctx.config_file.display()))?;
             let r = a.secret_ref(&name).map_err(|e| anyhow!(e))?;
+            system_credential(ctx, &r)?;
             let stores = ctx.secrets();
             if !stores.writable(&r) {
                 bail!(
@@ -355,7 +357,8 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
                 .account
                 .iter()
                 .any(|(n, o)| n != &name && o.secret_ref(n).ok().as_ref() == Some(&r));
-            if ctx.secrets().writable(&r) && !shared {
+            // Another service's credential is never removed (see `system_credential`).
+            if ctx.secrets().writable(&r) && !shared && system_credential(ctx, &r).is_ok() {
                 ctx.secrets().delete(&r)?;
             }
             println!("removed account {name}");
@@ -363,6 +366,18 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
             Ok(0)
         }
     }
+}
+
+/// A system service's credential is one of lsync's (`lsync-NAME`): root
+/// never reads, writes or removes another service's in the same folder,
+/// nor loads it into lsync's unit.
+fn system_credential(ctx: &Setup, r: &SecretRef) -> Result<()> {
+    if ctx.system && r.kind == livesync_host::secret::StoreKind::Credential {
+        if let Some(why) = livesync_host::secret::foreign_credential(&r.key) {
+            bail!("{why}");
+        }
+    }
+    Ok(())
 }
 
 /// Undo a password this command stored: the one it replaced comes back,
@@ -492,7 +507,12 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
             let cfg = file.save(&ctx.dirs).map_err(|e| anyhow!(e))?;
             println!("added vault {name} to {}", ctx.config_file.display());
             print_vault(ctx, &name, &cfg.vault[&name]);
-            service::config_changed(ctx, &Change::Vault(name));
+            let named = crate::install::Named {
+                vault: name.clone(),
+                folder: true,
+                state: given.has("state_dir"),
+            };
+            service::config_changed_naming(ctx, &Change::Vault(name), &named);
             Ok(0)
         }
         VaultCmd::Ls { json } => {
@@ -666,7 +686,12 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
             }
             println!("changed vault {name}");
             print_vault(ctx, &name, new);
-            service::config_changed(ctx, &Change::Vault(name));
+            let named = crate::install::Named {
+                vault: name.clone(),
+                folder: given.has("folder"),
+                state: given.has("state_dir"),
+            };
+            service::config_changed_naming(ctx, &Change::Vault(name), &named);
             Ok(0)
         }
         VaultCmd::Enable { name } => set_enabled(ctx, &name, true),
