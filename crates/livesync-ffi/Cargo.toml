@@ -3,7 +3,7 @@ name = "livesync-ffi"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
-description = "UniFFI surface over the LiveSync engine for the Android app: one host, N profiles"
+description = "UniFFI surface over livesync-host for the Android app: one host, N profiles"
 
 [lib]
 # cdylib for the app (liblivesync_ffi.so), lib for the tests.
@@ -12,6 +12,7 @@ name = "livesync_ffi"
 
 [dependencies]
 livesync-engine = { version = "0.1.0", path = "../livesync-engine" }
+livesync-host = { version = "0.1.0", path = "../livesync-host" }
 livesync-model = { version = "0.1.0", path = "../livesync-model" }
 livesync-remote = { version = "0.1.0", path = "../livesync-remote" }
 serde = { version = "1.0.229", features = ["derive"] }

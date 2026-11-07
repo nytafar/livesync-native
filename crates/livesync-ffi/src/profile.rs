@@ -1,10 +1,11 @@
-//! A profile as the app hands it over, and the checks that apply before an
-//! engine is opened for it.
+//! A profile as the app hands it over. The checks that apply before an
+//! engine is opened for it are the host's (`livesync_host::RunConfig`).
 
 use livesync_engine::EngineConfig;
+use livesync_host::RunConfig;
 use livesync_model::scope::{Scope, ScopeMode};
 use livesync_remote::RemoteConfig;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 /// Folder-scope mode (spec "Folder scope").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -57,122 +58,61 @@ impl std::fmt::Debug for ProfileConfig {
 }
 
 impl ProfileConfig {
-    pub fn scope(&self) -> Result<Scope, String> {
-        let mode = match self.scope_kind {
+    /// What the host runs: this profile, with a phone's fewer chunk fetches
+    /// in flight than a desktop's.
+    pub fn run_config(&self) -> RunConfig {
+        let scope_mode = match self.scope_kind {
             ScopeKind::All => ScopeMode::All,
             ScopeKind::Include => ScopeMode::Include,
             ScopeKind::Exclude => ScopeMode::Exclude,
         };
-        let folders: Vec<String> = self
-            .scope_folders
-            .iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        Scope::new(mode, &folders)
-    }
-
-    pub fn remote(&self) -> RemoteConfig {
-        RemoteConfig {
-            url: self.url.trim().to_string(),
-            database: self.database.trim().to_string(),
-            username: Some(self.username.clone()).filter(|s| !s.is_empty()),
-            password: Some(self.password.clone()).filter(|s| !s.is_empty()),
+        RunConfig {
+            id: self.id.clone(),
+            vault_path: self.vault_path.clone(),
+            state_dir: self.state_dir.clone(),
+            url: self.url.clone(),
+            database: self.database.clone(),
+            username: self.username.clone(),
+            password: self.password.clone(),
+            scope_mode,
+            scope_folders: self.scope_folders.clone(),
+            pull_only: self.pull_only,
+            device_name: self.device_name.clone(),
+            ignore_regex: self.ignore_regex.clone(),
+            concurrency: Some(4),
+            max_size_mb: None,
         }
     }
 
+    pub fn scope(&self) -> Result<Scope, String> {
+        self.run_config().scope()
+    }
+
+    pub fn remote(&self) -> RemoteConfig {
+        self.run_config().remote()
+    }
+
     pub fn index_path(&self) -> PathBuf {
-        Path::new(&self.state_dir).join("index.sqlite")
+        self.run_config().index_path()
     }
 
     /// Check the fields that do not need the network or the disk.
     pub fn validate(&self) -> Result<(), String> {
-        if self.id.trim().is_empty() {
-            return Err("the profile has no ID".into());
-        }
-        let vault = Path::new(&self.vault_path);
-        if !vault.is_absolute() {
-            return Err(format!(
-                "the vault folder must be an absolute path: {:?}",
-                self.vault_path
-            ));
-        }
-        if vault.parent().is_none() {
-            return Err("the vault folder cannot be the filesystem root".into());
-        }
-        if !Path::new(&self.state_dir).is_absolute() {
-            return Err("the state folder must be an absolute path".into());
-        }
-        if paths_overlap(&self.vault_path, &self.state_dir) {
-            return Err("the state folder must be outside the vault folder".into());
-        }
-        let url = self.url.trim();
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            return Err("the server URL must start with https:// or http://".into());
-        }
-        if self.database.trim().is_empty() {
-            return Err("no database name".into());
-        }
-        self.scope()?;
-        Ok(())
+        self.run_config().validate()
     }
 
     pub fn engine_config(&self) -> Result<EngineConfig, String> {
-        let mut ec = EngineConfig::new(PathBuf::from(&self.vault_path), self.index_path());
-        ec.scope = self.scope()?;
-        ec.device_name = Some(self.device_name.trim().to_string()).filter(|s| !s.is_empty());
-        ec.ignore_regex = Some(self.ignore_regex.clone()).filter(|s| !s.trim().is_empty());
-        // A phone: fewer chunk fetches in flight than on a desktop.
-        ec.concurrency = 4;
-        Ok(ec)
+        self.run_config().engine_config()
     }
 }
 
-/// The path as compared for overlap: canonical when it exists (resolves
-/// `/sdcard` and other links), otherwise lexically normalised; then
-/// lower-cased, because Android shared storage folds case (two spellings of
-/// one folder are one folder there, and refusing them elsewhere is harmless).
-pub fn comparable(path: &str) -> PathBuf {
-    let p = normalise(Path::new(path));
-    // Canonicalise the longest existing ancestor, so a folder that does not
-    // exist yet under a link (`/sdcard/...`) compares like its siblings.
-    let mut base = p.clone();
-    let mut rest: Vec<std::ffi::OsString> = Vec::new();
-    let resolved = loop {
-        if let Ok(c) = std::fs::canonicalize(&base) {
-            break rest.iter().rev().fold(c, |acc, seg| acc.join(seg));
-        }
-        match (base.file_name().map(|s| s.to_owned()), base.parent()) {
-            (Some(name), Some(parent)) => {
-                rest.push(name);
-                base = parent.to_path_buf();
-            }
-            _ => break p.clone(),
-        }
-    };
-    PathBuf::from(resolved.to_string_lossy().to_lowercase())
-}
-
-fn normalise(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
+pub use livesync_host::paths::comparable;
 
 /// Whether two folders are the same, or one lies inside the other (spec
 /// "Designed for multiple vaults": vault folders may not overlap).
 #[uniffi::export]
 pub fn paths_overlap(a: &str, b: &str) -> bool {
-    let (a, b) = (comparable(a), comparable(b));
-    a.starts_with(&b) || b.starts_with(&a)
+    livesync_host::paths_overlap(a, b)
 }
 
 /// Normalise and check a folder list for a scope mode; returns the folders

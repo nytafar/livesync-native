@@ -966,6 +966,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "livesync-engine",
+ "livesync-host",
  "livesync-model",
  "livesync-remote",
  "serde",
@@ -976,6 +977,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uniffi",
+]
+
+[[package]]
+name = "livesync-host"
+version = "0.1.0"
+dependencies = [
+ "livesync-engine",
+ "livesync-model",
+ "livesync-remote",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

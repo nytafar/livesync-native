@@ -1,0 +1,17 @@
+[package]
+name = "livesync-host"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+description = "Hosts LiveSync vaults for every front-end: one supervisor per vault"
+
+[dependencies]
+livesync-engine = { version = "0.1.0", path = "../livesync-engine" }
+livesync-model = { version = "0.1.0", path = "../livesync-model" }
+livesync-remote = { version = "0.1.0", path = "../livesync-remote" }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"

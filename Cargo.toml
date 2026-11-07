@@ -4,6 +4,7 @@ members = [
     "crates/livesync-model",
     "crates/livesync-remote",
     "crates/livesync-engine",
+    "crates/livesync-host",
     "crates/lsync",
     "crates/livesync-ffi",
     "crates/uniffi-bindgen",

@@ -1,11 +1,12 @@
 //! UniFFI surface over the LiveSync engine, for the Android app (spec D1,
-//! "Designed for multiple vaults").
+//! "Designed for multiple vaults"): a thin wrapper over `livesync-host`.
 //!
 //! One [`LiveSync`] host holds N engines, one per profile, each run by its own
-//! supervisor task on a shared Tokio runtime. Every call takes a profile ID.
-//! Nothing here is Android-specific except the logcat sink in `logging`; the
-//! app owns the service, the Keystore, the network callback and the UI, and
-//! hands each profile over with its credentials already resolved.
+//! supervisor task on a shared Tokio runtime (`livesync_host::Host`). Every
+//! call takes a profile ID. Nothing here is Android-specific except the
+//! logcat sink in `logging`; the app owns the service, the Keystore, the
+//! network callback and the UI, and hands each profile over with its
+//! credentials already resolved.
 
 uniffi::setup_scaffolding!();
 
@@ -21,7 +22,7 @@ pub use profile::{check_scope, paths_overlap, ProfileConfig, ScopeKind};
 pub use status::{AttentionItem, GateOutcome, GateResult, ProfileStatus, StateCount};
 
 use livesync_engine::EngineError;
-use livesync_remote::RemoteError;
+use livesync_host::HostError;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum LiveSyncError {
@@ -50,29 +51,25 @@ pub enum LiveSyncError {
 
 impl From<EngineError> for LiveSyncError {
     fn from(e: EngineError) -> Self {
-        let msg = e.to_string();
+        HostError::from(e).into()
+    }
+}
+
+impl From<HostError> for LiveSyncError {
+    fn from(e: HostError) -> Self {
         match e {
-            EngineError::Refused(_) => LiveSyncError::Refused { msg },
-            EngineError::Remote(_) => LiveSyncError::Remote { msg },
-            EngineError::Busy(_) => LiveSyncError::Busy { msg },
-            EngineError::Index(_) | EngineError::Other(_) => LiveSyncError::Other { msg },
+            HostError::Invalid { msg } => LiveSyncError::Invalid { msg },
+            HostError::Busy { msg } => LiveSyncError::Busy { msg },
+            HostError::NotRunning { msg } => LiveSyncError::NotRunning { msg },
+            HostError::Refused { msg } => LiveSyncError::Refused { msg },
+            HostError::StopChanged { msg } => LiveSyncError::StopChanged { msg },
+            HostError::Remote { msg } => LiveSyncError::Remote { msg },
+            HostError::Other { msg } => LiveSyncError::Other { msg },
         }
     }
 }
 
-/// A sentence for the user about a remote error, without the request
-/// details that only matter in the log.
-pub(crate) fn explain_remote(e: &RemoteError) -> String {
-    match e {
-        RemoteError::Http { status: 401, .. } => "the server refused the user name or password (HTTP 401)".into(),
-        RemoteError::Http { status: 403, .. } => "this user may not read the database (HTTP 403)".into(),
-        RemoteError::Http { status: 404, what, .. } if what == "database info" => {
-            "the database does not exist on this server (HTTP 404)".into()
-        }
-        RemoteError::Transport { .. } => format!("cannot reach the server: {e}"),
-        _ => e.to_string(),
-    }
-}
+pub(crate) use livesync_host::explain_remote;
 
 /// The FFI crate's version (the workspace version).
 #[uniffi::export]

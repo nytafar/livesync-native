@@ -2,17 +2,14 @@
 //! shows them (spec "Picking folders from the server (M2)").
 
 use livesync_engine::{FolderEntry, FolderListing};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Notify;
 
 /// Cancels a listing in flight: the app hands one to `list_folders` and
 /// cancels it when the user leaves the screen, so a listing nobody waits for
 /// stops downloading at once instead of running to its timeout.
 #[derive(Debug, Default, uniffi::Object)]
 pub struct Cancel {
-    flag: AtomicBool,
-    notify: Notify,
+    inner: livesync_host::Cancel,
 }
 
 #[uniffi::export]
@@ -24,26 +21,17 @@ impl Cancel {
 
     /// Stop the call this was handed to (now or when it starts).
     pub fn cancel(&self) {
-        self.flag.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        self.inner.cancel();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        self.inner.is_cancelled()
     }
 }
 
 impl Cancel {
-    /// Resolves once [`Cancel::cancel`] was called, before or after.
-    pub(crate) async fn cancelled(&self) {
-        loop {
-            // Registered before the check, so a cancel in between still wakes it.
-            let woken = self.notify.notified();
-            if self.is_cancelled() {
-                return;
-            }
-            woken.await;
-        }
+    pub(crate) fn inner(&self) -> &livesync_host::Cancel {
+        &self.inner
     }
 }
 
