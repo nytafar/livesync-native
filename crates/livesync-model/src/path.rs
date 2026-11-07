@@ -102,6 +102,106 @@ pub fn classify_path(path: &str) -> Option<PathSkip> {
     None
 }
 
+/// Dot-paths that may sync after all (`sync_dot_paths`): each entry names
+/// a dot-folder or dot-file, vault-relative, compared case-insensitively.
+/// Everything below an allowed dot-folder follows the usual rules, so a dot
+/// segment further down needs an entry of its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DotAllow {
+    /// Normalised, lower-cased entries.
+    entries: Vec<String>,
+}
+
+/// Dot names that can never be allowlisted: Obsidian's settings (settings
+/// sync is its own feature), the vault trash, git's internals, and lsync's
+/// own temp and lock files.
+fn never_allowed(seg: &str) -> bool {
+    let s = js_to_lower_case(seg);
+    s == ".obsidian" || s == ".trash" || s == ".git" || s.starts_with(".lsync")
+}
+
+impl DotAllow {
+    pub fn none() -> Self {
+        DotAllow::default()
+    }
+
+    /// Check and normalise the configured entries.
+    pub fn new(entries: &[String]) -> Result<DotAllow, String> {
+        let mut out: Vec<String> = Vec::new();
+        for e in entries {
+            let segs: Vec<&str> = e.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+            let Some(last) = segs.last() else {
+                return Err(format!("sync_dot_paths: empty entry {e:?}"));
+            };
+            for s in &segs {
+                if *s == "." || *s == ".." {
+                    return Err(format!("sync_dot_paths: {e:?} contains {s:?}"));
+                }
+                if never_allowed(s) {
+                    return Err(format!("sync_dot_paths: {e:?}: {s} can never sync as ordinary files"));
+                }
+            }
+            if !last.starts_with('.') {
+                return Err(format!(
+                    "sync_dot_paths: {e:?} is not a dot-path (name the dot-folder or dot-file itself)"
+                ));
+            }
+            out.push(js_to_lower_case(&segs.join("/")));
+        }
+        out.sort();
+        out.dedup();
+        Ok(DotAllow { entries: out })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+
+    /// Whether every dot segment of `path` is an allowed entry.
+    pub fn covers(&self, path: &str) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let lower = js_to_lower_case(path);
+        let mut end = 0usize;
+        for seg in lower.split('/') {
+            end += seg.len();
+            if seg.starts_with('.') {
+                if seg == "." || seg == ".." {
+                    return false;
+                }
+                let prefix = &lower[..end];
+                if !self.entries.iter().any(|e| e == prefix) {
+                    return false;
+                }
+            }
+            end += 1; // the '/'
+        }
+        true
+    }
+}
+
+/// [`classify_path`], with the dot-paths `allow` names let through.
+pub fn classify_path_allowing(path: &str, allow: &DotAllow) -> Option<PathSkip> {
+    match classify_path(path) {
+        Some(PathSkip::DotPath) if allow.covers(path) => {
+            // The other rules still apply.
+            if path.split('/').any(|s| s.is_empty()) {
+                Some(PathSkip::Unsafe)
+            } else if is_flag_file(path) {
+                Some(PathSkip::FlagFile)
+            } else {
+                None
+            }
+        }
+        other => other,
+    }
+}
+
 /// Upstream ignores exactly `redflag.md`, `redflag2.md`, `redflag3.md`,
 /// `flag_rebuild.md`, `flag_fetch.md` at the vault root and anything starting
 /// with `livesync_log_` / `LIVESYNC_LOG_`. We skip the broader root-level
@@ -150,6 +250,45 @@ mod tests {
         assert_eq!(classify_path("sub/redflag.md"), None);
         assert_eq!(classify_path("notes/a.md"), None);
         assert_eq!(classify_path("x.v1.md"), None);
+    }
+
+    #[test]
+    fn dot_allowlist() {
+        let a = DotAllow::new(&[".notes".into(), "Work/.Drafts/".into()]).unwrap();
+        assert_eq!(classify_path_allowing(".notes/a.md", &a), None);
+        assert_eq!(classify_path_allowing(".NOTES/sub/a.md", &a), None);
+        assert_eq!(classify_path_allowing("work/.drafts/x.md", &a), None);
+        assert_eq!(
+            classify_path_allowing(".notes/.hidden/a.md", &a),
+            Some(PathSkip::DotPath)
+        );
+        assert_eq!(classify_path_allowing(".other/a.md", &a), Some(PathSkip::DotPath));
+        assert_eq!(
+            classify_path_allowing(".notes/.lsync-1.tmp", &a),
+            Some(PathSkip::DotPath)
+        );
+        assert_eq!(classify_path_allowing(".notesx/a.md", &a), Some(PathSkip::DotPath));
+        assert_eq!(
+            classify_path_allowing(".obsidian/app.json", &a),
+            Some(PathSkip::DotPath)
+        );
+        for bad in [
+            ".obsidian",
+            ".trash",
+            ".git",
+            "a/.obsidian",
+            ".lsync.lock",
+            "notes",
+            "..",
+            "a/../.x",
+            "",
+        ] {
+            assert!(DotAllow::new(&[bad.into()]).is_err(), "{bad:?} must be refused");
+        }
+        assert_eq!(
+            classify_path_allowing(".notes/a.md", &DotAllow::none()),
+            Some(PathSkip::DotPath)
+        );
     }
 
     #[test]

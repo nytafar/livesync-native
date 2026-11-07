@@ -5,6 +5,7 @@ pub mod chunk;
 pub mod codec;
 pub mod doc;
 pub mod gate;
+pub mod ignore;
 pub mod milestone;
 pub mod path;
 pub mod scope;

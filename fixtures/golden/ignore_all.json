@@ -1,0 +1,1706 @@
+{
+ "meta": {
+  "generator": "tools/golden/generate.mjs",
+  "package": "@vrtmrz/livesync-commonlib",
+  "version": "0.2.1"
+ },
+ "vault": {
+  ".gitignore": "*.log\nbuild/\n!important.log\nprivate.md\n/anchored.md\n",
+  ".obsidianignore": "*.canvas\n",
+  "notes/.gitignore": "drafts/\n*.tmp\n!keep.tmp\nsecret\n!secret/public.md\n",
+  "notes/drafts/.gitignore": "!*.md\n",
+  "notes/deep/.gitignore": "# nothing but a comment\n\n",
+  "code/.gitignore": "node_modules/\n.venv/\n*.pyc\n",
+  "code/app/.obsidianignore": "secret*\n",
+  "code/app/.gitignore": "!secret-ok.md\n",
+  "Mixed/.GITIGNORE": "*.md\n",
+  "mixed/.gitignore": "*.txt\n"
+ },
+ "cases": [
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "a.md",
+   "accepted": true,
+   "asked": [
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "a.log",
+   "accepted": false,
+   "asked": [
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "important.log",
+   "accepted": true,
+   "asked": [
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "private.md",
+   "accepted": false,
+   "asked": [
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "anchored.md",
+   "accepted": true,
+   "asked": [
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "sub/anchored.md",
+   "accepted": true,
+   "asked": [
+    "sub/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "sub/private.md",
+   "accepted": true,
+   "asked": [
+    "sub/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "sub/a.log",
+   "accepted": true,
+   "asked": [
+    "sub/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "build/x.md",
+   "accepted": false,
+   "asked": [
+    "build/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "sub/build/x.md",
+   "accepted": true,
+   "asked": [
+    "sub/build/.gitignore",
+    "sub/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "x.canvas",
+   "accepted": true,
+   "asked": [
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/n.md",
+   "accepted": true,
+   "asked": [
+    "notes/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/a.log",
+   "accepted": true,
+   "asked": [
+    "notes/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/x.tmp",
+   "accepted": false,
+   "asked": [
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/keep.tmp",
+   "accepted": true,
+   "asked": [
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/sub/x.tmp",
+   "accepted": true,
+   "asked": [
+    "notes/sub/.gitignore",
+    "notes/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/drafts/d.md",
+   "accepted": true,
+   "asked": [
+    "notes/drafts/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/drafts/d.txt",
+   "accepted": false,
+   "asked": [
+    "notes/drafts/.gitignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/drafts/sub/d.md",
+   "accepted": false,
+   "asked": [
+    "notes/drafts/sub/.gitignore",
+    "notes/drafts/.gitignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/secret/x.md",
+   "accepted": false,
+   "asked": [
+    "notes/secret/.gitignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/secret/public.md",
+   "accepted": true,
+   "asked": [
+    "notes/secret/.gitignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/deep/a.log",
+   "accepted": true,
+   "asked": [
+    "notes/deep/.gitignore",
+    "notes/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/deep/x.tmp",
+   "accepted": true,
+   "asked": [
+    "notes/deep/.gitignore",
+    "notes/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/deep/ok.md",
+   "accepted": true,
+   "asked": [
+    "notes/deep/.gitignore",
+    "notes/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "code/main.py",
+   "accepted": true,
+   "asked": [
+    "code/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "code/main.pyc",
+   "accepted": false,
+   "asked": [
+    "code/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "code/node_modules/pkg/readme.md",
+   "accepted": false,
+   "asked": [
+    "code/node_modules/pkg/.gitignore",
+    "code/node_modules/.gitignore",
+    "code/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "code/.venv/lib/x.py",
+   "accepted": false,
+   "asked": [
+    "code/.venv/lib/.gitignore",
+    "code/.venv/.gitignore",
+    "code/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "code/app/secret.md",
+   "accepted": true,
+   "asked": [
+    "code/app/.gitignore",
+    "code/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "code/app/secret-ok.md",
+   "accepted": true,
+   "asked": [
+    "code/app/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "code/app/readme.md",
+   "accepted": true,
+   "asked": [
+    "code/app/.gitignore",
+    "code/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "code/app/sub/secret.md",
+   "accepted": true,
+   "asked": [
+    "code/app/sub/.gitignore",
+    "code/app/.gitignore",
+    "code/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "code/app/x.log",
+   "accepted": true,
+   "asked": [
+    "code/app/.gitignore",
+    "code/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "Mixed/a.md",
+   "accepted": true,
+   "asked": [
+    "Mixed/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "mixed/a.md",
+   "accepted": true,
+   "asked": [
+    "mixed/.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "mixed/a.txt",
+   "accepted": false,
+   "asked": [
+    "mixed/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "Mr./note.md",
+   "accepted": false,
+   "asked": [
+    "Mr./.gitignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore"
+   ],
+   "path": "notes/Mr./note.md",
+   "accepted": false,
+   "asked": [
+    "notes/Mr./.gitignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "a.md",
+   "accepted": true,
+   "asked": [
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "a.log",
+   "accepted": false,
+   "asked": [
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "important.log",
+   "accepted": true,
+   "asked": [
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "private.md",
+   "accepted": false,
+   "asked": [
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "anchored.md",
+   "accepted": true,
+   "asked": [
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "sub/anchored.md",
+   "accepted": true,
+   "asked": [
+    "sub/.gitignore",
+    "sub/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "sub/private.md",
+   "accepted": true,
+   "asked": [
+    "sub/.gitignore",
+    "sub/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "sub/a.log",
+   "accepted": true,
+   "asked": [
+    "sub/.gitignore",
+    "sub/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "build/x.md",
+   "accepted": false,
+   "asked": [
+    "build/.gitignore",
+    "build/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "sub/build/x.md",
+   "accepted": true,
+   "asked": [
+    "sub/build/.gitignore",
+    "sub/build/.obsidianignore",
+    "sub/.gitignore",
+    "sub/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "x.canvas",
+   "accepted": false,
+   "asked": [
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/n.md",
+   "accepted": true,
+   "asked": [
+    "notes/.gitignore",
+    "notes/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/a.log",
+   "accepted": true,
+   "asked": [
+    "notes/.gitignore",
+    "notes/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/x.tmp",
+   "accepted": false,
+   "asked": [
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/keep.tmp",
+   "accepted": true,
+   "asked": [
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/sub/x.tmp",
+   "accepted": true,
+   "asked": [
+    "notes/sub/.gitignore",
+    "notes/sub/.obsidianignore",
+    "notes/.gitignore",
+    "notes/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/drafts/d.md",
+   "accepted": true,
+   "asked": [
+    "notes/drafts/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/drafts/d.txt",
+   "accepted": false,
+   "asked": [
+    "notes/drafts/.gitignore",
+    "notes/drafts/.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/drafts/sub/d.md",
+   "accepted": false,
+   "asked": [
+    "notes/drafts/sub/.gitignore",
+    "notes/drafts/sub/.obsidianignore",
+    "notes/drafts/.gitignore",
+    "notes/drafts/.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/secret/x.md",
+   "accepted": false,
+   "asked": [
+    "notes/secret/.gitignore",
+    "notes/secret/.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/secret/public.md",
+   "accepted": true,
+   "asked": [
+    "notes/secret/.gitignore",
+    "notes/secret/.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/deep/a.log",
+   "accepted": true,
+   "asked": [
+    "notes/deep/.gitignore",
+    "notes/deep/.obsidianignore",
+    "notes/.gitignore",
+    "notes/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/deep/x.tmp",
+   "accepted": true,
+   "asked": [
+    "notes/deep/.gitignore",
+    "notes/deep/.obsidianignore",
+    "notes/.gitignore",
+    "notes/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/deep/ok.md",
+   "accepted": true,
+   "asked": [
+    "notes/deep/.gitignore",
+    "notes/deep/.obsidianignore",
+    "notes/.gitignore",
+    "notes/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "code/main.py",
+   "accepted": true,
+   "asked": [
+    "code/.gitignore",
+    "code/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "code/main.pyc",
+   "accepted": false,
+   "asked": [
+    "code/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "code/node_modules/pkg/readme.md",
+   "accepted": false,
+   "asked": [
+    "code/node_modules/pkg/.gitignore",
+    "code/node_modules/pkg/.obsidianignore",
+    "code/node_modules/.gitignore",
+    "code/node_modules/.obsidianignore",
+    "code/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "code/.venv/lib/x.py",
+   "accepted": false,
+   "asked": [
+    "code/.venv/lib/.gitignore",
+    "code/.venv/lib/.obsidianignore",
+    "code/.venv/.gitignore",
+    "code/.venv/.obsidianignore",
+    "code/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "code/app/secret.md",
+   "accepted": false,
+   "asked": [
+    "code/app/.gitignore",
+    "code/app/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "code/app/secret-ok.md",
+   "accepted": true,
+   "asked": [
+    "code/app/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "code/app/readme.md",
+   "accepted": true,
+   "asked": [
+    "code/app/.gitignore",
+    "code/app/.obsidianignore",
+    "code/.gitignore",
+    "code/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "code/app/sub/secret.md",
+   "accepted": true,
+   "asked": [
+    "code/app/sub/.gitignore",
+    "code/app/sub/.obsidianignore",
+    "code/app/.gitignore",
+    "code/app/.obsidianignore",
+    "code/.gitignore",
+    "code/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "code/app/x.log",
+   "accepted": true,
+   "asked": [
+    "code/app/.gitignore",
+    "code/app/.obsidianignore",
+    "code/.gitignore",
+    "code/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "Mixed/a.md",
+   "accepted": true,
+   "asked": [
+    "Mixed/.gitignore",
+    "Mixed/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "mixed/a.md",
+   "accepted": true,
+   "asked": [
+    "mixed/.gitignore",
+    "mixed/.obsidianignore",
+    "/.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "mixed/a.txt",
+   "accepted": false,
+   "asked": [
+    "mixed/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "Mr./note.md",
+   "accepted": false,
+   "asked": [
+    "Mr./.gitignore",
+    "Mr./.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".gitignore",
+    ".obsidianignore"
+   ],
+   "path": "notes/Mr./note.md",
+   "accepted": false,
+   "asked": [
+    "notes/Mr./.gitignore",
+    "notes/Mr./.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "a.md",
+   "accepted": true,
+   "asked": [
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "a.log",
+   "accepted": false,
+   "asked": [
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "important.log",
+   "accepted": true,
+   "asked": [
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "private.md",
+   "accepted": false,
+   "asked": [
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "anchored.md",
+   "accepted": true,
+   "asked": [
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "sub/anchored.md",
+   "accepted": true,
+   "asked": [
+    "sub/.obsidianignore",
+    "sub/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "sub/private.md",
+   "accepted": true,
+   "asked": [
+    "sub/.obsidianignore",
+    "sub/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "sub/a.log",
+   "accepted": true,
+   "asked": [
+    "sub/.obsidianignore",
+    "sub/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "build/x.md",
+   "accepted": false,
+   "asked": [
+    "build/.obsidianignore",
+    "build/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "sub/build/x.md",
+   "accepted": true,
+   "asked": [
+    "sub/build/.obsidianignore",
+    "sub/build/.gitignore",
+    "sub/.obsidianignore",
+    "sub/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "x.canvas",
+   "accepted": false,
+   "asked": [
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/n.md",
+   "accepted": true,
+   "asked": [
+    "notes/.obsidianignore",
+    "notes/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/a.log",
+   "accepted": true,
+   "asked": [
+    "notes/.obsidianignore",
+    "notes/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/x.tmp",
+   "accepted": false,
+   "asked": [
+    "notes/.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/keep.tmp",
+   "accepted": true,
+   "asked": [
+    "notes/.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/sub/x.tmp",
+   "accepted": true,
+   "asked": [
+    "notes/sub/.obsidianignore",
+    "notes/sub/.gitignore",
+    "notes/.obsidianignore",
+    "notes/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/drafts/d.md",
+   "accepted": true,
+   "asked": [
+    "notes/drafts/.obsidianignore",
+    "notes/drafts/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/drafts/d.txt",
+   "accepted": false,
+   "asked": [
+    "notes/drafts/.obsidianignore",
+    "notes/drafts/.gitignore",
+    "notes/.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/drafts/sub/d.md",
+   "accepted": false,
+   "asked": [
+    "notes/drafts/sub/.obsidianignore",
+    "notes/drafts/sub/.gitignore",
+    "notes/drafts/.obsidianignore",
+    "notes/drafts/.gitignore",
+    "notes/.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/secret/x.md",
+   "accepted": false,
+   "asked": [
+    "notes/secret/.obsidianignore",
+    "notes/secret/.gitignore",
+    "notes/.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/secret/public.md",
+   "accepted": true,
+   "asked": [
+    "notes/secret/.obsidianignore",
+    "notes/secret/.gitignore",
+    "notes/.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/deep/a.log",
+   "accepted": true,
+   "asked": [
+    "notes/deep/.obsidianignore",
+    "notes/deep/.gitignore",
+    "notes/.obsidianignore",
+    "notes/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/deep/x.tmp",
+   "accepted": true,
+   "asked": [
+    "notes/deep/.obsidianignore",
+    "notes/deep/.gitignore",
+    "notes/.obsidianignore",
+    "notes/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/deep/ok.md",
+   "accepted": true,
+   "asked": [
+    "notes/deep/.obsidianignore",
+    "notes/deep/.gitignore",
+    "notes/.obsidianignore",
+    "notes/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "code/main.py",
+   "accepted": true,
+   "asked": [
+    "code/.obsidianignore",
+    "code/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "code/main.pyc",
+   "accepted": false,
+   "asked": [
+    "code/.obsidianignore",
+    "code/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "code/node_modules/pkg/readme.md",
+   "accepted": false,
+   "asked": [
+    "code/node_modules/pkg/.obsidianignore",
+    "code/node_modules/pkg/.gitignore",
+    "code/node_modules/.obsidianignore",
+    "code/node_modules/.gitignore",
+    "code/.obsidianignore",
+    "code/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "code/.venv/lib/x.py",
+   "accepted": false,
+   "asked": [
+    "code/.venv/lib/.obsidianignore",
+    "code/.venv/lib/.gitignore",
+    "code/.venv/.obsidianignore",
+    "code/.venv/.gitignore",
+    "code/.obsidianignore",
+    "code/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "code/app/secret.md",
+   "accepted": false,
+   "asked": [
+    "code/app/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "code/app/secret-ok.md",
+   "accepted": false,
+   "asked": [
+    "code/app/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "code/app/readme.md",
+   "accepted": true,
+   "asked": [
+    "code/app/.obsidianignore",
+    "code/app/.gitignore",
+    "code/.obsidianignore",
+    "code/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "code/app/sub/secret.md",
+   "accepted": true,
+   "asked": [
+    "code/app/sub/.obsidianignore",
+    "code/app/sub/.gitignore",
+    "code/app/.obsidianignore",
+    "code/app/.gitignore",
+    "code/.obsidianignore",
+    "code/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "code/app/x.log",
+   "accepted": true,
+   "asked": [
+    "code/app/.obsidianignore",
+    "code/app/.gitignore",
+    "code/.obsidianignore",
+    "code/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "Mixed/a.md",
+   "accepted": true,
+   "asked": [
+    "Mixed/.obsidianignore",
+    "Mixed/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "mixed/a.md",
+   "accepted": true,
+   "asked": [
+    "mixed/.obsidianignore",
+    "mixed/.gitignore",
+    "/.obsidianignore",
+    "/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "mixed/a.txt",
+   "accepted": false,
+   "asked": [
+    "mixed/.obsidianignore",
+    "mixed/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "Mr./note.md",
+   "accepted": false,
+   "asked": [
+    "Mr./.obsidianignore",
+    "Mr./.gitignore",
+    "/.obsidianignore"
+   ]
+  },
+  {
+   "ignoreFiles": [
+    ".obsidianignore",
+    ".gitignore"
+   ],
+   "path": "notes/Mr./note.md",
+   "accepted": false,
+   "asked": [
+    "notes/Mr./.obsidianignore",
+    "notes/Mr./.gitignore",
+    "notes/.obsidianignore",
+    "notes/.gitignore"
+   ]
+  },
+  {
+   "ignoreFiles": [],
+   "path": "a.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "a.log",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "important.log",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "private.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "anchored.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "sub/anchored.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "sub/private.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "sub/a.log",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "build/x.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "sub/build/x.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "x.canvas",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/n.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/a.log",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/x.tmp",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/keep.tmp",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/sub/x.tmp",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/drafts/d.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/drafts/d.txt",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/drafts/sub/d.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/secret/x.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/secret/public.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/deep/a.log",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/deep/x.tmp",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/deep/ok.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "code/main.py",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "code/main.pyc",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "code/node_modules/pkg/readme.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "code/.venv/lib/x.py",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "code/app/secret.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "code/app/secret-ok.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "code/app/readme.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "code/app/sub/secret.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "code/app/x.log",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "Mixed/a.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "mixed/a.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "mixed/a.txt",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "Mr./note.md",
+   "accepted": true,
+   "asked": []
+  },
+  {
+   "ignoreFiles": [],
+   "path": "notes/Mr./note.md",
+   "accepted": true,
+   "asked": []
+  }
+ ]
+}

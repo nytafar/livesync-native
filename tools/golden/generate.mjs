@@ -6,6 +6,7 @@
 //   chunk_ids.json    piece -> chunk ID (HashManager, hashAlg=xxhash64, encryption off)
 //   decompress.json   compressed `data` field -> decompressed `data` (decompressDoc)
 //   classify.json     path -> shouldBeIgnored / isPlainText
+//   ignore_*.json     ignore-file decisions (isAccepted, isAcceptedAll); see ignore.mjs
 //   splitter.json     v3-rabin-karp splits (ContentSplitter, as EntryManager uses it):
 //                     inputs are recipes both sides regenerate, outputs are piece
 //                     lengths (in UTF-8 bytes) and chunk IDs
@@ -16,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { path2id_base, shouldBeIgnored, isPlainText } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/path";
 import { HashManager } from "@vrtmrz/livesync-commonlib/hashing";
+import { generateIgnore } from "./ignore.mjs";
 
 // compress.js is not in the package's export map; import it by file URL.
 const here = dirname(fileURLToPath(import.meta.url));
@@ -26,8 +28,8 @@ const { compressDoc, decompressDoc } = await import(pathToFileURL(join(pkgDir, "
 const outDir = process.argv[2] ?? join(here, "..", "..", "fixtures", "golden");
 mkdirSync(outDir, { recursive: true });
 const meta = { generator: "tools/golden/generate.mjs", package: pkg.name, version: pkg.version };
-const emit = (name, cases) => {
-    writeFileSync(join(outDir, name), JSON.stringify({ meta, cases }, null, 1) + "\n");
+const emit = (name, cases, extra = {}) => {
+    writeFileSync(join(outDir, name), JSON.stringify({ meta, ...extra, cases }, null, 1) + "\n");
     console.log(`${name}: ${cases.length} cases`);
 };
 
@@ -308,3 +310,5 @@ for (const c of splitCases) {
     });
 }
 emit("splitter.json", splitOut);
+
+await generateIgnore(emit);
