@@ -19,8 +19,9 @@
 //! with a message, never ignored.
 
 use crate::paths::{comparable, nested_under, normalise, paths_overlap};
-use crate::run::{check_url, split_userinfo, RunConfig};
+use crate::run::{check_url, split_userinfo, RunConfig, WhatSyncs};
 use crate::secret::SecretRef;
+use livesync_engine::vaultfs::TrashMode;
 use livesync_model::scope::{Scope, ScopeMode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -140,6 +141,22 @@ pub struct Vault {
     /// Local `syncIgnoreRegEx` in upstream format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_regex: Option<String>,
+    /// Honour ignore files (upstream `useIgnoreFiles`). Default: on when
+    /// `ignore_files` is set, otherwise off, as upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_ignore_files: Option<bool>,
+    /// The ignore files' names (upstream `ignoreFiles`, default `.gitignore`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_files: Option<Vec<String>>,
+    /// Local `syncOnlyRegEx` in upstream format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_only_regex: Option<String>,
+    /// Dot-folders and dot-files that sync after all (never `.obsidian`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_dot_paths: Option<Vec<String>>,
+    /// Where remote deletions go: `vault` (default), `system` or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash: Option<String>,
     /// Device name shown to other LiveSync clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
@@ -166,6 +183,11 @@ impl Vault {
             exclude: None,
             mode: Mode::TwoWay,
             ignore_regex: None,
+            use_ignore_files: None,
+            ignore_files: None,
+            sync_only_regex: None,
+            sync_dot_paths: None,
+            trash: None,
             device_name: None,
             enabled: true,
             max_size_mb: None,
@@ -180,6 +202,17 @@ impl Vault {
             (None, Some(e)) => Scope::new(ScopeMode::Exclude, e),
             (None, None) => Ok(Scope::all()),
         }
+    }
+
+    /// Ignore files, `sync_only_regex`, `sync_dot_paths` and `trash`, checked.
+    pub fn what_syncs(&self) -> Result<WhatSyncs, String> {
+        what_syncs(
+            self.use_ignore_files,
+            self.ignore_files.as_deref(),
+            self.sync_only_regex.as_deref(),
+            self.sync_dot_paths.as_deref(),
+            self.trash.as_deref(),
+        )
     }
 
     pub fn folder_path(&self, dirs: &Dirs) -> PathBuf {
@@ -221,8 +254,42 @@ impl Vault {
             allow_mass_delete: false,
             remove_out_of_scope_copies: false,
             rebuild_quiet: None,
+            what_syncs: self.what_syncs()?,
         })
     }
+}
+
+/// Build and check [`WhatSyncs`] from the optional settings (shared by
+/// vaults in `lsync.toml` and profile files).
+pub fn what_syncs(
+    use_ignore_files: Option<bool>,
+    ignore_files: Option<&[String]>,
+    sync_only_regex: Option<&str>,
+    sync_dot_paths: Option<&[String]>,
+    trash: Option<&str>,
+) -> Result<WhatSyncs, String> {
+    let d = WhatSyncs::default();
+    let names = match ignore_files {
+        Some(n) => livesync_engine::filters::check_ignore_file_names(n)?,
+        None => d.ignore_files.clone(),
+    };
+    let use_ignore_files = use_ignore_files.unwrap_or(ignore_files.is_some());
+    if use_ignore_files && names.is_empty() {
+        return Err("use_ignore_files is on, but ignore_files names no file".into());
+    }
+    let dots = sync_dot_paths.unwrap_or_default().to_vec();
+    livesync_model::path::DotAllow::new(&dots)?;
+    let trash = match trash {
+        Some(t) => TrashMode::parse(t)?,
+        None => d.trash,
+    };
+    Ok(WhatSyncs {
+        use_ignore_files,
+        ignore_files: names,
+        sync_only_regex: sync_only_regex.unwrap_or_default().to_string(),
+        sync_dot_paths: dots,
+        trash,
+    })
 }
 
 impl Account {
@@ -392,6 +459,7 @@ impl Config {
             }
             check_state_placement(&folder, &state).map_err(at)?;
             check_scope_lists(v).map_err(at)?;
+            v.what_syncs().map_err(at)?;
         }
         self.check_folders(dirs)
     }
@@ -599,6 +667,42 @@ exclude = ["Archive"]
         assert_eq!(rc.scope_mode, ScopeMode::Exclude);
         assert_eq!(rc.scope_folders, vec!["archive".to_string()]);
         assert!(rc.validate().is_ok());
+    }
+
+    #[test]
+    fn what_syncs_settings() {
+        use livesync_engine::vaultfs::TrashMode;
+        let c = with("").unwrap();
+        let w = c.vault["notes"].what_syncs().unwrap();
+        assert!(!w.use_ignore_files, "off by default, as upstream");
+        assert_eq!(w.ignore_files, vec![".gitignore".to_string()]);
+        assert_eq!(w.trash, TrashMode::Vault);
+        let v = |extra: &str| {
+            Config::parse(
+                &format!("{BASE}[vault.x]\naccount = \"home\"\ndatabase = \"d\"\nfolder = \"/x\"\n{extra}"),
+                &dirs(),
+            )
+        };
+        let c = v(
+            "ignore_files = [\".gitignore\", \".obsidianignore\"]\ntrash = \"none\"\nsync_dot_paths = [\".notes\"]\n",
+        )
+        .unwrap();
+        let w = c.vault["x"].what_syncs().unwrap();
+        assert!(w.use_ignore_files, "naming ignore files turns them on");
+        assert_eq!(w.ignore_files.len(), 2);
+        assert_eq!(w.trash, TrashMode::None);
+        let rc = c.vault["x"].run_config("x", &c.account["home"], None, &dirs()).unwrap();
+        let ec = rc.engine_config().unwrap();
+        assert!(ec.use_ignore_files && ec.trash == TrashMode::None && ec.sync_dot_paths == [".notes"]);
+        let c = v("ignore_files = [\".gitignore\"]\nuse_ignore_files = false\n").unwrap();
+        assert!(!c.vault["x"].what_syncs().unwrap().use_ignore_files);
+        for bad in [
+            "trash = \"bin\"\n",
+            "sync_dot_paths = [\".obsidian\"]\n",
+            "ignore_files = [\"a/.gitignore\"]\n",
+        ] {
+            assert!(v(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

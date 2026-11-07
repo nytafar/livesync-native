@@ -32,7 +32,7 @@ pub mod supervisor;
 
 pub use cancel::Cancel;
 pub use paths::paths_overlap;
-pub use run::RunConfig;
+pub use run::{RunConfig, WhatSyncs};
 pub use supervisor::{GateCheck, Host, RunState, StateListener, VaultAccess, VaultStatus};
 
 use livesync_engine::EngineError;

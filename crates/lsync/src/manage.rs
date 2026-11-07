@@ -84,7 +84,8 @@ pub enum VaultCmd {
         #[arg(long)]
         mode: Option<String>,
         /// Remove an optional setting (state_dir, ignore_regex, device_name,
-        /// max_size_mb, concurrency); repeatable
+        /// max_size_mb, concurrency, use_ignore_files, ignore_files,
+        /// sync_only_regex, sync_dot_paths, trash); repeatable
         #[arg(long, value_name = "KEY")]
         unset: Vec<String>,
     },
@@ -468,6 +469,21 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
             if given.has("concurrency") {
                 v.concurrency = o.concurrency;
             }
+            if given.has("use_ignore_files") {
+                v.use_ignore_files = o.use_ignore_files;
+            }
+            if given.has("ignore_files") {
+                v.ignore_files = Some(o.ignore_files.clone());
+            }
+            if given.has("sync_only_regex") {
+                v.sync_only_regex = o.sync_only_regex.clone().filter(|s| !s.is_empty());
+            }
+            if given.has("sync_dot_paths") {
+                v.sync_dot_paths = Some(o.sync_dot_paths.clone()).filter(|d| !d.is_empty());
+            }
+            if given.has("trash") {
+                v.trash = o.trash.clone();
+            }
             file.add_vault(&name, &v, None).map_err(|e| anyhow!(e))?;
             let cfg = file.save(&ctx.dirs).map_err(|e| anyhow!(e))?;
             println!("added vault {name} to {}", ctx.config_file.display());
@@ -588,11 +604,46 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
             if given.has("concurrency") {
                 set("concurrency", o.concurrency.map(|n| (n as i64).into()))?;
             }
+            if given.has("use_ignore_files") {
+                set("use_ignore_files", o.use_ignore_files.map(Into::into))?;
+            }
+            if given.has("ignore_files") {
+                set("ignore_files", Some(string_array(&o.ignore_files)))?;
+            }
+            if given.has("sync_only_regex") {
+                set(
+                    "sync_only_regex",
+                    o.sync_only_regex.clone().filter(|s| !s.is_empty()).map(Into::into),
+                )?;
+            }
+            if given.has("sync_dot_paths") {
+                set(
+                    "sync_dot_paths",
+                    Some(&o.sync_dot_paths)
+                        .filter(|d| !d.is_empty())
+                        .map(|d| string_array(d)),
+                )?;
+            }
+            if given.has("trash") {
+                set("trash", o.trash.clone().map(Into::into))?;
+            }
+            const UNSETTABLE: [&str; 10] = [
+                "state_dir",
+                "ignore_regex",
+                "device_name",
+                "max_size_mb",
+                "concurrency",
+                "use_ignore_files",
+                "ignore_files",
+                "sync_only_regex",
+                "sync_dot_paths",
+                "trash",
+            ];
             for key in &unset {
-                match key.as_str() {
-                    "state_dir" | "ignore_regex" | "device_name" | "max_size_mb" | "concurrency" => set(key, None)?,
-                    other => bail!("--unset {other}: only state_dir, ignore_regex, device_name, max_size_mb and concurrency can be unset"),
+                if !UNSETTABLE.contains(&key.as_str()) {
+                    bail!("--unset {key}: only {} can be unset", UNSETTABLE.join(", "));
                 }
+                set(key, None)?;
             }
             if !changed {
                 bail!("nothing to change; give the settings to change (see `lsync vault edit --help`)");
@@ -685,6 +736,21 @@ fn print_vault(ctx: &Setup, name: &str, v: &Vault) {
     println!("  mode      {}", v.mode.as_str());
     if let Some(d) = &v.device_name {
         println!("  device    {d}");
+    }
+    match v.what_syncs() {
+        Ok(w) => {
+            if w.use_ignore_files {
+                println!("  ignore    {}", w.ignore_files.join(", "));
+            }
+            if !w.sync_only_regex.is_empty() {
+                println!("  only      {}", w.sync_only_regex);
+            }
+            if !w.sync_dot_paths.is_empty() {
+                println!("  dot-paths {}", w.sync_dot_paths.join(", "));
+            }
+            println!("  trash     {}", w.trash.as_str());
+        }
+        Err(e) => println!("  filters   INVALID: {e}"),
     }
 }
 
@@ -820,6 +886,25 @@ pub fn configure(ctx: &Setup, sel: &Selected, o: &Overrides, mut password: Optio
     }
     if let Some(n) = o.concurrency {
         set(&mut file, "concurrency", Some((n as i64).into()))?;
+    }
+    if let Some(b) = o.use_ignore_files {
+        set(&mut file, "use_ignore_files", Some(b.into()))?;
+    }
+    if !o.ignore_files.is_empty() {
+        set(&mut file, "ignore_files", Some(string_array(&o.ignore_files)))?;
+    }
+    if let Some(r) = &o.sync_only_regex {
+        set(
+            &mut file,
+            "sync_only_regex",
+            Some(r.clone()).filter(|s| !s.is_empty()).map(Into::into),
+        )?;
+    }
+    if !o.sync_dot_paths.is_empty() {
+        set(&mut file, "sync_dot_paths", Some(string_array(&o.sync_dot_paths)))?;
+    }
+    if let Some(t) = &o.trash {
+        set(&mut file, "trash", Some(t.clone().into()))?;
     }
     if !o.include.is_empty() {
         set(&mut file, "include", Some(string_array(&o.include)))?;

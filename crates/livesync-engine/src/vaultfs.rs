@@ -234,6 +234,10 @@ pub fn atomic_write(target: &Path, bytes: &[u8], mtime_ms: i64, expect: &Expect)
 #[derive(Debug, PartialEq, Eq)]
 pub enum RemoveOutcome {
     Removed,
+    /// Moved into a trash (`<vault>/.trash/` or the system's) instead.
+    Trashed {
+        to: PathBuf,
+    },
     AlreadyGone,
     Diverged {
         found: String,
@@ -273,6 +277,381 @@ pub fn remove_if_matches(root: &Path, target: &Path, hash: &str) -> io::Result<R
     Ok(RemoveOutcome::Removed)
 }
 
+// ----------------------------------------------------------------------
+// Trash
+// ----------------------------------------------------------------------
+
+/// Where a remote deletion puts the local file (`trash` in the vault's
+/// settings).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrashMode {
+    /// `<vault>/.trash/<path>`, folders kept (a dot-folder, so never synced).
+    #[default]
+    Vault,
+    /// The freedesktop trash, or `~/.Trash` on macOS.
+    System,
+    /// Delete permanently, as the official CLI does.
+    None,
+}
+
+impl TrashMode {
+    pub fn parse(s: &str) -> Result<TrashMode, String> {
+        match s.trim() {
+            "vault" => Ok(TrashMode::Vault),
+            "system" => Ok(TrashMode::System),
+            "none" => Ok(TrashMode::None),
+            other => Err(format!("unknown trash {other:?} (use vault, system or none)")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrashMode::Vault => "vault",
+            TrashMode::System => "system",
+            TrashMode::None => "none",
+        }
+    }
+}
+
+/// The vault trash folder, at the vault root.
+pub const VAULT_TRASH: &str = ".trash";
+
+/// A resolved trash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Trash {
+    Vault,
+    System(SystemTrash),
+    Delete,
+}
+
+/// A system trash on the vault's filesystem: `files` takes the file, and
+/// `info` (freedesktop only) a `.trashinfo` record of where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemTrash {
+    pub files: PathBuf,
+    pub info: Option<PathBuf>,
+}
+
+impl Trash {
+    /// Resolve a mode for a vault; `Err` says why the system trash cannot
+    /// be used here.
+    pub fn for_vault(mode: TrashMode, vault: &Path) -> Result<Trash, String> {
+        Ok(match mode {
+            TrashMode::Vault => Trash::Vault,
+            TrashMode::None => Trash::Delete,
+            TrashMode::System => Trash::System(system_trash(vault)?),
+        })
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Trash::Vault => format!("the vault's {VAULT_TRASH}/ folder"),
+            Trash::System(s) => format!("the system trash ({})", s.files.display()),
+            Trash::Delete => "nowhere (deleted permanently)".into(),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn device_of(p: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    // The nearest existing ancestor (the trash may not exist yet).
+    let mut cur = Some(p);
+    while let Some(c) = cur {
+        if let Ok(md) = fs::metadata(c) {
+            return Some(md.dev());
+        }
+        cur = c.parent();
+    }
+    None
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+fn system_trash(vault: &Path) -> Result<SystemTrash, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    let vault = fs::canonicalize(vault).map_err(|e| format!("cannot resolve the vault folder: {e}"))?;
+    let vdev = device_of(&vault).ok_or("cannot stat the vault folder")?;
+    let mk = |d: &Path| -> Result<(), String> {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(d)
+            .map_err(|e| format!("cannot create {}: {e}", d.display()))
+    };
+    let both = |base: PathBuf| -> Result<SystemTrash, String> {
+        mk(&base.join("files"))?;
+        mk(&base.join("info"))?;
+        Ok(SystemTrash {
+            files: base.join("files"),
+            info: Some(base.join("info")),
+        })
+    };
+    // The home trash, when the vault is on the same filesystem.
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    let mut why = String::new();
+    if let Some(d) = data {
+        let home_trash = d.join("Trash");
+        if device_of(&home_trash) == Some(vdev) {
+            return both(home_trash);
+        }
+        why = format!("{} is on another filesystem", home_trash.display());
+    }
+    // Otherwise the trash at the top of the vault's filesystem.
+    let mut top = vault.clone();
+    while let Some(p) = top.parent() {
+        if device_of(p) != Some(vdev) {
+            break;
+        }
+        top = p.to_path_buf();
+    }
+    let uid = unsafe { libc::getuid() };
+    let shared = top.join(".Trash");
+    if let Ok(md) = fs::symlink_metadata(&shared) {
+        let sticky = md.permissions().mode() & 0o1000 != 0;
+        if md.is_dir() && !md.file_type().is_symlink() && sticky && md.dev() == vdev {
+            if let Ok(t) = both(shared.join(uid.to_string())) {
+                return Ok(t);
+            }
+        }
+    }
+    match both(top.join(format!(".Trash-{uid}"))) {
+        Ok(t) => Ok(t),
+        Err(e) => Err(format!("no system trash for {}: {why}; {e}", vault.display())),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn system_trash(vault: &Path) -> Result<SystemTrash, String> {
+    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let t = PathBuf::from(home).join(".Trash");
+    if !t.is_dir() {
+        return Err(format!("{} does not exist", t.display()));
+    }
+    let vault = fs::canonicalize(vault).map_err(|e| format!("cannot resolve the vault folder: {e}"))?;
+    if device_of(&t) != device_of(&vault) {
+        return Err(format!(
+            "{} is on another volume than {}; use trash = \"vault\"",
+            t.display(),
+            vault.display()
+        ));
+    }
+    Ok(SystemTrash { files: t, info: None })
+}
+
+#[cfg(any(target_os = "android", not(unix)))]
+fn system_trash(_vault: &Path) -> Result<SystemTrash, String> {
+    Err("there is no system trash on this platform; use trash = \"vault\"".into())
+}
+
+/// `name`, then `stem 1.ext`, `stem 2.ext`, ...
+fn numbered(name: &str, n: usize) -> String {
+    if n == 0 {
+        return name.to_string();
+    }
+    match name.rfind('.') {
+        Some(i) if i > 0 => format!("{} {n}{}", &name[..i], &name[i..]),
+        _ => format!("{name} {n}"),
+    }
+}
+
+/// Move `src` to `dst` without replacing anything at `dst`.
+fn move_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::hard_link(src, dst) {
+        Ok(()) => {
+            if let Err(e) = fs::remove_file(src) {
+                let _ = fs::remove_file(dst);
+                return Err(e);
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => {
+            // No hard links here (Android's FUSE, some network mounts):
+            // check, then rename.
+            if fs::symlink_metadata(dst).is_ok() {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            fs::rename(src, dst)
+        }
+    }
+}
+
+/// Percent-encode a path for a `.trashinfo` file (RFC 2396, `/` kept).
+fn trashinfo_path(p: &Path) -> String {
+    let mut out = String::new();
+    for b in p.to_string_lossy().bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+#[cfg(unix)]
+fn local_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&now, &mut tm) };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
+}
+
+#[cfg(not(unix))]
+fn local_timestamp() -> String {
+    String::new()
+}
+
+/// Move `target` (vault-relative `rel`) into the trash; returns where it went.
+fn move_to_trash(root: &Path, rel: &str, target: &Path, trash: &Trash) -> io::Result<PathBuf> {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    match trash {
+        Trash::Delete => unreachable!("not a trash"),
+        Trash::Vault => {
+            let base = root.join(VAULT_TRASH);
+            if let Ok(md) = fs::symlink_metadata(&base) {
+                if !md.is_dir() || md.file_type().is_symlink() {
+                    return Err(io::Error::other(format!(
+                        "{} is not a folder; not moving files into it",
+                        base.display()
+                    )));
+                }
+            }
+            let dir = match Path::new(rel).parent() {
+                Some(p) if !p.as_os_str().is_empty() => base.join(p),
+                _ => base,
+            };
+            fs::create_dir_all(&dir)?;
+            for n in 0..10_000 {
+                let dst = dir.join(numbered(&name, n));
+                match move_no_replace(target, &dst) {
+                    Ok(()) => return Ok(dst),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(io::Error::other("no free name in the trash"))
+        }
+        Trash::System(s) => {
+            for n in 0..10_000 {
+                let fname = numbered(&name, n);
+                let dst = s.files.join(&fname);
+                let info = match &s.info {
+                    Some(dir) => {
+                        let p = dir.join(format!("{fname}.trashinfo"));
+                        match OpenOptions::new().write(true).create_new(true).open(&p) {
+                            Ok(mut f) => {
+                                let text = format!(
+                                    "[Trash Info]\nPath={}\nDeletionDate={}\n",
+                                    trashinfo_path(target),
+                                    local_timestamp()
+                                );
+                                f.write_all(text.as_bytes())?;
+                                Some(p)
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    None => None,
+                };
+                match move_no_replace(target, &dst) {
+                    Ok(()) => return Ok(dst),
+                    Err(e) => {
+                        if let Some(p) = info {
+                            let _ = fs::remove_file(p);
+                        }
+                        if e.kind() == io::ErrorKind::AlreadyExists {
+                            continue;
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            Err(io::Error::other("no free name in the system trash"))
+        }
+    }
+}
+
+/// [`remove_if_matches`], but into `trash` (unless it says delete). Only a
+/// regular file that still hashes to `hash` is touched; empty parent
+/// folders are removed afterwards, never `root` itself.
+pub fn trash_if_matches(root: &Path, rel: &str, hash: &str, trash: &Trash) -> io::Result<RemoveOutcome> {
+    let target = root.join(rel);
+    if *trash == Trash::Delete {
+        return remove_if_matches(root, &target, hash);
+    }
+    let md = match fs::symlink_metadata(&target) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RemoveOutcome::AlreadyGone),
+        Err(e) => return Err(e),
+    };
+    if !md.is_file() {
+        return Ok(RemoveOutcome::Diverged {
+            found: format!("not-a-file:{:?}", md.file_type()),
+        });
+    }
+    let mut f = File::open(&target)?;
+    let (found, _) = hash_reader(&mut f)?;
+    if found != hash {
+        return Ok(RemoveOutcome::Diverged { found });
+    }
+    let to = move_to_trash(root, rel, &target, trash)?;
+    // An edit through a handle opened before the move lands in the moved
+    // file; it is returned so the caller puts it back.
+    let (after, content) = hash_reader(&mut f)?;
+    prune_empty_dirs(root, &target);
+    if after != hash {
+        return Ok(RemoveOutcome::Raced { displaced: content });
+    }
+    Ok(RemoveOutcome::Trashed { to })
+}
+
+/// What kind of folder a vault is (spec D11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FolderKind {
+    /// It has `.obsidian/`: an Obsidian vault.
+    Obsidian,
+    /// Any other folder of notes.
+    Plain,
+}
+
+impl FolderKind {
+    pub fn of(root: &Path) -> FolderKind {
+        if root.join(".obsidian").is_dir() {
+            FolderKind::Obsidian
+        } else {
+            FolderKind::Plain
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FolderKind::Obsidian => "obsidian vault",
+            FolderKind::Plain => "plain folder",
+        }
+    }
+}
+
 pub fn prune_empty_dirs(root: &Path, from: &Path) {
     let mut cur = from.parent();
     while let Some(dir) = cur {
@@ -288,6 +667,12 @@ pub fn prune_empty_dirs(root: &Path, from: &Path) {
 
 /// Remove stale temp files left by an interrupted run.
 pub fn sweep_temp_files(root: &Path) -> usize {
+    sweep_temp_files_in(root, |rel| !rel.rsplit('/').next().unwrap_or(rel).starts_with('.'))
+}
+
+/// [`sweep_temp_files`] in the folders `descend` (given a vault-relative
+/// folder) lets it into.
+pub fn sweep_temp_files_in(root: &Path, descend: impl Fn(&str) -> bool) -> usize {
     let mut removed = 0;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -297,7 +682,12 @@ pub fn sweep_temp_files(root: &Path) -> usize {
             let name = name.to_string_lossy();
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_dir() {
-                if !name.starts_with('.') {
+                let rel = e
+                    .path()
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|r| r.to_string_lossy().replace('\\', "/"));
+                if rel.is_some_and(|r| descend(&r)) {
                     stack.push(e.path());
                 }
             } else if name.starts_with(TEMP_PREFIX) && name.ends_with(TEMP_SUFFIX) && fs::remove_file(e.path()).is_ok()
@@ -458,6 +848,86 @@ mod tests {
             remove_if_matches(d.path(), &t, &s.hash).unwrap(),
             RemoveOutcome::AlreadyGone
         );
+    }
+
+    #[test]
+    fn vault_trash_keeps_folders_and_numbers_clashes() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let put = |rel: &str, c: &[u8]| atomic_write(&root.join(rel), c, 0, &Expect::Absent).unwrap().state;
+        let s = put("notes/sub/a.md", b"one");
+        put("notes/keep.md", b"keep");
+        let out = trash_if_matches(root, "notes/sub/a.md", &s.hash, &Trash::Vault).unwrap();
+        assert_eq!(
+            out,
+            RemoveOutcome::Trashed {
+                to: root.join(".trash/notes/sub/a.md")
+            }
+        );
+        assert_eq!(fs::read(root.join(".trash/notes/sub/a.md")).unwrap(), b"one");
+        assert!(!root.join("notes/sub").exists(), "the emptied folder is removed");
+        assert!(root.join("notes/keep.md").exists(), "a folder holding anything stays");
+        // A second deletion of the same path gets a numbered name.
+        let s = put("notes/sub/a.md", b"two");
+        let out = trash_if_matches(root, "notes/sub/a.md", &s.hash, &Trash::Vault).unwrap();
+        assert_eq!(
+            out,
+            RemoveOutcome::Trashed {
+                to: root.join(".trash/notes/sub/a 1.md")
+            }
+        );
+        assert_eq!(fs::read(root.join(".trash/notes/sub/a.md")).unwrap(), b"one");
+        // Edited files are never touched.
+        let s = put("x.md", b"base");
+        fs::write(root.join("x.md"), b"edit").unwrap();
+        assert!(matches!(
+            trash_if_matches(root, "x.md", &s.hash, &Trash::Vault).unwrap(),
+            RemoveOutcome::Diverged { .. }
+        ));
+        assert_eq!(fs::read(root.join("x.md")).unwrap(), b"edit");
+        assert!(root.exists(), "never the root");
+        // A `.trash` that is not a folder: refused, the file stays.
+        let e = tempfile::tempdir().unwrap();
+        let s = atomic_write(&e.path().join("y.md"), b"y", 0, &Expect::Absent)
+            .unwrap()
+            .state;
+        fs::write(e.path().join(".trash"), b"not a folder").unwrap();
+        assert!(trash_if_matches(e.path(), "y.md", &s.hash, &Trash::Vault).is_err());
+        assert!(e.path().join("y.md").exists());
+    }
+
+    #[test]
+    fn system_trash_records_where_a_file_came_from() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("vault");
+        let t = SystemTrash {
+            files: d.path().join("Trash/files"),
+            info: Some(d.path().join("Trash/info")),
+        };
+        fs::create_dir_all(&t.files).unwrap();
+        fs::create_dir_all(t.info.as_ref().unwrap()).unwrap();
+        let s = atomic_write(&root.join("a b.md"), b"x", 0, &Expect::Absent)
+            .unwrap()
+            .state;
+        let out = trash_if_matches(&root, "a b.md", &s.hash, &Trash::System(t.clone())).unwrap();
+        assert_eq!(
+            out,
+            RemoveOutcome::Trashed {
+                to: t.files.join("a b.md")
+            }
+        );
+        let info = fs::read_to_string(t.info.unwrap().join("a b.md.trashinfo")).unwrap();
+        assert!(info.starts_with("[Trash Info]\nPath=/"), "{info}");
+        assert!(info.contains("a%20b.md\nDeletionDate=20"), "{info}");
+        assert!(root.exists(), "the vault root is never removed");
+    }
+
+    #[test]
+    fn folder_kind() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(FolderKind::of(d.path()), FolderKind::Plain);
+        fs::create_dir(d.path().join(".obsidian")).unwrap();
+        assert_eq!(FolderKind::of(d.path()), FolderKind::Obsidian);
     }
 
     #[test]

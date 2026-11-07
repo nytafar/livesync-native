@@ -2,7 +2,7 @@
 //! engine is opened for it are the host's (`livesync_host::RunConfig`).
 
 use livesync_engine::EngineConfig;
-use livesync_host::RunConfig;
+use livesync_host::{RunConfig, WhatSyncs};
 use livesync_model::scope::{Scope, ScopeMode};
 use livesync_remote::RemoteConfig;
 use std::path::PathBuf;
@@ -84,6 +84,9 @@ impl ProfileConfig {
             allow_mass_delete: false,
             remove_out_of_scope_copies: false,
             rebuild_quiet: None,
+            // The desktop defaults: remote deletions go to the vault's
+            // `.trash/`; no ignore files or dot-paths yet (no UI for them).
+            what_syncs: WhatSyncs::default(),
         }
     }
 

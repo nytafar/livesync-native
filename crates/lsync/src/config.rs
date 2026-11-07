@@ -48,6 +48,21 @@ pub struct Overrides {
     /// Chunk-fetch requests in flight
     #[arg(long, env = "LSYNC_CONCURRENCY", global = true)]
     pub concurrency: Option<usize>,
+    /// Honour ignore files, as the plugin's useIgnoreFiles (true or false)
+    #[arg(long, env = "LSYNC_USE_IGNORE_FILES", global = true, value_name = "BOOL")]
+    pub use_ignore_files: Option<bool>,
+    /// Ignore file names, as the plugin's ignoreFiles (comma-separated; default .gitignore)
+    #[arg(long, env = "LSYNC_IGNORE_FILES", global = true, value_delimiter = ',')]
+    pub ignore_files: Vec<String>,
+    /// Local syncOnlyRegEx (upstream format): only matching paths sync
+    #[arg(long, env = "LSYNC_SYNC_ONLY_REGEX", global = true)]
+    pub sync_only_regex: Option<String>,
+    /// Dot-folders or dot-files that sync after all (comma-separated; never .obsidian)
+    #[arg(long, env = "LSYNC_SYNC_DOT_PATHS", global = true, value_delimiter = ',')]
+    pub sync_dot_paths: Vec<String>,
+    /// Where remote deletions go: vault (<folder>/.trash/, default), system or none
+    #[arg(long, env = "LSYNC_TRASH", global = true)]
+    pub trash: Option<String>,
     /// Sync only these vault folders (repeatable or comma-separated; case-insensitive)
     #[arg(
         long,
@@ -87,6 +102,15 @@ pub fn merged(mut cfg: FileConfig, o: &Overrides) -> FileConfig {
     take!(max_size_mb, max_size_mb);
     take!(concurrency, concurrency);
     take!(device_name, device_name);
+    take!(use_ignore_files, use_ignore_files);
+    take!(sync_only_regex, sync_only_regex);
+    take!(trash, trash);
+    if !o.ignore_files.is_empty() {
+        cfg.ignore_files = Some(o.ignore_files.clone());
+    }
+    if !o.sync_dot_paths.is_empty() {
+        cfg.sync_dot_paths = Some(o.sync_dot_paths.clone());
+    }
     if !o.include.is_empty() {
         cfg.scope_mode = Some("include".into());
         cfg.scope_folders = Some(o.include.clone());
@@ -407,6 +431,11 @@ impl Setup {
             ignore_regex: v.ignore_regex.clone(),
             max_size_mb: v.max_size_mb,
             concurrency: v.concurrency,
+            use_ignore_files: v.use_ignore_files,
+            ignore_files: v.ignore_files.clone(),
+            sync_only_regex: v.sync_only_regex.clone(),
+            sync_dot_paths: v.sync_dot_paths.clone(),
+            trash: v.trash.clone(),
             scope_mode: Some(format!("{:?}", scope.mode).to_lowercase()),
             scope_folders: v.include.clone().or_else(|| v.exclude.clone()),
             device_name: v.device_name.clone(),
@@ -443,6 +472,7 @@ pub struct Resolved {
     pub concurrency: Option<usize>,
     pub scope: livesync_model::scope::Scope,
     pub device_name: Option<String>,
+    pub what_syncs: livesync_host::WhatSyncs,
 }
 
 pub fn default_state_dir(dirs: &Dirs, name: &str) -> PathBuf {
@@ -500,7 +530,20 @@ pub fn resolve(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, need_remote: bool)
         concurrency: cfg.concurrency,
         scope: cfg.scope().map_err(|e| anyhow!(e))?,
         device_name: cfg.device_name.clone(),
+        what_syncs: what_syncs(cfg)?,
     })
+}
+
+/// A profile's ignore files, `sync_only_regex`, `sync_dot_paths` and `trash`.
+pub fn what_syncs(cfg: &FileConfig) -> Result<livesync_host::WhatSyncs> {
+    livesync_host::config::what_syncs(
+        cfg.use_ignore_files,
+        cfg.ignore_files.as_deref(),
+        cfg.sync_only_regex.as_deref().filter(|s| !s.is_empty()),
+        cfg.sync_dot_paths.as_deref(),
+        cfg.trash.as_deref(),
+    )
+    .map_err(|e| anyhow!(e))
 }
 
 #[cfg(test)]

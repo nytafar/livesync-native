@@ -9,6 +9,7 @@
 //! write to the remote.
 
 pub mod engine;
+pub mod filters;
 pub mod folders;
 pub mod fsrules;
 pub mod index;

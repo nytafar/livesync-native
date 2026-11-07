@@ -154,6 +154,11 @@ fn vault_from(p: &Profile, account: &str) -> Result<Vault, String> {
     v.device_name = p.device_name.clone().filter(|s| !s.is_empty());
     v.max_size_mb = p.max_size_mb;
     v.concurrency = p.concurrency;
+    v.use_ignore_files = p.use_ignore_files;
+    v.ignore_files = p.ignore_files.clone();
+    v.sync_only_regex = p.sync_only_regex.clone().filter(|s| !s.is_empty());
+    v.sync_dot_paths = p.sync_dot_paths.clone();
+    v.trash = p.trash.clone();
     Ok(v)
 }
 

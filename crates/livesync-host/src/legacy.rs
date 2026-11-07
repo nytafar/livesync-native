@@ -20,6 +20,21 @@ pub struct Profile {
     pub ignore_regex: Option<String>,
     pub max_size_mb: Option<u64>,
     pub concurrency: Option<usize>,
+    /// Honour ignore files (upstream `useIgnoreFiles`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_ignore_files: Option<bool>,
+    /// The ignore files' names (upstream `ignoreFiles`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_files: Option<Vec<String>>,
+    /// Local `syncOnlyRegEx` in upstream format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_only_regex: Option<String>,
+    /// Dot-folders and dot-files that sync after all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_dot_paths: Option<Vec<String>>,
+    /// `vault` (default), `system` or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trash: Option<String>,
     /// Folder scope: `all` (default), `include` or `exclude`.
     pub scope_mode: Option<String>,
     /// Vault-relative folders for `include`/`exclude` (case-insensitive).
@@ -40,6 +55,11 @@ impl std::fmt::Debug for Profile {
             .field("ignore_regex", &self.ignore_regex)
             .field("max_size_mb", &self.max_size_mb)
             .field("concurrency", &self.concurrency)
+            .field("use_ignore_files", &self.use_ignore_files)
+            .field("ignore_files", &self.ignore_files)
+            .field("sync_only_regex", &self.sync_only_regex)
+            .field("sync_dot_paths", &self.sync_dot_paths)
+            .field("trash", &self.trash)
             .field("scope_mode", &self.scope_mode)
             .field("scope_folders", &self.scope_folders)
             .field("device_name", &self.device_name)

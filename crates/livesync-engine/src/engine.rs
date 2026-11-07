@@ -1,22 +1,22 @@
 //! Gate evaluation, the pull loop, the daemons (pull-only and two-way) and
 //! milestone registration. The push side lives in `push.rs`.
 
+use crate::filters::{FilterSettings, Filters, IgnoreState};
 use crate::fsrules::{FsRules, PROBED_CHARS};
 use crate::index::{FileRow, Index, LocalIssue, Origin, PendingRow, RevisionRow, State};
 use crate::platform::{self, Holder, VaultLock, VaultLockError};
-use crate::vaultfs::{self, DiskState, Expect, LockError, LockFile, RemoveOutcome, WriteError};
+use crate::vaultfs::{self, DiskState, Expect, LockError, LockFile, RemoveOutcome, Trash, TrashMode, WriteError};
 use futures::stream::{self, StreamExt};
 use livesync_model::chunk::chunk_id_xxhash64;
 use livesync_model::codec::{self, CodecError};
 use livesync_model::doc::{classify_doc, Classified, MILESTONE_LOCAL_ID, SYNC_PARAMS_LOCAL_ID, VERSION_DOC_ID};
 use livesync_model::gate::{self, Milestone, Refusal};
 use livesync_model::milestone::{register_node, DeviceInfo};
-use livesync_model::path::{classify_path, is_internal_id, PathSkip};
+use livesync_model::path::{is_internal_id, PathSkip};
 use livesync_model::scope::Scope;
 use livesync_model::splitter::SplitParams;
 use livesync_model::{FileDoc, FileKind};
 use livesync_remote::{Backoff, ChangeRow, ChangesQuery, Couch, DocFetch, PutOutcome, RemoteError};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -88,6 +88,9 @@ pub(crate) mod meta_keys {
     /// to stands, later parts are judged together with them (`DeleteHold`).
     /// Kept here so a restart does not forget them.
     pub const DELETE_BURST: &str = "delete_burst_sent";
+    /// The local filters (ignore files included) the index last synced
+    /// with (JSON `FilterState`), to catch up what they stop hiding.
+    pub const FILTERS: &str = "filters";
 }
 
 /// Aborts a spawned task when dropped.
@@ -127,6 +130,21 @@ pub struct EngineConfig {
     pub ignore_regex: Option<String>,
     /// Override for `syncMaxSizeInMB` (otherwise taken from PREFERRED).
     pub max_size_mb: Option<u64>,
+    /// Local `syncOnlyRegEx` (same format as `ignore_regex`): when set, only
+    /// paths matching one of its entries sync.
+    pub sync_only_regex: Option<String>,
+    /// Honour ignore files (upstream `useIgnoreFiles`).
+    pub use_ignore_files: bool,
+    /// Their names (upstream `ignoreFiles`, default `.gitignore`).
+    pub ignore_files: Vec<String>,
+    /// Dot-paths that sync after all (each a dot-folder or dot-file).
+    /// `.obsidian`, `.trash`, `.git` and lsync's own files are refused.
+    pub sync_dot_paths: Vec<String>,
+    /// Where a remote deletion puts the local file.
+    pub trash: TrashMode,
+    /// Keep a `.nomedia` at the vault root (Android, so the media scanner
+    /// skips the vault's images).
+    pub write_nomedia: bool,
     /// Chunk-fetch units in flight.
     pub concurrency: usize,
     /// `_changes` page size.
@@ -206,12 +224,29 @@ impl std::fmt::Debug for AccessCheck {
 }
 
 impl EngineConfig {
+    /// The local filters this config asks for.
+    pub fn filter_settings(&self) -> FilterSettings {
+        FilterSettings {
+            use_ignore_files: self.use_ignore_files,
+            ignore_files: self.ignore_files.clone(),
+            ignore_regex: self.ignore_regex.clone(),
+            sync_only_regex: self.sync_only_regex.clone(),
+            sync_dot_paths: self.sync_dot_paths.clone(),
+        }
+    }
+
     pub fn new(vault: PathBuf, index_path: PathBuf) -> Self {
         EngineConfig {
             vault,
             index_path,
             ignore_regex: None,
             max_size_mb: None,
+            sync_only_regex: None,
+            use_ignore_files: false,
+            ignore_files: vec![".gitignore".into()],
+            sync_dot_paths: vec![],
+            trash: TrashMode::Vault,
+            write_nomedia: cfg!(target_os = "android"),
             concurrency: 6,
             batch_limit: 250,
             regate_interval: Duration::from_secs(300),
@@ -378,6 +413,9 @@ pub struct Status {
     /// Local files the push side cannot sync.
     pub local_issues: Vec<LocalIssue>,
     pub scope: Option<String>,
+    /// An Obsidian vault (it has `.obsidian/`) or a plain folder of notes
+    /// (`None` from a service too old to say).
+    pub folder_kind: Option<vaultfs::FolderKind>,
     pub fs_rules: Option<String>,
     /// The vault locks the engine took at its last open, e.g. "flock and
     /// host lock" or "host lock only (flock: ...)" on Android's shared storage.
@@ -400,49 +438,14 @@ pub struct Status {
     pub rebuild_orphans: Option<String>,
 }
 
-/// One upstream `syncIgnoreRegEx` entry.
-#[derive(Debug, Clone)]
-struct IgnoreRule {
-    re: Regex,
-    negate: bool,
-}
-
-/// Parse a `syncIgnoreRegEx` list as upstream does (`parseCustomRegExpList`
-/// in commonlib `utils.ts`): drop every space and newline from the whole
-/// list, split on `|[]|`, drop empty entries; a `!!` prefix negates.
-fn parse_ignore(src: &str, case_sensitive: bool) -> std::result::Result<Vec<IgnoreRule>, regex::Error> {
-    let cleaned: String = src.chars().filter(|c| *c != ' ' && *c != '\n').collect();
-    cleaned
-        .split("|[]|")
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            let (negate, pat) = match s.strip_prefix("!!") {
-                Some(p) => (true, p),
-                None => (false, s),
-            };
-            let re = regex::RegexBuilder::new(pat)
-                .case_insensitive(!case_sensitive)
-                .build()?;
-            Ok(IgnoreRule { re, negate })
-        })
-        .collect()
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct Runtime {
     pub(crate) max_size_bytes: Option<u64>,
-    ignore: Vec<IgnoreRule>,
     /// Document IDs keep their case (`handleFilenameCaseSensitive`).
     pub(crate) case_sensitive_ids: bool,
     pub(crate) split: SplitParams,
     /// The PREFERRED tweaks, advertised as ours when registering.
     pub(crate) preferred: Map<String, Value>,
-}
-
-impl Runtime {
-    pub(crate) fn ignored(&self, path: &str) -> bool {
-        self.ignore.iter().any(|r| r.re.is_match(path) != r.negate)
-    }
 }
 
 pub(crate) struct Inner {
@@ -455,6 +458,13 @@ pub(crate) struct Inner {
     pub(crate) fs: FsRules,
     pub(crate) index: Mutex<Index>,
     pub(crate) runtime: Mutex<Runtime>,
+    /// The local filters (rebuilt when the gate learns the remote's case
+    /// rule). Ignore files are read lazily and cached until `refresh`.
+    pub(crate) filters: Mutex<Arc<Filters>>,
+    /// Where remote deletions put local files.
+    pub(crate) trash: Trash,
+    /// Serialises the filter catch-up (pull and push sides both run it).
+    pub(crate) filters_lock: tokio::sync::Mutex<()>,
     mem: Semaphore,
     report: Mutex<PullReport>,
     /// The two-way daemon's push totals for this session (`push_report`).
@@ -495,6 +505,8 @@ pub struct Engine {
 enum Skip {
     Path(PathSkip),
     Ignored,
+    /// Not matched by `syncOnlyRegEx`.
+    NotOnly,
     TooLarge(u64),
     Legacy,
     /// The vault's filesystem cannot hold this name.
@@ -509,6 +521,7 @@ impl Skip {
         match self {
             Skip::Path(p) => p.as_str(),
             Skip::Ignored => "ignore-regex",
+            Skip::NotOnly => "sync-only-regex",
             Skip::TooLarge(_) => "too-large",
             Skip::Legacy => "legacy-notes-doc",
             Skip::Unwritable(_) => "unwritable-name",
@@ -627,10 +640,9 @@ impl Engine {
         if probe_ok {
             index.set_meta(meta::FS_RULES, &serde_json::to_string(&fs).unwrap_or_default())?;
         }
-        let ignore = match &cfg.ignore_regex {
-            Some(s) => parse_ignore(s, false).map_err(|e| EngineError::Other(format!("invalid ignore regex: {e}")))?,
-            None => Vec::new(),
-        };
+        let filters = cfg.filter_settings().build(&canon, false).map_err(EngineError::Other)?;
+        let trash = Trash::for_vault(cfg.trash, &canon)
+            .map_err(|e| EngineError::Other(format!("trash = \"{}\": {e}", cfg.trash.as_str())))?;
         let budget = cfg.memory_budget_mb.max(16);
         Ok(Engine {
             inner: Arc::new(Inner {
@@ -640,11 +652,13 @@ impl Engine {
                 fs,
                 runtime: Mutex::new(Runtime {
                     max_size_bytes: cfg.max_size_mb.map(|m| m * 1024 * 1024),
-                    ignore,
                     case_sensitive_ids: false,
                     split: SplitParams::default(),
                     preferred: Map::new(),
                 }),
+                filters: Mutex::new(Arc::new(filters)),
+                trash,
+                filters_lock: tokio::sync::Mutex::new(()),
                 cfg,
                 index: Mutex::new(index),
                 mem: Semaphore::new(budget),
@@ -662,6 +676,24 @@ impl Engine {
                 _state_lock: state_lock,
             }),
         })
+    }
+
+    /// The local filters as they stand (ignore files read lazily).
+    pub(crate) fn filters(&self) -> Arc<Filters> {
+        self.inner.filters.lock().unwrap().clone()
+    }
+
+    /// Which layer of the local filters decides `path` (vault-relative),
+    /// with the ignore files as they are on disk now.
+    pub fn explain(&self, path: &str) -> crate::filters::Check {
+        let f = self.filters();
+        f.refresh();
+        f.check(path, &self.inner.cfg.scope)
+    }
+
+    /// Where remote deletions go.
+    pub fn trash(&self) -> &Trash {
+        &self.inner.trash
     }
 
     /// The probed (or configured) filesystem rules.
@@ -903,11 +935,14 @@ impl Engine {
             rt.split = SplitParams::from_tweaks(&preferred);
             rt.preferred = preferred.clone();
             rt.max_size_bytes = if max_mb == 0 { None } else { Some(max_mb * 1024 * 1024) };
-            if let Some(src) = &self.inner.cfg.ignore_regex {
-                rt.ignore = parse_ignore(src, case_sensitive)
-                    .map_err(|e| EngineError::Other(format!("invalid ignore regex: {e}")))?;
-            }
         }
+        let filters = self
+            .inner
+            .cfg
+            .filter_settings()
+            .build(Path::new(&self.inner.vault_canon), case_sensitive)
+            .map_err(EngineError::Other)?;
+        *self.inner.filters.lock().unwrap() = Arc::new(filters);
         Ok(GateReport {
             remote: label,
             node_id,
@@ -1019,6 +1054,7 @@ impl Engine {
         self.catch_up(start).await?;
         self.finish_read_only_fetch()?;
         self.scope_catch_up(&old_scope).await?;
+        self.filters_catch_up().await?;
         self.retry_pending(true).await?;
         self.with_index(|ix| ix.set_meta(meta::LAST_PULL, &vaultfs::now_ms().to_string()))?;
         let mut rep = self.report();
@@ -1075,9 +1111,19 @@ impl Engine {
     /// since this process holds the vault) and make sure `.nomedia` exists.
     pub(crate) fn prepare_vault(&self) {
         let vault = &self.inner.cfg.vault;
-        let swept = vaultfs::sweep_temp_files(vault);
+        // Our temp files lie where we write: not in ignored folders, nor in
+        // dot-folders other than allowlisted ones.
+        let filters = self.filters();
+        let swept = vaultfs::sweep_temp_files_in(vault, |rel| {
+            let name = rel.rsplit('/').next().unwrap_or(rel);
+            (!name.starts_with('.') || filters.dot.covers(rel))
+                && !matches!(filters.folder_state(rel), IgnoreState::Ignored(_))
+        });
         if swept > 0 {
             info!("removed {swept} stale temp files");
+        }
+        if !self.inner.cfg.write_nomedia {
+            return;
         }
         match vaultfs::ensure_nomedia(vault) {
             Ok(true) => info!("created .nomedia at the vault root"),
@@ -1111,6 +1157,9 @@ impl Engine {
     /// Apply one page of changes. The caller persists `since` afterwards.
     pub(crate) async fn apply_batch(&self, rows: Vec<ChangeRow>) -> Result<()> {
         let _ops = self.inner.ops.lock().await;
+        // Ignore files are read afresh for every batch.
+        let filters = self.filters();
+        filters.refresh();
         {
             let mut r = self.inner.report.lock().unwrap();
             r.batches += 1;
@@ -1139,6 +1188,10 @@ impl Engine {
         // Deleted winners that still have live conflicting revisions.
         let mut conflicted_deletes: Vec<FileDoc> = Vec::new();
         let mut skips: Vec<(FileDoc, Skip)> = Vec::new();
+        // At paths the ignore files hide (untracked, file left alone), or
+        // cannot judge (deferred).
+        let mut hidden: Vec<FileDoc> = Vec::new();
+        let mut undecided: Vec<(FileDoc, String)> = Vec::new();
         let mut ignored = 0u64;
         // Pre-scan: refusals stop the batch before anything is applied.
         for id in &order {
@@ -1159,7 +1212,11 @@ impl Engine {
                 }
                 Classified::LegacyNote { id, path } => {
                     let path = path.unwrap_or_else(|| id.clone());
-                    if is_internal_id(&id) || classify_path(&path).is_some() || !self.inner.cfg.scope.contains(&path) {
+                    if is_internal_id(&id)
+                        || filters.path_skip(&path).is_some()
+                        || !self.inner.cfg.scope.contains(&path)
+                        || !matches!(filters.ignore_state(&path), IgnoreState::Synced { .. })
+                    {
                         ignored += 1;
                     } else {
                         let f = FileDoc {
@@ -1197,14 +1254,23 @@ impl Engine {
                             .skipped
                             .entry("out-of-scope".into())
                             .or_default() += 1;
-                    } else if f.deleted && !f.conflicts.is_empty() {
-                        conflicted_deletes.push(f);
-                    } else if f.deleted {
-                        deletes.push((f.id.clone(), Some(f.rev.clone()), Some(f)));
-                    } else if let Some(s) = self.skip_reason(&f) {
-                        skips.push((f, s));
                     } else {
-                        writes.push(f);
+                        match filters.ignore_state(&f.path) {
+                            IgnoreState::Ignored(_) => hidden.push(f),
+                            IgnoreState::Unknown { file, why } => {
+                                undecided.push((f, format!("ignore file {file} {why}")))
+                            }
+                            IgnoreState::Synced { .. } if f.deleted && !f.conflicts.is_empty() => {
+                                conflicted_deletes.push(f)
+                            }
+                            IgnoreState::Synced { .. } if f.deleted => {
+                                deletes.push((f.id.clone(), Some(f.rev.clone()), Some(f)))
+                            }
+                            IgnoreState::Synced { .. } => match self.skip_reason(&f) {
+                                Some(s) => skips.push((f, s)),
+                                None => writes.push(f),
+                            },
+                        }
                     }
                 }
             }
@@ -1222,6 +1288,12 @@ impl Engine {
             }
             for (f, s) in skips {
                 this.apply_skip(&f, &s)?;
+            }
+            for f in hidden {
+                this.apply_ignored(&f)?;
+            }
+            for (f, why) in undecided {
+                this.defer_doc(&f, &why)?;
             }
             Ok(())
         })
@@ -1246,7 +1318,8 @@ impl Engine {
     }
 
     fn skip_reason(&self, f: &FileDoc) -> Option<Skip> {
-        if let Some(p) = classify_path(&f.path) {
+        let filters = self.filters();
+        if let Some(p) = filters.path_skip(&f.path) {
             return Some(Skip::Path(p));
         }
         if let Some(why) = self.inner.fs.unwritable_reason(&f.path) {
@@ -1261,10 +1334,12 @@ impl Engine {
                 }
             }
         }
-        let rt = self.inner.runtime.lock().unwrap();
-        if rt.ignored(&f.path) {
-            return Some(Skip::Ignored);
+        match filters.regex_skip(&f.path) {
+            Some(true) => return Some(Skip::NotOnly),
+            Some(false) => return Some(Skip::Ignored),
+            None => {}
         }
+        let rt = self.inner.runtime.lock().unwrap();
         if let Some(max) = rt.max_size_bytes {
             if f.size > max {
                 return Some(Skip::TooLarge(f.size));
@@ -1334,6 +1409,37 @@ impl Engine {
         })
     }
 
+    /// A remote document at a path the ignore files hide: not written, and
+    /// a row this index had for it is dropped (the file stays as it is, and
+    /// the remote document is left alone).
+    fn apply_ignored(&self, f: &FileDoc) -> Result<()> {
+        *self
+            .inner
+            .report
+            .lock()
+            .unwrap()
+            .skipped
+            .entry("ignore-file".into())
+            .or_default() += 1;
+        let seen = RevisionRow::of_doc(f, None, Origin::Remote, false, vaultfs::now_ms());
+        let had = self.with_index(|ix| ix.by_doc(&f.id))?;
+        if let Some(b) = &had {
+            info!(
+                "{}: ignored here now; no longer synced (the remote copy is kept)",
+                b.path
+            );
+        }
+        self.with_index(|ix| {
+            ix.atomically(|ix| {
+                if had.is_some() {
+                    ix.delete_doc(&f.id)?;
+                    ix.record_revision(&seen)?;
+                }
+                ix.remove_pending(&f.id)
+            })
+        })
+    }
+
     fn apply_delete(&self, id: &str, rev: Option<&str>, doc: Option<&FileDoc>) -> Result<()> {
         let base = self.with_index(|ix| ix.by_doc(id))?;
         let Some(mut b) = base else {
@@ -1365,6 +1471,33 @@ impl Engine {
                 })
             })
         };
+        match self.filters().ignore_state(&b.path) {
+            IgnoreState::Synced { .. } => {}
+            IgnoreState::Ignored(by) => {
+                // Ignored here now: the file is not ours to remove.
+                debug!(
+                    "{}: deleted remotely, but ignored here ({}); the local file is left alone",
+                    b.path,
+                    by.describe()
+                );
+                let seen = deletion(false);
+                return self.with_index(|ix| {
+                    ix.atomically(|ix| {
+                        ix.delete_doc(id)?;
+                        record(ix, seen)?;
+                        ix.remove_pending(id)
+                    })
+                });
+            }
+            IgnoreState::Unknown { file, why } => {
+                return self.defer(
+                    id,
+                    rev,
+                    &b.path,
+                    &format!("deletion not applied: ignore file {file} {why}"),
+                );
+            }
+        }
         if matches!(b.state, State::Skipped | State::OutOfScope) {
             // No file of ours at this path (or the user moved it away).
             let seen = deletion(true);
@@ -1398,7 +1531,7 @@ impl Engine {
         }
         let target = self.inner.cfg.vault.join(&b.path);
         let outcome = match &b.disk_hash {
-            Some(h) => vaultfs::remove_if_matches(&self.inner.cfg.vault, &target, h),
+            Some(h) => vaultfs::trash_if_matches(&self.inner.cfg.vault, &b.path, h, &self.inner.trash),
             None => vaultfs::read_state(&target).map(|st| match st {
                 None => RemoveOutcome::AlreadyGone,
                 Some(s) => RemoveOutcome::Diverged { found: s.hash },
@@ -1409,10 +1542,13 @@ impl Engine {
             // This file only: keep it and its row, retry the deletion later.
             Err(e) => return self.defer(id, rev, &b.path, &format!("deletion not applied: {e}")),
         };
-        match outcome {
-            RemoveOutcome::Removed | RemoveOutcome::AlreadyGone => {
+        match &outcome {
+            RemoveOutcome::Removed | RemoveOutcome::AlreadyGone | RemoveOutcome::Trashed { .. } => {
                 self.inner.report.lock().unwrap().deleted += 1;
-                debug!("deleted {}", b.path);
+                match &outcome {
+                    RemoveOutcome::Trashed { to } => info!("{}: deleted remotely; moved to {}", b.path, to.display()),
+                    _ => debug!("deleted {}", b.path),
+                }
                 let applied = deletion(true);
                 self.with_index(|ix| {
                     ix.atomically(|ix| {
@@ -1427,7 +1563,7 @@ impl Engine {
                 // An edit landed while we removed the file: put it back.
                 warn!("{}: edited while being deleted; the edit is kept", b.path);
                 self.inner.report.lock().unwrap().restored_edits += 1;
-                self.put_back(&b.path, displaced, None);
+                self.put_back(&b.path, displaced.clone(), None);
                 b.state = State::Dirty;
                 b.note = Some("deleted remotely; a local edit made meanwhile was kept".into());
                 keep_file(&b)
@@ -1454,6 +1590,9 @@ impl Engine {
             // Nothing of ours on disk; the conflict is resolved elsewhere.
             return self.with_index(|ix| ix.remove_pending(&f.id));
         };
+        if !matches!(self.filters().ignore_state(&b.path), IgnoreState::Synced { .. }) {
+            return self.apply_ignored(f);
+        }
         match b.state {
             State::Skipped | State::OutOfScope => {
                 let gone = RevisionRow::of_doc(f, None, Origin::Remote, true, vaultfs::now_ms());
@@ -2261,6 +2400,7 @@ impl Engine {
             }
         }
         self.scope_catch_up(old_scope).await?;
+        self.filters_catch_up().await?;
         self.retry_pending(true).await?;
         let resolve_owed = self.with_index(|ix| ix.get_meta(meta::RESOLVE_OWED))?.is_some();
         let mark_resolved = needs_fetch || resolve_owed;
@@ -2468,7 +2608,10 @@ impl Engine {
                         }
                     } else {
                         match self.finish_read_only_fetch() {
-                            Ok(()) => self.scope_catch_up(&scope).await,
+                            Ok(()) => match self.scope_catch_up(&scope).await {
+                                Ok(()) => self.filters_catch_up().await.map(|_| ()),
+                                Err(e) => Err(e),
+                            },
                             Err(e) => Err(e),
                         }
                     };
@@ -2656,6 +2799,7 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
             .get_meta(meta::SCOPE)?
             .and_then(|s| serde_json::from_str::<Scope>(&s).ok())
             .map(|s| s.describe()),
+        folder_kind: Some(vaultfs::FolderKind::of(vault)),
         fs_rules: ix.get_meta(meta::FS_RULES)?,
         vault_lock: ix.get_meta(meta::VAULT_LOCK)?,
         registered_ms: num(meta::REGISTERED)?,
@@ -2673,7 +2817,7 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::filters::{parse_regex_list as parse_ignore, RegexRule as IgnoreRule};
 
     #[test]
     fn ignore_rules() {

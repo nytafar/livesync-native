@@ -676,10 +676,13 @@ async fn index_is_bound_to_its_vault_folder() {
 async fn pull_creates_nomedia_but_keeps_an_existing_one() {
     let env = Env::new().await;
     env.mock.put_text("a.md", &["A"]);
+    // Off by default except on Android.
     env.engine().pull_once().await.unwrap();
+    assert_eq!(env.read(".nomedia").is_some(), cfg!(target_os = "android"));
+    env.engine_with(|c| c.write_nomedia = true).pull_once().await.unwrap();
     assert_eq!(env.read(".nomedia").unwrap(), b"");
     std::fs::write(env.vault().join(".nomedia"), b"mine").unwrap();
-    env.engine().pull_once().await.unwrap();
+    env.engine_with(|c| c.write_nomedia = true).pull_once().await.unwrap();
     assert_eq!(env.read(".nomedia").unwrap(), b"mine");
 }
 

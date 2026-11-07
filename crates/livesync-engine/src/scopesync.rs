@@ -11,13 +11,14 @@
 //! after the catch-up completed, so an interrupted catch-up runs again.
 
 use crate::engine::{meta_keys as meta, Engine, EngineError};
+use crate::filters::{FilterState, IgnoreState, Saved, Vis};
 use crate::index::State;
 use crate::vaultfs::{self, RemoveOutcome};
 use livesync_model::path::{is_internal_id, path_to_id};
 use livesync_model::scope::{Scope, Widening};
 use livesync_remote::ChangeRow;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use tracing::{debug, info, warn};
 
 type Result<T> = std::result::Result<T, EngineError>;
@@ -91,7 +92,7 @@ impl Engine {
                 if let Some(h) = &r.disk_hash {
                     let target = self.inner.cfg.vault.join(&r.path);
                     match vaultfs::remove_if_matches(&self.inner.cfg.vault, &target, h) {
-                        Ok(RemoveOutcome::Removed) => removed += 1,
+                        Ok(RemoveOutcome::Removed | RemoveOutcome::Trashed { .. }) => removed += 1,
                         Ok(RemoveOutcome::Raced { displaced }) => self.put_back(&r.path, displaced, None),
                         Ok(_) => {}
                         Err(e) => warn!("{}: cannot remove the local copy: {e}", r.path),
@@ -175,6 +176,141 @@ impl Engine {
         }
         self.with_index(|ix| ix.set_meta(meta::SCOPE, &serde_json::to_string(&new).unwrap()))?;
         Ok(())
+    }
+
+    /// Read every ignore file a walk of the vault meets (the folders that
+    /// sync, plus the own ignore files of folders that may be ignored as a
+    /// whole), with a reader of its own.
+    pub(crate) fn scan_ignore_files(&self, case_sensitive: bool) -> Result<BTreeMap<String, Saved>> {
+        let settings = self.inner.cfg.filter_settings();
+        if !settings.use_ignore_files {
+            return Ok(BTreeMap::new());
+        }
+        let root = self.inner.cfg.vault.clone();
+        let f = settings.build(&root, case_sensitive).map_err(EngineError::Other)?;
+        let scope = &self.inner.cfg.scope;
+        let mut stack = vec![String::new()];
+        while let Some(dir) = stack.pop() {
+            if !matches!(f.folder_state(&dir), IgnoreState::Synced { .. }) {
+                continue;
+            }
+            let path = if dir.is_empty() { root.clone() } else { root.join(&dir) };
+            let Ok(rd) = std::fs::read_dir(&path) else { continue };
+            for e in rd.flatten() {
+                if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let name = e.file_name().to_string_lossy().into_owned();
+                let rel = if dir.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{dir}/{name}")
+                };
+                if name.starts_with('.') && !f.dot.covers(&rel) {
+                    continue;
+                }
+                if scope.may_contain_under(&rel) {
+                    stack.push(rel);
+                }
+            }
+        }
+        Ok(f.files.as_ref().map(|x| x.read_so_far()).unwrap_or_default())
+    }
+
+    /// Apply changed local filters (ignore files edited, settings changed
+    /// since the last run): stop tracking what they now hide (the files and
+    /// the remote documents stay), and fetch what they stopped hiding, as
+    /// for a widened scope. Returns whether anything changed.
+    pub(crate) async fn filters_catch_up(&self) -> Result<bool> {
+        let _one = self.inner.filters_lock.lock().await;
+        let case_sensitive = self.inner.runtime.lock().unwrap().case_sensitive_ids;
+        let this = self.clone();
+        let files = tokio::task::spawn_blocking(move || this.scan_ignore_files(case_sensitive))
+            .await
+            .map_err(EngineError::other)??;
+        let new = FilterState::new(self.inner.cfg.filter_settings(), files);
+        let (since, stored) = self.with_index(|ix| Ok((ix.get_meta(meta::SINCE)?, FilterState::load(ix)?)))?;
+        let old = match (since, stored) {
+            // Nothing synced yet: the full pull covers the filters as they are.
+            (None, _) => new.clone(),
+            (Some(_), Some(s)) => s,
+            (Some(_), None) => FilterState::before_filters(&self.inner.cfg.filter_settings()),
+        };
+        if old == new {
+            return Ok(false);
+        }
+        let scope = self.inner.cfg.scope.clone();
+        // Narrowing: tracked paths the filters now hide are untracked.
+        let live = self.filters();
+        live.refresh();
+        let mut untracked = 0usize;
+        for r in self.with_index(|ix| ix.all_rows())? {
+            if !matches!(r.state, State::Clean | State::Dirty | State::Conflicted) {
+                continue;
+            }
+            if live.vis(&r.path, &scope) == Vis::Hidden && scope.contains(&r.path) {
+                self.with_index(|ix| {
+                    ix.atomically(|ix| {
+                        ix.delete_path(&r.path)?;
+                        ix.remove_pending(&r.doc_id)
+                    })
+                })?;
+                untracked += 1;
+            }
+        }
+        if untracked > 0 {
+            info!("the local filters changed: stopped tracking {untracked} file(s) they now hide (files and remote copies kept)");
+        }
+        // Widening: what was hidden and is not now, fetched like a widened scope.
+        let old_eval = old.evaluator(case_sensitive).map_err(EngineError::Other)?;
+        let new_eval = new.evaluator(case_sensitive).map_err(EngineError::Other)?;
+        let ids: Vec<String> = self
+            .scan_ids(None, None)
+            .await?
+            .into_iter()
+            .filter(|id| {
+                let p = id_to_scope_path(id);
+                scope.contains(p) && new_eval.vis(p, &scope) != Vis::Hidden && old_eval.vis(p, &scope) != Vis::Visible
+            })
+            .collect();
+        let ids: Vec<String> = {
+            let ix = self.inner.index.lock().unwrap();
+            let mut keep = Vec::new();
+            for id in ids {
+                let tracked = ix
+                    .by_doc(&id)?
+                    .is_some_and(|r| matches!(r.state, State::Clean | State::Dirty | State::Conflicted));
+                if !tracked {
+                    keep.push(id);
+                }
+            }
+            keep
+        };
+        if !ids.is_empty() {
+            info!(
+                "the local filters changed: fetching {} document(s) they no longer hide",
+                ids.len()
+            );
+        }
+        for keys in ids.chunks(100) {
+            let rows = self.inner.couch.all_docs_by_keys(keys).await?;
+            let changes: Vec<ChangeRow> = rows
+                .into_iter()
+                .filter_map(|r| {
+                    let doc = r.doc.filter(|d| !d.is_null())?;
+                    Some(ChangeRow {
+                        seq: Value::Null,
+                        id: r.key.unwrap_or_default(),
+                        changes: vec![],
+                        deleted: false,
+                        doc: Some(doc),
+                    })
+                })
+                .collect();
+            self.apply_batch(changes).await?;
+        }
+        self.with_index(|ix| new.save(ix))?;
+        Ok(true)
     }
 
     /// Document IDs in `[start, end]` (or all), without chunks and internal

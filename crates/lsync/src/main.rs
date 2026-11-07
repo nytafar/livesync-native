@@ -154,6 +154,20 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Say which rule keeps each path out of sync, like `git check-ignore -v`
+    /// (ignore files use the plugin's rules, not git's). Exits 0 when some
+    /// path is not synced, 1 when all are. Reads the vault folder only
+    CheckIgnore {
+        /// Paths: vault-relative, or file paths inside the vault
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Also list the paths that do sync (`::` when no rule matched)
+        #[arg(long, short = 'n')]
+        non_matching: bool,
+        /// Print JSON (every path)
+        #[arg(long)]
+        json: bool,
+    },
     /// Interactive on-device check: does Obsidian see outside writes, and does
     /// file watcher see Obsidian's saves?
     Probe(probe::ProbeArgs),
@@ -341,6 +355,11 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             Ok(0)
         }
         Cmd::Folders { json } => rt()?.block_on(folders(&sel, &cfg, &ctx.dirs, json)),
+        Cmd::CheckIgnore {
+            paths,
+            non_matching,
+            json,
+        } => check_ignore(&sel, &cfg, &ctx.dirs, &paths, non_matching, json),
         Cmd::Connect { adopt_tweaks, json } => rt()?.block_on(async {
             let gate = match routed(&sel, &cfg, &ctx.dirs, "connect")? {
                 Some((mut client, vault, fingerprint)) => {
@@ -692,6 +711,7 @@ fn run_config_for(
         pull_only,
         device_name: r.device_name.unwrap_or_default(),
         ignore_regex: r.ignore_regex.unwrap_or_default(),
+        what_syncs: r.what_syncs,
         concurrency: r.concurrency,
         max_size_mb: r.max_size_mb,
         allow_mass_delete: push.allow_mass_delete,
@@ -916,6 +936,93 @@ fn absolute(p: &std::path::Path) -> Result<PathBuf> {
     })
 }
 
+/// A path given to `check-ignore`, vault-relative: an absolute path, or one
+/// relative to the current folder when that is inside the vault, must lie
+/// in the vault; anything else is taken as vault-relative already.
+fn vault_relative(vault: &std::path::Path, given: &str) -> Result<String> {
+    use std::path::{Component, Path};
+    let vault = std::fs::canonicalize(vault).unwrap_or_else(|_| vault.to_path_buf());
+    let cwd = std::env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok());
+    let p = Path::new(given);
+    let abs = if p.is_absolute() {
+        Some(p.to_path_buf())
+    } else {
+        cwd.filter(|c| c.starts_with(&vault)).map(|c| c.join(p))
+    };
+    let Some(abs) = abs else {
+        return Ok(given.replace('\\', "/").trim_matches('/').to_string());
+    };
+    // Lexically: the path need not exist.
+    let mut norm = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::ParentDir => {
+                norm.pop();
+            }
+            Component::CurDir => {}
+            other => norm.push(other),
+        }
+    }
+    let rel = norm
+        .strip_prefix(&vault)
+        .map_err(|_| anyhow::anyhow!("{given}: outside the vault folder {}", vault.display()))?;
+    Ok(rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn check_ignore(
+    sel: &Selected,
+    cfg: &FileConfig,
+    dirs: &Dirs,
+    paths: &[String],
+    non_matching: bool,
+    json: bool,
+) -> Result<u8> {
+    let r = config::resolve(sel, cfg, dirs, false)?;
+    let mut ec = EngineConfig::new(absolute(&r.vault)?, r.state_dir.join("index.sqlite"));
+    ec.ignore_regex = r.ignore_regex.clone();
+    ec.scope = r.scope.clone();
+    let w = r.what_syncs.clone();
+    ec.use_ignore_files = w.use_ignore_files;
+    ec.ignore_files = w.ignore_files;
+    ec.sync_only_regex = Some(w.sync_only_regex).filter(|s| !s.trim().is_empty());
+    ec.sync_dot_paths = w.sync_dot_paths;
+    // The remote's case rule, as the index adopted it (default: case-insensitive).
+    let case_sensitive = Some(&ec.index_path)
+        .filter(|p| p.exists())
+        .and_then(|p| Index::open(p).ok())
+        .and_then(|ix| ix.get_meta("adopted_tweaks").ok().flatten())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|t| t.get("handleFilenameCaseSensitive").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let rels: Vec<String> = paths
+        .iter()
+        .map(|p| vault_relative(&ec.vault, p))
+        .collect::<Result<_>>()?;
+    let checks = livesync_engine::filters::check_paths(&ec, &rels, case_sensitive).map_err(|e| anyhow::anyhow!(e))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&checks)?);
+    } else {
+        for (c, given) in checks.iter().zip(paths) {
+            let source = match &c.source {
+                Some(s) => match (s.line, &s.pattern) {
+                    (Some(l), Some(p)) => format!("{}:{l}:{p}", s.file),
+                    _ => format!("{}::", s.file),
+                },
+                None if c.synced => "::".to_string(),
+                None => format!("[{}]", c.reason),
+            };
+            if c.synced && !non_matching {
+                continue;
+            }
+            println!("{source}\t{given}");
+            if c.reason == "undecidable" {
+                eprintln!("  {}: {}", c.path, c.detail);
+            }
+        }
+    }
+    Ok(if checks.iter().any(|c| !c.synced) { 0 } else { 1 })
+}
+
 fn engine_for(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, push: &PushOpts) -> Result<Engine> {
     // After a rebuild elsewhere, how long the remote must stay unchanged
     // before the refetch counts as complete (default 30 s; tests shorten it).
@@ -929,6 +1036,12 @@ fn engine_for(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, push: &PushOpts) ->
     ec.max_size_mb = r.max_size_mb;
     ec.scope = r.scope;
     ec.device_name = r.device_name;
+    let w = r.what_syncs;
+    ec.use_ignore_files = w.use_ignore_files;
+    ec.ignore_files = w.ignore_files;
+    ec.sync_only_regex = Some(w.sync_only_regex).filter(|s| !s.trim().is_empty());
+    ec.sync_dot_paths = w.sync_dot_paths;
+    ec.trash = w.trash;
     ec.allow_mass_delete = push.allow_mass_delete;
     ec.remove_out_of_scope_copies = push.remove_out_of_scope_copies;
     if let Some(q) = quiet {
@@ -971,6 +1084,24 @@ fn print_config(c: &FileConfig) {
             .unwrap_or("(default)".into())
     );
     println!("  ignore re  {}", show(&c.ignore_regex));
+    match config::what_syncs(c) {
+        Ok(w) => {
+            if w.use_ignore_files {
+                println!("  ignore     {}", w.ignore_files.join(", "));
+            } else {
+                println!("  ignore     - (ignore files off)");
+            }
+            println!(
+                "  sync only  {}",
+                show(&Some(w.sync_only_regex).filter(|s| !s.is_empty()))
+            );
+            if !w.sync_dot_paths.is_empty() {
+                println!("  dot-paths  {}", w.sync_dot_paths.join(", "));
+            }
+            println!("  trash      {}", w.trash.as_str());
+        }
+        Err(e) => println!("  filters    INVALID: {e}"),
+    }
     match c.scope() {
         Ok(s) => println!("  folders    {}", s.describe()),
         Err(e) => println!("  folders    INVALID: {e}"),
@@ -1014,6 +1145,7 @@ fn print_status(s: &livesync_engine::Status) {
     println!("last push       {}", fmt_ms(s.last_push_ms));
     println!("registered      {}", fmt_ms(s.registered_ms));
     println!("folders         {}", s.scope.as_deref().unwrap_or("-"));
+    println!("folder kind     {}", s.folder_kind.map_or("-", |k| k.as_str()));
     println!("vault lock      {}", s.vault_lock.as_deref().unwrap_or("-"));
     if s.needs_full_fetch {
         println!("full fetch      owed; pushes are held until a two-way sync completes it");

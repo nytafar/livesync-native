@@ -2,10 +2,38 @@
 //! and the checks that apply before an engine is opened for it.
 
 use crate::paths::{nested_under, paths_overlap};
+use livesync_engine::vaultfs::TrashMode;
 use livesync_engine::EngineConfig;
 use livesync_model::scope::{Scope, ScopeMode};
 use livesync_remote::RemoteConfig;
 use std::path::{Path, PathBuf};
+
+/// What syncs besides the folder scope (spec D11): ignore files,
+/// `syncOnlyRegEx`, the dot-path allowlist, and where remote deletions go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhatSyncs {
+    /// Honour ignore files (upstream `useIgnoreFiles`).
+    pub use_ignore_files: bool,
+    /// Their names (upstream `ignoreFiles`).
+    pub ignore_files: Vec<String>,
+    /// Local `syncOnlyRegEx` (upstream format); empty for none.
+    pub sync_only_regex: String,
+    /// Dot-folders and dot-files that sync after all.
+    pub sync_dot_paths: Vec<String>,
+    pub trash: TrashMode,
+}
+
+impl Default for WhatSyncs {
+    fn default() -> Self {
+        WhatSyncs {
+            use_ignore_files: false,
+            ignore_files: vec![".gitignore".into()],
+            sync_only_regex: String::new(),
+            sync_dot_paths: vec![],
+            trash: TrashMode::Vault,
+        }
+    }
+}
 
 /// One vault as the host runs it. Front-ends build it from their own
 /// settings (the Android app's profile, a vault in `lsync.toml`) with the
@@ -42,6 +70,7 @@ pub struct RunConfig {
     /// After a rebuild elsewhere, how long the remote must stay unchanged
     /// (`None`: the engine's default; tests shorten it).
     pub rebuild_quiet: Option<std::time::Duration>,
+    pub what_syncs: WhatSyncs,
 }
 
 impl std::fmt::Debug for RunConfig {
@@ -63,6 +92,7 @@ impl std::fmt::Debug for RunConfig {
             .field("allow_mass_delete", &self.allow_mass_delete)
             .field("remove_out_of_scope_copies", &self.remove_out_of_scope_copies)
             .field("rebuild_quiet", &self.rebuild_quiet)
+            .field("what_syncs", &self.what_syncs)
             .finish()
     }
 }
@@ -140,6 +170,12 @@ impl RunConfig {
         ec.device_name = Some(self.device_name.trim().to_string()).filter(|s| !s.is_empty());
         ec.ignore_regex = Some(self.ignore_regex.clone()).filter(|s| !s.trim().is_empty());
         ec.max_size_mb = self.max_size_mb;
+        let w = &self.what_syncs;
+        ec.use_ignore_files = w.use_ignore_files;
+        ec.ignore_files = w.ignore_files.clone();
+        ec.sync_only_regex = Some(w.sync_only_regex.clone()).filter(|s| !s.trim().is_empty());
+        ec.sync_dot_paths = w.sync_dot_paths.clone();
+        ec.trash = w.trash;
         if let Some(c) = self.concurrency {
             ec.concurrency = c.max(1);
         }
@@ -253,6 +289,7 @@ mod tests {
             pull_only: true,
             device_name: "phone".into(),
             ignore_regex: String::new(),
+            what_syncs: WhatSyncs::default(),
             concurrency: Some(4),
             max_size_mb: None,
             allow_mass_delete: false,

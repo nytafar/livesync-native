@@ -29,11 +29,12 @@
 //! Chunks always go before metadata.
 
 use crate::engine::{meta_keys as meta, Engine, EngineError};
+use crate::filters::{IgnoreState, Verdict};
 use crate::index::{FileRow, Origin, RevisionRow, State};
 use crate::vaultfs::{self, DiskState, RemoveOutcome};
 use crate::watcher::{NoWatcher, WatchEvent, Watcher};
 use livesync_model::doc::{classify_doc, Classified};
-use livesync_model::path::{classify_path, path_to_id};
+use livesync_model::path::path_to_id;
 use livesync_model::splitter::chunk_file;
 use livesync_model::FileKind;
 use livesync_remote::{Backoff, DocFetch, PutOutcome, RemoteError};
@@ -699,12 +700,33 @@ impl Engine {
         path_to_id(rel, self.ids_case_insensitive())
     }
 
-    /// Whether a local path takes part in sync: not a built-in skip, not
-    /// ignored, inside the folder scope.
+    /// Whether a local path takes part in sync: not a built-in skip (dot-
+    /// paths unless allowlisted), not ignored by a regex or an ignore file,
+    /// inside the folder scope.
     pub(crate) fn local_visible(&self, rel: &str) -> bool {
-        classify_path(rel).is_none()
-            && !self.inner.runtime.lock().unwrap().ignored(rel)
-            && self.inner.cfg.scope.contains(rel)
+        matches!(
+            self.filters().verdict(rel, &self.inner.cfg.scope),
+            Verdict::Synced { .. }
+        )
+    }
+
+    /// Whether a walk may go into the folder `rel`: not a dot-folder (unless
+    /// allowlisted), possibly holding files in scope, and not ignored as a
+    /// whole. `Err` when an ignore file on the way cannot be read.
+    fn dir_walkable(&self, rel: &str) -> std::result::Result<bool, String> {
+        let f = self.filters();
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        if name.starts_with('.') && !f.dot.covers(rel) {
+            return Ok(false);
+        }
+        if !self.inner.cfg.scope.may_contain_under(rel) {
+            return Ok(false);
+        }
+        match f.folder_state(rel) {
+            IgnoreState::Synced { .. } => Ok(true),
+            IgnoreState::Ignored(_) => Ok(false),
+            IgnoreState::Unknown { file, why } => Err(format!("ignore file {file} {why}")),
+        }
     }
 
     /// All visible files under `start` (a vault-relative folder, "" for the
@@ -713,6 +735,28 @@ impl Engine {
         use std::io::ErrorKind::NotFound;
         let root = self.inner.cfg.vault.clone();
         let mut w = Walk::default();
+        // The start folder and those above it must be walkable too.
+        let mut at = String::new();
+        for seg in start.split('/').filter(|s| !s.is_empty()) {
+            if !at.is_empty() {
+                at.push('/');
+            }
+            at.push_str(seg);
+            match self.dir_walkable(&at) {
+                Ok(true) => {}
+                Ok(false) => return w,
+                Err(why) => {
+                    w.unreadable.push((at, why));
+                    return w;
+                }
+            }
+        }
+        if start.is_empty() {
+            if let IgnoreState::Unknown { file, why } = self.filters().folder_state("") {
+                w.unreadable.push((String::new(), format!("ignore file {file} {why}")));
+                return w;
+            }
+        }
         let mut stack = vec![if start.is_empty() {
             root.clone()
         } else {
@@ -740,10 +784,10 @@ impl Engine {
                 };
                 let name = e.file_name();
                 let name = name.to_string_lossy();
-                if name.starts_with('.') {
+                let Some(rel) = rel_of(&root, &e.path()) else { continue };
+                if name.starts_with('.') && !self.filters().dot.covers(&rel) {
                     continue;
                 }
-                let Some(rel) = rel_of(&root, &e.path()) else { continue };
                 let ft = match e.file_type() {
                     Ok(t) => t,
                     Err(err) if err.kind() == NotFound => continue,
@@ -753,8 +797,10 @@ impl Engine {
                     }
                 };
                 if ft.is_dir() {
-                    if self.inner.cfg.scope.may_contain_under(&rel) {
-                        stack.push(e.path());
+                    match self.dir_walkable(&rel) {
+                        Ok(true) => stack.push(e.path()),
+                        Ok(false) => {}
+                        Err(why) => w.unreadable.push((rel, why)),
                     }
                 } else if ft.is_file() && self.local_visible(&rel) {
                     match e.metadata() {
@@ -890,6 +936,7 @@ impl Engine {
             passes: 1,
             ..Default::default()
         };
+        self.filters().refresh();
         let this = self.clone();
         let scan_at = Instant::now();
         let walk = tokio::task::spawn_blocking(move || this.walk_visible(""))
@@ -1041,6 +1088,7 @@ impl Engine {
             passes: 1,
             ..Default::default()
         };
+        self.filters().refresh();
         let tracked: u64 = self
             .with_index(|ix| ix.counts_by_state())?
             .iter()
@@ -1488,8 +1536,8 @@ impl Engine {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
             Err(e) => return Err(EngineError::Other(format!("reading {rel}: {e}"))),
         }
-        match vaultfs::remove_if_matches(&self.inner.cfg.vault, &abs, hash) {
-            Ok(RemoveOutcome::Removed | RemoveOutcome::AlreadyGone) => {
+        match vaultfs::trash_if_matches(&self.inner.cfg.vault, rel, hash, &self.inner.trash) {
+            Ok(RemoveOutcome::Removed | RemoveOutcome::AlreadyGone | RemoveOutcome::Trashed { .. }) => {
                 warn!("{rel}: deleted on another device after this copy last changed (same content); the stale local copy was removed (a copy is in the state directory's recovered/ folder)");
                 rep.deleted_locally += 1;
                 self.with_index(|ix| {
@@ -1760,6 +1808,38 @@ impl Engine {
         rep: &mut PushReport,
         issues_seen: &mut HashSet<String>,
     ) -> Result<()> {
+        // Paths the filters now hide are untracked, never deleted remotely
+        // (the files and the remote documents stay as they are).
+        let filters = self.filters();
+        let mut rows = rows;
+        rows.retain(|r| match filters.verdict(&r.path, &self.inner.cfg.scope) {
+            Verdict::Synced { .. } | Verdict::Unknown { .. } | Verdict::OutOfScope => true,
+            v => {
+                let why = match &v {
+                    Verdict::Ignored(by) => format!("ignored by {}", by.describe()),
+                    Verdict::IgnoreRegex => "ignored by syncIgnoreRegEx".into(),
+                    Verdict::NotInSyncOnly => "not matched by syncOnlyRegEx".into(),
+                    Verdict::Skip(s) => format!("not synced ({})", s.as_str()),
+                    _ => String::new(),
+                };
+                info!("{}: {why}; no longer synced (the remote copy is kept)", r.path);
+                let _ = self.with_index(|ix| {
+                    ix.atomically(|ix| {
+                        ix.delete_path(&r.path)?;
+                        ix.remove_pending(&r.doc_id)
+                    })
+                });
+                false
+            }
+        });
+        // Paths an unreadable ignore file leaves undecidable are not judged.
+        let mut unreadable: Vec<(String, String)> = unreadable.to_vec();
+        for r in &rows {
+            if let Verdict::Unknown { file, why } = filters.verdict(&r.path, &self.inner.cfg.scope) {
+                unreadable.push((r.path.clone(), format!("ignore file {file} {why}")));
+            }
+        }
+        let unreadable = &unreadable[..];
         if rows.is_empty() {
             if tally.scan.is_some() {
                 if let Some(h) = hold.as_deref_mut() {
@@ -2448,6 +2528,9 @@ impl Engine {
     fn watch_tree(&self, w: &mut dyn Watcher, start: &str, watched: &mut HashSet<PathBuf>) -> usize {
         let root = self.inner.cfg.vault.clone();
         let mut added = 0;
+        if !start.is_empty() && !matches!(self.dir_walkable(start), Ok(true)) {
+            return 0; // ignored, a dot-folder, or undecidable: not watched
+        }
         let mut stack = vec![if start.is_empty() {
             root.clone()
         } else {
@@ -2470,12 +2553,53 @@ impl Engine {
             }
             let Ok(rd) = std::fs::read_dir(&dir) else { continue };
             for e in rd.flatten() {
-                if e.file_type().is_ok_and(|t| t.is_dir()) && !e.file_name().to_string_lossy().starts_with('.') {
+                if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                // Never ignored folders (`node_modules/`, `.venv/`), nor
+                // dot-folders other than allowlisted ones.
+                if rel_of(&root, &e.path()).is_some_and(|rel| matches!(self.dir_walkable(&rel), Ok(true))) {
                     stack.push(e.path());
                 }
             }
         }
         added
+    }
+
+    /// The folders that should be watched now: after the filters changed,
+    /// stop watching what they hide and start on what they no longer do.
+    fn rewatch(&self, w: &mut dyn Watcher, watched: &mut HashSet<PathBuf>) {
+        let root = self.inner.cfg.vault.clone();
+        let trash = root.join(".trash");
+        let gone: Vec<PathBuf> = watched
+            .iter()
+            .filter(|d| **d != root && **d != trash)
+            .filter(|d| {
+                rel_of(&root, d).is_none_or(|rel| {
+                    // Walkable itself and every folder above it.
+                    let mut at = String::new();
+                    !rel.split('/').all(|seg| {
+                        if !at.is_empty() {
+                            at.push('/');
+                        }
+                        at.push_str(seg);
+                        matches!(self.dir_walkable(&at), Ok(true))
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+        for d in &gone {
+            w.unwatch_dir(d);
+            watched.remove(d);
+        }
+        let added = self.watch_tree(w, "", watched);
+        if !gone.is_empty() || added > 0 {
+            debug!(
+                "filters changed: stopped watching {} folder(s), started {added}",
+                gone.len()
+            );
+        }
     }
 
     /// The push side of the two-way daemon: watcher events and periodic
@@ -2556,6 +2680,26 @@ impl Engine {
             }
             if Instant::now() >= next_rescan {
                 full_due = true;
+            }
+            if full_due {
+                // Edited ignore files and other filter changes first: what
+                // they now hide is untracked, what they stopped hiding is
+                // fetched before anything is pushed.
+                self.filters().refresh();
+                match self.filters_catch_up().await {
+                    Ok(true) => self.rewatch(&mut *watcher, &mut watched),
+                    Ok(false) => {}
+                    Err(e) => {
+                        let wait = backoff.next_delay();
+                        self.record_error(&e);
+                        warn!("applying changed filters failed: {e}; retrying in {wait:.0?}");
+                        retry_at = Some(Instant::now() + wait);
+                        if !matches!(e, EngineError::Remote(_) | EngineError::Other(_)) {
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                }
             }
             // Held deletions: the burst looks over; a full pass decides.
             if hold.due().is_some_and(|d| Instant::now() >= d) {
@@ -2639,7 +2783,18 @@ impl Engine {
                 }
                 return;
             }
-            if classify_path(&rel).is_some() {
+            // An ignore file changed: the filters are applied anew by a full
+            // pass (they may hide or show any path below it).
+            let name = rel.rsplit('/').next().unwrap_or(&rel);
+            let filters = self.filters();
+            if filters
+                .files
+                .as_ref()
+                .is_some_and(|f| f.names().iter().any(|n| n.eq_ignore_ascii_case(name)))
+            {
+                *full_due = true;
+            }
+            if filters.path_skip(&rel).is_some() {
                 return; // dot-paths (including our temp files) and flag files
             }
             if abs.is_dir() && !watched.contains(abs) && !watched.is_empty() {
@@ -3098,6 +3253,75 @@ mod tests {
             .with_index(|ix| ix.get_meta(meta::DELETE_BURST))
             .unwrap()
             .is_none());
+    }
+
+    struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>);
+
+    impl Watcher for Recorder {
+        fn watch_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(dir.to_path_buf());
+            Ok(())
+        }
+        fn unwatch_dir(&mut self, dir: &Path) {
+            self.0.lock().unwrap().retain(|d| d != dir);
+        }
+    }
+
+    #[test]
+    fn ignored_folders_are_never_watched() {
+        use crate::engine::EngineConfig;
+        use livesync_remote::{Couch, RemoteConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        for d in [
+            "notes/sub",
+            "code/node_modules/pkg/deep",
+            "code/venv/lib",
+            "code/src",
+            ".obsidian/plugins",
+            ".notes/x",
+        ] {
+            std::fs::create_dir_all(vault.join(d)).unwrap();
+        }
+        // Upstream matches `node_modules/` only beside its ignore file.
+        std::fs::write(vault.join(".gitignore"), b"**/node_modules/\n").unwrap();
+        std::fs::write(vault.join("code/venv/.gitignore"), b"*\n").unwrap();
+        let couch = Couch::new(&RemoteConfig {
+            url: "http://127.0.0.1:9".into(),
+            database: "db".into(),
+            username: None,
+            password: None,
+        })
+        .unwrap();
+        let mut cfg = EngineConfig::new(vault.clone(), dir.path().join("state/index.sqlite"));
+        cfg.use_ignore_files = true;
+        cfg.sync_dot_paths = vec![".notes".into()];
+        let engine = Engine::open(couch, cfg).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut w = Recorder(seen.clone());
+        let mut watched = HashSet::new();
+        engine.watch_tree(&mut w, "", &mut watched);
+        let rels = |seen: &std::sync::Mutex<Vec<PathBuf>>| -> Vec<String> {
+            let mut v: Vec<String> = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| rel_of(&vault, p).unwrap_or_default())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            rels(&seen),
+            vec!["", ".notes", ".notes/x", "code", "code/src", "notes", "notes/sub"]
+        );
+        // The rule goes away: the folder is watched; a new rule: it is not.
+        std::fs::write(vault.join(".gitignore"), b"notes/\n").unwrap();
+        engine.filters().refresh();
+        engine.rewatch(&mut w, &mut watched);
+        let now = rels(&seen);
+        assert!(now.contains(&"code/node_modules/pkg/deep".to_string()), "{now:?}");
+        assert!(!now.iter().any(|d| d.starts_with("notes")), "{now:?}");
     }
 
     #[test]
