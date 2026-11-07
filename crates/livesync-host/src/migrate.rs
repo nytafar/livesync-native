@@ -17,7 +17,7 @@
 //! from them after a downgrade (with the settings of the time of the
 //! migration). They still hold their passwords; the migration says so.
 
-use crate::config::{check_name, server_key, Account, Config, Dirs, Vault, CONFIG_FILE, SECRETS_FILE};
+use crate::config::{check_name, server_key, Account, Config, Dirs, Migration, Vault, CONFIG_FILE, SECRETS_FILE};
 use crate::edit::ConfigFile;
 use crate::legacy::{self, Profile};
 use crate::run::split_userinfo;
@@ -243,9 +243,15 @@ pub fn migrate(dirs: &Dirs, secrets: &dyn SecretStore) -> Result<Option<Report>,
         trial.account.insert(a.name.clone(), a.account.clone());
         trial.vault.insert(name.clone(), vault.clone());
         if let Err(e) = trial.validate(dirs) {
+            // The account has no name yet: say "the server" instead.
+            let placeholder = format!("[account.{}]: ", a.name);
             if created {
                 accounts.pop();
             }
+            let e = match e.strip_prefix(&placeholder) {
+                Some(rest) => format!("its server: {rest}"),
+                None => e,
+            };
             skip(&mut report, e);
             continue;
         }
@@ -306,6 +312,10 @@ pub fn migrate(dirs: &Dirs, secrets: &dyn SecretStore) -> Result<Option<Report>,
         note.push_str("\nTo migrate them after a fix, add them with `lsync vault add`, or move this file\naway while it has no vaults; it is not tried again while this file exists.");
     }
     file.add_header_note(&note);
+    file.set_migration(&Migration {
+        migrated: vaults.iter().map(|(_, _, p)| file_name(p)).collect(),
+        skipped: report.skipped.iter().map(|(p, _)| file_name(p)).collect(),
+    })?;
     for a in &accounts {
         file.add_account(&a.name, &a.account, None)?;
         report.accounts.push(a.name.clone());

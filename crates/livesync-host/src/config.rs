@@ -36,6 +36,28 @@ pub struct Config {
     pub account: BTreeMap<String, Account>,
     #[serde(default)]
     pub vault: BTreeMap<String, Vault>,
+    /// What the migration from profile files did, kept so that a profile it
+    /// skipped is still read as before and one it migrated is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<Migration>,
+}
+
+/// `[migration]`: the profile files (`NAME.toml`) a migration turned into
+/// vaults, and the ones it left as they were.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Migration {
+    #[serde(default)]
+    pub migrated: Vec<String>,
+    #[serde(default)]
+    pub skipped: Vec<String>,
+}
+
+impl Migration {
+    /// Whether the profile file `file_name` was left by the migration.
+    pub fn skipped(&self, file_name: &str) -> bool {
+        self.skipped.iter().any(|s| s == file_name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

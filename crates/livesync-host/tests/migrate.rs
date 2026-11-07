@@ -254,6 +254,10 @@ fn profiles_that_cannot_be_vaults_are_left_and_reported() {
     assert!(why("other").contains("use the same folder"), "{}", why("other"));
     // Only what a vault uses becomes an account.
     assert_eq!(m.config().account.len(), 1);
+    // Which were migrated and which were left, in lsync.toml itself.
+    let rec = m.config().migration.unwrap();
+    assert_eq!(rec.migrated, vec!["notes.toml".to_string()]);
+    assert!(rec.skipped("partial.toml") && rec.skipped("other.toml") && !rec.skipped("notes.toml"));
 }
 
 #[test]
@@ -278,7 +282,9 @@ fn nothing_to_migrate_is_recorded_once_without_the_values() {
     assert!(text.contains("- partial.toml: it has no url"), "{text}");
     assert!(text.contains("- typo.toml: parsing"), "{text}");
     assert!(!text.contains("Hunter2"), "{text}");
-    assert_eq!(m.config(), Config::default());
+    let c = m.config();
+    assert!(c.account.is_empty() && c.vault.is_empty());
+    assert!(c.migration.unwrap().skipped("typo.toml"));
     assert!(!m.dirs.secrets_file().exists());
     // Not tried (nor reported) again.
     assert!(!migrate::needed(&m.dirs));
@@ -348,4 +354,21 @@ fn a_profile_with_neither_user_nor_password_migrates() {
     assert!(r.passwords.is_empty());
     let c = m.config();
     assert_eq!(c.account[&c.vault["open"].account].username, None);
+}
+
+#[test]
+fn a_skip_reason_never_names_an_account_that_was_never_made() {
+    let m = Machine::new();
+    m.profile(
+        "odd",
+        "url = \"ftp://couch.example.net\"\ndatabase = \"d\"\nvault = \"@ROOT@/vaults/odd\"\n",
+    );
+    let r = migrate(&m.dirs, &m.store()).unwrap().unwrap();
+    let why = &r.skipped[0].1;
+    assert!(
+        why.contains("https://") && !why.contains("new-account") && !why.contains("[account."),
+        "{why}"
+    );
+    let text = std::fs::read_to_string(m.dirs.config_file()).unwrap();
+    assert!(!text.contains("new-account"), "{text}");
 }

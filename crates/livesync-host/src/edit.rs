@@ -3,7 +3,7 @@
 //! is replaced atomically under a lock, so two commands at once never lose
 //! each other's change.
 
-use crate::config::{Account, Config, Dirs, Vault};
+use crate::config::{Account, Config, Dirs, Migration, Vault};
 use livesync_engine::platform::{LockError, LockFile};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -234,6 +234,25 @@ impl ConfigFile {
         }
         t.decor_mut().set_prefix(prefix);
         self.section(kind).insert(name, Item::Table(t));
+        Ok(())
+    }
+
+    /// Write `[migration]` (a new file only: it goes first, under the header).
+    pub fn set_migration(&mut self, m: &Migration) -> Result<(), String> {
+        let text = toml::to_string(m).map_err(|e| e.to_string())?;
+        let mut t = text
+            .parse::<DocumentMut>()
+            .map_err(|e| e.to_string())?
+            .as_table()
+            .clone();
+        t.set_implicit(false);
+        let mut prefix = match self.header.take() {
+            Some(h) => format!("{h}\n"),
+            None => String::from("\n"),
+        };
+        prefix.push_str("# Which profile files were migrated, and which were left (read as before).\n");
+        t.decor_mut().set_prefix(prefix);
+        self.doc.insert("migration", Item::Table(t));
         Ok(())
     }
 

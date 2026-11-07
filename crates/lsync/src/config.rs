@@ -169,7 +169,7 @@ fn is_accounts_file(text: &str, path: &Path, empty_is_accounts: bool) -> Result<
     let table: toml::Table = toml::from_str(text)
         .map_err(|e| anyhow!("parsing {}: {}", path.display(), livesync_host::toml_de_error(text, &e)))?;
     // A profile's `vault` is its folder (a string); here it is a table.
-    let section = |k: &str, v: &toml::Value| (k == "account" || k == "vault") && v.is_table();
+    let section = |k: &str, v: &toml::Value| matches!(k, "account" | "vault" | "migration") && v.is_table();
     let new = table.iter().filter(|(k, v)| section(k, v)).count();
     if new > 0 && new < table.len() {
         bail!(
@@ -340,9 +340,23 @@ impl Setup {
                 let implicit = cfg.implicit_vault().map(str::to_string);
                 let default_profile = migrate::profile_path(&self.dirs, "default");
                 if self.explicit.is_none() && !cfg.vault.contains_key("default") && default_profile.exists() {
-                    // `default.toml` was not migrated: with no name, it is read
-                    // as before, never another vault in its place.
-                    return profile("default".into(), default_profile);
+                    match &cfg.migration {
+                        // Skipped by the migration: with no name, it is read
+                        // as before, never another vault in its place.
+                        Some(m) if m.skipped("default.toml") => return profile("default".into(), default_profile),
+                        // Migrated (and its vault since removed), or new:
+                        // the vaults decide.
+                        Some(_) => {}
+                        // No record of a migration: there is no telling which
+                        // one was meant.
+                        None if !cfg.vault.is_empty() => bail!(
+                            "{} and the vaults in {} ({}) could both be meant; name one with --vault NAME, or --profile default for the profile file",
+                            default_profile.display(),
+                            self.config_file.display(),
+                            list(cfg.vault.keys())
+                        ),
+                        None => {}
+                    }
                 }
                 match implicit {
                     // The folder given without a vault: flags and
@@ -364,10 +378,10 @@ impl Setup {
         let v = &cfg.vault[&chosen];
         let a = &cfg.account[&v.account];
         let scope = v.scope().map_err(|e| anyhow!("[vault.{chosen}]: {e}"))?;
-        let no_user = a.username.as_deref().is_none_or(|u| u.is_empty());
+        // Looked up even without a user here: --user or LSYNC_USER may give
+        // one. Whether a missing password matters is decided in `resolve`,
+        // with the overrides applied.
         let (password, password_error) = match a.secret_ref(&v.account) {
-            // No user: a server without authentication, no password needed.
-            _ if no_user => (None, None),
             Ok(r) => match self.secrets().get(&r) {
                 Ok(Some(s)) => (Some(s.expose().to_string()), None),
                 Ok(None) => (
@@ -461,7 +475,10 @@ pub fn resolve(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, need_remote: bool)
             several(sel)
         );
     }
-    if need_remote && cfg.password.is_none() {
+    // No user (after the overrides): a server without authentication, no
+    // password needed.
+    let has_user = cfg.username.as_deref().is_some_and(|u| !u.is_empty());
+    if need_remote && has_user && cfg.password.is_none() {
         if let Some(e) = &sel.password_error {
             bail!("{e} (or give LSYNC_PASSWORD)");
         }
@@ -588,7 +605,7 @@ mod tests {
         );
         write(
             &c.config_file,
-            "[account.home]\nurl = \"https://couch.example.net\"\nusername = \"me\"\n\n[vault.work]\naccount = \"home\"\ndatabase = \"work\"\nfolder = \"/srv/work\"\n",
+            "[migration]\nmigrated = [\"work.toml\"]\nskipped = [\"default.toml\"]\n\n[account.home]\nurl = \"https://couch.example.net\"\nusername = \"me\"\n\n[vault.work]\naccount = \"home\"\ndatabase = \"work\"\nfolder = \"/srv/work\"\n",
         );
         let o = Overrides {
             url: Some("https://other.example.org".into()),
@@ -645,9 +662,66 @@ mod tests {
         );
         let o = Overrides::default();
         let s = c.select(None, &o).unwrap();
-        assert_eq!(s.password_error, None);
         let r = resolve(&s, &merged(s.file.clone(), &o), &c.dirs, true).unwrap();
         assert_eq!((r.remote.username, r.remote.password), (None, None));
+        // A user given for the run: now the missing password matters.
+        let o = Overrides {
+            username: Some("bob".into()),
+            ..Default::default()
+        };
+        let e = resolve(&s, &merged(s.file.clone(), &o), &c.dirs, true).err().unwrap();
+        assert!(e.to_string().contains("no password"), "{e}");
+    }
+
+    #[test]
+    fn a_stored_password_is_used_when_the_user_comes_from_the_run() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(d.path());
+        // Migrated from a profile with a password and no username, run
+        // with LSYNC_USER.
+        write(
+            &c.dirs.config.join("notes.toml"),
+            "url = \"https://couch.example.net\"\ndatabase = \"notes\"\npassword = \"pw-notes\"\nvault = \"/srv/notes\"\n",
+        );
+        c.migrate_if_needed();
+        let o = Overrides {
+            username: Some("bob".into()),
+            ..Default::default()
+        };
+        let s = c.select(None, &o).unwrap();
+        assert!(matches!(s.origin, Origin::Vault { .. }));
+        let r = resolve(&s, &merged(s.file.clone(), &o), &c.dirs, true).unwrap();
+        assert_eq!(r.remote.username.as_deref(), Some("bob"));
+        assert_eq!(r.remote.password.as_deref(), Some("pw-notes"));
+    }
+
+    #[test]
+    fn a_migrated_default_profile_is_not_read_once_its_vault_is_gone() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(d.path());
+        write(
+            &c.dirs.config.join("default.toml"),
+            "database = \"stale\"\nvault = \"/srv/notes\"\n",
+        );
+        let notes = "[account.home]\nurl = \"https://couch.example.net\"\n\n[vault.notes]\naccount = \"home\"\ndatabase = \"notes\"\nfolder = \"/srv/notes\"\n";
+        let o = Overrides::default();
+        // Migrated, then `vault rm default`: the only vault is the one.
+        write(
+            &c.config_file,
+            &format!("[migration]\nmigrated = [\"default.toml\"]\n\n{notes}"),
+        );
+        let s = c.select(None, &o).unwrap();
+        assert_eq!(s.name, "notes");
+        // Skipped: read as before.
+        write(
+            &c.config_file,
+            &format!("[migration]\nskipped = [\"default.toml\"]\n\n{notes}"),
+        );
+        assert_eq!(c.select(None, &o).unwrap().file.database.as_deref(), Some("stale"));
+        // No record: neither is guessed.
+        write(&c.config_file, notes);
+        let e = c.select(None, &o).unwrap_err().to_string();
+        assert!(e.contains("--vault NAME") && e.contains("--profile default"), "{e}");
     }
 
     #[test]

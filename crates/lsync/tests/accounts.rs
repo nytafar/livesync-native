@@ -891,3 +891,25 @@ fn configure_never_gives_a_new_account_a_password_left_in_secrets_toml() {
         "{text}"
     );
 }
+
+#[test]
+fn a_migrated_default_profile_is_not_run_after_its_vault_is_removed() {
+    let m = Machine::new();
+    let folder = m.folder("notes");
+    std::fs::write(
+        m.config_dir().join("default.toml"),
+        format!(
+            "url = \"https://couch.example.net\"\ndatabase = \"notes\"\nusername = \"me\"\npassword = \"pw-old\"\nvault = \"{folder}\"\n"
+        ),
+    )
+    .unwrap();
+    m.ok(&["vault", "ls"], None);
+    assert!(m.config().contains("[vault.default]") && m.config().contains("[migration]"));
+    m.ok(&["vault", "rm", "default"], None);
+    m.ok(&["vault", "add", "notes", "--db", "notes", "--folder", &folder], None);
+    // The record survives the edits.
+    assert!(m.config().contains("migrated = [\"default.toml\"]"), "{}", m.config());
+    m.index(&m.root.join("state/lsync/default"), "node-default");
+    m.index(&m.root.join("state/lsync/notes"), "node-notes");
+    assert_eq!(node_id(&m.ok(&["status", "--json"], None)), "node-notes");
+}
