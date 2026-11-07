@@ -301,7 +301,7 @@ impl TrashMode {
             "vault" => Ok(TrashMode::Vault),
             "system" => Ok(TrashMode::System),
             "none" => Ok(TrashMode::None),
-            other => Err(format!("unknown trash {other:?} (use vault, system or none)")),
+            _ => Err("unknown trash (use vault, system or none)".into()),
         }
     }
 

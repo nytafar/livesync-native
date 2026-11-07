@@ -127,23 +127,27 @@ impl DotAllow {
 
     /// Check and normalise the configured entries.
     pub fn new(entries: &[String]) -> Result<DotAllow, String> {
+        // Errors say which entry, never what it holds.
         let mut out: Vec<String> = Vec::new();
-        for e in entries {
+        for (i, e) in entries.iter().enumerate() {
+            let n = i + 1;
             let segs: Vec<&str> = e.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
             let Some(last) = segs.last() else {
-                return Err(format!("sync_dot_paths: empty entry {e:?}"));
+                return Err(format!("sync_dot_paths: entry {n} is empty"));
             };
             for s in &segs {
                 if *s == "." || *s == ".." {
-                    return Err(format!("sync_dot_paths: {e:?} contains {s:?}"));
+                    return Err(format!("sync_dot_paths: entry {n} contains . or .."));
                 }
                 if never_allowed(s) {
-                    return Err(format!("sync_dot_paths: {e:?}: {s} can never sync as ordinary files"));
+                    return Err(format!(
+                        "sync_dot_paths: entry {n} names .obsidian, .trash, .git or an .lsync file, which never sync as ordinary files"
+                    ));
                 }
             }
             if !last.starts_with('.') {
                 return Err(format!(
-                    "sync_dot_paths: {e:?} is not a dot-path (name the dot-folder or dot-file itself)"
+                    "sync_dot_paths: entry {n} is not a dot-path (name the dot-folder or dot-file itself)"
                 ));
             }
             out.push(js_to_lower_case(&segs.join("/")));

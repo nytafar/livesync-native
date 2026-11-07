@@ -1590,8 +1590,12 @@ impl Engine {
             // Nothing of ours on disk; the conflict is resolved elsewhere.
             return self.with_index(|ix| ix.remove_pending(&f.id));
         };
-        if !matches!(self.filters().ignore_state(&b.path), IgnoreState::Synced { .. }) {
-            return self.apply_ignored(f);
+        match self.filters().ignore_state(&b.path) {
+            IgnoreState::Synced { .. } => {}
+            IgnoreState::Ignored(_) => return self.apply_ignored(f),
+            IgnoreState::Unknown { file, why } => {
+                return self.defer_doc(f, &format!("ignore file {file} {why}"));
+            }
         }
         match b.state {
             State::Skipped | State::OutOfScope => {

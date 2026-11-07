@@ -573,13 +573,13 @@ pub struct FilterSettings {
 /// Check the names in `ignore_files`.
 pub fn check_ignore_file_names(names: &[String]) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
-    for n in names {
+    for (i, n) in names.iter().enumerate() {
         let n = n.trim();
         if n.is_empty() {
             continue;
         }
         if n.contains('/') || n.contains('\\') || n == "." || n == ".." {
-            return Err(format!("ignore_files: {n:?} must be a file name, not a path"));
+            return Err(format!("ignore_files: entry {} must be a file name, not a path", i + 1));
         }
         if !out.iter().any(|o: &String| o == n) {
             out.push(n.to_string());
