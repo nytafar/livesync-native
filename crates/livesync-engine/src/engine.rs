@@ -1459,7 +1459,16 @@ impl Engine {
                 });
             }
             // An unpushed local edit: the push side writes it as a branch.
-            State::Dirty => return self.with_index(|ix| ix.remove_pending(&f.id)),
+            // The deletion is seen, not applied: the file survives it.
+            State::Dirty => {
+                let seen = RevisionRow::of_doc(f, None, Origin::Remote, false, vaultfs::now_ms());
+                return self.with_index(|ix| {
+                    ix.atomically(|ix| {
+                        ix.record_revision(&seen)?;
+                        ix.remove_pending(&f.id)
+                    })
+                });
+            }
             State::Clean | State::Conflicted => {}
         }
         let ours_is_leaf = b.base_rev.as_ref().is_some_and(|r| f.conflicts.contains(r));

@@ -251,3 +251,63 @@ async fn nothing_is_recorded_when_an_apply_or_push_fails() {
     assert_eq!((h[1].rev.as_str(), h[1].applied), (on_server.as_str(), true));
     assert_eq!(h[1].rev, env.base_rev("p.md"));
 }
+
+#[tokio::test]
+async fn a_stale_copy_removed_for_a_remote_deletion_records_it() {
+    let env = Env::new().await;
+    env.mock.put_text("gone.md", &["old note"]);
+    env.mock.soft_delete("gone.md");
+    let deleted = env.mock.doc("gone.md").unwrap()["_rev"].as_str().unwrap().to_string();
+    env.write("gone.md", b"old note");
+    let f = std::fs::File::options()
+        .write(true)
+        .open(env.vault().join("gone.md"))
+        .unwrap();
+    f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        .unwrap();
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted_locally, 1, "{rep:?}");
+    let r = env.index().revision("gone.md", &deleted).unwrap().expect("recorded");
+    assert!(r.deleted && r.applied, "{r:?}");
+    assert_eq!(r.origin, Origin::Remote);
+    assert_eq!(r.hash.as_deref(), Some(Env::hash(b"old note").as_str()));
+    assert!(!r.children.is_empty());
+}
+
+#[tokio::test]
+async fn a_deleted_winner_over_a_dirty_file_is_recorded_as_seen() {
+    let env = Env::new().await;
+    let base = env.mock.put_text("c.md", &["base"]);
+    env.engine().pull_once().await.unwrap();
+    // A remote edit held back by a local one: the row is dirty.
+    env.write("c.md", b"local edit");
+    env.mock.put_text("c.md", &["remote edit"]);
+    env.engine().pull_once().await.unwrap();
+    assert_eq!(env.index().by_doc("c.md").unwrap().unwrap().state, State::Dirty);
+    // Another device's deletion of the base wins; the remote edit stays a leaf.
+    let mut d = env.mock.doc("c.md").unwrap();
+    d["deleted"] = json!(true);
+    if let Some(o) = d.as_object_mut() {
+        o.remove("_conflicts");
+    }
+    let winner = env.mock.put_branch_with(d, &base, "zzzz");
+    env.engine().pull_once().await.unwrap();
+    assert_eq!(env.mock.doc("c.md").unwrap()["_rev"], json!(winner));
+    assert_eq!(std::fs::read(env.vault().join("c.md")).unwrap(), b"local edit");
+    let r = env.index().revision("c.md", &winner).unwrap().expect("recorded");
+    assert!(r.deleted && !r.applied, "{r:?}");
+}
+
+#[tokio::test]
+async fn a_lossy_text_push_records_the_hash_of_what_the_chunks_hold() {
+    let env = Env::new().await;
+    let bytes = b"caf\xe9 au lait\n";
+    env.write("lossy.md", bytes);
+    env.engine().sync_once().await.unwrap();
+    let h = env.history("lossy.md");
+    assert_eq!(h.len(), 1, "{h:?}");
+    let text = String::from_utf8_lossy(bytes);
+    assert_ne!(Env::hash(text.as_bytes()), Env::hash(bytes));
+    assert_eq!(h[0].hash.as_deref(), Some(Env::hash(text.as_bytes()).as_str()));
+    assert_eq!(env.mock.content("lossy.md").unwrap(), text.as_bytes());
+}

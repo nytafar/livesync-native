@@ -1293,6 +1293,14 @@ impl Engine {
                 .await
                 .map_err(EngineError::other)?
         };
+        // What the chunks hold, hashed: for text with invalid UTF-8 that is
+        // the converted text (with U+FFFD), not the bytes on disk.
+        let content_hash = if chunked.lossy {
+            let text: String = chunked.chunks.iter().map(|(_, d)| d.as_str()).collect();
+            vaultfs::hash_bytes(text.as_bytes())
+        } else {
+            hash.clone()
+        };
         let mut issue = None;
         if chunked.lossy {
             let note = "not valid UTF-8; synced with replacement characters".to_string();
@@ -1333,9 +1341,21 @@ impl Engine {
         };
         let written = match self.write_meta(doc, base.as_deref(), no_base).await? {
             MetaWrite::Written(w) => w,
-            MetaWrite::DeletedElsewhere => {
+            MetaWrite::DeletedElsewhere(deleted) => {
                 ctx.attempt = None;
-                if !self.remove_deleted_elsewhere(rel, &doc_id, row.as_ref(), &hash, rep)? {
+                // The remote deletion, to record once applied here; it holds
+                // this content.
+                let revision = match classify_doc(&deleted) {
+                    Classified::File(f) => Some(RevisionRow::of_doc(
+                        &f,
+                        Some(content_hash.clone()),
+                        Origin::Remote,
+                        true,
+                        vaultfs::now_ms(),
+                    )),
+                    _ => None,
+                };
+                if !self.remove_deleted_elsewhere(rel, &doc_id, row.as_ref(), &hash, revision, rep)? {
                     // Not settled yet: the reconcile pass must come back to it.
                     ctx.incomplete = true;
                 }
@@ -1381,7 +1401,9 @@ impl Engine {
         let revision = match written.adopted.as_ref().map(classify_doc) {
             // A version the remote already had (same chunks and type): its
             // own fields, and not known to be ours.
-            Some(Classified::File(cur)) => RevisionRow::of_doc(&cur, Some(hash.clone()), Origin::Remote, true, now),
+            Some(Classified::File(cur)) => {
+                RevisionRow::of_doc(&cur, Some(content_hash.clone()), Origin::Remote, true, now)
+            }
             _ => RevisionRow {
                 doc_id: doc_id.clone(),
                 rev: written.rev.clone(),
@@ -1393,7 +1415,7 @@ impl Engine {
                 ctime: Some(ctime),
                 size: chunked.size,
                 deleted: false,
-                hash: Some(hash.clone()),
+                hash: Some(content_hash.clone()),
                 origin: if written.adopted.is_some() {
                     Origin::Remote
                 } else {
@@ -1443,6 +1465,7 @@ impl Engine {
         doc_id: &str,
         row: Option<&FileRow>,
         hash: &str,
+        revision: Option<RevisionRow>,
         rep: &mut PushReport,
     ) -> Result<bool> {
         let abs = self.inner.cfg.vault.join(rel);
@@ -1469,10 +1492,15 @@ impl Engine {
                 warn!("{rel}: deleted on another device after this copy last changed (same content); the stale local copy was removed (a copy is in the state directory's recovered/ folder)");
                 rep.deleted_locally += 1;
                 self.with_index(|ix| {
-                    if let Some(r) = row {
-                        ix.delete_doc(&r.doc_id)?;
-                    }
-                    ix.remove_pending(doc_id)
+                    ix.atomically(|ix| {
+                        if let Some(r) = row {
+                            ix.delete_doc(&r.doc_id)?;
+                        }
+                        if let Some(r) = &revision {
+                            ix.record_revision(r)?;
+                        }
+                        ix.remove_pending(doc_id)
+                    })
                 })?;
                 Ok(true)
             }
@@ -1680,7 +1708,7 @@ impl Engine {
                         if no_base == NoBase::Reconcile && same_content(&cur, &doc) {
                             // The very content that was deleted, and not
                             // changed since: it was deleted elsewhere.
-                            return Ok(MetaWrite::DeletedElsewhere);
+                            return Ok(MetaWrite::DeletedElsewhere(cur));
                         }
                         // Older than the deletion but different from what
                         // was deleted: keep both, as a conflict.
@@ -2715,8 +2743,8 @@ impl Written {
 enum MetaWrite {
     Written(Written),
     /// No known base, and the remote deleted exactly this content after the
-    /// local copy last changed: the local copy is stale.
-    DeletedElsewhere,
+    /// local copy last changed: the local copy is stale. The deleted document.
+    DeletedElsewhere(Value),
 }
 
 fn has_conflicts(doc: &Value) -> bool {

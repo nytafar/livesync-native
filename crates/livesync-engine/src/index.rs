@@ -87,8 +87,17 @@ pub enum Origin {
     /// already had when we pushed the same content).
     Remote,
     /// Taken from the `files` table when the history was introduced (schema
-    /// v3): the revision a file was synced at, of unknown origin and without
-    /// its encoding.
+    /// v3): the revision a file was synced at, of unknown origin. Weaker than
+    /// the others, so don't rely on more than `doc_id`, `rev`, `path` and
+    /// `children`:
+    /// - `mtime` and `size` are the file's on disk (the document's own
+    ///   values were never kept); `ctime` is unknown;
+    /// - `kind` is unknown (`None`) and `eden` is empty: a revision whose
+    ///   chunks were inline in the document cannot be rebuilt;
+    /// - `hash` is the disk hash at that revision, or `None` where the index
+    ///   had cleared it (a deletion kept against a conflict), in which case
+    ///   the encoding cannot be told by checking it either;
+    /// - `seen_ms` is the migration time, not when it was synced.
     Migrated,
 }
 
@@ -325,6 +334,23 @@ impl Index {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        // Fail closed on an index a newer binary wrote: its tables may carry
+        // data this one would not keep up to date.
+        let found: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
+            .optional()
+            .unwrap_or(None);
+        if let Some(v) = found.as_deref().and_then(|v| v.parse::<u64>().ok()) {
+            let known: u64 = SCHEMA_VERSION.parse().unwrap();
+            if v > known {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some(format!(
+                        "the index has schema version {v}, written by a newer lsync; this one knows up to version {known}. Upgrade lsync, or move the state folder away to start a fresh index"
+                    )),
+                ));
+            }
+        }
         conn.execute_batch(SCHEMA)?;
         let idx = Index { conn };
         let version = idx.get_meta("schema_version")?;
@@ -382,14 +408,29 @@ impl Index {
     /// Run `f` in one transaction (a savepoint, so it nests): everything it
     /// writes is committed together, or nothing is when it fails.
     pub fn atomically<T>(&self, f: impl FnOnce(&Index) -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+        // Outermost, the release is the commit: when it fails (busy, a
+        // deferred constraint), roll the whole transaction back so the
+        // connection is left in autocommit, never inside an open transaction.
+        let outermost = self.conn.is_autocommit();
         self.conn.execute_batch("SAVEPOINT atomically")?;
+        let undo = || {
+            let sql = if outermost {
+                "ROLLBACK"
+            } else {
+                "ROLLBACK TO atomically; RELEASE atomically"
+            };
+            let _ = self.conn.execute_batch(sql);
+        };
         match f(self) {
-            Ok(v) => {
-                self.conn.execute_batch("RELEASE atomically")?;
-                Ok(v)
-            }
+            Ok(v) => match self.conn.execute_batch("RELEASE atomically") {
+                Ok(()) => Ok(v),
+                Err(e) => {
+                    undo();
+                    Err(e)
+                }
+            },
             Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK TO atomically; RELEASE atomically");
+                undo();
                 Err(e)
             }
         }
@@ -916,6 +957,45 @@ mod tests {
         .unwrap();
         assert!(ix.by_doc("a.md").unwrap().is_some());
         assert_eq!(ix.revision_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_failed_commit_rolls_back_and_leaves_autocommit() {
+        let ix = Index::open_in_memory().unwrap();
+        // A deferred foreign key makes the outermost release (the commit) fail.
+        ix.conn
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE parent (id TEXT PRIMARY KEY);
+                 CREATE TABLE child (p TEXT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);",
+            )
+            .unwrap();
+        let r = ix.atomically(|ix| {
+            ix.upsert(&row("a.md", "a.md"))?;
+            ix.record_revision(&rev("a.md", "1-a"))?;
+            ix.conn.execute("INSERT INTO child VALUES ('nobody')", [])?;
+            Ok(())
+        });
+        assert!(r.is_err(), "{r:?}");
+        assert!(ix.conn.is_autocommit(), "left inside a transaction");
+        assert!(ix.by_doc("a.md").unwrap().is_none());
+        assert_eq!(ix.revision_count().unwrap(), 0);
+        // Later writes still commit on their own.
+        ix.upsert(&row("b.md", "b.md")).unwrap();
+        assert!(ix.conn.is_autocommit());
+        assert!(ix.by_doc("b.md").unwrap().is_some());
+    }
+
+    #[test]
+    fn an_index_from_a_newer_binary_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('schema_version', '4');",
+        )
+        .unwrap();
+        let msg = Index::init(conn).err().expect("refused").to_string();
+        assert!(msg.contains("version 4") && msg.contains("up to version 3"), "{msg}");
     }
 
     #[test]
