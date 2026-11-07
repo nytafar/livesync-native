@@ -434,7 +434,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
     // A user outside the system service's group cannot read its config
     // (root's, 0640 to that group: it may hold passwords). A command for one
     // of its vaults, named with --vault, goes to the service by that name
-    // (a socket-group member who is not in the service's group).
+    // (a socket-group member: the socket group never reads the config).
     if ctx.system && unreadable(&ctx.config_file) {
         if let Some(vault) = cli.vault.clone().filter(|v| !config::looks_like_path(v)) {
             return by_name(cmd, &vault, &ctx, matches);
@@ -904,7 +904,7 @@ fn root_runs_no_system_vault(system: bool, euid: u32, cmd: &Cmd) -> Result<()> {
         return Ok(());
     }
     bail!(
-        "root does not run the system service's vaults itself: their folders and state belong to the service's user, and root would act on whatever that user put there. Run it as that user, with the service's group (`sudo -u USER -g GROUP lsync --system ...`, as User= and Group= in lsync.service say), or through the service as a member of its group (`lsync --system --vault NAME status|sync|fetch|pull`, `sync-now`, `status --all`)"
+        "root does not run the system service's vaults itself: their folders and state belong to the service's user, and root would act on whatever that user put there. Run it as that user, with the service's group (`sudo -u USER -g GROUP lsync --system ...`, as User= and Group= in lsync.service say), or through the service as a member of its socket group (`lsync --system --vault NAME status|sync|fetch|pull`, `sync-now`, `status --all`)"
     )
 }
 
@@ -993,7 +993,7 @@ fn by_name(cmd: Cmd, vault: &str, ctx: &Setup, matches: &clap::ArgMatches) -> Re
             }
         }
         _ => bail!(
-            "{cannot}; a member of its group can run `lsync --system --vault {vault} status|sync|fetch|pull`, and `status --all`, `pause`, `resume`, `sync-now`, `events` and `reload`"
+            "{cannot}; a member of its socket group can run `lsync --system --vault {vault} status|sync|fetch|pull`, and `status --all`, `pause`, `resume`, `sync-now`, `events` and `reload`"
         ),
     }
 }

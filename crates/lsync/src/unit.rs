@@ -110,9 +110,12 @@ pub fn user_unit(exec: &Exec) -> String {
 pub struct SystemService {
     pub exec: Exec,
     pub user: String,
+    /// The user's own (primary) group: the config's group, so the socket
+    /// group never reads the config.
     pub group: String,
-    /// The group may use the control socket.
-    pub socket_group: bool,
+    /// The group whose members may use the control socket: a
+    /// supplementary group of the service, never the config's.
+    pub socket_group: Option<String>,
 }
 
 /// `/etc/systemd/system/lsync.service`.
@@ -123,19 +126,25 @@ pub fn system_unit(u: &SystemService) -> String {
          Wants=network-online.target\nAfter=network-online.target\n\n[Service]\n"
     );
     s.push_str(&format!("User={}\nGroup={}\n", u.user, u.group));
+    if let Some(g) = &u.socket_group {
+        s.push_str(&format!(
+            "# The control socket's group: its members use the socket, not the config.\n\
+             SupplementaryGroups={g}\n"
+        ));
+    }
     service_common(&u.exec, &mut s);
     s.push_str(&format!(
         "# Files the service writes are group-writable, for vaults shared with a group,\n\
          # and not readable by other users.\n\
          UMask=0007\n\
-         # The config stays root's; the service reads it through its group (systemd\n\
-         # sets the folder's mode, never its owner).\n\
+         # The config stays root's; the service reads it through Group= (its user's\n\
+         # own group, not the socket's). systemd sets the folder's mode, never its owner.\n\
          ConfigurationDirectory=lsync\nConfigurationDirectoryMode=0750\n\
          StateDirectory=lsync\nStateDirectoryMode=0700\n\
          RuntimeDirectory=lsync\nRuntimeDirectoryMode={}\n\
          ProtectSystem=strict\nPrivateTmp=yes\nNoNewPrivileges=yes\n\
          # The vault folders (ReadWritePaths=) and the credentials are in lsync.service.d/{DROPIN_NAME}.\n",
-        if u.socket_group { "0750" } else { "0700" }
+        if u.socket_group.is_some() { "0750" } else { "0700" }
     ));
     s.push_str("\n[Install]\nWantedBy=multi-user.target\n");
     s
@@ -270,12 +279,13 @@ mod tests {
         let u = system_unit(&SystemService {
             exec: exec(&["/usr/local/bin/lsync", "--system", "serve", "--socket-group", "notes"]),
             user: "lsync".into(),
-            group: "notes".into(),
-            socket_group: true,
+            group: "lsync".into(),
+            socket_group: Some("notes".into()),
         });
         for line in [
             "User=lsync",
-            "Group=notes",
+            "Group=lsync",
+            "SupplementaryGroups=notes",
             "ExecStart=/usr/local/bin/lsync --system serve --socket-group notes",
             "ExecReload=/usr/local/bin/lsync --system reload",
             "UMask=0007",
@@ -380,10 +390,19 @@ mod tests {
         let sys = system_unit(&SystemService {
             exec: exec(&[&exe, "--system", "serve"]),
             user: me.clone(),
-            group: me,
-            socket_group: false,
+            group: me.clone(),
+            socket_group: None,
         });
         verify("system", &sys, &[]);
+        // With a socket group of its own (a supplementary group).
+        let with_group = system_unit(&SystemService {
+            exec: exec(&[&exe, "--system", "serve", "--socket-group", "agents"]),
+            user: me.clone(),
+            group: me,
+            socket_group: Some("agents".into()),
+        });
+        assert!(with_group.contains("\nSupplementaryGroups=agents\n"), "{with_group}");
+        verify("system", &with_group, &[]);
         let dir = d.path().join("system");
         std::fs::create_dir_all(dir.join("lsync.service.d")).unwrap();
         // Paths with a quote, a space or a backslash: systemd reads the whole

@@ -35,13 +35,14 @@ pub enum ServiceCmd {
         print: bool,
         /// With --system (required there): the user the service runs as, a
         /// user of its own or the one whose vaults these are. The config
-        /// folder stays root's; the service reads it through its group
+        /// folder stays root's; the service reads it through the user's own
+        /// group (the unit's Group=)
         #[arg(long, value_name = "USER")]
         run_as: Option<String>,
-        /// With --system: the service's group (default: the user's own).
-        /// Its members may use the control socket and read the config
-        /// (secrets.toml too), and the files the service writes are
-        /// group-writable (for vaults shared with agents)
+        /// With --system: a group whose members may use the control socket
+        /// (agents running as other users). The service gets it as a
+        /// supplementary group; its members cannot read the config. Vault
+        /// folders install creates are shared with it (setgid, 2770)
         #[arg(long, value_name = "GROUP")]
         group: Option<String>,
         /// Replace a service file that lsync did not write
@@ -901,24 +902,29 @@ fn create_for_service(path: &Path, uid: u32, gid: u32, mode: u32) -> std::result
     Ok(true)
 }
 
-/// The mode a folder the service writes gets: a vault's is shared with
-/// its group, a state folder is the service's alone.
-fn writable_mode(w: &Writable) -> u32 {
-    if w.vault {
-        0o770
-    } else {
-        0o700
+/// The group and mode a folder the service writes gets. A state folder is
+/// the service's alone (its own group, 0700). A vault's is shared with
+/// its group: the socket group when there is one, with the setgid bit so
+/// that what the service writes in it (as its own group) takes the socket
+/// group too, else the service's own group.
+fn writable_owner<G: Copy>(w: &Writable, own: G, socket: Option<G>) -> (G, u32) {
+    match (w.vault, socket) {
+        (true, Some(s)) => (s, 0o2770),
+        (true, None) => (own, 0o770),
+        (false, _) => (own, 0o700),
     }
 }
 
 /// Create the folders the service may write that do not exist yet (it
 /// cannot: `ProtectSystem=strict` leaves a missing path read-only), owned
-/// by the service's user and group. Folders that exist are left as they
-/// are. The lines to print.
-fn create_writable(writable: &[&Writable], uid: u32, gid: u32) -> Vec<String> {
+/// by the service's user, with the group of [`writable_owner`] (`gid`
+/// the service's own, `share` the socket group). Folders that exist are
+/// left as they are. The lines to print.
+fn create_writable(writable: &[&Writable], uid: u32, gid: u32, share: Option<u32>) -> Vec<String> {
     let mut out = vec![];
     for w in writable {
-        match create_for_service(&w.path, uid, gid, writable_mode(w)) {
+        let (g, mode) = writable_owner(w, gid, share);
+        match create_for_service(&w.path, uid, g, mode) {
             Ok(true) => out.push(format!("created {} for the service", w.path.display())),
             Ok(false) => {}
             Err(e) => out.push(format!(
@@ -1166,10 +1172,25 @@ fn install_system(
         bail!("which user should the system service run as? Give --run-as USER (a user of its own, or the one whose vaults these are); it gets {} and the passwords kept there", config_dir.display());
     };
     let user = user_named(name).ok_or_else(|| anyhow!("no user named {name:?}"))?;
-    let (group_name, gid) = match &o.group {
-        Some(g) => group(Some(g), 0).ok_or_else(|| anyhow!("no group named {g:?}"))?,
-        None => group(None, user.gid).unwrap_or_else(|| (user.gid.to_string(), user.gid)),
+    // The unit's Group= and the config's group: the user's own, so that
+    // the socket group (whose members may hold no passwords) never reads
+    // the config. The socket group is a supplementary group of the service.
+    let (group_name, gid) = group(None, user.gid).unwrap_or_else(|| (user.gid.to_string(), user.gid));
+    let socket = match &o.group {
+        Some(g) => {
+            let (sname, sgid) = group(Some(g), 0).ok_or_else(|| anyhow!("no group named {g:?}"))?;
+            if sgid == user.gid {
+                bail!(
+                    "--group {g} is {}'s own group, which reads the config and the passwords in it; the socket's users must not. Give --group a group of its own for them (e.g. `sudo groupadd lsync-agents`), or leave --group out",
+                    user.name
+                );
+            }
+            Some((sname, sgid))
+        }
+        None => None,
     };
+    let socket_name = socket.as_ref().map(|s| s.0.clone());
+    let share = socket.as_ref().map(|s| s.1);
     let trash = system_trash_vaults(cfg);
     if !trash.is_empty() {
         bail!("{}", system_trash_message(&trash));
@@ -1189,17 +1210,17 @@ fn install_system(
     let files = file_store_accounts(cfg);
     if !files.is_empty() {
         warnings.push(format!(
-            "account(s) {} keep the password in plain text in {}, which every member of group {group_name} can read; systemd credentials keep it encrypted, for the service alone: give the account `secret = \"credential:lsync-NAME\"` (edit {} as root), then `sudo lsync --system account passwd NAME`",
+            "account(s) {} keep the password in plain text in {}, which the service's group {group_name} reads; systemd credentials keep it encrypted, for the service alone: give the account `secret = \"credential:lsync-NAME\"` (edit {} as root), then `sudo lsync --system account passwd NAME`",
             files.join(", "),
             config_dir.join(livesync_host::config::SECRETS_FILE).display(),
             config_dir.join(livesync_host::config::CONFIG_FILE).display()
         ));
     }
     let svc = SystemService {
-        exec: exec_for(ctx, o.group.as_deref()),
+        exec: exec_for(ctx, socket_name.as_deref()),
         user: user.name.clone(),
         group: group_name.clone(),
-        socket_group: o.group.is_some(),
+        socket_group: socket_name.clone(),
     };
     let text = unit::system_unit(&svc);
     let (dropin, missing) = dropin_for(ctx, cfg, Some(&user.home));
@@ -1215,11 +1236,11 @@ fn install_system(
             SHARED_FILES.join(" and ")
         ));
         for w in &create {
+            let (g, m) = writable_owner(w, group_name.as_str(), socket_name.as_deref());
             out.push(format!(
-                "# would create {} for the service ({}:{group_name}, {:04o})",
+                "# would create {} for the service ({}:{g}, {m:04o})",
                 w.path.display(),
                 user.name,
-                writable_mode(w)
             ));
         }
         out.push(format!("# {}", path.display()));
@@ -1232,7 +1253,7 @@ fn install_system(
     out.extend(share_config(&config_dir, gid, &group_name)?);
     // The folders the config names that do not exist yet: the config is
     // root's, so these are root's choice (`--print` lists them).
-    out.extend(create_writable(&create, user.uid, gid));
+    out.extend(create_writable(&create, user.uid, gid, share));
     write_service_file(&path, &text, o.force)?;
     write_service_file(&dpath, &dropin, o.force)?;
     out.push(format!("wrote {} and {}", path.display(), dpath.display()));
@@ -1252,9 +1273,10 @@ fn install_system(
             user.name
         ));
     }
-    if o.group.is_some() {
+    if let Some(g) = &socket_name {
         out.push(format!(
-            "members of {group_name} may use it: lsync --system status --all"
+            "members of {g} may use it (lsync --system status --all) and cannot read {}",
+            config_dir.display()
         ));
     }
     out.push("logs: lsync --system service logs -f   status: lsync --system service status".into());
@@ -1598,6 +1620,10 @@ pub fn refresh_dropin(ctx: &Ctx, named: &Named) -> Vec<String> {
         .and_then(|g| group(Some(&g), 0))
         .map(|(_, gid)| gid)
         .or(user.as_ref().map(|u| u.gid));
+    // The socket group, which vault folders are shared with.
+    let share = setting("SupplementaryGroups=")
+        .and_then(|g| group(Some(g.trim()), 0))
+        .map(|(_, gid)| gid);
     let home = user.as_ref().map(|u| u.home.clone());
     let (text, missing) = dropin_for(ctx, &cfg, home.as_deref());
     let mut out: Vec<String> = missing.into_iter().map(|m| format!("warning: {m}")).collect();
@@ -1612,7 +1638,7 @@ pub fn refresh_dropin(ctx: &Ctx, named: &Named) -> Vec<String> {
         .into_iter()
         .partition(|w| ctx.euid == 0 && named.names(w));
     match (&user, gid) {
-        (Some(u), Some(gid)) => out.extend(create_writable(&create, u.uid, gid)),
+        (Some(u), Some(gid)) => out.extend(create_writable(&create, u.uid, gid, share)),
         _ => out.extend(create.iter().map(|w| {
             format!(
                 "warning: {} was not created: the installed unit names no user or group to give it to",
@@ -2101,19 +2127,10 @@ mod tests {
         assert_eq!(untouched(&etc.join(".lsync.toml.lock")), lock_was);
         assert_eq!(untouched(&etc.join("stranger")), stranger_was);
         assert_eq!(untouched(&shadow), shadow_was);
-        if let Some((_, gid)) = &other {
-            for n in ["", "lsync.toml", "secrets.toml"] {
-                assert_eq!(gid_of(&etc.join(n)), *gid, "{n} shared with the service's group");
-            }
-            // Again with the user's own group (finding 5: they follow the
-            // service's group).
-            let primary = user_named(&me()).unwrap().gid;
-            install(&c, &as_me()).unwrap();
-            for n in ["", "lsync.toml", "secrets.toml"] {
-                assert_eq!(gid_of(&etc.join(n)), primary, "{n} moved to the new group");
-            }
-        } else {
-            eprintln!("this user has one group only: the groups were not compared");
+        // The user's own group, never --group's (the socket group).
+        let primary = user_named(&me()).unwrap().gid;
+        for n in ["", "lsync.toml", "secrets.toml"] {
+            assert_eq!(gid_of(&etc.join(n)), primary, "{n} shared with the service's own group");
         }
 
         // A config folder its group (or anyone) could write: refused, as
@@ -2124,6 +2141,209 @@ mod tests {
         assert!(e.contains("is not root's alone") && e.contains("mode 770"), "{e}");
         assert_eq!(mode(&etc), 0o770);
         assert_eq!(untouched(&etc.join("lsync.toml")), lsync_toml_was);
+    }
+
+    /// Whether a user who is neither `path`'s owner nor in `own` (the
+    /// service's own group), only in `gid`, could read it.
+    fn readable_by_member_of(path: &Path, gid: u32) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::symlink_metadata(path).unwrap();
+        md.mode() & 0o004 != 0 || (md.gid() == gid && md.mode() & 0o040 != 0)
+    }
+
+    /// The lead's decision: the socket group (`--group`) uses the control
+    /// socket but never reads the config, as `secrets.toml` holds the
+    /// passwords of `file:` accounts. The config and the unit's Group= are
+    /// the user's own group; the socket group is a supplementary group.
+    #[test]
+    fn the_socket_group_uses_the_socket_and_never_reads_the_config() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let h = home(true);
+        let f = Fake::default();
+        let c = ctx(&h, &f, Manager::SystemdSystem);
+        let etc = h.setup.dirs.config.clone();
+        // `home` keeps its password in secrets.toml (the file: store).
+        let text = std::fs::read_to_string(&h.setup.config_file).unwrap();
+        std::fs::write(
+            &h.setup.config_file,
+            text.replace("secret = \"credential:lsync-home\"\n", ""),
+        )
+        .unwrap();
+        std::fs::write(etc.join("secrets.toml"), "\"home\" = \"pw\"\n").unwrap();
+        std::fs::set_permissions(etc.join("secrets.toml"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let user = user_named(&me()).unwrap();
+        let (primary_name, primary) = group(None, user.gid).unwrap();
+
+        // --group the user's own group: refused, nothing written.
+        let o = InstallOpts {
+            group: Some(primary_name.clone()),
+            ..as_me()
+        };
+        let e = install(&c, &o).unwrap_err().to_string();
+        assert!(e.contains("own group") && e.contains("--group"), "{e}");
+        assert!(!h.root.join("units").exists() && f.calls.borrow().is_empty());
+        assert_eq!(mode(&etc.join("secrets.toml")), 0o600);
+
+        // The test user's groups other than its primary one stand in for
+        // the socket group: its members would be in it alone.
+        let mut others = vec![];
+        {
+            let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+            let mut gs = vec![0 as libc::gid_t; n.max(0) as usize];
+            let n = unsafe { libc::getgroups(gs.len() as i32, gs.as_mut_ptr()) };
+            gs.truncate(n.max(0) as usize);
+            others.extend(gs.into_iter().filter(|g| *g != primary).filter_map(|g| group(None, g)));
+        }
+        let Some((sock_name, sock)) = others.first().cloned() else {
+            eprintln!("this user has one group only: the socket group was not compared");
+            return;
+        };
+
+        // An earlier install gave the config to the socket group (as
+        // f8c7ed7 did): a re-install takes it back.
+        for n in ["", "lsync.toml", "secrets.toml"] {
+            std::os::unix::fs::chown(etc.join(n), None, Some(sock)).unwrap();
+        }
+        std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let o = InstallOpts {
+            group: Some(sock_name.clone()),
+            ..as_me()
+        };
+        let printed = install(
+            &c,
+            &InstallOpts {
+                print: true,
+                ..o.clone()
+            },
+        )
+        .unwrap()
+        .join("\n");
+        assert!(
+            printed.contains(&format!(
+                "# would create {}/srv/Notes for the service ({}:{sock_name}, 2770)",
+                h.root.display(),
+                user.name
+            )),
+            "{printed}"
+        );
+        assert!(
+            printed.contains(&format!(
+                "# would create {}/srv/state/work for the service ({}:{primary_name}, 0700)",
+                h.root.display(),
+                user.name
+            )),
+            "{printed}"
+        );
+        let out = install(&c, &o).unwrap().join("\n");
+        assert!(
+            out.contains(&format!("members of {sock_name} may use it")) && out.contains("cannot read"),
+            "{out}"
+        );
+        let unit = std::fs::read_to_string(h.root.join("units/lsync.service")).unwrap();
+        for line in [
+            format!("Group={primary_name}"),
+            format!("SupplementaryGroups={sock_name}"),
+            format!(
+                "ExecStart={} --system serve --socket-group {sock_name}",
+                roots_exe().display()
+            ),
+            "RuntimeDirectoryMode=0750".into(),
+        ] {
+            assert!(unit.lines().any(|l| l == line), "{line} missing:\n{unit}");
+        }
+        let check_config = |what: &str| {
+            for n in ["", "lsync.toml", "secrets.toml"] {
+                let p = etc.join(n);
+                assert_eq!(gid_of(&p), primary, "{what}: {n} is the service's own group's");
+                assert!(
+                    !readable_by_member_of(&p, sock),
+                    "{what}: {n} readable by the socket group"
+                );
+            }
+            assert_eq!(mode(&etc), 0o750);
+            assert_eq!(mode(&etc.join("secrets.toml")), 0o640);
+        };
+        check_config("install");
+        // The plain-password warning names the group that reads it, not the
+        // socket group.
+        assert!(
+            out.contains(&format!("which the service's group {primary_name} reads"))
+                && !out.contains(&format!("group {sock_name} reads")),
+            "{out}"
+        );
+        // Vault folders are shared with the socket group (setgid, so what
+        // the service writes there is the group's too); state is not.
+        let srv = h.root.join("srv");
+        assert_eq!((gid_of(&srv.join("Notes")), mode(&srv.join("Notes"))), (sock, 0o2770));
+        assert_eq!(
+            (gid_of(&srv.join("state/work")), mode(&srv.join("state/work"))),
+            (primary, 0o700)
+        );
+        // A vault folder root names later follows the unit's socket group.
+        let mut text = std::fs::read_to_string(&h.setup.config_file).unwrap();
+        text.push_str(&format!(
+            "\n[vault.more]\naccount = \"home\"\ndatabase = \"more\"\nfolder = \"{}/more\"\n",
+            srv.display()
+        ));
+        std::fs::write(&h.setup.config_file, text).unwrap();
+        let named = Named {
+            vault: "more".into(),
+            folder: true,
+            state: false,
+        };
+        let said = refresh_dropin(&c, &named).join("\n");
+        assert!(said.contains("created"), "{said}");
+        assert_eq!((gid_of(&srv.join("more")), mode(&srv.join("more"))), (sock, 0o2770));
+        check_config("vault add");
+
+        // Re-installed with another --group: the config stays the user's
+        // group's, unreadable to both socket groups.
+        if let Some((name2, gid2)) = others.get(1).cloned() {
+            let o = InstallOpts {
+                group: Some(name2.clone()),
+                ..as_me()
+            };
+            install(&c, &o).unwrap();
+            let unit = std::fs::read_to_string(h.root.join("units/lsync.service")).unwrap();
+            assert!(unit.contains(&format!("\nSupplementaryGroups={name2}\n")), "{unit}");
+            check_config("re-install");
+            for n in ["", "lsync.toml", "secrets.toml"] {
+                assert!(!readable_by_member_of(&etc.join(n), gid2), "{n} readable by {name2}");
+            }
+        } else {
+            eprintln!("this user has two groups only: a second socket group was not tried");
+        }
+        // Without --group: no supplementary group, the config as it was.
+        install(&c, &as_me()).unwrap();
+        let unit = std::fs::read_to_string(h.root.join("units/lsync.service")).unwrap();
+        assert!(
+            !unit.contains("SupplementaryGroups=") && !unit.contains("--socket-group"),
+            "{unit}"
+        );
+        check_config("without --group");
+
+        // The socket the service binds with that unit (as the service's
+        // user, which has the supplementary group): the socket group's,
+        // and a member of it alone is admitted.
+        let run = h.root.join("run/lsync");
+        let policy = livesync_host::control::Policy {
+            uid: user.uid,
+            group: Some(sock),
+        };
+        let bound = livesync_host::control::bind(&run, &policy).unwrap();
+        let sock_md = std::fs::symlink_metadata(run.join(livesync_host::control::SOCKET_NAME)).unwrap();
+        assert_eq!((sock_md.gid(), sock_md.mode() & 0o777), (sock, 0o660));
+        assert_eq!((gid_of(&run), mode(&run)), (sock, 0o750));
+        let member = livesync_host::control::Peer {
+            uid: u32::MAX - 1,
+            gid: sock,
+        };
+        assert!(policy.admits(member));
+        assert!(!policy.admits(livesync_host::control::Peer {
+            uid: u32::MAX - 1,
+            gid: primary
+        }));
+        drop(bound);
     }
 
     #[test]
