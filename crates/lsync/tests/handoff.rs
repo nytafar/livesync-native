@@ -253,6 +253,24 @@ fn a_file_flushed_on_one_machine_is_waited_for_on_the_other() {
 }
 
 #[test]
+fn a_wait_without_a_service_ends_at_once_when_the_plugin_is_on() {
+    let rt = runtime();
+    let mock = rt.block_on(Mock::start());
+    let m = Machine::new(&mock);
+    let obsidian = m.file(".obsidian");
+    std::fs::create_dir_all(obsidian.join("plugins/obsidian-livesync")).unwrap();
+    std::fs::write(obsidian.join("community-plugins.json"), r#"["obsidian-livesync"]"#).unwrap();
+    // The two-way run refuses before it starts: blocked (2), not the
+    // timeout's 124 after 60 s.
+    let t0 = Instant::now();
+    let out = m.run(&["wait", "--idle", "--timeout", "60"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("obsidian-livesync"), "{err}");
+    assert!(t0.elapsed() < Duration::from_secs(20));
+}
+
+#[test]
 fn the_status_line_follows_the_service_and_conflicts_are_notified_once() {
     let rt = runtime();
     let mock = rt.block_on(Mock::start());

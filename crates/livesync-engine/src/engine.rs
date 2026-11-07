@@ -2685,7 +2685,16 @@ impl Engine {
     /// Refuses at once on an Obsidian vault whose Self-hosted LiveSync
     /// plugin is enabled (unless `allow_plugin`); the check is repeated at
     /// every regate, and ends the run when the plugin was turned on.
-    pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    ///
+    /// The engine is marked ended whenever this returns, early refusals
+    /// included, so a wait or flush on it ends then too.
+    pub async fn run(&self, shutdown: watch::Receiver<bool>) -> Result<()> {
+        let r = self.run_inner(shutdown).await;
+        self.mark_ended();
+        r
+    }
+
+    async fn run_inner(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         self.check_plugin_guard()?;
         // Each side stops when the caller says so, or when the other side
         // ended (a fatal error on one side stops both).
