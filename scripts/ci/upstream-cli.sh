@@ -6,27 +6,50 @@
 #   scripts/ci/upstream-cli.sh DIR            # the latest release
 #   scripts/ci/upstream-cli.sh DIR 1.0.46     # a given release tag
 #
+#   scripts/ci/upstream-cli.sh --tag [TAG]    # only print tag=<TAG, or the latest>
+#
 # Clones github.com/vrtmrz/obsidian-livesync at the release tag into
-# DIR/obsidian-livesync (shallow), runs `npm ci` and builds the CLI workspace
-# the way upstream's own README does. Prints two lines on stdout:
+# DIR/obsidian-livesync (shallow), runs `npm ci --ignore-scripts` and builds
+# the CLI workspace the way upstream's own README does. Prints two lines on
+# stdout:
 #   tag=<release tag>
 #   cli_js=<path of the built dist/index.cjs>
-# Reads only public GitHub data (GITHUB_TOKEN, when set, only raises the API
-# rate limit). Never pushes or publishes anything.
+# Reads only public GitHub data. GITHUB_TOKEN, when set, is used only for the
+# API call that finds the latest release (it raises the rate limit), and is
+# dropped from the environment before any upstream code runs: no install
+# scripts (--ignore-scripts), and the build runs without it. The weekly job
+# looks the tag up with `--tag` in a step of its own and builds without the
+# token. Never pushes or publishes anything.
 set -euo pipefail
-DIR=${1:?usage: upstream-cli.sh DIR [TAG]}
-TAG=${2:-}
-REPO_URL=https://github.com/vrtmrz/obsidian-livesync
-API=https://api.github.com/repos/vrtmrz/obsidian-livesync
 
-if [[ -z "$TAG" ]]; then
-  auth=()
+latest_tag() {
+  local auth=()
   [[ -n "${GITHUB_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
   # The latest full release (GitHub's "latest" skips drafts and pre-releases).
-  TAG=$(curl -fsSL "${auth[@]}" -H 'Accept: application/vnd.github+json' "$API/releases/latest" |
-    python3 -I -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+  curl -fsSL "${auth[@]}" -H 'Accept: application/vnd.github+json' \
+    https://api.github.com/repos/vrtmrz/obsidian-livesync/releases/latest |
+    python3 -I -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])'
+}
+
+check_tag() {
+  [[ "$1" =~ ^[0-9A-Za-z._-]+$ ]] || { echo "upstream-cli: odd release tag: $1" >&2; exit 1; }
+}
+
+if [[ "${1:-}" == "--tag" ]]; then
+  TAG=${2:-}
+  [[ -n "$TAG" ]] || TAG=$(latest_tag)
+  check_tag "$TAG"
+  echo "tag=$TAG"
+  exit 0
 fi
-[[ "$TAG" =~ ^[0-9A-Za-z._-]+$ ]] || { echo "upstream-cli: odd release tag: $TAG" >&2; exit 1; }
+
+DIR=${1:?usage: upstream-cli.sh DIR [TAG] | upstream-cli.sh --tag [TAG]}
+TAG=${2:-}
+REPO_URL=https://github.com/vrtmrz/obsidian-livesync
+[[ -n "$TAG" ]] || TAG=$(latest_tag)
+check_tag "$TAG"
+# From here on upstream code runs (the build): no credentials in reach.
+unset GITHUB_TOKEN GH_TOKEN
 
 mkdir -p "$DIR"
 SRC="$DIR/obsidian-livesync"
@@ -38,7 +61,9 @@ else
 fi
 (
   cd "$SRC"
-  npm ci --no-audit --no-fund --loglevel=error >&2
+  # No install scripts: the build needs none (esbuild and the prebuilt
+  # leveldown ship their binaries in optional packages).
+  npm ci --ignore-scripts --no-audit --no-fund --loglevel=error >&2
   npm run build -w self-hosted-livesync-cli >&2
 )
 CLI_JS="$SRC/src/apps/cli/dist/index.cjs"

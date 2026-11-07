@@ -5,8 +5,10 @@
 # CouchDB runs as a throwaway service container published on port 8411
 # (interop.sh accepts only 127.0.0.1:8411); its credentials exist
 # only for this job. The official CLI is built from the release tag with
-# scripts/ci/upstream-cli.sh. Nothing is published: no release, no
-# artefact, nothing pushed.
+# scripts/ci/upstream-cli.sh, without install scripts and without the
+# job's token in reach (the checkout keeps no credentials, and only the
+# step that looks up the latest release gets the token). Nothing is
+# published: no release, no artefact, nothing pushed.
 name: Upstream interop
 
 on:
@@ -49,6 +51,9 @@ jobs:
           - 8411:5984
     steps:
       - uses: actions/checkout@v7
+        with:
+          # No token left in .git/config for upstream's build to find.
+          persist-credentials: false
       - name: Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
@@ -57,11 +62,18 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "24.x"
-      - name: Build the official CLI from the upstream release
-        id: cli
+      # The token only looks up the latest release (API rate limit). The
+      # build, which runs upstream code, gets the tag and no token.
+      - name: Pick the upstream release
+        id: tag
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
+        run: scripts/ci/upstream-cli.sh --tag "$TAG" | tee -a "$GITHUB_OUTPUT"
+      - name: Build the official CLI from the upstream release
+        id: cli
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: scripts/ci/upstream-cli.sh "$RUNNER_TEMP/upstream" "$TAG" | tee -a "$GITHUB_OUTPUT"
       - name: Configure CouchDB
         env:
