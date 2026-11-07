@@ -925,7 +925,7 @@ impl Engine {
                 Ok(rd) => rd,
                 Err(e) if e.kind() == NotFound => continue, // removed meanwhile
                 Err(e) => {
-                    w.unreadable.push((dir_rel, e.to_string()));
+                    w.unreadable.push((dir_rel, crate::access::describe(&e)));
                     continue;
                 }
             };
@@ -949,7 +949,7 @@ impl Engine {
                     Ok(t) => t,
                     Err(err) if err.kind() == NotFound => continue,
                     Err(err) => {
-                        w.unreadable.push((rel, err.to_string()));
+                        w.unreadable.push((rel, crate::access::describe(&err)));
                         continue;
                     }
                 };
@@ -967,7 +967,7 @@ impl Engine {
                             mtime_ms: mtime_ms(&md),
                         }),
                         Err(err) if err.kind() == NotFound => {}
-                        Err(err) => w.unreadable.push((rel, err.to_string())),
+                        Err(err) => w.unreadable.push((rel, crate::access::describe(&err))),
                     }
                 }
             }
@@ -1340,7 +1340,7 @@ impl Engine {
                         gone.insert(r.doc_id.clone(), r);
                     }
                 }
-                Err(e) => unreadable.push((p.clone(), e.to_string())),
+                Err(e) => unreadable.push((p.clone(), crate::access::describe(&e))),
             }
         }
         let mut issues_seen: HashSet<String> = HashSet::new();
@@ -1472,7 +1472,7 @@ impl Engine {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => {
-                let note = format!("cannot read: {e}");
+                let note = format!("cannot read: {}", crate::access::describe(&e));
                 warn!("{rel}: {note}");
                 self.with_index(|ix| ix.set_issue(rel, "unreadable", &note, vaultfs::now_ms()))?;
                 rep.issues += 1;
@@ -2095,11 +2095,16 @@ impl Engine {
         let n = rows.len();
         // The vault folder itself must be there; an unmounted card or a
         // revoked permission must not look like "everything was deleted".
-        if std::fs::read_dir(&self.inner.cfg.vault).is_err() {
-            return Err(EngineError::Other(format!(
-                "the vault folder {} cannot be read; not treating missing files as deleted",
-                self.inner.cfg.vault.display()
-            )));
+        if let Err(e) = std::fs::read_dir(&self.inner.cfg.vault) {
+            return Err(EngineError::Other(
+                match crate::access::no_access(&self.inner.cfg.vault, &e) {
+                    Some(msg) => format!("{msg}; not treating {n} missing file(s) as deleted"),
+                    None => format!(
+                        "the vault folder {} cannot be read ({e}); not treating missing files as deleted",
+                        self.inner.cfg.vault.display()
+                    ),
+                },
+            ));
         }
         if let Some(check) = &self.inner.cfg.access_check {
             if let Err(why) = (check.0)() {
@@ -2117,11 +2122,23 @@ impl Engine {
                 unchecked.push(r.doc_id);
                 continue;
             }
-            match std::fs::symlink_metadata(self.inner.cfg.vault.join(&r.path)) {
+            let at = self.inner.cfg.vault.join(&r.path);
+            let looked = match std::fs::symlink_metadata(&at) {
+                // Only iCloud Drive's placeholder is here: the file is in
+                // iCloud, not deleted.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && crate::access::icloud_placeholder(&at) => Err(
+                    std::io::Error::other("evicted to iCloud Drive; only its .icloud placeholder is here"),
+                ),
+                x => x,
+            };
+            match looked {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => gone.push(r),
                 Ok(_) => debug!("{}: still there; not treated as deleted", r.path),
                 Err(e) => {
-                    let note = format!("cannot be checked ({e}); not treated as deleted");
+                    let note = format!(
+                        "cannot be checked ({}); not treated as deleted",
+                        crate::access::describe(&e)
+                    );
                     warn!("{}: {note}", r.path);
                     self.with_index(|ix| ix.set_issue(&r.path, "unreadable", &note, vaultfs::now_ms()))?;
                     if issues_seen.insert(r.path.clone()) {

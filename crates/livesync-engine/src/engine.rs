@@ -788,8 +788,16 @@ impl Engine {
     /// Open the index and take the locks on the state directory and the
     /// vault (`EngineError::Busy` when another process holds either).
     pub fn open(couch: Couch, cfg: EngineConfig) -> Result<Self> {
-        std::fs::create_dir_all(&cfg.vault).map_err(EngineError::other)?;
-        let canon = std::fs::canonicalize(&cfg.vault).map_err(EngineError::other)?;
+        // A folder this process may not read (a macOS privacy block, a
+        // revoked permission) is "no access", never an empty vault: the
+        // engine does not start, so nothing in it can look deleted.
+        let no_access = |e: std::io::Error| match crate::access::no_access(&cfg.vault, &e) {
+            Some(msg) => EngineError::Other(msg),
+            None => EngineError::other(e),
+        };
+        crate::access::check_vault_root(&cfg.vault).map_err(EngineError::Other)?;
+        std::fs::create_dir_all(&cfg.vault).map_err(no_access)?;
+        let canon = std::fs::canonicalize(&cfg.vault).map_err(no_access)?;
         let state_dir = cfg.index_path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let holder = Holder::current(&state_dir);
         let state_lock = match LockFile::try_acquire(&state_dir.join(STATE_LOCK)) {

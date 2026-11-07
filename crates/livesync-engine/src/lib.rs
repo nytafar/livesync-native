@@ -8,6 +8,7 @@
 //! index (spec D2). `Engine::pull_once` and `Engine::daemon_pull_only` never
 //! write to the remote.
 
+pub mod access;
 pub mod activity;
 pub mod adopt;
 pub mod engine;

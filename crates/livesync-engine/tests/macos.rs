@@ -1,6 +1,7 @@
 //! What a Mac's vault folder does that a Linux one does not, run on any
 //! filesystem: Unicode normalisation folded by APFS and HFS+ (through the
-//! probe seam, `EngineConfig::fs_probe`).
+//! probe seam, `EngineConfig::fs_probe`), privacy blocks (TCC) and iCloud
+//! Drive's evicted files.
 
 mod common;
 
@@ -55,6 +56,9 @@ impl Env {
         let r = rules.clone();
         cfg.fs_probe = Some(FsProbe::new(move |_| Ok(r.clone())));
         Engine::open(self.couch(), cfg).unwrap()
+    }
+    fn engine(&self) -> Engine {
+        Engine::open(self.couch(), self.config()).unwrap()
     }
     fn write(&self, rel: &str, bytes: &[u8]) {
         let p = self.vault().join(rel);
@@ -251,4 +255,62 @@ async fn adopt_matches_an_nfd_name_with_its_nfc_document_where_names_fold() {
         .await
         .unwrap();
     assert_eq!(rep.name_case.len(), 1, "{rep:#?}");
+}
+
+/// A vault folder this process may not read (macOS answers EPERM without a
+/// privacy grant; EACCES stands in for it here) is "no access": the engine
+/// does not start, so nothing in it can look deleted, and the message says
+/// so. Once it can read the folder again, nothing was lost.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_vault_without_access_is_refused_never_taken_for_empty() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new().await;
+    for i in 0..30 {
+        env.write(&format!("n{i}.md"), b"x");
+    }
+    env.engine().sync_once().await.unwrap();
+    let mode = |m| std::fs::set_permissions(env.vault(), std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o000);
+    if std::fs::read_dir(env.vault()).is_ok() {
+        mode(0o755);
+        eprintln!("SKIPPED: root reads anything");
+        return;
+    }
+    let opened = Engine::open(env.couch(), env.config());
+    mode(0o755);
+    let err = opened.err().expect("opened a vault it cannot read").to_string();
+    assert!(err.contains("no access to the vault folder"), "{err}");
+    assert!(err.contains("no file in it counts as deleted"), "{err}");
+    assert_eq!(env.mock.live_paths().len(), 30);
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0, "{rep:?}");
+    assert_eq!(env.mock.live_paths().len(), 30);
+}
+
+/// A file evicted to iCloud Drive (only `.NAME.icloud` is left beside it)
+/// is not a deleted file.
+#[tokio::test]
+async fn a_file_evicted_to_icloud_is_not_deleted() {
+    let env = Env::new().await;
+    env.write("a.md", b"a");
+    env.write("b.md", b"b");
+    env.engine().sync_once().await.unwrap();
+    std::fs::remove_file(env.vault().join("a.md")).unwrap();
+    env.write(".a.md.icloud", b"placeholder");
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0, "{rep:?}");
+    assert!(!env.deleted("a.md"));
+    let st = env.engine().status().unwrap();
+    assert!(
+        st.local_issues
+            .iter()
+            .any(|i| i.path == "a.md" && i.note.contains("iCloud")),
+        "{:?}",
+        st.local_issues
+    );
+    // Gone for real, placeholder and all: deleted.
+    std::fs::remove_file(env.vault().join(".a.md.icloud")).unwrap();
+    env.engine().sync_once().await.unwrap();
+    assert!(env.deleted("a.md"));
 }

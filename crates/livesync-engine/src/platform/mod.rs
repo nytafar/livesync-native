@@ -17,6 +17,11 @@ pub use vault_lock::{lock_vault, record_path, VaultLock, VaultLockError};
 use crate::watcher::{WatchSender, Watcher};
 use std::io;
 
+/// Whether `EPERM` on a vault path means a privacy block the user can lift
+/// (macOS TCC: Full Disk Access or a folder grant), rather than an ordinary
+/// permission problem (`EACCES`).
+pub const PRIVACY_EPERM: bool = cfg!(target_os = "macos");
+
 /// The platform's default local-change watcher.
 pub fn default_watcher(tx: WatchSender) -> io::Result<Box<dyn Watcher>> {
     Ok(Box::new(notify_watcher::NotifyWatcher::new(tx)?))
