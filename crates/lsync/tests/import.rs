@@ -58,6 +58,13 @@ impl Machine {
         p
     }
 
+    /// `rel` under the temp folder with its links resolved: the folder an
+    /// import finds is where the settings file really lies, and the temp
+    /// folder is itself under a link on macOS (/var -> /private/var).
+    fn real(&self, rel: &str) -> PathBuf {
+        std::fs::canonicalize(&self.root).unwrap().join(rel)
+    }
+
     fn config(&self) -> String {
         std::fs::read_to_string(self.root.join("config/lsync/lsync.toml")).unwrap_or_default()
     }
@@ -136,7 +143,7 @@ fn a_plugin_data_json_becomes_an_account_and_a_disabled_vault() {
     let v = &t["vault"]["my-notes"];
     assert_eq!(v["account"].as_str(), Some("couch-example-invalid"));
     assert_eq!(v["database"].as_str(), Some("notes-db"));
-    assert_eq!(v["folder"].as_str(), Some(s(&m.root.join("My Notes"))));
+    assert_eq!(v["folder"].as_str(), Some(s(&m.real("My Notes"))));
     assert_eq!(v["enabled"].as_bool(), Some(false));
     assert_eq!(v["ignore_regex"].as_str(), Some("\\/\\.git\\/|[]|^Archive\\/"));
     assert_eq!(v["use_ignore_files"].as_bool(), Some(true));
@@ -179,7 +186,7 @@ fn the_official_clis_settings_json_finds_its_folder() {
     let out = m.ok(&["import", s(&f)], None);
     assert!(out.contains("official CLI settings.json"), "{out}");
     let v = &toml(&m)["vault"]["server-notes"];
-    assert_eq!(v["folder"].as_str(), Some(s(&m.root.join("server-notes"))));
+    assert_eq!(v["folder"].as_str(), Some(s(&m.real("server-notes"))));
     assert_eq!(v["database"].as_str(), Some("notes-db"));
 }
 
