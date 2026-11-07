@@ -8,6 +8,7 @@
 //! config file is left alone, and no service is not an error: the change
 //! applies at its next start.
 
+use crate::config::Setup;
 use livesync_host::control::{Client, ClientError};
 use livesync_host::protocol::{method, Hello};
 use serde_json::json;
@@ -29,8 +30,16 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Tell a running service to reload `config_file`.
-pub fn config_changed(config_file: &Path, change: &Change) {
+/// Tell a running service to reload the config file, and with `--system`,
+/// update the folders and credentials the system unit lists.
+pub fn config_changed(ctx: &Setup, change: &Change) {
+    for line in crate::install::refresh_system_dropin(ctx) {
+        println!("{line}");
+    }
+    tell(&ctx.config_file, change);
+}
+
+fn tell(config_file: &Path, change: &Change) {
     let mut client = match Client::connect_default() {
         Ok(Some(c)) => c,
         Ok(None) => {

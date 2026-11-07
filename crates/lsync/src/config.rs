@@ -215,11 +215,13 @@ pub struct Setup {
     pub config_file: PathBuf,
     /// An explicit `--config` file.
     pub explicit: Option<PathBuf>,
+    /// `lsync --system`: the system service's config, state and socket.
+    pub system: bool,
 }
 
 impl Setup {
-    pub fn new(explicit: Option<PathBuf>) -> Setup {
-        let mut dirs = Dirs::from_env();
+    pub fn new(explicit: Option<PathBuf>, system: bool) -> Setup {
+        let mut dirs = if system { Dirs::system() } else { Dirs::from_env() };
         let config_file = match &explicit {
             Some(p) => {
                 // `secrets.toml` and relative paths live beside an explicit file.
@@ -236,6 +238,7 @@ impl Setup {
             dirs,
             config_file,
             explicit,
+            system,
         }
     }
 
@@ -247,7 +250,7 @@ impl Setup {
     /// A failed migration leaves the profiles as they are; they are read as
     /// before.
     pub fn migrate_if_needed(&self) {
-        if self.explicit.is_some() || !migrate::needed(&self.dirs) {
+        if self.explicit.is_some() || self.system || !migrate::needed(&self.dirs) {
             return;
         }
         let store = FileStore::new(self.dirs.secrets_file());
@@ -564,6 +567,7 @@ mod tests {
             },
             config_file: d.join("config/lsync/lsync.toml"),
             explicit: None,
+            system: false,
         }
     }
 
@@ -815,6 +819,7 @@ mod tests {
             },
             config_file: p.clone(),
             explicit: Some(p),
+            system: false,
         };
         let c = explicit(p.clone());
         let s = c.select(None, &Overrides::default()).unwrap();

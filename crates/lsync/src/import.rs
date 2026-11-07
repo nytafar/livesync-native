@@ -757,7 +757,7 @@ pub fn run(ctx: &Setup, a: ImportArgs, given: &Given) -> Result<u8> {
             }
             bail!(e);
         }
-        service::config_changed(&ctx.config_file, &Change::Vault(name.clone()));
+        service::config_changed(ctx, &Change::Vault(name.clone()));
     }
     if a.json {
         println!("{}", serde_json::to_string_pretty(&out)?);

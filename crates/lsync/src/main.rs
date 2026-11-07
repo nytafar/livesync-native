@@ -5,6 +5,7 @@ mod bar;
 mod config;
 mod handoff;
 mod import;
+mod install;
 mod manage;
 mod probe;
 mod prompt;
@@ -12,6 +13,7 @@ mod route;
 mod sdnotify;
 mod serve;
 mod service;
+mod unit;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -51,6 +53,11 @@ struct Cli {
     /// file in the format before lsync.toml is read as such
     #[arg(long, env = "LSYNC_CONFIG", global = true)]
     config: Option<PathBuf>,
+    /// Work with the system service: its config ($CONFIGURATION_DIRECTORY
+    /// or /etc/lsync), its state ($STATE_DIRECTORY or /var/lib/lsync) and
+    /// its control socket (/run/lsync), not this user's
+    #[arg(long, env = "LSYNC_SYSTEM", global = true)]
+    system: bool,
     #[command(flatten)]
     overrides: Overrides,
     #[command(subcommand)]
@@ -117,6 +124,12 @@ enum Cmd {
     Serve {
         #[command(flatten)]
         opts: serve::ServeOpts,
+    },
+    /// Run `lsync serve` as a service: install, uninstall, status, logs
+    /// (systemd user or, with --system, system service; launchd on macOS)
+    Service {
+        #[command(subcommand)]
+        cmd: install::ServiceCmd,
     },
     /// Follow the remote continuously and push local changes as they happen
     /// (one vault, from any settings; refused for a vault `lsync serve` runs)
@@ -324,7 +337,10 @@ pub fn peak_rss_kib() -> Option<u64> {
 
 fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
     let mut overrides = cli.overrides.clone();
-    let ctx = Setup::new(cli.config.clone());
+    if cli.system {
+        livesync_host::control::use_system_service();
+    }
+    let ctx = Setup::new(cli.config.clone(), cli.system);
     ctx.migrate_if_needed();
     if let Cmd::Account { .. } | Cmd::Vault { .. } = &cli.cmd {
         if cli.vault.is_some() || cli.profile.is_some() {
@@ -361,6 +377,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             return import::run(&ctx, args, &given);
         }
         Cmd::Probe(args) => return probe::run(args),
+        Cmd::Service { cmd } => return install::run(&ctx, cmd),
         Cmd::Pause { json } => return service_verb(named?, method::PAUSE, "paused", json),
         Cmd::Resume { json } => return service_verb(named?, method::RESUME, "resumed", json),
         Cmd::SyncNow { json } => return service_verb(named?, method::SYNC_NOW, "syncing now", json),
@@ -611,6 +628,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         | Cmd::Account { .. }
         | Cmd::Vault { .. }
         | Cmd::Serve { .. }
+        | Cmd::Service { .. }
         | Cmd::Pause { .. }
         | Cmd::Resume { .. }
         | Cmd::SyncNow { .. }

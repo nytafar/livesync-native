@@ -20,14 +20,10 @@ use tracing::{info, warn};
 /// `lsync serve`'s own options.
 #[derive(clap::Args, Debug, Clone, Default)]
 pub struct ServeOpts {
-    /// Run as a system service: the socket in $RUNTIME_DIRECTORY or
-    /// /run/lsync instead of the user's runtime folder
-    #[arg(long)]
-    pub system: bool,
     /// With --system: also let the members of this group use the control
     /// socket (the directory becomes 0750 and the socket 0660, both owned by
     /// the group)
-    #[arg(long, value_name = "GROUP", requires = "system")]
+    #[arg(long, value_name = "GROUP")]
     pub socket_group: Option<String>,
     /// Desktop notifications (notify-send on Linux, osascript on macOS) for
     /// a safety stop, the upstream stop, a remote lock, new conflicts and a
@@ -236,7 +232,10 @@ pub fn serve(ctx: &Setup, only: Option<String>, opts: &ServeOpts, version: &str)
             bail!("no vault named {n:?} in {}", ctx.config_file.display());
         }
     }
-    let kind = if opts.system { Kind::System } else { Kind::User };
+    if opts.socket_group.is_some() && !ctx.system {
+        bail!("--socket-group is for the system service: `lsync --system serve --socket-group GROUP`");
+    }
+    let kind = if ctx.system { Kind::System } else { Kind::User };
     let policy = policy(opts)?;
     let dir = control::service_dir(kind).map_err(|e| anyhow!(e))?;
     let bound = control::bind(&dir, &policy)?;

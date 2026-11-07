@@ -64,6 +64,10 @@ fn write_then_rename(
         opts.mode(0o600);
     }
     let mut f = opts.open(tmp)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        hand_to_folder_owner(&f, dir)?;
+    }
     let done = fill(&mut f).and_then(|()| {
         drop(f);
         std::fs::rename(tmp, path)
@@ -72,6 +76,30 @@ fn write_then_rename(
         let _ = std::fs::remove_file(tmp);
     }
     done
+}
+
+/// The owner a file root writes into `dir` should have: the folder's owner,
+/// when that is another user. A system service's config folder belongs to
+/// the service's user (`lsync service install --system`), so a
+/// `sudo lsync --system vault add` leaves files that the service can read.
+/// `None` for everyone else, and for a folder of root's.
+#[cfg(unix)]
+pub fn folder_owner_for_root(dir: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let md = std::fs::metadata(dir).ok()?;
+    (md.uid() != 0).then(|| (md.uid(), md.gid()))
+}
+
+#[cfg(unix)]
+fn hand_to_folder_owner(f: &std::fs::File, dir: &Path) -> std::io::Result<()> {
+    if let Some((uid, gid)) = folder_owner_for_root(dir) {
+        std::os::unix::fs::fchown(f, Some(uid), Some(gid))?;
+    }
+    Ok(())
 }
 
 /// How long a change waits for another one to finish.
@@ -102,7 +130,14 @@ impl ConfigLock {
         let end = Instant::now() + LOCK_WAIT;
         loop {
             match LockFile::try_acquire(&lock_path) {
-                Ok(l) => return Ok(ConfigLock { _lock: l }),
+                Ok(l) => {
+                    // As the files beside it (see `folder_owner_for_root`).
+                    #[cfg(unix)]
+                    if let Some((uid, gid)) = path.parent().and_then(folder_owner_for_root) {
+                        let _ = std::os::unix::fs::lchown(&lock_path, Some(uid), Some(gid));
+                    }
+                    return Ok(ConfigLock { _lock: l });
+                }
                 Err(LockError::Busy(_)) if Instant::now() < end => std::thread::sleep(Duration::from_millis(50)),
                 Err(LockError::Busy(_)) => {
                     return Err(format!(

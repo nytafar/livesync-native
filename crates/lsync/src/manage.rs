@@ -250,7 +250,7 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
                     println!("            (lsync reads it from there; it does not store it)");
                 }
             }
-            service::config_changed(&ctx.config_file, &Change::Account(name));
+            service::config_changed(ctx, &Change::Account(name));
             Ok(0)
         }
         AccountCmd::Ls { json } => {
@@ -326,7 +326,7 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
             let pw = prompt::new_password(password_stdin, &format!("new password for {name}"))?;
             stores.set(&r, &pw)?;
             println!("changed the password of {name} ({})", stores.describe(&r));
-            service::config_changed(&ctx.config_file, &Change::Account(name));
+            service::config_changed(ctx, &Change::Account(name));
             Ok(0)
         }
         AccountCmd::Rm { name } => {
@@ -355,7 +355,7 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
                 ctx.secrets().delete(&r)?;
             }
             println!("removed account {name}");
-            service::config_changed(&ctx.config_file, &Change::Account(name));
+            service::config_changed(ctx, &Change::Account(name));
             Ok(0)
         }
     }
@@ -488,7 +488,7 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
             let cfg = file.save(&ctx.dirs).map_err(|e| anyhow!(e))?;
             println!("added vault {name} to {}", ctx.config_file.display());
             print_vault(ctx, &name, &cfg.vault[&name]);
-            service::config_changed(&ctx.config_file, &Change::Vault(name));
+            service::config_changed(ctx, &Change::Vault(name));
             Ok(0)
         }
         VaultCmd::Ls { json } => {
@@ -662,7 +662,7 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
             }
             println!("changed vault {name}");
             print_vault(ctx, &name, new);
-            service::config_changed(&ctx.config_file, &Change::Vault(name));
+            service::config_changed(ctx, &Change::Vault(name));
             Ok(0)
         }
         VaultCmd::Enable { name } => set_enabled(ctx, &name, true),
@@ -704,7 +704,7 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
                     }
                 );
             }
-            service::config_changed(&ctx.config_file, &Change::Vault(name));
+            service::config_changed(ctx, &Change::Vault(name));
             Ok(0)
         }
     }
@@ -719,7 +719,7 @@ fn set_enabled(ctx: &Setup, name: &str, on: bool) -> Result<u8> {
         .map_err(|e| anyhow!(e))?;
     file.save(&ctx.dirs).map_err(|e| anyhow!(e))?;
     println!("vault {name} {}", if on { "enabled" } else { "disabled" });
-    service::config_changed(&ctx.config_file, &Change::Vault(name.to_string()));
+    service::config_changed(ctx, &Change::Vault(name.to_string()));
     Ok(0)
 }
 
@@ -936,7 +936,7 @@ pub fn configure(ctx: &Setup, sel: &Selected, o: &Overrides, mut password: Optio
         }
         bail!(e);
     }
-    service::config_changed(&ctx.config_file, &Change::Vault(name));
+    service::config_changed(ctx, &Change::Vault(name));
     Ok(ctx.config_file.clone())
 }
 

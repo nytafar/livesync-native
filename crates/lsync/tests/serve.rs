@@ -826,6 +826,54 @@ fn an_older_service_without_a_method_still_lets_other_vaults_run_here() {
     );
 }
 
+#[test]
+fn the_system_service_has_its_own_config_state_and_socket() {
+    let rt = runtime();
+    let mock = rt.block_on(Mock::start());
+    mock.put_text("Notes/a.md", &["note a"]);
+    let mut m = Machine::with_vault(&mock);
+    // As systemd's ConfigurationDirectory= and StateDirectory= set them.
+    let (etc, var) = (m.root.join("etc/lsync"), m.root.join("var/lib/lsync"));
+    std::fs::create_dir_all(&etc).unwrap();
+    for f in ["lsync.toml", "secrets.toml"] {
+        std::fs::rename(m.root.join("config/lsync").join(f), etc.join(f)).unwrap();
+    }
+    m.env
+        .push(("CONFIGURATION_DIRECTORY".into(), etc.display().to_string()));
+    m.env.push(("STATE_DIRECTORY".into(), var.display().to_string()));
+    // The user's own config has no vaults; the system's has `notes`.
+    assert!(!m.ok(&["vault", "ls"]).contains("notes"));
+    assert!(m.ok(&["--system", "vault", "ls"]).contains("notes"));
+    let svc = m.spawn(&["--system", "serve"], "serve.log");
+    wait_until("the system service runs notes", || {
+        let out = m.run(&["--system", "status", "--all", "--json"]);
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("running")
+    });
+    // The vault's state is under the system state folder.
+    let st = m.json(&["--system", "--vault", "notes", "status", "--json"]);
+    assert!(
+        st.to_string().contains(&var.join("notes").display().to_string()),
+        "{st}"
+    );
+    assert!(var.join("notes").is_dir());
+    assert_eq!(svc.stop(), Some(0));
+
+    // Without LSYNC_RUNTIME_DIR, `--system` looks only at the system
+    // socket: a user service's socket is not taken for it.
+    m.env.retain(|(k, _)| k != "CONFIGURATION_DIRECTORY");
+    let mut c = m.cmd(&["--system", "pause"]);
+    c.env_remove("LSYNC_RUNTIME_DIR")
+        .env("XDG_RUNTIME_DIR", m.root.join("run-user"));
+    let user = m.root.join("run-user/lsync");
+    std::fs::create_dir_all(&user).unwrap();
+    let out = c.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("/run/lsync/control.sock") && !err.contains("run-user"),
+        "{err}"
+    );
+}
+
 /// The messages a `Type=notify` unit's manager gets, from a fake
 /// `NOTIFY_SOCKET` (a datagram socket in the machine's temp folder).
 struct FakeManager {

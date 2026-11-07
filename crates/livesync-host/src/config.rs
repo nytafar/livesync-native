@@ -29,6 +29,10 @@ use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE: &str = "lsync.toml";
 pub const SECRETS_FILE: &str = "secrets.toml";
+/// A system service's config folder, without systemd's `ConfigurationDirectory=`.
+pub const SYSTEM_CONFIG_DIR: &str = "/etc/lsync";
+/// A system service's state folder, without systemd's `StateDirectory=`.
+pub const SYSTEM_STATE_DIR: &str = "/var/lib/lsync";
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -379,6 +383,28 @@ impl Dirs {
         }
     }
 
+    /// A system service's folders (`lsync --system`): systemd's
+    /// `ConfigurationDirectory=` and `StateDirectory=` when it set them,
+    /// else `/etc/lsync` and `/var/lib/lsync`.
+    pub fn system() -> Dirs {
+        Dirs::system_from(&|k| std::env::var_os(k))
+    }
+
+    pub fn system_from(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Dirs {
+        // systemd lists several directories separated by ':'; ours is the first.
+        let from = |var: &str, fallback: &str| {
+            env(var)
+                .and_then(|v| v.to_string_lossy().split(':').next().map(PathBuf::from))
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| PathBuf::from(fallback))
+        };
+        Dirs {
+            home: env("HOME").filter(|v| !v.is_empty()).map(PathBuf::from),
+            config: from("CONFIGURATION_DIRECTORY", SYSTEM_CONFIG_DIR),
+            state: from("STATE_DIRECTORY", SYSTEM_STATE_DIR),
+        }
+    }
+
     pub fn config_file(&self) -> PathBuf {
         self.config.join(CONFIG_FILE)
     }
@@ -689,6 +715,23 @@ exclude = ["Archive"]
 
     fn with(extra: &str) -> Result<Config, String> {
         Config::parse(&format!("{BASE}{extra}"), &dirs())
+    }
+
+    #[test]
+    fn a_system_service_reads_systemds_folders_or_the_fixed_ones() {
+        let none = Dirs::system_from(&|_| None);
+        assert_eq!(none.config, PathBuf::from(SYSTEM_CONFIG_DIR));
+        assert_eq!(none.state, PathBuf::from(SYSTEM_STATE_DIR));
+        assert_eq!(none.config_file(), PathBuf::from("/etc/lsync/lsync.toml"));
+        let set = Dirs::system_from(&|k| match k {
+            "CONFIGURATION_DIRECTORY" => Some("/etc/lsync-a:/etc/other".into()),
+            "STATE_DIRECTORY" => Some("relative".into()),
+            "HOME" => Some("/var/lib/lsync-home".into()),
+            _ => None,
+        });
+        assert_eq!(set.config, PathBuf::from("/etc/lsync-a"));
+        assert_eq!(set.state, PathBuf::from(SYSTEM_STATE_DIR));
+        assert_eq!(set.home, Some(PathBuf::from("/var/lib/lsync-home")));
     }
 
     #[test]

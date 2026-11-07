@@ -96,11 +96,23 @@ fn user_dir() -> Option<PathBuf> {
     env_dir("XDG_RUNTIME_DIR").map(|d| d.join("lsync"))
 }
 
+static SYSTEM_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process works with the system service (`lsync --system`): its
+/// clients use only the system service's socket, never a user service's.
+pub fn use_system_service() {
+    SYSTEM_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// The sockets a client tries, in order: `$LSYNC_RUNTIME_DIR` alone when
-/// it is set; else the user service's, then the system service's.
+/// it is set; else the user service's, then the system service's (only
+/// the system service's after [`use_system_service`]).
 pub fn client_sockets() -> Vec<PathBuf> {
     if let Some(d) = env_dir("LSYNC_RUNTIME_DIR") {
         return vec![d.join(SOCKET_NAME)];
+    }
+    if SYSTEM_ONLY.load(std::sync::atomic::Ordering::SeqCst) {
+        return vec![Path::new(SYSTEM_DIR).join(SOCKET_NAME)];
     }
     let mut out: Vec<PathBuf> = user_dir().into_iter().map(|d| d.join(SOCKET_NAME)).collect();
     if !cfg!(target_os = "macos") {
