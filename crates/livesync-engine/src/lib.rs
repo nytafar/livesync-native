@@ -8,9 +8,11 @@
 //! index (spec D2). `Engine::pull_once` and `Engine::daemon_pull_only` never
 //! write to the remote.
 
+pub mod activity;
 pub mod adopt;
 pub mod engine;
 pub mod filters;
+pub mod flush;
 pub mod folderkind;
 pub mod folders;
 pub mod fsrules;
@@ -22,10 +24,12 @@ mod scopesync;
 pub mod vaultfs;
 pub mod watcher;
 
+pub use activity::{Activity, EngineEvent, Idle, PullPhase, Reached, RevisionEvent, Target, WaitFor, WaitOutcome};
 pub use adopt::{AdoptEntry, AdoptOptions, AdoptReport};
 pub use engine::{
     AccessCheck, Alerts, Engine, EngineConfig, EngineError, GateReport, PullReport, Status, SyncReport, WallClock,
 };
+pub use flush::{FlushOutcome, FlushReport, FlushedPath};
 pub use folders::{list_remote_folders, local_top_folders, FolderEntry, FolderListing};
 pub use index::{FileRow, Index, LocalIssue, Origin, RevisionRow, State};
 pub use push::{Confirmation, PushReport};

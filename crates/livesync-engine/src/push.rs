@@ -673,7 +673,7 @@ fn pass_fatal(e: &EngineError) -> bool {
     }
 }
 
-fn mtime_ms(md: &std::fs::Metadata) -> i64 {
+pub(crate) fn mtime_ms(md: &std::fs::Metadata) -> i64 {
     md.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -994,7 +994,7 @@ impl Engine {
 
     /// The index row a local file belongs to: by exact path, by document ID,
     /// and on folding filesystems by the folded name.
-    fn row_for_local(&self, rel: &str) -> Result<Option<FileRow>> {
+    pub(crate) fn row_for_local(&self, rel: &str) -> Result<Option<FileRow>> {
         let id = self.doc_id_for(rel);
         let folds = self.inner.fs.folds();
         self.with_index(|ix| {
@@ -1013,7 +1013,7 @@ impl Engine {
 
     /// Whether a row's file is unchanged since it was synced (by stat), so
     /// the pass can skip it.
-    fn unchanged(&self, r: &FileRow, f: &Found) -> bool {
+    pub(crate) fn unchanged(&self, r: &FileRow, f: &Found) -> bool {
         r.disk_size == Some(f.size)
             && r.disk_mtime == Some(f.mtime_ms)
             && r.base_rev.is_some()
@@ -3063,9 +3063,18 @@ impl Engine {
         let mut retry_at: Option<Instant> = None;
         let mut backoff = Backoff::default();
         let mut total = PushReport::default();
+        let mut flushes = crate::flush::Flushes::default();
+        // Flushes still waiting when the loop ends are answered `Stopped`.
+        let _flushes_end = DropFlushes(self.clone());
         let tick_every = (settle / 4).clamp(Duration::from_millis(50), Duration::from_millis(500));
         let mut tick = tokio::time::interval(tick_every);
         loop {
+            self.set_activity(|a| {
+                a.settling = (queue.len() + flushes.now.len()) as u64;
+                a.pushing = false;
+                a.push_due = full_due || retry_at.is_some();
+                a.flushes = flushes.len() as u64;
+            });
             tokio::select! {
                 _ = shutdown.changed() => return Ok(total),
                 ev = rx.recv() => {
@@ -3075,6 +3084,7 @@ impl Engine {
                 }
                 _ = tick.tick() => {}
                 _ = self.inner.rescan.notified() => full_due = true,
+                _ = self.inner.flush_wake.notified() => {}
             }
             while let Ok(ev) = rx.try_recv() {
                 self.on_watch_event(
@@ -3087,11 +3097,22 @@ impl Engine {
                     &mut full_due,
                 );
             }
+            // A flush: its paths go out now, and it is tried at once even
+            // after a failed pass.
+            if flushes.take(&self, &mut queue, &mut full_due) {
+                retry_at = None;
+            }
+            self.set_activity(|a| {
+                a.settling = (queue.len() + flushes.now.len()) as u64;
+                a.push_due = full_due || retry_at.is_some();
+                a.flushes = flushes.len() as u64;
+            });
             // Pushes wait for the gate, the owed full fetch (with its quiet
             // wait after a rebuild) and the registration. Queued paths and
             // a due full pass stay queued meanwhile.
             if !self.inner.push_enabled.load(Ordering::SeqCst) {
                 was_enabled = false;
+                flushes.held(&self)?;
                 continue;
             }
             if !was_enabled {
@@ -3136,11 +3157,15 @@ impl Engine {
             if hold.due().is_some_and(|d| Instant::now() >= d) {
                 full_due = true;
             }
+            self.set_activity(|a| a.pushing = true);
             let result = if full_due {
                 next_rescan = Instant::now() + self.inner.cfg.rescan_interval;
-                match self.full_pass(&hints, Some(&mut hold), true).await {
+                // A flush of everything pushes what was written moments ago too.
+                let defer_recent = !flushes.wants_all();
+                match self.full_pass(&hints, Some(&mut hold), defer_recent).await {
                     Ok(Some((rep, deferred))) => {
                         full_due = false;
+                        flushes.passed(true, !deferred.is_empty() || rep.deferred > 0);
                         for p in deferred {
                             queue.entry(p).or_insert_with(Settling::new);
                         }
@@ -3151,12 +3176,18 @@ impl Engine {
                     Err(e) => Err(e),
                 }
             } else {
-                let ready = take_settled(&mut queue, &root, settle);
+                let mut ready = take_settled(&mut queue, &root, settle);
+                ready.extend(std::mem::take(&mut flushes.now));
+                ready.sort();
+                ready.dedup();
                 if ready.is_empty() {
                     continue;
                 }
                 match self.partial_pass(ready.clone(), &hints, &mut hold).await {
-                    Ok(Some(rep)) => Ok(rep),
+                    Ok(Some(rep)) => {
+                        flushes.passed(false, rep.deferred > 0);
+                        Ok(rep)
+                    }
                     Ok(None) => {
                         // Held: look at them again once pushes resume.
                         for p in ready {
@@ -3179,6 +3210,11 @@ impl Engine {
                     total.add(&rep);
                     self.inner.deletes_waiting.store(hold.waiting(), Ordering::SeqCst);
                     self.inner.push_report.lock().unwrap().add(&rep);
+                    // A flush of everything whose full pass found files still
+                    // being written: another one, once they settled a little.
+                    if flushes.answer(&self, hold.waiting())? {
+                        full_due = true;
+                    }
                 }
                 Err(e) => {
                     let wait = backoff.next_delay();
@@ -3244,6 +3280,15 @@ impl Engine {
                 note_path(&to, watcher, watched);
             }
         }
+    }
+}
+
+/// Clears the flushes the push loop did not take in, when it ends.
+struct DropFlushes(Engine);
+
+impl Drop for DropFlushes {
+    fn drop(&mut self) {
+        self.0.drop_flushes();
     }
 }
 

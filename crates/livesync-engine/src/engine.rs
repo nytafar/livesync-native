@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
+use crate::activity::PullPhase;
 use meta_keys as meta;
 
 /// Keys used in the index `meta` table.
@@ -671,6 +672,14 @@ pub(crate) struct Inner {
     /// The two-way daemon allows pushes only after the gate passed and the
     /// owed full fetch and registration are done.
     pub(crate) push_enabled: AtomicBool,
+    /// The revisions the index takes as files' synced versions, once
+    /// committed (`Engine::subscribe`).
+    pub(crate) events: tokio::sync::broadcast::Sender<crate::activity::EngineEvent>,
+    /// What the two sides are doing (`Engine::activity`).
+    pub(crate) activity: watch::Sender<crate::activity::Activity>,
+    /// `flush` requests for the push loop (`Engine::flush`), and its wake-up.
+    pub(crate) flushes: Mutex<Vec<crate::flush::FlushWaiter>>,
+    pub(crate) flush_wake: Notify,
     /// Held while materialising on a filesystem that folds names, so the
     /// collision check and the write cannot interleave across units.
     fold_lock: Mutex<()>,
@@ -783,8 +792,13 @@ impl Engine {
             }
         };
         info!("vault lock: {}", vault_lock.mode());
-        let index = Index::open(&cfg.index_path)?;
+        let mut index = Index::open(&cfg.index_path)?;
         index.set_meta(meta::VAULT_LOCK, vault_lock.mode())?;
+        let (events, _) = tokio::sync::broadcast::channel(crate::activity::EVENT_BUFFER);
+        let sink = events.clone();
+        index.set_applied_sink(Box::new(move |r| {
+            let _ = sink.send(crate::activity::EngineEvent::of(r));
+        }));
         let probed = FsRules::probe(&canon);
         let probe_ok = probed.is_ok();
         let mut fs = match probed {
@@ -866,6 +880,10 @@ impl Engine {
                 rescan: Notify::new(),
                 ops: tokio::sync::Mutex::new(()),
                 push_enabled: AtomicBool::new(false),
+                events,
+                activity: watch::Sender::new(crate::activity::Activity::default()),
+                flushes: Mutex::new(Vec::new()),
+                flush_wake: Notify::new(),
                 fold_lock: Mutex::new(()),
                 last_milestone: Mutex::new(None),
                 _vault_lock: vault_lock,
@@ -2938,10 +2956,14 @@ impl Engine {
         // The reason of the refusal the daemon last waited out, so a
         // refusal that repeats at every check is logged once.
         let mut refused: Option<String> = None;
+        // What the pull side does, for `activity` (and so `idle`); the
+        // daemon counts as ended when this goes.
+        let _running = crate::activity::Running::start(self, two_way);
         'outer: loop {
             if *shutdown.borrow() {
                 return Ok(());
             }
+            self.set_pull_phase(PullPhase::Starting);
             if two_way {
                 if let Err(e) = self.check_plugin_guard() {
                     self.inner.push_enabled.store(false, Ordering::SeqCst);
@@ -2985,6 +3007,7 @@ impl Engine {
                         EngineError::Remote(_) => backoff.next_delay(),
                         _ => return Err(e),
                     };
+                    self.set_pull_phase(PullPhase::Retrying);
                     log_wait(
                         &mut refused,
                         &e,
@@ -2997,6 +3020,7 @@ impl Engine {
                 }
             };
             let session = Instant::now();
+            self.set_pull_phase(PullPhase::CatchingUp);
             // Catch up without longpoll first, so we know when we are current.
             let caught = match self.catch_up(session).await {
                 Ok(()) => {
@@ -3052,6 +3076,7 @@ impl Engine {
                     EngineError::Remote(_) | EngineError::Other(_) => backoff.next_delay(),
                     _ => return Err(e),
                 };
+                self.set_pull_phase(PullPhase::Retrying);
                 log_wait(
                     &mut refused,
                     &e,
@@ -3067,15 +3092,19 @@ impl Engine {
             }
             let regate_at = Instant::now() + self.inner.cfg.regate_interval;
             let mut last_retry: Option<Instant> = None;
+            // The last batch said more changes are waiting on the server.
+            let mut behind = false;
             loop {
                 let retry_allowed_at = last_retry.map(|t| t + PENDING_RETRY_MIN_GAP);
                 let due = self.pending_due_at(retry_allowed_at)?;
                 if due.is_some_and(|d| d <= Instant::now()) {
+                    self.set_pull_phase(PullPhase::Applying);
                     if let Err(e) = self.retry_pending(false).await {
                         warn!("pending retry failed: {e}");
                     }
                     last_retry = Some(Instant::now());
                 }
+                self.set_pull_phase(if behind { PullPhase::CatchingUp } else { PullPhase::Live });
                 let _ = self.with_index(|ix| ix.set_meta(meta::DAEMON_SEEN, &vaultfs::now_ms().to_string()));
                 // Leave the longpoll open unless a pending row falls due or
                 // it is time to re-run the gate.
@@ -3145,11 +3174,13 @@ impl Engine {
                     None => {}
                     Some(Ok(resp)) => {
                         backoff.reset();
+                        behind = resp.pending.unwrap_or(0) > 0;
                         if resp.results.is_empty() {
                             self.with_index(|ix| ix.set_meta(meta::SINCE, &seq_to_string(&resp.last_seq)))?;
                             continue;
                         }
                         let before = self.report();
+                        self.set_pull_phase(PullPhase::Applying);
                         match self.apply_batch(resp.results).await {
                             Ok(()) => {
                                 self.with_index(|ix| {
@@ -3171,6 +3202,7 @@ impl Engine {
                                     EngineError::Remote(_) => backoff.next_delay(),
                                     _ => return Err(e),
                                 };
+                                self.set_pull_phase(PullPhase::Retrying);
                                 log_wait(
                                     &mut refused,
                                     &e,
@@ -3199,6 +3231,7 @@ impl Engine {
                         }
                         let e = EngineError::from(e);
                         self.record_error(&e);
+                        self.set_pull_phase(PullPhase::Retrying);
                         warn!("changes feed failed: {e}; reconnecting in {wait:.0?}");
                         if self.sleep_or_shutdown(wait, &mut shutdown).await {
                             return Ok(());

@@ -218,7 +218,18 @@ impl RevisionRow {
 
 pub struct Index {
     conn: Connection,
+    /// Applied revisions recorded inside a transaction that has not
+    /// committed yet: handed to `sink` at the commit, dropped at a rollback.
+    applied: std::cell::RefCell<Vec<RevisionRow>>,
+    /// Where an applied revision goes once it is committed
+    /// ([`Index::set_applied_sink`]).
+    sink: Option<AppliedSink>,
 }
+
+/// Receives every applied revision once it is committed (see
+/// [`Index::set_applied_sink`]). Called with the index borrowed: it must
+/// return quickly and must not use the index.
+pub type AppliedSink = Box<dyn Fn(&RevisionRow) + Send>;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -365,7 +376,11 @@ impl Index {
             }
         }
         conn.execute_batch(SCHEMA)?;
-        let idx = Index { conn };
+        let idx = Index {
+            conn,
+            applied: Default::default(),
+            sink: None,
+        };
         let version = idx.get_meta("schema_version")?;
         if version.as_deref() == Some("1") {
             idx.migrate_v1()?;
@@ -426,6 +441,8 @@ impl Index {
         // connection is left in autocommit, never inside an open transaction.
         let outermost = self.conn.is_autocommit();
         self.conn.execute_batch("SAVEPOINT atomically")?;
+        // The applied revisions recorded before this savepoint stay.
+        let mark = self.applied.borrow().len();
         let undo = || {
             let sql = if outermost {
                 "ROLLBACK"
@@ -433,10 +450,16 @@ impl Index {
                 "ROLLBACK TO atomically; RELEASE atomically"
             };
             let _ = self.conn.execute_batch(sql);
+            self.applied.borrow_mut().truncate(if outermost { 0 } else { mark });
         };
         match f(self) {
             Ok(v) => match self.conn.execute_batch("RELEASE atomically") {
-                Ok(()) => Ok(v),
+                Ok(()) => {
+                    if outermost {
+                        self.committed();
+                    }
+                    Ok(v)
+                }
                 Err(e) => {
                     undo();
                     Err(e)
@@ -452,6 +475,24 @@ impl Index {
     /// Record a revision in the history. Seen again, it keeps when it was
     /// first seen, becomes applied once it is, and stays `local` once this
     /// device is known to have written it.
+    /// Hand every applied revision ([`RevisionRow::applied`]) to `sink` once
+    /// it is committed: at once outside a transaction, at the commit of the
+    /// outermost [`Index::atomically`] inside one, never when it is rolled
+    /// back. This is how the engine tells which revisions it stored on the
+    /// server and applied to the vault (`Engine::subscribe`).
+    pub fn set_applied_sink(&mut self, sink: AppliedSink) {
+        self.sink = Some(sink);
+    }
+
+    fn committed(&self) {
+        let done = std::mem::take(&mut *self.applied.borrow_mut());
+        if let Some(sink) = &self.sink {
+            for r in &done {
+                sink(r);
+            }
+        }
+    }
+
     pub fn record_revision(&self, r: &RevisionRow) -> rusqlite::Result<()> {
         let eden = (!r.eden.is_empty()).then(|| serde_json::to_string(&r.eden).unwrap());
         self.conn.execute(
@@ -482,6 +523,12 @@ impl Index {
                 r.seen_ms,
             ],
         )?;
+        if r.applied && self.sink.is_some() {
+            self.applied.borrow_mut().push(r.clone());
+            if self.conn.is_autocommit() {
+                self.committed();
+            }
+        }
         Ok(())
     }
 
@@ -889,7 +936,7 @@ mod tests {
                  UPDATE meta SET value = '2' WHERE key = 'schema_version';",
             )
             .unwrap();
-        let Index { conn } = ix;
+        let Index { conn, .. } = ix;
         let ix = Index::init(conn).unwrap();
         let revs: Vec<(String, Origin)> = ix
             .revisions_at("A.md")
@@ -907,7 +954,7 @@ mod tests {
         );
         assert_eq!(ix.get_meta("schema_version").unwrap().as_deref(), Some("3"));
         // Opening a current index again changes nothing.
-        let Index { conn } = ix;
+        let Index { conn, .. } = ix;
         assert_eq!(Index::init(conn).unwrap().revision_count().unwrap(), 4);
     }
 
@@ -997,6 +1044,47 @@ mod tests {
         ix.upsert(&row("b.md", "b.md")).unwrap();
         assert!(ix.conn.is_autocommit());
         assert!(ix.by_doc("b.md").unwrap().is_some());
+    }
+
+    #[test]
+    fn applied_revisions_reach_the_sink_only_once_committed() {
+        let mut ix = Index::open_in_memory().unwrap();
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = got.clone();
+        ix.set_applied_sink(Box::new(move |r| sink.lock().unwrap().push(r.rev.clone())));
+        let rev = |doc: &str, r: &str| RevisionRow {
+            applied: true,
+            ..rev(doc, r)
+        };
+        let seen = || -> Vec<String> { std::mem::take(&mut *got.lock().unwrap()) };
+        // Outside a transaction: at once. Seen-only revisions never.
+        ix.record_revision(&rev("a.md", "1-a")).unwrap();
+        let mut only_seen = rev("a.md", "2-a");
+        only_seen.applied = false;
+        ix.record_revision(&only_seen).unwrap();
+        assert_eq!(seen(), ["1-a"]);
+        // Inside one: at the outermost commit, not before.
+        ix.atomically(|ix| {
+            ix.record_revision(&rev("b.md", "1-b"))?;
+            assert!(got.lock().unwrap().is_empty(), "before the commit");
+            // A nested part that rolls back takes its own revisions along.
+            let inner: rusqlite::Result<()> = ix.atomically(|ix| {
+                ix.record_revision(&rev("c.md", "1-c"))?;
+                Err(rusqlite::Error::InvalidQuery)
+            });
+            assert!(inner.is_err());
+            ix.record_revision(&rev("d.md", "1-d"))
+        })
+        .unwrap();
+        assert_eq!(seen(), ["1-b", "1-d"]);
+        // A transaction that rolls back: none.
+        let r: rusqlite::Result<()> = ix.atomically(|ix| {
+            ix.record_revision(&rev("e.md", "1-e"))?;
+            Err(rusqlite::Error::InvalidQuery)
+        });
+        assert!(r.is_err());
+        ix.record_revision(&rev("f.md", "1-f")).unwrap();
+        assert_eq!(seen(), ["1-f"]);
     }
 
     #[test]
