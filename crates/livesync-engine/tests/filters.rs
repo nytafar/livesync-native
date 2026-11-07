@@ -417,3 +417,115 @@ async fn status_shows_the_folder_kind() {
     std::fs::create_dir_all(env.vault().join(".obsidian")).unwrap();
     assert_eq!(e.status().unwrap().folder_kind.unwrap().as_str(), "obsidian vault");
 }
+
+/// A file synced under `before`, deleted on another device, then a run
+/// under the narrower `after`: the local file stays where it is (the
+/// plugin leaves files it does not sync alone).
+async fn narrowed_then_deleted_remotely(
+    path: &str,
+    before: impl Fn(&mut EngineConfig),
+    after: impl Fn(&mut EngineConfig),
+    how: Delete,
+    run: Run,
+) {
+    let env = Env::new().await;
+    env.write(path, b"synced");
+    env.write("notes/keep.md", b"keep");
+    env.engine_with(&before).sync_once().await.unwrap();
+    assert!(env.row(path).is_some(), "{path} synced first");
+    match how {
+        Delete::Soft => env.mock.soft_delete(path),
+        Delete::Tombstone => env.mock.tombstone(path),
+        Delete::Conflicted => {
+            // The deletion wins over a live branch of the same base.
+            let id = path_to_id(path, true);
+            let base = env.mock.doc(&id).unwrap()["_rev"].as_str().unwrap().to_string();
+            env.mock.soft_delete(path);
+            let mut doc = env.mock.doc(&id).unwrap();
+            doc["deleted"] = json!(false);
+            env.mock.put_branch_with(doc, &base, "0000");
+        }
+    }
+    let e = env.engine_with(|c| {
+        c.trash = TrashMode::None;
+        after(c)
+    });
+    match run {
+        Run::Pull => {
+            e.pull_once().await.unwrap();
+        }
+        Run::Sync => {
+            e.sync_once().await.unwrap();
+        }
+    }
+    assert_eq!(env.read(path).as_deref(), Some(&b"synced"[..]), "{path} left alone");
+    assert!(env.row(path).is_none(), "{path} no longer tracked");
+    assert_eq!(env.read("notes/keep.md").as_deref(), Some(&b"keep"[..]));
+}
+
+#[derive(Clone, Copy)]
+enum Delete {
+    Soft,
+    Tombstone,
+    Conflicted,
+}
+
+#[derive(Clone, Copy)]
+enum Run {
+    Pull,
+    Sync,
+}
+
+#[tokio::test]
+async fn a_narrowed_sync_only_regex_keeps_remote_deletes_off_the_files_it_hides() {
+    for (how, run) in [
+        (Delete::Soft, Run::Pull),
+        (Delete::Tombstone, Run::Sync),
+        (Delete::Conflicted, Run::Sync),
+    ] {
+        narrowed_then_deleted_remotely(
+            "other/b.md",
+            |_| {},
+            |c| c.sync_only_regex = Some("^notes/".into()),
+            how,
+            run,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_narrowed_ignore_regex_keeps_remote_deletes_off_the_files_it_hides() {
+    for (how, run) in [
+        (Delete::Soft, Run::Sync),
+        (Delete::Tombstone, Run::Pull),
+        (Delete::Conflicted, Run::Pull),
+    ] {
+        narrowed_then_deleted_remotely(
+            "other/b.md",
+            |_| {},
+            |c| c.ignore_regex = Some("^other/".into()),
+            how,
+            run,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_dot_path_dropped_from_the_allowlist_keeps_remote_deletes_off_its_files() {
+    for (how, run) in [
+        (Delete::Soft, Run::Sync),
+        (Delete::Tombstone, Run::Pull),
+        (Delete::Conflicted, Run::Sync),
+    ] {
+        narrowed_then_deleted_remotely(
+            ".notes/c.md",
+            |c| c.sync_dot_paths = vec![".notes".into()],
+            |_| {},
+            how,
+            run,
+        )
+        .await;
+    }
+}

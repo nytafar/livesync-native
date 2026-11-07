@@ -223,6 +223,32 @@ impl Engine {
     /// for a widened scope. Returns whether anything changed.
     pub(crate) async fn filters_catch_up(&self) -> Result<bool> {
         let _one = self.inner.filters_lock.lock().await;
+        let Some((old, new)) = self.filter_change().await? else {
+            return Ok(false);
+        };
+        let case_sensitive = self.inner.runtime.lock().unwrap().case_sensitive_ids;
+        let scope = self.inner.cfg.scope.clone();
+        self.untrack_hidden()?;
+        // Widening: what was hidden and is not now, fetched like a widened scope.
+        self.fetch_unhidden(&old, &new, case_sensitive, &scope).await?;
+        self.with_index(|ix| new.save(ix))?;
+        Ok(true)
+    }
+
+    /// The narrowing half of [`Engine::filters_catch_up`], for the start of a
+    /// run, before the first catch-up: a remote deletion in that catch-up
+    /// must not reach a file the filters hide now. The filter state is saved
+    /// only by the full catch-up afterwards.
+    pub(crate) async fn filters_narrowing(&self) -> Result<()> {
+        let _one = self.inner.filters_lock.lock().await;
+        if self.filter_change().await?.is_some() {
+            self.untrack_hidden()?;
+        }
+        Ok(())
+    }
+
+    /// The filters at the last sync and now, when they differ.
+    async fn filter_change(&self) -> Result<Option<(FilterState, FilterState)>> {
         let case_sensitive = self.inner.runtime.lock().unwrap().case_sensitive_ids;
         let this = self.clone();
         let files = tokio::task::spawn_blocking(move || this.scan_ignore_files(case_sensitive))
@@ -236,11 +262,13 @@ impl Engine {
             (Some(_), Some(s)) => s,
             (Some(_), None) => FilterState::before_filters(&self.inner.cfg.filter_settings()),
         };
-        if old == new {
-            return Ok(false);
-        }
-        let scope = self.inner.cfg.scope.clone();
-        // Narrowing: tracked paths the filters now hide are untracked.
+        Ok((old != new).then_some((old, new)))
+    }
+
+    /// Narrowing: tracked paths the filters now hide are untracked (the
+    /// files and the remote documents stay).
+    fn untrack_hidden(&self) -> Result<()> {
+        let scope = &self.inner.cfg.scope;
         let live = self.filters();
         live.refresh();
         let mut untracked = 0usize;
@@ -248,7 +276,7 @@ impl Engine {
             if !matches!(r.state, State::Clean | State::Dirty | State::Conflicted) {
                 continue;
             }
-            if live.vis(&r.path, &scope) == Vis::Hidden && scope.contains(&r.path) {
+            if live.vis(&r.path, scope) == Vis::Hidden && scope.contains(&r.path) {
                 self.with_index(|ix| {
                     ix.atomically(|ix| {
                         ix.delete_path(&r.path)?;
@@ -261,7 +289,18 @@ impl Engine {
         if untracked > 0 {
             info!("the local filters changed: stopped tracking {untracked} file(s) they now hide (files and remote copies kept)");
         }
-        // Widening: what was hidden and is not now, fetched like a widened scope.
+        Ok(())
+    }
+
+    /// Widening: fetch what `old` hid and `new` does not, as for a widened
+    /// scope.
+    async fn fetch_unhidden(
+        &self,
+        old: &FilterState,
+        new: &FilterState,
+        case_sensitive: bool,
+        scope: &Scope,
+    ) -> Result<()> {
         let old_eval = old.evaluator(case_sensitive).map_err(EngineError::Other)?;
         let new_eval = new.evaluator(case_sensitive).map_err(EngineError::Other)?;
         let ids: Vec<String> = self
@@ -270,7 +309,7 @@ impl Engine {
             .into_iter()
             .filter(|id| {
                 let p = id_to_scope_path(id);
-                scope.contains(p) && new_eval.vis(p, &scope) != Vis::Hidden && old_eval.vis(p, &scope) != Vis::Visible
+                scope.contains(p) && new_eval.vis(p, scope) != Vis::Hidden && old_eval.vis(p, scope) != Vis::Visible
             })
             .collect();
         let ids: Vec<String> = {
@@ -309,8 +348,7 @@ impl Engine {
                 .collect();
             self.apply_batch(changes).await?;
         }
-        self.with_index(|ix| new.save(ix))?;
-        Ok(true)
+        Ok(())
     }
 
     /// Document IDs in `[start, end]` (or all), without chunks and internal

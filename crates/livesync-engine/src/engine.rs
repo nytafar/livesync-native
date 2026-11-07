@@ -1,7 +1,7 @@
 //! Gate evaluation, the pull loop, the daemons (pull-only and two-way) and
 //! milestone registration. The push side lives in `push.rs`.
 
-use crate::filters::{FilterSettings, Filters, IgnoreState};
+use crate::filters::{FilterSettings, Filters, IgnoreState, Verdict};
 use crate::fsrules::{FsRules, PROBED_CHARS};
 use crate::index::{FileRow, Index, LocalIssue, Origin, PendingRow, RevisionRow, State};
 use crate::platform::{self, Holder, VaultLock, VaultLockError};
@@ -1050,6 +1050,7 @@ impl Engine {
             gate.remote, gate.version, gate.doc_count
         );
         let old_scope = self.apply_scope_narrowing()?;
+        self.filters_narrowing().await?;
         self.prepare_vault();
         self.catch_up(start).await?;
         self.finish_read_only_fetch()?;
@@ -1471,14 +1472,25 @@ impl Engine {
                 })
             })
         };
-        match self.filters().ignore_state(&b.path) {
-            IgnoreState::Synced { .. } => {}
-            IgnoreState::Ignored(by) => {
-                // Ignored here now: the file is not ours to remove.
+        // Every local filter, not only the ignore files: settings narrowed
+        // since the file was synced hide it too.
+        let f = self.filters();
+        match f.verdict(&b.path, &self.inner.cfg.scope) {
+            Verdict::Synced { .. } => {}
+            Verdict::Unknown { file, why } => {
+                return self.defer(
+                    id,
+                    rev,
+                    &b.path,
+                    &format!("deletion not applied: ignore file {file} {why}"),
+                );
+            }
+            _ => {
+                // Not synced here now: the file is not ours to remove.
                 debug!(
-                    "{}: deleted remotely, but ignored here ({}); the local file is left alone",
+                    "{}: deleted remotely, but {}; the local file is left alone",
                     b.path,
-                    by.describe()
+                    f.check(&b.path, &self.inner.cfg.scope).detail
                 );
                 let seen = deletion(false);
                 return self.with_index(|ix| {
@@ -1488,14 +1500,6 @@ impl Engine {
                         ix.remove_pending(id)
                     })
                 });
-            }
-            IgnoreState::Unknown { file, why } => {
-                return self.defer(
-                    id,
-                    rev,
-                    &b.path,
-                    &format!("deletion not applied: ignore file {file} {why}"),
-                );
             }
         }
         if matches!(b.state, State::Skipped | State::OutOfScope) {
@@ -1590,12 +1594,12 @@ impl Engine {
             // Nothing of ours on disk; the conflict is resolved elsewhere.
             return self.with_index(|ix| ix.remove_pending(&f.id));
         };
-        match self.filters().ignore_state(&b.path) {
-            IgnoreState::Synced { .. } => {}
-            IgnoreState::Ignored(_) => return self.apply_ignored(f),
-            IgnoreState::Unknown { file, why } => {
+        match self.filters().verdict(&b.path, &self.inner.cfg.scope) {
+            Verdict::Synced { .. } => {}
+            Verdict::Unknown { file, why } => {
                 return self.defer_doc(f, &format!("ignore file {file} {why}"));
             }
+            _ => return self.apply_ignored(f),
         }
         match b.state {
             State::Skipped | State::OutOfScope => {
@@ -2329,6 +2333,7 @@ impl Engine {
             gate.remote, gate.version, gate.doc_count
         );
         let old_scope = self.apply_scope_narrowing()?;
+        self.filters_narrowing().await?;
         self.prepare_vault();
         self.catch_up(start).await?;
         let done = self.after_catch_up(&gate, &old_scope, None).await?;
@@ -2561,6 +2566,9 @@ impl Engine {
                     }
                     if !prepared {
                         old_scope = Some(self.apply_scope_narrowing()?);
+                        // Before the catch-up: no remote deletion in it may
+                        // reach a file the filters hide now.
+                        self.filters_narrowing().await?;
                         let this = self.clone();
                         tokio::task::spawn_blocking(move || this.prepare_vault()).await.ok();
                         prepared = true;
