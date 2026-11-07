@@ -529,3 +529,28 @@ async fn a_dot_path_dropped_from_the_allowlist_keeps_remote_deletes_off_its_file
         .await;
     }
 }
+
+#[tokio::test]
+async fn the_daemon_sees_the_fix_of_an_unreadable_nested_ignore_file_at_once() {
+    let env = Env::new().await;
+    env.write("a.md", b"a");
+    env.write("notes/.gitignore", b"+(x|y).md\n");
+    env.write("notes/n.md", b"n");
+    let engine = env.engine_with(|c| c.rescan_interval = Duration::from_secs(3600));
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("initial push", || env.remote("a.md").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(env.remote("notes/n.md").is_none(), "undecidable: not pushed");
+    // Fixed while running: picked up by the watcher, not the hourly rescan.
+    env.write("notes/.gitignore", b"*.tmp\n");
+    wait_until("notes/n.md pushed", || env.remote("notes/n.md").is_some()).await;
+    // And the folder is walked and watched again.
+    env.write("notes/later.md", b"later");
+    wait_until("notes/later.md pushed", || env.remote("notes/later.md").is_some()).await;
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+}

@@ -2529,7 +2529,9 @@ impl Engine {
         let root = self.inner.cfg.vault.clone();
         let mut added = 0;
         if !start.is_empty() && !matches!(self.dir_walkable(start), Ok(true)) {
-            return 0; // ignored, a dot-folder, or undecidable: not watched
+            // Ignored or a dot-folder: not watched. Undecidable: only the
+            // folder itself, for the fix of its ignore file.
+            return self.watch_undecided(w, start, watched);
         }
         let mut stack = vec![if start.is_empty() {
             root.clone()
@@ -2558,12 +2560,40 @@ impl Engine {
                 }
                 // Never ignored folders (`node_modules/`, `.venv/`), nor
                 // dot-folders other than allowlisted ones.
-                if rel_of(&root, &e.path()).is_some_and(|rel| matches!(self.dir_walkable(&rel), Ok(true))) {
-                    stack.push(e.path());
+                let Some(rel) = rel_of(&root, &e.path()) else { continue };
+                match self.dir_walkable(&rel) {
+                    Ok(true) => stack.push(e.path()),
+                    Ok(false) => {}
+                    Err(_) => added += self.watch_undecided(w, &rel, watched),
                 }
             }
         }
         added
+    }
+
+    /// Watch the undecidable folder `rel` itself, not what is below it, when
+    /// the folder above it is walked: an edit that fixes its unreadable
+    /// ignore file is then seen at once (and runs a full pass).
+    fn watch_undecided(&self, w: &mut dyn Watcher, rel: &str, watched: &mut HashSet<PathBuf>) -> usize {
+        if !self.undecided_top(rel) {
+            return 0;
+        }
+        let abs = self.inner.cfg.vault.join(rel);
+        if watched.contains(&abs) || w.watch_dir(&abs).is_err() {
+            return 0;
+        }
+        watched.insert(abs);
+        1
+    }
+
+    /// `rel` is undecidable and the folder above it (the root included) is
+    /// walked.
+    fn undecided_top(&self, rel: &str) -> bool {
+        self.dir_walkable(rel).is_err()
+            && match rel.rsplit_once('/') {
+                None => true,
+                Some((parent, _)) => matches!(self.dir_walkable(parent), Ok(true)),
+            }
     }
 
     /// The folders that should be watched now: after the filters changed,
@@ -2576,15 +2606,17 @@ impl Engine {
             .filter(|d| **d != root && **d != trash)
             .filter(|d| {
                 rel_of(&root, d).is_none_or(|rel| {
-                    // Walkable itself and every folder above it.
+                    // Walkable itself and every folder above it, or the
+                    // topmost undecidable folder.
                     let mut at = String::new();
-                    !rel.split('/').all(|seg| {
+                    let walked = rel.split('/').all(|seg| {
                         if !at.is_empty() {
                             at.push('/');
                         }
                         at.push_str(seg);
                         matches!(self.dir_walkable(&at), Ok(true))
-                    })
+                    });
+                    !walked && !self.undecided_top(&rel)
                 })
             })
             .cloned()
