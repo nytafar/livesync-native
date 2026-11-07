@@ -1934,7 +1934,6 @@ async fn a_few_deletions_now_and_then_go_through_after_the_hold() {
     task.await.unwrap().unwrap();
 }
 
-/// #10: deletions that came from the server are not this device's: 30 of
 /// Files the daemon pulled are watched as any other: one deleted and one
 /// edited here go out without waiting for a rescan. On macOS FSEvents
 /// reports nothing for a file that was ever a hard link, so a pulled file
@@ -1969,6 +1968,7 @@ async fn a_pulled_file_deleted_or_edited_here_is_seen_by_the_watcher() {
     task.await.unwrap().unwrap();
 }
 
+/// #10: deletions that came from the server are not this device's: 30 of
 /// 40 deleted remotely, beside 5 deleted here, do not trip the stop, and
 /// the local ones go out.
 #[tokio::test]
