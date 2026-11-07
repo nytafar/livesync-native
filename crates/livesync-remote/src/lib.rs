@@ -14,6 +14,8 @@ use url::Url;
 
 pub mod backoff;
 pub use backoff::Backoff;
+/// The HTTP client a [`Couch`] uses; one per server lets vaults share its connection pool.
+pub use reqwest::Client as HttpClient;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteError {

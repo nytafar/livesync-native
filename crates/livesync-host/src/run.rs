@@ -1,7 +1,7 @@
 //! What one supervised engine needs, fully resolved (the password included),
 //! and the checks that apply before an engine is opened for it.
 
-use crate::paths::paths_overlap;
+use crate::paths::{nested_under, paths_overlap};
 use livesync_engine::EngineConfig;
 use livesync_model::scope::{Scope, ScopeMode};
 use livesync_remote::RemoteConfig;
@@ -34,6 +34,14 @@ pub struct RunConfig {
     pub concurrency: Option<usize>,
     /// Override of the remote's `syncMaxSizeInMB`.
     pub max_size_mb: Option<u64>,
+    /// Let a pass delete files en masse (`lsync daemon --allow-mass-delete`);
+    /// the app confirms single stops instead.
+    pub allow_mass_delete: bool,
+    /// When the scope narrows, remove the clean local copies that fell out.
+    pub remove_out_of_scope_copies: bool,
+    /// After a rebuild elsewhere, how long the remote must stay unchanged
+    /// (`None`: the engine's default; tests shorten it).
+    pub rebuild_quiet: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for RunConfig {
@@ -52,6 +60,9 @@ impl std::fmt::Debug for RunConfig {
             .field("device_name", &self.device_name)
             .field("concurrency", &self.concurrency)
             .field("max_size_mb", &self.max_size_mb)
+            .field("allow_mass_delete", &self.allow_mass_delete)
+            .field("remove_out_of_scope_copies", &self.remove_out_of_scope_copies)
+            .field("rebuild_quiet", &self.rebuild_quiet)
             .finish()
     }
 }
@@ -80,8 +91,16 @@ impl RunConfig {
         Path::new(&self.state_dir).join("index.sqlite")
     }
 
-    /// Check the fields that do not need the network or the disk.
+    /// Check the fields that do not need the network or the disk. The
+    /// state folder must be outside the vault folder.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with(false)
+    }
+
+    /// [`RunConfig::validate`], where `hidden_state` also allows the state
+    /// folder in a dot-folder inside the vault, which never syncs (as the
+    /// CLI and `lsync.toml` always allowed; the Android app never does).
+    pub fn validate_with(&self, hidden_state: bool) -> Result<(), String> {
         if self.id.trim().is_empty() {
             return Err("the profile has no ID".into());
         }
@@ -99,7 +118,13 @@ impl RunConfig {
             return Err("the state folder must be an absolute path".into());
         }
         if paths_overlap(&self.vault_path, &self.state_dir) {
-            return Err("the state folder must be outside the vault folder".into());
+            let hidden = nested_under(&self.vault_path, &self.state_dir).is_some_and(|rel| rel.starts_with('.'));
+            if !hidden_state {
+                return Err("the state folder must be outside the vault folder".into());
+            }
+            if !hidden {
+                return Err("the state folder must be outside the vault folder (or in a dot-folder inside it)".into());
+            }
         }
         check_url(&self.url)?;
         if self.database.trim().is_empty() {
@@ -117,6 +142,11 @@ impl RunConfig {
         ec.max_size_mb = self.max_size_mb;
         if let Some(c) = self.concurrency {
             ec.concurrency = c.max(1);
+        }
+        ec.allow_mass_delete = self.allow_mass_delete;
+        ec.remove_out_of_scope_copies = self.remove_out_of_scope_copies;
+        if let Some(q) = self.rebuild_quiet {
+            ec.rebuild_quiet = q;
         }
         Ok(ec)
     }
@@ -225,6 +255,9 @@ mod tests {
             ignore_regex: String::new(),
             concurrency: Some(4),
             max_size_mb: None,
+            allow_mass_delete: false,
+            remove_out_of_scope_copies: false,
+            rebuild_quiet: None,
         }
     }
 
@@ -232,8 +265,17 @@ mod tests {
     fn validation() {
         assert!(cfg().validate().is_ok());
         let mut c = cfg();
-        c.state_dir = format!("{}/.state", c.vault_path);
+        c.state_dir = format!("{}/state", c.vault_path);
         assert!(c.validate().unwrap_err().contains("outside the vault"));
+        c.state_dir = c.vault_path.clone();
+        assert!(c.validate().unwrap_err().contains("outside the vault"));
+        // A dot-folder inside the vault never syncs: the CLI may keep the
+        // index there, the app never.
+        c.state_dir = format!("{}/.lsync-state", c.vault_path);
+        assert!(c.validate().unwrap_err().contains("outside the vault"));
+        assert!(c.validate_with(true).is_ok());
+        c.state_dir = format!("{}/state", c.vault_path);
+        assert!(c.validate_with(true).unwrap_err().contains("dot-folder"));
         let mut c = cfg();
         c.url = "couch.example.net".into();
         assert!(c.validate().is_err());

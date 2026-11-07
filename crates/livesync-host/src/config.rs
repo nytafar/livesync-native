@@ -218,6 +218,9 @@ impl Vault {
             ignore_regex: self.ignore_regex.clone().unwrap_or_default(),
             concurrency: self.concurrency,
             max_size_mb: self.max_size_mb,
+            allow_mass_delete: false,
+            remove_out_of_scope_copies: false,
+            rebuild_quiet: None,
         })
     }
 }

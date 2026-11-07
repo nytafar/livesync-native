@@ -81,6 +81,9 @@ impl ProfileConfig {
             ignore_regex: self.ignore_regex.clone(),
             concurrency: Some(4),
             max_size_mb: None,
+            allow_mass_delete: false,
+            remove_out_of_scope_copies: false,
+            rebuild_quiet: None,
         }
     }
 

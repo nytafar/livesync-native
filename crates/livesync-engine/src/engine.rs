@@ -17,7 +17,7 @@ use livesync_model::splitter::SplitParams;
 use livesync_model::{FileDoc, FileKind};
 use livesync_remote::{Backoff, ChangeRow, ChangesQuery, Couch, DocFetch, PutOutcome, RemoteError};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -258,7 +258,7 @@ impl EngineError {
 type Result<T> = std::result::Result<T, EngineError>;
 
 /// Outcome of the connect gate.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GateReport {
     pub remote: String,
     pub node_id: String,
@@ -280,14 +280,14 @@ pub struct GateReport {
 }
 
 /// Result of [`Engine::sync_once`].
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncReport {
     pub pull: PullReport,
     pub push: crate::push::PushReport,
 }
 
 /// Counters for one pull (or one daemon session).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PullReport {
     pub batches: u64,
     pub changes: u64,
@@ -343,7 +343,7 @@ impl PullReport {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     pub remote: Option<String>,
     pub vault: String,

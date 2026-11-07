@@ -8,18 +8,26 @@
 //! - [`edit`]: changing `lsync.toml` with its comments and layout kept.
 //! - [`secret`]: the `SecretStore` seam and its backends.
 //! - [`migrate`]: from `<profile>.toml` files to `lsync.toml`.
+//! - [`service`]: one process hosting a set of vaults (`lsync serve`), with
+//!   reload, pause and resume, commands for clients, and events.
+//! - [`control`]: the local control socket in front of a service, and its
+//!   client; [`protocol`]: what goes over it (spec D7).
 //!
-//! Nothing here is platform-specific: the front-end owns the service, the
-//! UI, the network callback and the platform's secret store.
+//! The front-end owns the process, the UI, the network callback and the
+//! platform's secret store. The control socket is Unix-only (`cfg(unix)`).
 
 pub mod cancel;
 pub mod config;
+#[cfg(unix)]
+pub mod control;
 pub mod edit;
 pub mod legacy;
 pub mod migrate;
 pub mod paths;
+pub mod protocol;
 pub mod run;
 pub mod secret;
+pub mod service;
 pub mod supervisor;
 
 pub use cancel::Cancel;

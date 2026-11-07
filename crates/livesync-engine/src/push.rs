@@ -62,7 +62,7 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const MAX_ORPHAN_PATHS: usize = 100;
 
 /// Counters for push passes.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PushReport {
     pub passes: u64,
     /// Files looked at (stat).

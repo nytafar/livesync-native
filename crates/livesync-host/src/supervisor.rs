@@ -21,7 +21,7 @@ use livesync_engine::platform::{LockError, LockFile};
 use livesync_engine::{
     Confirmation, Engine, EngineError, FolderListing, GateReport, Index, PullReport, PushReport, Status,
 };
-use livesync_remote::Couch;
+use livesync_remote::{Couch, HttpClient};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -78,6 +78,36 @@ pub const CONNECT_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 type Listener = Arc<Mutex<Option<Arc<dyn StateListener>>>>;
 type Access = Arc<Mutex<Option<Arc<dyn VaultAccess>>>>;
 
+/// One HTTP client (and so one connection pool and its TLS sessions) per
+/// server, shared by every vault on it (spec D6). Keyed by the server URL as
+/// accounts compare it; credentials go with each request, not the client.
+#[derive(Clone, Default)]
+pub(crate) struct Pool(Arc<Mutex<HashMap<String, HttpClient>>>);
+
+impl Pool {
+    fn couch(&self, cfg: &RunConfig) -> Result<Couch, HostError> {
+        let invalid = |e: livesync_remote::RemoteError| HostError::Invalid { msg: e.to_string() };
+        let key = crate::config::server_key(&cfg.url);
+        let client = {
+            let mut clients = lock(&self.0);
+            match clients.get(&key) {
+                Some(c) => c.clone(),
+                None => {
+                    let c = livesync_remote::http_client().map_err(invalid)?;
+                    clients.insert(key, c.clone());
+                    c
+                }
+            }
+        };
+        Couch::with_client(&cfg.remote(), client).map_err(invalid)
+    }
+
+    /// How many servers have a client (for tests).
+    fn servers(&self) -> usize {
+        lock(&self.0).len()
+    }
+}
+
 /// Lock, recovering from poisoning: a panic elsewhere must not wedge every
 /// later call (the data behind these locks is always left consistent).
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -128,6 +158,7 @@ struct Shared {
     /// The running engine task, so a stop that times out can cancel it too
     /// (the supervisor alone is not enough: the task would run on, detached).
     run_abort: Mutex<Option<tokio::task::AbortHandle>>,
+    pool: Pool,
 }
 
 impl Shared {
@@ -171,9 +202,12 @@ pub struct Host {
     stop_timeouts: Mutex<(Duration, Duration)>,
     listener: Listener,
     access: Access,
+    pool: Pool,
+    /// The state folder may be a dot-folder inside the vault (the CLI).
+    hidden_state: std::sync::atomic::AtomicBool,
 }
 
-fn open_engine(cfg: &RunConfig, access: &Access) -> Result<Engine, HostError> {
+fn open_engine(cfg: &RunConfig, access: &Access, pool: &Pool) -> Result<Engine, HostError> {
     let mut ec = cfg.engine_config().map_err(|msg| HostError::Invalid { msg })?;
     // Read at every check, so a check installed after the start still applies.
     let access = access.clone();
@@ -189,7 +223,7 @@ fn open_engine(cfg: &RunConfig, access: &Access) -> Result<Engine, HostError> {
             Err(_) => Err("the vault access check failed".into()),
         }
     }));
-    let couch = Couch::new(&cfg.remote()).map_err(|e| HostError::Invalid { msg: e.to_string() })?;
+    let couch = pool.couch(cfg)?;
     std::fs::create_dir_all(&cfg.state_dir).map_err(|e| HostError::Other {
         msg: format!("cannot create the state folder: {e}"),
     })?;
@@ -205,7 +239,8 @@ async fn supervise(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
         shared.set_state(RunState::Starting, None);
         let cfg = shared.cfg.clone();
         let access = shared.access.clone();
-        let opened = tokio::task::spawn_blocking(move || open_engine(&cfg, &access)).await;
+        let pool = shared.pool.clone();
+        let opened = tokio::task::spawn_blocking(move || open_engine(&cfg, &access, &pool)).await;
         let failure = match opened {
             Ok(Ok(engine)) => {
                 *lock(&shared.engine) = Some(engine.clone());
@@ -271,7 +306,8 @@ fn in_quiet_wait(e: &Engine) -> bool {
 
 /// Wait until no engine holds the state folder's lock (the engine's own
 /// `flock` on `lsync.lock`, which conflicts within one process too).
-fn wait_released(state_dir: &str, timeout: Duration) -> bool {
+/// Blocks; true once it is free (or when there is nothing to wait for).
+pub fn wait_released(state_dir: &str, timeout: Duration) -> bool {
     let path = Path::new(state_dir).join(STATE_LOCK);
     if !Path::new(state_dir).exists() {
         return true;
@@ -318,7 +354,37 @@ impl Host {
             stop_timeouts: Mutex::new((STOP_TIMEOUT, RELEASE_TIMEOUT)),
             listener: Arc::new(Mutex::new(None)),
             access: Arc::new(Mutex::new(None)),
+            pool: Pool::default(),
+            hidden_state: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Allow a vault's state folder in a dot-folder inside its vault folder,
+    /// as the CLI always did (see [`RunConfig::validate_with`]).
+    pub fn allow_hidden_state(&self) {
+        self.hidden_state.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn validate(&self, cfg: &RunConfig) -> Result<(), HostError> {
+        cfg.validate_with(self.hidden_state.load(std::sync::atomic::Ordering::SeqCst))
+            .map_err(|msg| HostError::Invalid { msg })
+    }
+
+    /// Open an engine for `cfg` outside any slot, for one command run by a
+    /// service on behalf of a client (`lsync sync` while the service runs
+    /// the vault): with the vault access check and the server's shared
+    /// connection pool, like a supervised engine. The caller must have
+    /// stopped the vault's slot first; the engine's own locks refuse a
+    /// second engine on the same folders (`Busy`). Blocks.
+    pub fn open_engine(&self, cfg: &RunConfig) -> Result<Engine, HostError> {
+        self.validate(cfg)?;
+        open_engine(cfg, &self.access, &self.pool)
+    }
+
+    /// How many servers the shared connection pools are for.
+    #[doc(hidden)]
+    pub fn pooled_servers(&self) -> usize {
+        self.pool.servers()
     }
 
     /// The runtime the supervisors run on.
@@ -342,6 +408,12 @@ impl Host {
     /// the host's own calls (a control socket).
     pub fn engine(&self, id: &str) -> Option<Engine> {
         self.slot_shared(id).and_then(|s| s.engine())
+    }
+
+    /// A vault's run state and why, without touching its index; `None`
+    /// when it has no slot.
+    pub fn state(&self, id: &str) -> Option<(RunState, Option<String>)> {
+        self.slot_shared(id).map(|s| lock(&s.state).clone())
     }
 
     /// The settings a slot was started with.
@@ -397,7 +469,7 @@ impl Host {
     }
 
     fn start_locked(&self, cfg: RunConfig) -> Result<(), HostError> {
-        cfg.validate().map_err(|msg| HostError::Invalid { msg })?;
+        self.validate(&cfg)?;
         let previous = {
             let mut slots = lock(&self.slots);
             if slots.get(&cfg.id).is_some_and(|s| s.shared.cfg == cfg) {
@@ -438,6 +510,7 @@ impl Host {
             listener: self.listener.clone(),
             access: self.access.clone(),
             run_abort: Mutex::new(None),
+            pool: self.pool.clone(),
         });
         let span = tracing::info_span!("profile", id = %cfg.id);
         let task = self.handle.spawn(supervise(shared.clone(), rx).instrument(span));
@@ -665,7 +738,9 @@ impl Host {
         test.state_dir = scratch.join("state").display().to_string();
         let result = self.handle.block_on(async {
             let access = self.access.clone();
-            let engine = match tokio::task::spawn_blocking(move || open_engine(&test, &access)).await {
+            // A throwaway pool: the test's settings are not saved yet.
+            let engine = match tokio::task::spawn_blocking(move || open_engine(&test, &access, &Pool::default())).await
+            {
                 Ok(Ok(e)) => e,
                 Ok(Err(e)) => return GateCheck::OpenFailed(e.to_string()),
                 Err(e) => return GateCheck::OpenFailed(e.to_string()),
@@ -783,7 +858,7 @@ impl Host {
                 msg: "the engine did not stop; the full fetch was not scheduled".into(),
             });
         }
-        let r = open_engine(&cfg, &self.access).and_then(|e| Ok(e.request_full_fetch()?));
+        let r = open_engine(&cfg, &self.access, &self.pool).and_then(|e| Ok(e.request_full_fetch()?));
         if let Err(e) = &r {
             warn!("profile {id}: full fetch not scheduled: {e}");
         } else {
