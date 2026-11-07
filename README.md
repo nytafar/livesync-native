@@ -250,7 +250,7 @@ lsync reload                  # reread lsync.toml; only the vaults that changed 
 | Method | Params | Result |
 |---|---|---|
 | `hello` | | `protocol`, `version`, `pid`, `methods`, `config` (the file the service reads) |
-| `status` | `vault`? | `vaults`: per vault `name`, `state`, `message`, `paused`, `enabled`, `account`, `command`, `settings` (URL without credentials, user, database, folders, scope, mode; never the password), `status` (as `lsync status --json`), `session` and `push` (this engine's counters), `deletes_waiting`, `mass_delete_allowed`, `fingerprint` (names `settings`; changes when they do) |
+| `status` | `vault`? | `vaults`: per vault `name`, `state`, `message`, `paused`, `enabled`, `account`, `command`, `settings` (URL without credentials, user, database, folders, scope, mode, what syncs: ignore files, regexes, dot-paths, trash; never the password), `status` (as `lsync status --json`), `session` and `push` (this engine's counters), `deletes_waiting`, `mass_delete_allowed`, `fingerprint` (names `settings`; changes when they do) |
 | `events` | `vault`? | `subscribed`, then events |
 | `sync-now`, `pause`, `resume` | `vault`? (else every vault) | `vaults`: the names acted on |
 | `reload` | `wait`? (`false`: return at once with `scheduled`) | `started`, `stopped`, `restarted`, `unchanged`, `failed` (`vault`, `message`) |
@@ -313,7 +313,7 @@ Examples, for a root `.gitignore` of `*.log`, `build/`, `!keep.log` and a `notes
 
 Beyond the plugin:
 
-- **Edits apply while running.** Changing an ignore file takes effect at once in `lsync daemon` (the plugin rechecks only when its settings change).
+- **Edits apply while running.** Changing an ignore file takes effect at once in `lsync daemon` and `lsync serve` (the plugin rechecks only when its settings change).
 - **A path that becomes ignored** is no longer tracked: its file stays, its remote document stays, and deleting it here deletes nothing remotely. **A path that stops being ignored** is fetched, as when a folder scope widens.
 - **Fails closed.** An ignore file that cannot be read, or that uses a pattern lsync does not evaluate (extglobs like `+(a|b)`, POSIX classes like `[[:alpha:]]`), stops everything in its folder and below: nothing there is pushed, written, untracked or treated as deleted until it is fixed. `lsync status` lists the folder. (The plugin skips such a file.)
 - **The vault-root ignore file counts.** commonlib asks for it as `/.gitignore`; the plugin reads it, and so does lsync. The official CLI (1.0.40) does not: its storage layer refuses a path with a leading slash, so it pushes what only the root file ignores.

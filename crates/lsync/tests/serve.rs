@@ -329,6 +329,51 @@ fn commands_for_a_served_vault_run_in_the_service_with_the_same_output() {
 }
 
 #[test]
+fn a_served_vault_syncs_what_its_settings_say() {
+    let rt = runtime();
+    let mock = rt.block_on(Mock::start());
+    mock.put_text("Notes/a.md", &["note a"]);
+    mock.put_text("Notes/skip/b.md", &["ignored here"]);
+    let m = Machine::with_vault(&mock);
+    let cfg = m.root.join("config/lsync/lsync.toml");
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str("mode = \"pull-only\"\nignore_files = [\".gitignore\"]\n");
+    std::fs::write(&cfg, text).unwrap();
+    std::fs::create_dir_all(m.folder("notes/Notes")).unwrap();
+    std::fs::write(m.folder("notes/Notes/.gitignore"), "skip/\n").unwrap();
+
+    let svc = m.spawn(&["serve"], "serve.log");
+    wait_until("the vault running in the service", || {
+        m.served_state("notes").as_deref() == Some("running") && m.folder("notes/Notes/a.md").exists()
+    });
+    // The ignore file holds in the service's engine.
+    assert!(!m.folder("notes/Notes/skip").exists());
+    let settings = m.json(&["status", "--all", "--json"])["vaults"][0]["settings"].clone();
+    assert_eq!(settings["use_ignore_files"], true);
+    assert_eq!(settings["ignore_files"], serde_json::json!([".gitignore"]));
+    assert_eq!(settings["trash"], "vault");
+    // A remote delete goes to the vault's trash.
+    mock.tombstone("Notes/a.md");
+    wait_until("the delete in the trash", || {
+        !m.folder("notes/Notes/a.md").exists() && m.folder("notes/.trash/Notes/a.md").exists()
+    });
+    // What-syncs settings given only to a command are refused, as the others.
+    let e = m.fails(&["--vault", "notes", "--sync-only-regex", "^Notes/", "pull"]);
+    assert!(e.contains("other settings") && e.contains("sync-only regex"), "{e}");
+    let e = m.fails(&["--vault", "notes", "--trash", "none", "pull"]);
+    assert!(e.contains("trash none (the service: vault)"), "{e}");
+    assert!(m.json(&["--vault", "notes", "pull", "--json"])["changes"].is_u64());
+
+    // An edit restarts the vault with it.
+    m.ok(&["vault", "edit", "notes", "--trash", "none"]);
+    wait_until("the new trash setting in the service", || {
+        let v = m.json(&["status", "--all", "--json"]);
+        v["vaults"][0]["settings"]["trash"] == "none" && v["vaults"][0]["state"] == "running"
+    });
+    assert_eq!(svc.stop(), Some(0));
+}
+
+#[test]
 fn a_daemon_from_flags_serves_its_vault_and_the_bench_command_line_works() {
     let rt = runtime();
     let mock = rt.block_on(Mock::start());

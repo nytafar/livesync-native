@@ -283,6 +283,11 @@ pub fn settings_of(cfg: &RunConfig) -> Settings {
         device_name: cfg.device_name.clone(),
         max_size_mb: cfg.max_size_mb,
         concurrency: cfg.concurrency,
+        use_ignore_files: cfg.what_syncs.use_ignore_files,
+        ignore_files: cfg.what_syncs.ignore_files.clone(),
+        sync_only_regex: cfg.what_syncs.sync_only_regex.clone(),
+        sync_dot_paths: cfg.what_syncs.sync_dot_paths.clone(),
+        trash: cfg.what_syncs.trash.as_str().to_string(),
     }
 }
 

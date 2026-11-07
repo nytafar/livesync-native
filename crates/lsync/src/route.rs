@@ -155,6 +155,36 @@ pub fn differences(r: &Resolved, s: &Settings) -> Vec<String> {
         show(&ignore),
         show(&s.ignore_regex),
     );
+    let w = &r.what_syncs;
+    // The names only count when ignore files are in use.
+    let files = |on: bool, names: &[String]| if on { names.join(", ") } else { String::new() };
+    let (mine, theirs) = (
+        files(w.use_ignore_files, &w.ignore_files),
+        files(s.use_ignore_files, &s.ignore_files),
+    );
+    check("ignore files", mine == theirs, show(&mine), show(&theirs));
+    check(
+        "sync-only regex",
+        w.sync_only_regex == s.sync_only_regex,
+        show(&w.sync_only_regex),
+        show(&s.sync_only_regex),
+    );
+    check(
+        "dot-paths",
+        w.sync_dot_paths == s.sync_dot_paths,
+        show(&w.sync_dot_paths.join(", ")),
+        show(&s.sync_dot_paths.join(", ")),
+    );
+    check(
+        "trash",
+        w.trash.as_str() == s.trash,
+        w.trash.as_str().to_string(),
+        if s.trash.is_empty() {
+            "none known; it is older than the trash".to_string()
+        } else {
+            s.trash.clone()
+        },
+    );
     let device = r.device_name.clone().unwrap_or_default();
     check(
         "device name",

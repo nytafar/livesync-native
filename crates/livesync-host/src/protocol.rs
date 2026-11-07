@@ -357,6 +357,14 @@ pub struct Settings {
     pub device_name: String,
     pub max_size_mb: Option<u64>,
     pub concurrency: Option<usize>,
+    /// What syncs besides the scope (`RunConfig::what_syncs`). From an
+    /// older service these are missing, and `trash` is empty.
+    pub use_ignore_files: bool,
+    pub ignore_files: Vec<String>,
+    pub sync_only_regex: String,
+    pub sync_dot_paths: Vec<String>,
+    /// `vault`, `system` or `none`.
+    pub trash: String,
 }
 
 /// One vault in `status`.
