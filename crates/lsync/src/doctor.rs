@@ -309,6 +309,13 @@ pub fn checks(ctx: &Setup) -> Vec<Check> {
                 "no service answers on the control socket".into()
             };
             out.push(check(level, "service", format!("{what}; {sock}")));
+            // The config's group must be the service user's alone: it reads
+            // secrets.toml.
+            match install::config_group_check(&ic) {
+                Some(Ok(m)) => out.push(check(Level::Ok, "service", m)),
+                Some(Err(m)) => out.push(check(Level::Error, "service", m)),
+                None => {}
+            }
             if st["linger"] == false && installed {
                 out.push(check(
                     Level::Info,

@@ -35,8 +35,8 @@ pub enum ServiceCmd {
         print: bool,
         /// With --system (required there): the user the service runs as, a
         /// user of its own or the one whose vaults these are. The config
-        /// folder stays root's; the service reads it through the user's own
-        /// group (the unit's Group=)
+        /// folder stays root's; the service reads it through the user's
+        /// primary group (the unit's Group=), which must be the user's alone
         #[arg(long, value_name = "USER")]
         run_as: Option<String>,
         /// With --system: a group whose members may use the control socket
@@ -151,6 +151,9 @@ pub struct Ctx<'a> {
     pub env: Vec<(String, String)>,
     /// Whether `status` asks the control socket (not in the unit tests).
     pub ask_socket: bool,
+    /// The users other than the service's who are in the group the config
+    /// is given to ([`others_in_group`]; fake data in the unit tests).
+    pub group_sharers: fn(user: &str, gid: u32) -> Vec<String>,
 }
 
 impl Ctx<'_> {
@@ -250,6 +253,7 @@ pub fn real_ctx<'a>(setup: &'a Setup, runner: &'a dyn Runner) -> Result<Ctx<'a>>
         exe,
         env,
         ask_socket: true,
+        group_sharers: others_in_group,
     })
 }
 
@@ -414,6 +418,128 @@ fn group(name: Option<&str>, gid: u32) -> Option<(String, u32)> {
             .into_owned();
         return Some((n, gr.gr_gid));
     }
+}
+
+/// The members a group lists (`gr_mem`).
+fn group_members(gid: u32) -> Vec<String> {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        // SAFETY: as in `passwd`.
+        let mut gr: libc::group = unsafe { std::mem::zeroed() };
+        let mut out: *mut libc::group = std::ptr::null_mut();
+        let rc = unsafe { libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr().cast(), buf.len(), &mut out) };
+        if rc == libc::ERANGE && buf.len() < 1 << 22 {
+            buf.resize(buf.len() * 4, 0);
+            continue;
+        }
+        if rc != 0 || out.is_null() || gr.gr_mem.is_null() {
+            return vec![];
+        }
+        let mut names = vec![];
+        // SAFETY: gr_mem is a NULL-terminated array of NUL-terminated
+        // strings in `buf`.
+        unsafe {
+            let mut p = gr.gr_mem;
+            while !(*p).is_null() {
+                names.push(std::ffi::CStr::from_ptr(*p).to_string_lossy().into_owned());
+                p = p.add(1);
+            }
+        }
+        return names;
+    }
+}
+
+/// Every user's name, uid and primary group (`getpwent`, which keeps its
+/// place in process-wide state: one caller at a time).
+fn all_users() -> Vec<(String, u32, u32)> {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = vec![];
+    // SAFETY: setpwent/getpwent/endpwent under the lock above; each entry
+    // is copied before the next call overwrites it.
+    unsafe {
+        libc::setpwent();
+        loop {
+            let pw = libc::getpwent();
+            if pw.is_null() {
+                break;
+            }
+            if (*pw).pw_name.is_null() {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned();
+            out.push((name, (*pw).pw_uid, (*pw).pw_gid));
+        }
+        libc::endpwent();
+    }
+    out
+}
+
+/// The users besides `user` (and root, who reads everything anyway) whose
+/// primary group is `gid`, or whom the group lists as members.
+pub fn group_sharers(user: &str, gid: u32, users: &[(String, u32, u32)], members: &[String]) -> Vec<String> {
+    let root = |n: &str| users.iter().any(|(u, uid, _)| u == n && *uid == 0) || n == "root";
+    let mut out: Vec<String> = users
+        .iter()
+        .filter(|(n, uid, g)| *g == gid && n != user && *uid != 0)
+        .map(|(n, _, _)| n.clone())
+        .chain(members.iter().filter(|n| *n != user && !root(n)).cloned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// [`group_sharers`] from the system's user and group databases.
+pub fn others_in_group(user: &str, gid: u32) -> Vec<String> {
+    group_sharers(user, gid, &all_users(), &group_members(gid))
+}
+
+/// Why the config, given to group `group` (`gid`), would not be the
+/// service user's alone: other users in that group would read
+/// `secrets.toml`. `None` when only the user (and root) are in it.
+fn shared_group_problem(ctx: &Ctx, user: &str, group: &str, gid: u32) -> Option<String> {
+    let others = (ctx.group_sharers)(user, gid);
+    if others.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = others.iter().take(5).map(String::as_str).collect();
+    let more = if others.len() > 5 {
+        format!(" and {} more", others.len() - 5)
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "the system config would be given to group {group}, {user}'s primary group, but {group} is not {user}'s alone ({}{more} are in it too), and they could read the passwords in secrets.toml. Run the service as a user with a group of its own: `sudo useradd --system --user-group --create-home --home-dir /var/lib/lsync-home lsync`, then `--run-as lsync`",
+        shown.join(", ")
+    ))
+}
+
+/// `doctor --system`: whether the installed unit's `Group=`, which the
+/// config is given to, is its `User=`'s alone. `None` without a system unit.
+pub fn config_group_check(ctx: &Ctx) -> Option<std::result::Result<String, String>> {
+    if ctx.manager != Manager::SystemdSystem {
+        return None;
+    }
+    let text = std::fs::read_to_string(ctx.unit_file()).ok()?;
+    let setting = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()))
+    };
+    let user = setting("User=")?;
+    let (group_name, gid) = match setting("Group=") {
+        Some(g) => group(Some(&g), 0).or_else(|| g.parse().ok().map(|n| (g.clone(), n)))?,
+        None => {
+            let u = user_named(&user)?;
+            group(None, u.gid).unwrap_or_else(|| (u.gid.to_string(), u.gid))
+        }
+    };
+    Some(match shared_group_problem(ctx, &user, &group_name, gid) {
+        Some(p) => Err(p),
+        None => Ok(format!(
+            "the config's group {group_name} is {user}'s alone (the socket group cannot read it)"
+        )),
+    })
 }
 
 /// Write a service file: atomically, mode 0644, and only over one of ours
@@ -1191,11 +1317,15 @@ fn install_system(
     };
     let socket_name = socket.as_ref().map(|s| s.0.clone());
     let share = socket.as_ref().map(|s| s.1);
+    let shared = shared_group_problem(ctx, &user.name, &group_name, gid);
+    if let (Some(p), false) = (&shared, o.print) {
+        bail!("{p}");
+    }
     let trash = system_trash_vaults(cfg);
     if !trash.is_empty() {
         bail!("{}", system_trash_message(&trash));
     }
-    let mut warnings: Vec<String> = elsewhere.into_iter().collect();
+    let mut warnings: Vec<String> = elsewhere.into_iter().chain(shared).collect();
     if let Some(why) = exe_not_roots(&ctx.exe) {
         let what = format!(
             "the service would run {}, but {why}; install the binary where only root can change it (`sudo install -m755 {} /usr/local/bin/lsync`) and run that one",
@@ -1782,6 +1912,7 @@ mod tests {
             },
             env: vec![("XDG_STATE_HOME".into(), "/data/state".into())],
             ask_socket: false,
+            group_sharers: |_, _| vec![],
         }
     }
 
@@ -2344,6 +2475,78 @@ mod tests {
             gid: primary
         }));
         drop(bound);
+    }
+
+    /// Who else is in a group, from fake user and group data.
+    #[test]
+    fn a_group_is_the_users_alone_only_without_others_in_it() {
+        let users = [
+            ("root".to_string(), 0, 0),
+            ("lasse".to_string(), 1000, 100),
+            ("anna".to_string(), 1001, 100),
+            ("lsync".to_string(), 990, 990),
+            ("nobody".to_string(), 65534, 65534),
+            ("daemon2".to_string(), 2, 65534),
+        ];
+        // `users` (gid 100) without per-user groups: anna's primary group
+        // too, and bob is listed in it.
+        let members = ["bob".to_string(), "lasse".to_string(), "root".to_string()];
+        assert_eq!(group_sharers("lasse", 100, &users, &members), ["anna", "bob"]);
+        // A user of its own with a group of its own; root listed is fine.
+        assert!(group_sharers("lsync", 990, &users, &[]).is_empty());
+        assert!(group_sharers("lsync", 990, &users, &["root".into(), "lsync".into()]).is_empty());
+        // `nobody`/`nogroup`: shared with every other daemon on it.
+        assert_eq!(group_sharers("nobody", 65534, &users, &[]), ["daemon2"]);
+        // Only named members: refused too.
+        assert_eq!(group_sharers("lsync", 990, &users, &["agent".into()]), ["agent"]);
+        // The real databases: this user is in them, and the call works.
+        let me = user_named(&me()).unwrap();
+        assert!(all_users().iter().any(|(n, uid, _)| *n == me.name && *uid == me.uid));
+        let _ = others_in_group(&me.name, me.gid);
+    }
+
+    /// The config goes to the run-as user's primary group: `install
+    /// --system` refuses one that others are in (they would read
+    /// secrets.toml), and `doctor --system` says so for an installed unit.
+    #[test]
+    fn a_system_install_refuses_a_primary_group_others_share() {
+        let h = home(true);
+        let f = Fake::default();
+        let mut c = ctx(&h, &f, Manager::SystemdSystem);
+        let etc = h.setup.dirs.config.clone();
+        let mode_was = mode(&etc);
+        c.group_sharers = |_, _| (0..7).map(|i| format!("user{i}")).collect();
+        let e = install(&c, &as_me()).unwrap_err().to_string();
+        assert!(
+            e.contains("is not") && e.contains("alone") && e.contains("user0, user1, user2, user3, user4 and 2 more"),
+            "{e}"
+        );
+        assert!(
+            e.contains("useradd --system --user-group") && e.contains("--run-as lsync"),
+            "{e}"
+        );
+        assert!(!h.root.join("units").exists() && f.calls.borrow().is_empty());
+        assert_eq!(mode(&etc), mode_was, "the config was not touched");
+        // --print shows it as a warning, and changes nothing.
+        let printed = install(&c, &InstallOpts { print: true, ..as_me() }).unwrap().join("\n");
+        assert!(
+            printed.contains("# warning: the system config would be given to group"),
+            "{printed}"
+        );
+        assert!(!h.root.join("units").exists());
+
+        // Alone in it: installed; doctor's check passes, then fails once
+        // someone else joins the group.
+        c.group_sharers = |_, _| vec![];
+        install(&c, &as_me()).unwrap();
+        let ok = config_group_check(&c).unwrap().unwrap();
+        assert!(ok.contains(&format!("is {}'s alone", me())), "{ok}");
+        c.group_sharers = |_, _| vec!["anna".into()];
+        let err = config_group_check(&c).unwrap().unwrap_err();
+        assert!(err.contains("anna") && err.contains("secrets.toml"), "{err}");
+        // No system unit: nothing to say.
+        uninstall(&c, false).unwrap();
+        assert!(config_group_check(&c).is_none());
     }
 
     #[test]
