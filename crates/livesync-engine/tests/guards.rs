@@ -352,3 +352,95 @@ async fn the_daemon_stops_when_the_plugin_is_turned_on_while_it_runs() {
         "{r:?}"
     );
 }
+
+/// The stops and the last error, as watchers read them.
+fn alerts(engine: &Engine) -> livesync_engine::Alerts {
+    engine.alerts().unwrap()
+}
+
+#[tokio::test]
+async fn a_repeated_refusal_leaves_the_recorded_stop_as_it_was() {
+    let env = Env::new().await;
+    env.mock.put_text("x.md", &["x"]);
+    let engine = env.engine_with(|_| {});
+    engine.sync_once().await.unwrap();
+
+    // Locked without a rebuild. The holder keeps connecting (its
+    // `last_connected` moves), and time passes: one state, recorded once.
+    let lock = |node: &str, device: &str, at: i64| {
+        let (node, device) = (node.to_string(), device.to_string());
+        env.mock.update_milestone(move |m| {
+            m["locked"] = json!(true);
+            m["accepted_nodes"] = json!([node.clone()]);
+            m["node_info"][node.as_str()] = json!({"device_name": device, "last_connected": at});
+        })
+    };
+    lock("someone", "laptop", 1_762_506_720_000);
+    assert!(engine.connect_gate(false).await.is_err());
+    let first = alerts(&engine);
+    let held = first.remote_locked.clone().unwrap();
+    assert!(
+        held.contains("\"laptop\" (node someone), last connected 2025-11-07 09:12 UTC"),
+        "{held}"
+    );
+    assert_eq!(first.last_error, first.remote_locked, "the error mirrors the stop");
+    for at in [1_762_506_780_000, 1_762_510_000_000] {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        lock("someone", "laptop", at);
+        assert!(engine.connect_gate(false).await.is_err());
+        assert_eq!(alerts(&engine), first, "a moved timestamp is no new state");
+    }
+    // Another device holds the lock: a real change.
+    lock("other", "phone", 1_762_510_000_000);
+    assert!(engine.connect_gate(false).await.is_err());
+    let changed = alerts(&engine).remote_locked.unwrap();
+    assert!(changed.contains("phone") && !changed.contains("laptop"), "{changed}");
+
+    // The upstream stop: the same, and its time is when it began.
+    env.mock.update_milestone(|m| {
+        m["locked"] = json!(false);
+        m["tweak_values"]["PREFERRED"]["customChunkSize"] = json!(100);
+    });
+    assert!(engine.connect_gate(false).await.is_err());
+    let first = alerts(&engine);
+    assert!(first.remote_locked.is_none(), "{first:?}");
+    assert!(first.upstream_stop.is_some());
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(engine.connect_gate(false).await.is_err());
+        assert_eq!(alerts(&engine), first);
+    }
+}
+
+#[tokio::test]
+async fn encrypted_content_stops_until_a_pull_gets_past_it_without_flapping() {
+    let env = Env::new().await;
+    env.mock.put_text("first.md", &["one"]);
+    let engine = env.engine_with(|c| c.regate_interval = Duration::from_millis(200));
+    let d = Daemon::two_way(&engine);
+    until("the first pull", 10, || env.read("first.md").is_some()).await;
+    env.mock
+        .put(json!({"_id": "h:abc", "type": "leaf", "data": "%=AAAA", "e_": true}));
+    env.mock.put(json!({"_id": "enc.md", "path": "enc.md", "type": "plain", "children": ["h:abc"], "mtime": 1, "ctime": 1, "size": 3, "eden": {}}));
+    until("the upstream stop", 10, || upstream_stop(&engine).is_some()).await;
+    let first = alerts(&engine);
+    assert!(
+        first.upstream_stop.as_deref().unwrap().contains("encrypted"),
+        "{first:?}"
+    );
+    // The gate passes at every regate (it has nothing against the remote),
+    // and the pull stops at the same place: the stop holds, unchanged.
+    let gates = env.gates();
+    let end = Instant::now() + Duration::from_millis(1200);
+    while Instant::now() < end {
+        assert_eq!(alerts(&engine), first, "the stop came and went");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(env.gates() >= gates + 2, "regated meanwhile");
+    // The document is written again in the clear: the pull gets past it.
+    env.mock.put_text("enc.md", &["clear"]);
+    until("the stop lifted", 10, || upstream_stop(&engine).is_none()).await;
+    until("the file", 10, || env.read("enc.md").as_deref() == Some(b"clear")).await;
+    assert!(alerts(&engine).last_error.is_none());
+    d.stop().await.unwrap();
+}

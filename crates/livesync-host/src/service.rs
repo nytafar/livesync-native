@@ -903,7 +903,9 @@ impl Service {
         let t0 = Instant::now();
         let report = match cmd {
             Command::Sync => engine.sync_once().await.map(|r| serde_json::to_value(&r)),
-            Command::Fetch => match engine.request_full_fetch() {
+            // Two-way (a pull-only vault refuses `fetch` before this): the
+            // plugin guard first, before the index is reset for the sync.
+            Command::Fetch => match engine.check_plugin_guard().and_then(|()| engine.request_full_fetch()) {
                 Ok(()) => engine.sync_once().await.map(|r| serde_json::to_value(&r)),
                 Err(e) => Err(e),
             },
@@ -1045,6 +1047,7 @@ struct Seen {
     /// `None` until the first read (which only sets the baseline).
     stop: Option<Option<String>>,
     error: Option<Option<String>>,
+    /// The guards' stops: their messages, without the time.
     upstream: Option<Option<String>>,
     locked: Option<Option<String>>,
 }
@@ -1116,27 +1119,23 @@ impl Seen {
                 svc.emit(event::SAFETY_STOP, Some(name), json!({"stop": stop}));
             }
         }
-        // The guards' stops, as recorded ("<ms> <message>"): the message.
+        // The guards' stops are states, recorded as "<ms> <message>" when
+        // one starts or its reason changes (the engine leaves them alone
+        // while the reason holds). Reported when one is set, lifted or its
+        // message changes, compared by the message alone.
         let text = |s: &Option<String>| {
             s.as_deref()
                 .map(|s| s.split_once(' ').map_or(s, |(_, m)| m).to_string())
         };
-        if self.upstream.as_ref().is_some_and(|b| *b != a.upstream_stop) {
-            svc.emit(
-                event::UPSTREAM_STOP,
-                Some(name),
-                json!({"stop": text(&a.upstream_stop)}),
-            );
+        let (upstream, locked) = (text(&a.upstream_stop), text(&a.remote_locked));
+        if self.upstream.as_ref().is_some_and(|b| *b != upstream) {
+            svc.emit(event::UPSTREAM_STOP, Some(name), json!({"stop": upstream}));
         }
-        if self.locked.as_ref().is_some_and(|b| *b != a.remote_locked) {
-            svc.emit(
-                event::REMOTE_LOCKED,
-                Some(name),
-                json!({"lock": text(&a.remote_locked)}),
-            );
+        if self.locked.as_ref().is_some_and(|b| *b != locked) {
+            svc.emit(event::REMOTE_LOCKED, Some(name), json!({"lock": locked}));
         }
-        self.upstream = Some(a.upstream_stop);
-        self.locked = Some(a.remote_locked);
+        self.upstream = Some(upstream);
+        self.locked = Some(locked);
         if let Some(before) = &self.error {
             if *before != error {
                 if let Some(e) = &error {

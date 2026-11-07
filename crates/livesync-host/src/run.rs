@@ -89,12 +89,27 @@ pub struct Tuning {
     /// The longpoll's heartbeat in seconds (default 10; Android 30).
     pub heartbeat_secs: Option<u64>,
     /// Seconds without a heartbeat before the connection is taken for dead
-    /// (default 25, or 2.5 heartbeats when only the heartbeat is set; Android 90).
+    /// (default 25, or 2.5 heartbeats, at most 89, when only the heartbeat is
+    /// set; Android 75). Below `livesync_remote::READ_TIMEOUT`.
     pub longpoll_timeout_secs: Option<u64>,
     /// A wall-clock jump of this many seconds past the monotonic clock
     /// counts as sleep: reconnect and rescan (default 10; 0 turns it off;
     /// Android: off).
     pub clock_jump_secs: Option<u64>,
+    /// Whether this front-end has a handover switch to name when the plugin
+    /// guard refuses (`lsync` has; the Android app has not).
+    pub handover: Handover,
+}
+
+/// How a front-end lets a vault run beside an enabled plugin, for the plugin
+/// guard's message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Handover {
+    /// `--allow-plugin`, or `allow_plugin = true` for the vault (`lsync`).
+    #[default]
+    Flag,
+    /// No switch: the plugin has to be off (the Android app).
+    Unavailable,
 }
 
 impl Tuning {
@@ -109,9 +124,22 @@ impl Tuning {
         if heartbeat < Duration::from_secs(1) {
             return Err("heartbeat_secs must be at least 1".into());
         }
+        // The HTTP client gives up on any response silent this long, as a
+        // plain transport error: the longpoll's own silence limit has to
+        // fire before it to be recognised (and reconnect on fresh connections).
+        let read = livesync_remote::READ_TIMEOUT;
+        let limit = read - Duration::from_secs(1);
+        if heartbeat >= limit {
+            return Err(format!(
+                "heartbeat_secs ({}) must be below {} (the HTTP read timeout is {} s, and the silence limit has to fit between them)",
+                heartbeat.as_secs(),
+                limit.as_secs(),
+                read.as_secs()
+            ));
+        }
         let timeout = match (self.longpoll_timeout_secs, self.heartbeat_secs) {
             (Some(t), _) => Duration::from_secs(t),
-            (None, Some(_)) => d::LONGPOLL_TIMEOUT.max(heartbeat * 5 / 2),
+            (None, Some(_)) => d::LONGPOLL_TIMEOUT.max(heartbeat * 5 / 2).min(limit),
             (None, None) => d::LONGPOLL_TIMEOUT,
         };
         if timeout <= heartbeat {
@@ -119,6 +147,13 @@ impl Tuning {
                 "longpoll_timeout_secs ({}) must be longer than heartbeat_secs ({}), or every longpoll is taken for dead",
                 timeout.as_secs(),
                 heartbeat.as_secs()
+            ));
+        }
+        if timeout >= read {
+            return Err(format!(
+                "longpoll_timeout_secs ({}) must be below {} s, the HTTP read timeout, or a dead connection is only noticed by that, without fresh connections",
+                timeout.as_secs(),
+                read.as_secs()
             ));
         }
         let jump = match self.clock_jump_secs {
@@ -136,6 +171,10 @@ impl Tuning {
     pub fn apply(&self, ec: &mut EngineConfig) -> Result<(), String> {
         let (regate, heartbeat, timeout, jump) = self.timings()?;
         ec.allow_plugin = self.allow_plugin;
+        ec.plugin_handover = match self.handover {
+            Handover::Flag => Some(livesync_engine::engine::PLUGIN_HANDOVER_CLI.into()),
+            Handover::Unavailable => None,
+        };
         ec.regate_interval = regate;
         ec.heartbeat = heartbeat;
         ec.longpoll_timeout = timeout;

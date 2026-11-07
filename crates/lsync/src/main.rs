@@ -758,7 +758,9 @@ fn two_way_allowed(sel: &Selected, what: &str) -> Result<()> {
 
 async fn run_sync(engine: &Engine, json: bool, fetch: bool) -> Result<u8> {
     if fetch {
-        match engine.request_full_fetch() {
+        // A fetch here is the start of a two-way sync: refused like one,
+        // before the index is reset for it.
+        match engine.check_plugin_guard().and_then(|()| engine.request_full_fetch()) {
             Ok(()) => {}
             Err(EngineError::Refused(r)) => {
                 eprintln!("fetch refused: {r}");

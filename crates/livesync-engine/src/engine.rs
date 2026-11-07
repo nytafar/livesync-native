@@ -99,6 +99,46 @@ pub(crate) mod meta_keys {
     /// (`<ms> <message>`). Set by that refusal, cleared by the next gate that
     /// passes.
     pub const REMOTE_LOCKED: &str = "remote_locked";
+    /// What stays the same while the stops above hold
+    /// ([`livesync_model::Refusal::reason`]): a refusal with the same reason
+    /// leaves the stop as it was recorded.
+    pub const UPSTREAM_STOP_REASON: &str = "upstream_stop_reason";
+    pub const REMOTE_LOCKED_REASON: &str = "remote_locked_reason";
+}
+
+/// The upstream stop's reason starts with this when content found encrypted
+/// in a pull made it (not the gate).
+const CONTENT_STOP: &str = "content: ";
+
+/// A guard's stop, as [`Engine::record_error`] records it.
+struct GuardStop {
+    key: &'static str,
+    reason_key: &'static str,
+    reason: String,
+    message: String,
+}
+
+/// Log what the daemon waits out. A refusal is logged at warn when its
+/// reason is new, and at debug while it repeats (a guard's stop is a state,
+/// logged once by [`Engine::record_error`]); other errors always at warn.
+fn log_wait(last: &mut Option<String>, e: &EngineError, line: &str) {
+    match e {
+        EngineError::Refused(r) => {
+            let reason = r.reason();
+            if last.as_deref() == Some(reason.as_str()) {
+                debug!("{line}");
+            } else {
+                warn!("{line}");
+                *last = Some(reason);
+            }
+        }
+        _ => warn!("{line}"),
+    }
+}
+
+/// The message of a value recorded as `<ms> <message>`.
+fn meta_text(v: &str) -> &str {
+    v.split_once(' ').map_or(v, |(_, m)| m)
 }
 
 /// Aborts a spawned task when dropped.
@@ -164,11 +204,18 @@ pub struct EngineConfig {
     /// Run two-way on an Obsidian vault whose Self-hosted LiveSync plugin is
     /// enabled (a deliberate handover). Off: two-way sync refuses it.
     pub allow_plugin: bool,
+    /// How a deliberate handover is allowed where this engine runs, for the
+    /// plugin guard's refusal; `None` where there is no such switch (the
+    /// Android app). Default: [`PLUGIN_HANDOVER_CLI`].
+    pub plugin_handover: Option<String>,
     /// The longpoll's heartbeat: CouchDB sends a newline this often while
     /// nothing changes.
     pub heartbeat: Duration,
     /// How long the longpoll may stay silent before its connection is taken
-    /// for dead and the daemon reconnects (a few heartbeats).
+    /// for dead and the daemon reconnects (a few heartbeats). Keep it, and
+    /// the heartbeat, below [`livesync_remote::READ_TIMEOUT`], or the
+    /// client's read timeout ends the longpoll first, as a plain transport
+    /// error (`livesync_host::Tuning` checks it).
     pub longpoll_timeout: Duration,
     /// A jump of at least this much between the wall clock and the monotonic
     /// clock means the machine slept: the daemon reconnects (with fresh
@@ -265,31 +312,55 @@ impl std::fmt::Debug for WallClock {
     }
 }
 
+/// How `lsync` (the CLI, `lsync serve`) allows a deliberate handover beside
+/// an enabled plugin ([`EngineConfig::plugin_handover`]).
+pub const PLUGIN_HANDOVER_CLI: &str = "run with --allow-plugin (or set allow_plugin = true for the vault)";
+
 /// The connection defaults (spec D8). Desktops and servers: a 10 s
 /// heartbeat and 25 s of silence before reconnecting, so a link that died in
 /// sleep or a Wi-Fi switch is noticed within 25 s, and a 10 s clock jump
-/// counts as sleep. Android keeps its 30 s heartbeat and 90 s timeout (each
-/// heartbeat wakes the radio) and does not watch the clock: the app gets
-/// network callbacks from the system instead (`NetworkMonitor`).
+/// counts as sleep. Android keeps its 30 s heartbeat (each heartbeat wakes
+/// the radio) with 75 s of silence (two and a half heartbeats), and does not
+/// watch the clock: the app gets network callbacks from the system instead
+/// (`NetworkMonitor`).
+///
+/// Both silence limits stay below the HTTP client's read timeout
+/// ([`livesync_remote::READ_TIMEOUT`]), so the longpoll's own check fires
+/// first and reconnects on fresh connections.
 pub mod connection_defaults {
     use std::time::Duration;
 
+    pub const DESKTOP_HEARTBEAT: Duration = Duration::from_secs(10);
+    pub const DESKTOP_LONGPOLL_TIMEOUT: Duration = Duration::from_secs(25);
+    pub const ANDROID_HEARTBEAT: Duration = Duration::from_secs(30);
+    pub const ANDROID_LONGPOLL_TIMEOUT: Duration = Duration::from_secs(75);
+
     #[cfg(not(target_os = "android"))]
-    pub const HEARTBEAT: Duration = Duration::from_secs(10);
+    pub const HEARTBEAT: Duration = DESKTOP_HEARTBEAT;
     #[cfg(not(target_os = "android"))]
-    pub const LONGPOLL_TIMEOUT: Duration = Duration::from_secs(25);
+    pub const LONGPOLL_TIMEOUT: Duration = DESKTOP_LONGPOLL_TIMEOUT;
     #[cfg(not(target_os = "android"))]
     pub const CLOCK_JUMP: Option<Duration> = Some(Duration::from_secs(10));
 
     #[cfg(target_os = "android")]
-    pub const HEARTBEAT: Duration = Duration::from_secs(30);
+    pub const HEARTBEAT: Duration = ANDROID_HEARTBEAT;
     #[cfg(target_os = "android")]
-    pub const LONGPOLL_TIMEOUT: Duration = Duration::from_secs(90);
+    pub const LONGPOLL_TIMEOUT: Duration = ANDROID_LONGPOLL_TIMEOUT;
     #[cfg(target_os = "android")]
     pub const CLOCK_JUMP: Option<Duration> = None;
 
     /// The default regate interval.
     pub const REGATE: Duration = Duration::from_secs(300);
+
+    // Each platform's heartbeat comes well within its silence limit, and the
+    // limit within the client's read timeout.
+    const _: () = {
+        let read = livesync_remote::READ_TIMEOUT.as_millis();
+        assert!(DESKTOP_HEARTBEAT.as_millis() < DESKTOP_LONGPOLL_TIMEOUT.as_millis());
+        assert!(DESKTOP_LONGPOLL_TIMEOUT.as_millis() < read);
+        assert!(ANDROID_HEARTBEAT.as_millis() < ANDROID_LONGPOLL_TIMEOUT.as_millis());
+        assert!(ANDROID_LONGPOLL_TIMEOUT.as_millis() < read);
+    };
 }
 
 impl EngineConfig {
@@ -320,6 +391,7 @@ impl EngineConfig {
             batch_limit: 250,
             regate_interval: connection_defaults::REGATE,
             allow_plugin: false,
+            plugin_handover: Some(PLUGIN_HANDOVER_CLI.into()),
             heartbeat: connection_defaults::HEARTBEAT,
             longpoll_timeout: connection_defaults::LONGPOLL_TIMEOUT,
             clock_jump: connection_defaults::CLOCK_JUMP,
@@ -832,39 +904,102 @@ impl Engine {
         Ok(f(&ix)?)
     }
 
+    /// Record an error for `status`. The guards' stops (the upstream stop, a
+    /// lock without a rebuild) are states: recorded, and logged, when one
+    /// starts or its reason changes, and left alone while the same reason
+    /// holds, so their time is when the stop began and watchers see no
+    /// change. `last_error` then mirrors the stop. Any other refusal repeated
+    /// word for word is left alone too; other errors are recorded each time.
     pub(crate) fn record_error(&self, e: &EngineError) {
         let now = vaultfs::now_ms();
-        let _ = self.with_index(|ix| ix.set_meta(meta::LAST_ERROR, &format!("{now} {e}")));
-        if let EngineError::Refused(r) = e {
-            if r.is_upstream_change() {
-                self.record_upstream_stop(r, now);
-            }
-            if matches!(r, Refusal::LockedWithoutRebuild { .. }) {
-                let msg = r.to_string();
-                let before = self.with_index(|ix| ix.get_meta(meta::REMOTE_LOCKED)).ok().flatten();
-                if before.as_deref().and_then(|b| b.split_once(' ')).map(|(_, m)| m) != Some(msg.as_str()) {
-                    warn!("{}: {msg}", self.inner.vault_canon);
+        let stop = match e {
+            EngineError::Refused(r) if r.is_upstream_change() => Some(self.upstream_stop_of(r)),
+            EngineError::Refused(r @ Refusal::LockedWithoutRebuild { .. }) => Some(GuardStop {
+                key: meta::REMOTE_LOCKED,
+                reason_key: meta::REMOTE_LOCKED_REASON,
+                reason: r.reason(),
+                message: r.to_string(),
+            }),
+            _ => None,
+        };
+        let vault = &self.inner.vault_canon;
+        let _ = self.with_index(|ix| {
+            let error = match &stop {
+                Some(s) => {
+                    let held = ix.get_meta(s.key)?;
+                    let same = ix.get_meta(s.reason_key)?.as_deref() == Some(s.reason.as_str());
+                    match held {
+                        Some(v) if same => v,
+                        _ => {
+                            if s.key == meta::UPSTREAM_STOP {
+                                warn!("upstream guard: syncing stopped for {vault}: {}", s.message);
+                            } else {
+                                warn!("{vault}: {}", s.message);
+                            }
+                            let v = format!("{now} {}", s.message);
+                            ix.set_meta(s.key, &v)?;
+                            ix.set_meta(s.reason_key, &s.reason)?;
+                            v
+                        }
+                    }
                 }
-                let _ = self.with_index(|ix| ix.set_meta(meta::REMOTE_LOCKED, &format!("{now} {msg}")));
+                None => {
+                    let msg = e.to_string();
+                    let before = ix.get_meta(meta::LAST_ERROR)?;
+                    if matches!(e, EngineError::Refused(_)) && before.as_deref().map(meta_text) == Some(msg.as_str()) {
+                        return Ok(());
+                    }
+                    format!("{now} {msg}")
+                }
+            };
+            if ix.get_meta(meta::LAST_ERROR)?.as_deref() != Some(error.as_str()) {
+                ix.set_meta(meta::LAST_ERROR, &error)?;
             }
-        }
+            Ok(())
+        });
     }
 
-    /// Record the upstream guard's stop for `status`, with the newest
-    /// plugin the milestone lists, and log it once per distinct message.
-    fn record_upstream_stop(&self, r: &Refusal, now: i64) {
+    /// The upstream stop a refusal makes, with the newest plugin the
+    /// milestone lists. Content found encrypted in a pull is a stop of its
+    /// own kind: the gate passes while it holds, so only a pull that gets
+    /// past it lifts it ([`Engine::clear_content_stop`]).
+    fn upstream_stop_of(&self, r: &Refusal) -> GuardStop {
         let node = self.node_id();
         let milestone = self.inner.last_milestone.lock().unwrap().clone();
         let seen = milestone.and_then(|m| gate::newest_remote_plugin(&m, &node));
-        let msg = match seen {
+        let message = match seen {
             Some(s) => format!("{r} (the newest plugin the remote's milestone lists: {s})"),
             None => r.to_string(),
         };
-        let before = self.with_index(|ix| ix.get_meta(meta::UPSTREAM_STOP)).ok().flatten();
-        if before.as_deref().and_then(|b| b.split_once(' ')).map(|(_, m)| m) != Some(msg.as_str()) {
-            warn!("upstream guard: syncing stopped for {}: {msg}", self.inner.vault_canon);
+        let reason = match r {
+            Refusal::EncryptedContent(_) => format!("{CONTENT_STOP}{message}"),
+            _ => message.clone(),
+        };
+        GuardStop {
+            key: meta::UPSTREAM_STOP,
+            reason_key: meta::UPSTREAM_STOP_REASON,
+            reason,
+            message,
         }
-        let _ = self.with_index(|ix| ix.set_meta(meta::UPSTREAM_STOP, &format!("{now} {msg}")));
+    }
+
+    /// A pull got past what stopped it (content found encrypted): lift that
+    /// upstream stop, and the error that mirrors it.
+    fn clear_content_stop(&self) -> Result<()> {
+        self.with_index(|ix| {
+            let content = ix
+                .get_meta(meta::UPSTREAM_STOP_REASON)?
+                .is_some_and(|r| r.starts_with(CONTENT_STOP));
+            if content {
+                info!("upstream guard: the pull got past the encrypted content; syncing resumes");
+                if ix.get_meta(meta::LAST_ERROR)? == ix.get_meta(meta::UPSTREAM_STOP)? {
+                    ix.delete_meta(meta::LAST_ERROR)?;
+                }
+                ix.delete_meta(meta::UPSTREAM_STOP)?;
+                ix.delete_meta(meta::UPSTREAM_STOP_REASON)?;
+            }
+            Ok(())
+        })
     }
 
     /// The plugin guard (spec D16): refuse two-way sync on an Obsidian vault
@@ -879,6 +1014,7 @@ impl Engine {
                 let e = EngineError::Refused(Refusal::PluginEnabled {
                     vault: self.inner.vault_canon.clone(),
                     why,
+                    handover: self.inner.cfg.plugin_handover.clone(),
                 });
                 self.record_error(&e);
                 Err(e)
@@ -904,15 +1040,20 @@ impl Engine {
             ix.set_meta(meta::LAST_GATE, &format!("{now} {summary}"))?;
             if r.is_ok() {
                 ix.set_meta(meta::LAST_GATE_OK, &now.to_string())?;
-                // A passed gate supersedes any earlier failure.
-                ix.delete_meta(meta::LAST_ERROR)?;
-                if ix.get_meta(meta::UPSTREAM_STOP)?.is_some() {
-                    info!("upstream guard: the remote is compatible again; syncing resumes");
+                // A passed gate supersedes any earlier failure, and lifts
+                // the gate's stops. Content found encrypted is not the
+                // gate's to judge: that stop (and its error) stays until a
+                // pull gets past it, or it would come and go at every regate.
+                let content_stop = ix
+                    .get_meta(meta::UPSTREAM_STOP_REASON)?
+                    .is_some_and(|r| r.starts_with(CONTENT_STOP));
+                if !content_stop {
+                    ix.delete_meta(meta::LAST_ERROR)?;
+                    if ix.get_meta(meta::UPSTREAM_STOP)?.is_some() {
+                        info!("upstream guard: the remote is compatible again; syncing resumes");
+                    }
                     ix.delete_meta(meta::UPSTREAM_STOP)?;
-                }
-                if ix.get_meta(meta::REMOTE_LOCKED)?.is_some() {
-                    info!("the remote no longer refuses this device with a lock; syncing resumes");
-                    ix.delete_meta(meta::REMOTE_LOCKED)?;
+                    ix.delete_meta(meta::UPSTREAM_STOP_REASON)?;
                 }
             }
             Ok(())
@@ -984,11 +1125,20 @@ impl Engine {
             // refusal says who holds the lock and what the ways out are.
             Err(Refusal::Locked) => {
                 let raw = self.inner.last_milestone.lock().unwrap().clone().unwrap_or_default();
-                let holders = gate::lock_holders(&raw, vaultfs::now_ms());
+                let holders = gate::lock_holders(&raw);
                 return Err(Refusal::LockedWithoutRebuild { holders }.into());
             }
             Err(e) => return Err(e.into()),
         }
+        // No lock against this device without a rebuild any more, whatever
+        // the rest of the gate finds.
+        self.with_index(|ix| {
+            if ix.get_meta(meta::REMOTE_LOCKED)?.is_some() {
+                info!("the remote no longer refuses this device with a lock");
+            }
+            ix.delete_meta(meta::REMOTE_LOCKED)?;
+            ix.delete_meta(meta::REMOTE_LOCKED_REASON)
+        })?;
         let preferred = milestone.preferred().ok_or(Refusal::MissingPreferredTweaks)?.clone();
         gate::assess_supported_tweaks(&preferred)?;
         let params = couch.get_doc(&format!("_local/{SYNC_PARAMS_LOCAL_ID}"), false).await?;
@@ -1259,7 +1409,7 @@ impl Engine {
                 self.log_progress(start, &before, resp.pending);
             }
             if n == 0 || resp.pending == Some(0) {
-                return Ok(());
+                return self.clear_content_stop();
             }
         }
     }
@@ -2517,9 +2667,11 @@ impl Engine {
     /// refreshed and edited ones protected), then do a full fetch at the
     /// next sync and mark this node resolved after it. This is how a lock
     /// that does not come with a rebuild (or `cleaned`) is cleared.
+    ///
+    /// Not refused by the plugin guard: a pull-only vault fetches too. A
+    /// two-way caller checks [`Engine::check_plugin_guard`] first, so a
+    /// refused vault's index is not reset for a sync that cannot run.
     pub fn request_full_fetch(&self) -> Result<()> {
-        // A fetch is the start of a two-way sync: refused like one.
-        self.check_plugin_guard()?;
         self.with_index(|ix| {
             ix.reset_for_rebuild()?;
             ix.set_meta(meta::NEEDS_FETCH, &vaultfs::now_ms().to_string())?;
@@ -2725,6 +2877,9 @@ impl Engine {
         let mut prepared = false;
         let mut caught_up_once = false;
         let mut old_scope: Option<Scope> = None;
+        // The reason of the refusal the daemon last waited out, so a
+        // refusal that repeats at every check is logged once.
+        let mut refused: Option<String> = None;
         'outer: loop {
             if *shutdown.borrow() {
                 return Ok(());
@@ -2772,7 +2927,11 @@ impl Engine {
                         EngineError::Remote(_) => backoff.next_delay(),
                         _ => return Err(e),
                     };
-                    warn!("{e}; not syncing, checking again in {:.0?}", wait);
+                    log_wait(
+                        &mut refused,
+                        &e,
+                        &format!("{e}; not syncing, checking again in {wait:.0?}"),
+                    );
                     if self.sleep_or_shutdown(wait, &mut shutdown).await {
                         return Ok(());
                     }
@@ -2814,6 +2973,7 @@ impl Engine {
                         }
                     };
                     if r.is_ok() {
+                        refused = None;
                         // A completed catch-up is a pull: the first one of
                         // the run, and any later one that brought changes.
                         if !caught_up_once || self.report().changes > 0 {
@@ -2834,7 +2994,11 @@ impl Engine {
                     EngineError::Remote(_) | EngineError::Other(_) => backoff.next_delay(),
                     _ => return Err(e),
                 };
-                warn!("catching up failed: {e}; retrying in {wait:.0?}");
+                log_wait(
+                    &mut refused,
+                    &e,
+                    &format!("catching up failed: {e}; retrying in {wait:.0?}"),
+                );
                 if self.sleep_or_shutdown(wait, &mut shutdown).await {
                     return Ok(());
                 }
@@ -2903,7 +3067,11 @@ impl Engine {
                         None
                     }
                     Woke::Nudged => {
+                        // A network change: the pooled connections went out
+                        // over the old link and may hang until the read
+                        // timeout, so the gate runs on fresh ones.
                         debug!("nudged: reconnecting and checking the remote again");
+                        self.inner.couch.reset_connections();
                         continue 'outer;
                     }
                     Woke::Slept(j) => {
@@ -2945,7 +3113,11 @@ impl Engine {
                                     EngineError::Remote(_) => backoff.next_delay(),
                                     _ => return Err(e),
                                 };
-                                warn!("batch failed: {e}; reconnecting in {wait:.0?}");
+                                log_wait(
+                                    &mut refused,
+                                    &e,
+                                    &format!("batch failed: {e}; reconnecting in {wait:.0?}"),
+                                );
                                 if self.sleep_or_shutdown(wait, &mut shutdown).await {
                                     return Ok(());
                                 }

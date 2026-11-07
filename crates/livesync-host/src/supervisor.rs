@@ -860,7 +860,15 @@ impl Host {
                 msg: "the engine did not stop; the full fetch was not scheduled".into(),
             });
         }
-        let r = open_engine(&cfg, &self.access, &self.pool).and_then(|e| Ok(e.request_full_fetch()?));
+        // A pull-only profile fetches read-only, so the plugin guard is
+        // for two-way profiles only, as in their runs.
+        let pull_only = cfg.pull_only;
+        let r = open_engine(&cfg, &self.access, &self.pool).and_then(|e| {
+            if !pull_only {
+                e.check_plugin_guard()?;
+            }
+            Ok(e.request_full_fetch()?)
+        });
         if let Err(e) = &r {
             warn!("profile {id}: full fetch not scheduled: {e}");
         } else {

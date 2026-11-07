@@ -230,6 +230,7 @@ impl Vault {
             heartbeat_secs: self.heartbeat_secs,
             longpoll_timeout_secs: self.longpoll_timeout_secs,
             clock_jump_secs: self.clock_jump_secs,
+            handover: Default::default(),
         }
     }
 

@@ -135,7 +135,8 @@ pub mod event {
     pub const UPSTREAM_STOP: &str = "upstream-stop";
     /// The remote is locked against this device without a rebuild:
     /// `{"lock": text}` (who holds it, the ways out), or `{"lock": null}`
-    /// once it no longer refuses this device.
+    /// once it no longer refuses this device. Both are states: sent when
+    /// one starts, ends or its reason changes, never again while it holds.
     pub const REMOTE_LOCKED: &str = "remote-locked";
     /// A new error recorded by the engine: `{"message"}`.
     pub const ERROR: &str = "error";

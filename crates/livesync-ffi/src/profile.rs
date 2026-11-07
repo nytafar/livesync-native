@@ -2,7 +2,7 @@
 //! engine is opened for it are the host's (`livesync_host::RunConfig`).
 
 use livesync_engine::EngineConfig;
-use livesync_host::{RunConfig, WhatSyncs};
+use livesync_host::{Handover, RunConfig, Tuning, WhatSyncs};
 use livesync_model::scope::{Scope, ScopeMode};
 use livesync_remote::RemoteConfig;
 use std::path::PathBuf;
@@ -88,8 +88,12 @@ impl ProfileConfig {
             // `.trash/`; no ignore files or dot-paths yet (no UI for them).
             what_syncs: WhatSyncs::default(),
             // The app has no plugin handover switch or timing settings yet:
-            // the guards and the platform defaults apply.
-            tuning: Default::default(),
+            // the guards and the platform defaults apply, and the plugin
+            // guard's refusal names no switch.
+            tuning: Tuning {
+                handover: Handover::Unavailable,
+                ..Tuning::default()
+            },
         }
     }
 
@@ -250,5 +254,9 @@ mod tests {
         assert_eq!(ec.device_name.as_deref(), Some("phone"));
         assert!(ec.ignore_regex.is_none());
         assert!(ec.index_path.ends_with("p1/index.sqlite"));
+        // No `--allow-plugin` in the app: the plugin guard says only to turn
+        // the plugin off.
+        assert!(!ec.allow_plugin);
+        assert_eq!(ec.plugin_handover, None);
     }
 }

@@ -90,33 +90,39 @@ pub enum Refusal {
     MissingMilestone,
     #[error("the milestone document is invalid: {0}")]
     InvalidMilestone(String),
-    #[error("the chunk-format ranges of the accepted nodes do not overlap with this client's ({0}..{1})")]
+    #[error("the chunk-format ranges of the accepted nodes do not overlap with this client's ({0}..{1}): a newer Self-hosted LiveSync may write chunks in a format this client does not read. {KNOWN_GOOD}")]
     IncompatibleChunkVersion(i64, i64),
     #[error("the remote database is locked (a rebuild is in progress or was done elsewhere) and this node is not accepted; fetch again with an official client or unlock the remote")]
     Locked,
     /// Locked against this device while its `created` is still the one this
     /// device synced with: no rebuild came of the lock (yet). Only a person
     /// can tell whether one was meant, so it is never unlocked automatically.
-    #[error("the remote database is locked against this device, but it was not rebuilt (its `created` is still the one this device synced with){holders}: another device locked it for a rebuild that has not happened (it may have failed, or still be under way). lsync never unlocks it by itself, because only you can tell whether the rebuild was meant. If it was not, unlock the database from an official client (the plugin's or the CLI's \"unlock\"); if you want this device to start over from the remote as it is, run `lsync fetch`, which marks it accepted once it completes. Syncing resumes by itself after an unlock or once the rebuild is done")]
-    LockedWithoutRebuild { holders: String },
+    #[error("the remote database is locked against this device, but it was not rebuilt (its `created` is still the one this device synced with){}: another device locked it for a rebuild that has not happened (it may have failed, or still be under way). This client never unlocks it by itself, because only you can tell whether the rebuild was meant. If it was not, unlock the database from an official client (the plugin's or the CLI's \"unlock\"); if you want this device to start over from the remote as it is, fetch (`lsync fetch`, or Fetch in the app), which marks it accepted once it completes. Syncing resumes by itself after an unlock or once the rebuild is done", holders_text(.holders, true))]
+    LockedWithoutRebuild { holders: Vec<LockHolder> },
     #[error("the remote database was cleaned and is locked against this node")]
     Cleaned,
     #[error("the milestone has no PREFERRED tweak values")]
     MissingPreferredTweaks,
-    #[error("remote setting not supported by this client: {0}")]
+    #[error("remote setting not supported by this client: {0}. {KNOWN_GOOD}")]
     UnsupportedSetting(String),
     #[error("the remote's PREFERRED settings (the milestone's tweaks) changed since this device adopted them: {0}. {KNOWN_GOOD}; once you checked the change was meant, adopt it with `lsync connect --adopt-tweaks`")]
     TweakMismatch(String),
     #[error("the remote's PREFERRED settings (the milestone's tweaks) hold settings this client does not know: {0}; a newer Self-hosted LiveSync may have added them. {KNOWN_GOOD}; once you checked they do not change what is stored, adopt them with `lsync connect --adopt-tweaks`")]
     UnknownTweaks(String),
-    #[error("encrypted or obfuscated content found ({0}); end-to-end encryption is not supported yet")]
+    #[error("encrypted or obfuscated content found ({0}); end-to-end encryption is not supported yet. {KNOWN_GOOD}")]
     EncryptedContent(String),
     #[error("the local index belongs to a different remote ({0}); use another state directory or reset the index")]
     ForeignIndex(String),
     #[error("the local index belongs to the vault folder {index_vault}, not {vault}; use the profile or state directory that belongs to {vault}, or a new one")]
     ForeignVault { index_vault: String, vault: String },
-    #[error("{vault} is an Obsidian vault with the Self-hosted LiveSync plugin enabled ({why}): the plugin and lsync would both write this folder and the database. Disable the plugin in Obsidian on this device (Settings, Community plugins), or, for a deliberate handover, run with --allow-plugin (or set allow_plugin = true for the vault)")]
-    PluginEnabled { vault: String, why: String },
+    /// `handover`: how this front-end allows a deliberate handover (a flag,
+    /// a setting), or `None` where it has no such switch (the Android app).
+    #[error("{vault} is an Obsidian vault with the Self-hosted LiveSync plugin enabled ({why}): the plugin and this client would both write this folder and the database. Disable the plugin in Obsidian on this device (Settings, Community plugins){}", handover_text(.handover))]
+    PluginEnabled {
+        vault: String,
+        why: String,
+        handover: Option<String>,
+    },
 }
 
 impl Refusal {
@@ -136,6 +142,61 @@ impl Refusal {
                 | Refusal::UnknownTweaks(_)
                 | Refusal::EncryptedContent(_)
         )
+    }
+
+    /// What stays the same for as long as the cause does: the message
+    /// without what moves on its own (a lock holder's last connection). Two
+    /// refusals with the same reason are one state, so a repeated refusal
+    /// is neither recorded, reported nor logged again.
+    pub fn reason(&self) -> String {
+        match self {
+            Refusal::LockedWithoutRebuild { holders } => {
+                format!("locked without a rebuild{}", holders_text(holders, false))
+            }
+            r => r.to_string(),
+        }
+    }
+}
+
+/// A node that holds a lock ([`Refusal::LockedWithoutRebuild`]), from the
+/// milestone's `accepted_nodes` and `node_info`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockHolder {
+    pub node: String,
+    /// Its `device_name`, when it has one other than the node ID.
+    pub device: Option<String>,
+    /// Its `last_connected`, in ms since the epoch: the closest to the lock
+    /// time the milestone tells (upstream records no lock time).
+    pub last_connected: Option<i64>,
+}
+
+/// `"; locked by ..."` (empty for no holders), with or without when each
+/// last connected.
+fn holders_text(holders: &[LockHolder], with_times: bool) -> String {
+    if holders.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = holders
+        .iter()
+        .map(|h| {
+            let who = match &h.device {
+                Some(n) => format!("{n:?} (node {})", h.node),
+                None => format!("node {}", h.node),
+            };
+            match h.last_connected {
+                Some(t) if with_times => format!("{who}, last connected {}", utc_minute(t)),
+                _ => who,
+            }
+        })
+        .collect();
+    format!("; locked by {}", parts.join(" and "))
+}
+
+/// How a refused plugin vault can be handed over, for [`Refusal::PluginEnabled`].
+fn handover_text(handover: &Option<String>) -> String {
+    match handover {
+        Some(h) => format!(", or, for a deliberate handover, {h}"),
+        None => ", then start syncing here again; this app does not run beside the plugin".into(),
     }
 }
 
@@ -419,48 +480,55 @@ pub fn newest_remote_plugin(milestone: &Value, our_node: &str) -> Option<String>
 
 /// Who holds a lock, for [`Refusal::LockedWithoutRebuild`]: the nodes the
 /// milestone accepts (the device that locked it), each with its device name
-/// and when it last connected, as `"; locked by ..."`; empty when the
-/// milestone names none.
-pub fn lock_holders(milestone: &Value, now_ms: i64) -> String {
+/// and when it last connected; empty when the milestone names none.
+pub fn lock_holders(milestone: &Value) -> Vec<LockHolder> {
     let accepted: Vec<&str> = milestone
         .get("accepted_nodes")
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    if accepted.is_empty() {
-        return String::new();
-    }
-    let parts: Vec<String> = accepted
+    accepted
         .iter()
         .map(|node| {
             let info = milestone.get("node_info").and_then(|i| i.get(*node));
-            let name = info.and_then(|i| i.get("device_name")).and_then(Value::as_str);
-            let who = match name {
-                Some(n) if !n.is_empty() && n != *node => format!("{n:?} (node {node})"),
-                _ => format!("node {node}"),
-            };
-            match info
+            let device = info
+                .and_then(|i| i.get("device_name"))
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty() && n != node)
+                .map(str::to_string);
+            let last_connected = info
                 .and_then(|i| i.get("last_connected"))
                 .and_then(Value::as_i64)
-                .filter(|t| *t > 0)
-            {
-                Some(t) => format!("{who}, last connected {} ago", ago(now_ms - t)),
-                None => who,
+                .filter(|t| *t > 0);
+            LockHolder {
+                node: node.to_string(),
+                device,
+                last_connected,
             }
         })
-        .collect();
-    format!("; locked by {}", parts.join(" and "))
+        .collect()
 }
 
-/// A span of milliseconds, roughly: `40 s`, `12 min`, `5 h`, `3 days`.
-fn ago(ms: i64) -> String {
-    let s = ms.max(0) / 1000;
-    match s {
-        0..=119 => format!("{s} s"),
-        120..=7199 => format!("{} min", s / 60),
-        7200..=172_799 => format!("{} h", s / 3600),
-        _ => format!("{} days", s / 86_400),
-    }
+/// A time in ms since the epoch as `2026-11-07 09:12 UTC`: fixed, so a
+/// message that holds it stays the same from one look to the next.
+fn utc_minute(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil date from days since 1970-01-01 (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60
+    )
 }
 
 /// `1.0.46` -> `[1, 0, 46]`; anything after the numbers is ignored.
@@ -647,6 +715,7 @@ mod tests {
 
     #[test]
     fn upstream_refusals_name_the_change_and_the_known_good_version() {
+        // Every refusal `is_upstream_change` counts (the upstream stop).
         for (r, what) in [
             (Refusal::UnsupportedGeneration(14), "generation 14"),
             (Refusal::UnknownFeatures("teleport-v1".into()), "teleport-v1"),
@@ -655,6 +724,13 @@ mod tests {
                 Refusal::UnknownTweaks("useWarpChunks=true".into()),
                 "useWarpChunks=true",
             ),
+            (
+                Refusal::UnsupportedFeatures("nfc-path-identity-v1".into()),
+                "nfc-path-identity-v1",
+            ),
+            (Refusal::IncompatibleChunkVersion(0, 2400), "0..2400"),
+            (Refusal::UnsupportedSetting("encrypt=true".into()), "encrypt=true"),
+            (Refusal::EncryptedContent("chunk h:1".into()), "chunk h:1"),
         ] {
             let msg = r.to_string();
             assert!(r.is_upstream_change(), "{msg}");
@@ -671,19 +747,76 @@ mod tests {
     #[test]
     fn a_lock_without_a_rebuild_names_who_holds_it() {
         let m = json!({"accepted_nodes": ["n1", "n2"], "node_info": {
-            "n1": {"device_name": "laptop", "last_connected": 1_000_000},
+            "n1": {"device_name": "laptop", "last_connected": 1_762_506_720_000_i64},
             "n2": {"device_name": "", "last_connected": 0}
         }});
-        let h = lock_holders(&m, 1_000_000 + 3 * 3_600_000);
-        assert_eq!(
-            h,
-            "; locked by \"laptop\" (node n1), last connected 3 h ago and node n2"
+        let holders = lock_holders(&m);
+        let msg = Refusal::LockedWithoutRebuild {
+            holders: holders.clone(),
+        }
+        .to_string();
+        assert!(
+            msg.contains("; locked by \"laptop\" (node n1), last connected 2025-11-07 09:12 UTC and node n2:"),
+            "{msg}"
         );
-        assert_eq!(lock_holders(&json!({"accepted_nodes": []}), 0), "");
-        let msg = Refusal::LockedWithoutRebuild { holders: h }.to_string();
-        assert!(msg.contains("not rebuilt") && msg.contains("laptop"), "{msg}");
-        assert!(msg.contains("lsync fetch") && msg.contains("never unlocks"), "{msg}");
-        assert!(!Refusal::LockedWithoutRebuild { holders: String::new() }.is_upstream_change());
+        assert!(lock_holders(&json!({"accepted_nodes": []})).is_empty());
+        assert!(msg.contains("not rebuilt") && msg.contains("never unlocks"), "{msg}");
+        assert!(msg.contains("lsync fetch") && msg.contains("Fetch in the app"), "{msg}");
+        assert!(!Refusal::LockedWithoutRebuild { holders: vec![] }.is_upstream_change());
+    }
+
+    #[test]
+    fn a_reason_stays_while_only_a_holders_last_connection_moves() {
+        let at = |t: i64| {
+            lock_holders(&json!({"accepted_nodes": ["n1"], "node_info": {
+                "n1": {"device_name": "laptop", "last_connected": t}}}))
+        };
+        let (a, b) = (
+            Refusal::LockedWithoutRebuild { holders: at(1_000_000) },
+            Refusal::LockedWithoutRebuild { holders: at(9_000_000) },
+        );
+        assert_ne!(a.to_string(), b.to_string(), "the message tells when");
+        assert_eq!(a.reason(), b.reason(), "the reason does not");
+        assert!(a.reason().contains("laptop"), "{}", a.reason());
+        // Another holder is another reason.
+        let c = Refusal::LockedWithoutRebuild {
+            holders: lock_holders(&json!({"accepted_nodes": ["n9"]})),
+        };
+        assert_ne!(a.reason(), c.reason());
+        // Other refusals: the message is the reason.
+        let r = Refusal::UnknownFeatures("teleport-v1".into());
+        assert_eq!(r.reason(), r.to_string());
+    }
+
+    #[test]
+    fn times_are_written_as_utc_minutes() {
+        assert_eq!(utc_minute(0), "1970-01-01 00:00 UTC");
+        assert_eq!(utc_minute(951_782_400_000), "2000-02-29 00:00 UTC");
+        assert_eq!(utc_minute(1_762_506_720_000), "2025-11-07 09:12 UTC");
+        assert_eq!(utc_minute(4_102_444_799_000), "2099-12-31 23:59 UTC");
+    }
+
+    #[test]
+    fn the_plugin_refusal_names_the_handover_only_where_there_is_one() {
+        let r = |handover: Option<&str>| {
+            Refusal::PluginEnabled {
+                vault: "/v".into(),
+                why: "listed".into(),
+                handover: handover.map(str::to_string),
+            }
+            .to_string()
+        };
+        let cli = r(Some("run with --allow-plugin"));
+        assert!(
+            cli.contains("Disable the plugin") && cli.contains("deliberate handover, run with --allow-plugin"),
+            "{cli}"
+        );
+        let app = r(None);
+        assert!(app.contains("Disable the plugin"), "{app}");
+        assert!(
+            !app.contains("--allow-plugin") && !app.contains("allow_plugin") && !app.contains("lsync"),
+            "{app}"
+        );
     }
 
     #[test]

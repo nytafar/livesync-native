@@ -32,6 +32,10 @@ impl Env {
         self.dir.path().join("vault")
     }
     fn engine_with(&self, f: impl FnOnce(&mut EngineConfig)) -> Engine {
+        self.engine_and_couch(f).0
+    }
+    /// The engine, and a clone of its client (the same connection pool).
+    fn engine_and_couch(&self, f: impl FnOnce(&mut EngineConfig)) -> (Engine, Couch) {
         let couch = Couch::new(&RemoteConfig {
             url: self.mock.url.clone(),
             database: DB.into(),
@@ -48,7 +52,7 @@ impl Env {
         cfg.longpoll_timeout = Duration::from_millis(500);
         cfg.clock_jump = None;
         f(&mut cfg);
-        Engine::open(couch, cfg).unwrap()
+        (Engine::open(couch.clone(), cfg).unwrap(), couch)
     }
     fn write(&self, rel: &str, bytes: &[u8]) {
         let p = self.vault().join(rel);
@@ -169,5 +173,37 @@ async fn a_clock_jump_reconnects_and_rescans_at_once() {
     offset.store(3_600_000, Ordering::SeqCst);
     until("the reconnect", 5, || env.gates() > before).await;
     until("the rescan pushed the file", 5, || env.pushed("written-in-sleep.md")).await;
+    d.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_network_change_reconnects_on_fresh_connections() {
+    let env = Env::new().await;
+    env.mock.put_text("a.md", &["a"]);
+    let (engine, couch) = env.engine_and_couch(|c| c.regate_interval = Duration::from_secs(3600));
+    let d = Daemon::two_way(&engine);
+    until("the first pull", 10, || env.read("a.md").is_some()).await;
+    until("pushes allowed", 10, || {
+        engine.status().unwrap().registered_ms.is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // An idle connection in the pool, beside the longpoll's: after a Wi-Fi
+    // switch it would lead nowhere, and hang until the read timeout.
+    couch.server_root().await.unwrap();
+    let old = env.mock.peers();
+    let seen = env.mock.state.lock().unwrap().conns.len();
+    let before = env.gates();
+    engine.network_changed(true);
+    until("the gate after the nudge", 5, || env.gates() > before).await;
+    let conns = env.mock.state.lock().unwrap().conns.clone();
+    let (_, _, peer) = conns[seen..]
+        .iter()
+        .find(|(m, p, _)| m == "GET" && p == "/")
+        .expect("the gate asked the server root");
+    assert!(
+        !old.contains(peer),
+        "the gate after a network change went out on a pooled connection ({peer})"
+    );
     d.stop().await.unwrap();
 }

@@ -382,6 +382,57 @@ fn fetch_from_remote_restarts_with_the_same_settings() {
     env.host.stop_all();
 }
 
+/// Turn the Self-hosted LiveSync plugin on in an Obsidian vault folder.
+fn enable_plugin(p: &ProfileConfig) {
+    let o = Path::new(&p.vault_path).join(".obsidian");
+    std::fs::create_dir_all(o.join("plugins/obsidian-livesync")).unwrap();
+    std::fs::write(o.join("community-plugins.json"), r#"["obsidian-livesync"]"#).unwrap();
+}
+
+#[test]
+fn the_plugin_guard_lets_a_pull_only_fetch_through_and_says_what_to_do_in_the_app() {
+    let env = Env::new();
+    env.mock.put_text("f.md", &["f"]);
+    // Pull-only beside the plugin: read-only, so the guard has no say, also
+    // for a fetch.
+    let p = env.profile("ro", "vault-ro");
+    enable_plugin(&p);
+    env.host.start(p.clone()).unwrap();
+    wait_until("f.md", Duration::from_secs(20), || read(&p, "f.md").is_some());
+    env.host.fetch_from_remote("ro".into()).unwrap();
+    wait_until("caught up again", Duration::from_secs(20), || {
+        env.status(&p).run_state == RunState::Running && !env.status(&p).needs_full_fetch
+    });
+    assert!(env.mock.writes().is_empty(), "{:?}", env.mock.writes());
+    env.host.stop_all();
+
+    // Two-way beside the plugin: refused, and the message names no switch
+    // the app does not have.
+    let mut p = env.profile("rw", "vault-rw");
+    p.pull_only = false;
+    enable_plugin(&p);
+    env.host.start(p.clone()).unwrap();
+    wait_until("the refusal", Duration::from_secs(20), || {
+        env.status(&p)
+            .run_message
+            .is_some_and(|m| m.contains("Self-hosted LiveSync plugin enabled"))
+    });
+    let msg = env.status(&p).run_message.unwrap();
+    assert!(msg.contains("Disable the plugin"), "{msg}");
+    assert!(!msg.contains("allow-plugin") && !msg.contains("allow_plugin"), "{msg}");
+    // A fetch is refused the same way, before the index is reset for it.
+    match env.host.fetch_from_remote("rw".into()) {
+        Err(LiveSyncError::Refused { msg }) => assert!(msg.contains("Disable the plugin"), "{msg}"),
+        other => panic!("expected the plugin guard, got {other:?}"),
+    }
+    assert!(
+        !env.status(&p).needs_full_fetch,
+        "the index was reset for a refused fetch"
+    );
+    assert!(env.mock.writes().is_empty(), "{:?}", env.mock.writes());
+    env.host.stop_all();
+}
+
 #[test]
 fn stop_cancels_an_engine_stuck_on_the_network_and_frees_its_state() {
     let env = Env::new();

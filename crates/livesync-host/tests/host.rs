@@ -180,12 +180,34 @@ fn the_guard_settings_are_checked_with_the_config() {
     let c = ec("heartbeat_secs = 30\nclock_jump_secs = 0\n");
     assert_eq!(c.longpoll_timeout, Duration::from_secs(75));
     assert_eq!(c.clock_jump, None);
+    // A long heartbeat: the derived timeout stays below the HTTP read
+    // timeout, so the longpoll's silence check still fires first.
+    let c = ec("heartbeat_secs = 60\n");
+    assert_eq!(c.longpoll_timeout, Duration::from_secs(89));
+    assert!(c.longpoll_timeout < livesync_remote::READ_TIMEOUT);
     let c = ec("");
     assert!(!c.allow_plugin);
+    // lsync names its handover switch in the plugin guard's refusal.
+    assert!(c
+        .plugin_handover
+        .as_deref()
+        .is_some_and(|h| h.contains("--allow-plugin")));
     for (bad, says) in [
         (
             "heartbeat_secs = 30\nlongpoll_timeout_secs = 20\n",
             "must be longer than heartbeat_secs",
+        ),
+        // Past the HTTP client's 90 s read timeout: every longpoll would end
+        // in a transport error, or a dead link would never count as silent.
+        ("heartbeat_secs = 120\n", "heartbeat_secs (120) must be below 89"),
+        ("heartbeat_secs = 89\n", "heartbeat_secs (89) must be below 89"),
+        (
+            "longpoll_timeout_secs = 95\n",
+            "longpoll_timeout_secs (95) must be below 90 s",
+        ),
+        (
+            "longpoll_timeout_secs = 90\n",
+            "longpoll_timeout_secs (90) must be below 90 s",
         ),
         ("regate_secs = 0\n", "regate_secs must be at least 1"),
         ("heartbeat_secs = 0\n", "heartbeat_secs must be at least 1"),

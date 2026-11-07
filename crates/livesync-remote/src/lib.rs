@@ -197,6 +197,12 @@ pub fn shared_http_client() -> Result<SharedClient> {
     Ok(Arc::new(RwLock::new(http_client()?)))
 }
 
+/// How long any response may stay silent before the client gives up on it
+/// (a transport error). The longpoll's silence limit
+/// ([`ChangesQuery::idle_timeout`]) and its heartbeat must stay below it, or
+/// this fires first and the dead connection is not recognised as such.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(90);
+
 #[derive(Clone)]
 pub struct Couch {
     /// Shared by this client's clones (and by every client made with
@@ -229,7 +235,7 @@ pub fn http_client() -> Result<Client> {
         // (`ChangesQuery::idle_timeout`, kept talking by heartbeats). The
         // other requests have no heartbeat, and a busy server may think for
         // a while before answering a large `_bulk_docs` or `_all_docs`.
-        .read_timeout(Duration::from_secs(90))
+        .read_timeout(READ_TIMEOUT)
         .tcp_keepalive(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(60))
         .build()

@@ -109,6 +109,9 @@ pub struct MockState {
     pub stalled_longpolls: u64,
     /// Heartbeat newlines sent on waiting longpolls.
     pub heartbeats_sent: u64,
+    /// Every request as (method, path, the client's address): one address
+    /// per TCP connection, so a request on a new connection shows.
+    pub conns: Vec<(String, String, std::net::SocketAddr)>,
 }
 
 #[derive(Clone)]
@@ -291,10 +294,12 @@ impl Mock {
             .route(&format!("/{DB}/_local/{{name}}"), get(get_local).put(put_local))
             .route(&format!("/{DB}/{{id}}"), get(get_doc).put(put_doc))
             .fallback(fallback)
-            .with_state((state.clone(), notify.clone()));
+            .with_state((state.clone(), notify.clone()))
+            .layer(axum::middleware::from_fn_with_state(state.clone(), track_conn));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, svc).await.unwrap() });
         let m = Mock {
             state,
             notify,
@@ -508,12 +513,31 @@ impl Mock {
         self.state.lock().unwrap().served_bodies.clone()
     }
 
+    /// The client addresses (one per connection) requests came from so far.
+    pub fn peers(&self) -> HashSet<std::net::SocketAddr> {
+        self.state.lock().unwrap().conns.iter().map(|c| c.2).collect()
+    }
+
     pub fn clear_requests(&self) {
         self.state.lock().unwrap().requests.clear();
     }
 }
 
 type S = State<(Arc<Mutex<MockState>>, Arc<Notify>)>;
+
+/// Note which connection each request came on (`MockState::conns`).
+async fn track_conn(
+    State(st): State<Arc<Mutex<MockState>>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    st.lock()
+        .unwrap()
+        .conns
+        .push((req.method().to_string(), req.uri().path().to_string(), peer));
+    next.run(req).await
+}
 
 fn record(st: &Arc<Mutex<MockState>>, m: &str, p: &str) {
     st.lock().unwrap().requests.push((m.into(), p.into()));

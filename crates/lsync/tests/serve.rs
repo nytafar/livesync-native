@@ -573,6 +573,20 @@ fn the_guards_stops_show_in_the_service_status_and_events() {
     assert!(stop.contains("is the newest version known to work"), "{stop}");
     let e = events.wait_for("upstream-stop", |d| d["stop"].as_str().is_some());
     assert!(e["stop"].as_str().unwrap().contains("teleport-v1"), "{e}");
+    // The error that mirrors it, once.
+    events.wait_for("error", |d| {
+        d["message"].as_str().is_some_and(|m| m.contains("teleport-v1"))
+    });
+    // A state, not a tick: the regates (every second) refuse again for the
+    // same reason, and neither the stop nor the error is reported again,
+    // also past the service's periodic status read (every 10 s).
+    let regated = mock.state.lock().unwrap().requests.len();
+    let again = events.kinds_within(Duration::from_millis(11_500));
+    assert!(mock.state.lock().unwrap().requests.len() > regated, "regated meanwhile");
+    assert!(
+        !again.iter().any(|k| k == "upstream-stop" || k == "error"),
+        "reported again: {again:?}"
+    );
     // Back to what lsync knows: the vault resumes by itself.
     mock.put(serde_json::json!({"_id": "obsydian_livesync_version", "type": "versioninfo", "version": 12}));
     wait_until("the stop cleared", || {
@@ -647,6 +661,20 @@ impl Events {
             }
         }
         panic!("no {kind} event; saw {seen:?}");
+    }
+}
+
+impl Events {
+    /// The kinds of the events that come within `d`.
+    fn kinds_within(&self, d: Duration) -> Vec<String> {
+        let end = Instant::now() + d;
+        let mut kinds = Vec::new();
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            if let Ok(v) = self.rx.recv_timeout(left) {
+                kinds.push(v["event"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        kinds
     }
 }
 
