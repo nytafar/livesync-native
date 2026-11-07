@@ -99,10 +99,21 @@ async fn signals(svc: &Arc<Service>) {
 /// Serve the socket (when bound) and the vaults until a stop signal.
 async fn run(svc: Arc<Service>, bound: Option<control::Bound>, policy: Policy, notifier: Option<Arc<dyn Notifier>>) {
     let activity = svc.spawn_activity();
-    let notifications = notifier.map(|n| {
-        info!("desktop notifications are on");
-        notify::spawn(svc.subscribe(), n)
-    });
+    let notifications = match notifier {
+        Some(n) => {
+            info!("desktop notifications are on");
+            // What the service shows now is not news: only changes are told.
+            let events = svc.subscribe();
+            let s = svc.clone();
+            let now = tokio::task::spawn_blocking(move || s.status(None)).await;
+            let watch = match now {
+                Ok(Ok(st)) => notify::Watch::knowing(&st),
+                _ => notify::Watch::new(),
+            };
+            Some(notify::spawn(events, watch, n))
+        }
+        None => None,
+    };
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let server = bound.map(|b| tokio::spawn(control::serve(b, svc.clone(), policy, stop_rx)));
     // Where a `Type=notify` unit gets READY=1 (P1): every vault is started

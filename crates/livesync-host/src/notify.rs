@@ -83,6 +83,31 @@ impl Watch {
         Watch::default()
     }
 
+    /// A watch that knows the state the service shows now: the stops and
+    /// the files in conflict when it starts are not news.
+    pub fn knowing(st: &crate::protocol::StatusResult) -> Watch {
+        let mut w = Watch::new();
+        for v in &st.vaults {
+            let Some(s) = &v.status else { continue };
+            let seen = w.vaults.entry(v.name.clone()).or_default();
+            let text = |x: &Option<String>| {
+                x.as_deref()
+                    .map(|t| t.split_once(' ').map_or(t, |(_, m)| m).to_string())
+            };
+            for (kind, stop) in [
+                (event::SAFETY_STOP, s.safety_stop.clone()),
+                (event::UPSTREAM_STOP, text(&s.upstream_stop)),
+                (event::REMOTE_LOCKED, text(&s.remote_locked)),
+            ] {
+                if let Some(t) = stop {
+                    seen.stops.insert(kind, t);
+                }
+            }
+            seen.conflicts = s.conflicted.iter().map(|r| r.path.clone()).collect();
+        }
+        w
+    }
+
     /// The notices an event calls for (often none).
     pub fn on_event(&mut self, e: &Event) -> Vec<Notice> {
         let Some(name) = e.vault.clone() else {
@@ -120,7 +145,12 @@ impl Watch {
                             event::UPSTREAM_STOP => (format!("lsync: {name} stopped syncing"), ""),
                             _ => (format!("lsync: {name} is locked by another device"), ""),
                         };
-                        vec![notice(kind, title, format!("{t}{hint}"), Urgency::Critical)]
+                        // The safety stop comes as recorded, `<ms> <text>`.
+                        let shown = t
+                            .split_once(' ')
+                            .filter(|(ms, _)| ms.len() >= 10 && ms.bytes().all(|b| b.is_ascii_digit()))
+                            .map_or(t.as_str(), |(_, m)| m);
+                        vec![notice(kind, title, format!("{shown}{hint}"), Urgency::Critical)]
                     }
                 }
             }
@@ -213,9 +243,12 @@ impl Watch {
 
 /// Feed the service's events to a [`Watch`] and show its notices, until the
 /// events end. Notifiers run on a blocking thread.
-pub fn spawn(mut events: broadcast::Receiver<Event>, notifier: Arc<dyn Notifier>) -> tokio::task::JoinHandle<()> {
+pub fn spawn(
+    mut events: broadcast::Receiver<Event>,
+    mut watch: Watch,
+    notifier: Arc<dyn Notifier>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut watch = Watch::new();
         loop {
             let e = match events.recv().await {
                 Ok(e) => e,
@@ -371,6 +404,9 @@ mod tests {
     fn a_stop_is_told_once_until_it_is_lifted_or_its_reason_changes() {
         let mut w = Watch::new();
         let stop = |t: Option<&str>| ev(event::SAFETY_STOP, "notes", 1, json!({ "stop": t }));
+        let first = w.on_event(&stop(Some("1730000000000 30 files went missing")));
+        assert!(first[0].body.starts_with("30 files went missing"), "{}", first[0].body);
+        assert!(w.on_event(&stop(None)).is_empty());
         let first = w.on_event(&stop(Some("30 files went missing")));
         assert_eq!(kinds(&first), ["safety-stop"]);
         assert_eq!(first[0].urgency, Urgency::Critical);
@@ -504,6 +540,28 @@ mod tests {
         assert!(w.on_event(&reload).is_empty());
     }
 
+    #[test]
+    fn what_the_service_shows_at_the_start_is_not_news() {
+        let st: crate::protocol::StatusResult = serde_json::from_value(json!({"vaults": [{
+            "name": "notes",
+            "status": {
+                "safety_stop": "30 files went missing",
+                "upstream_stop": "1730000000000 a newer format",
+                "conflicted": [{"path": "old.md"}]
+            }
+        }]}))
+        .unwrap();
+        let mut w = Watch::knowing(&st);
+        let stop = ev(event::SAFETY_STOP, "notes", 1, json!({"stop": "30 files went missing"}));
+        assert!(w.on_event(&stop).is_empty());
+        let up = ev(event::UPSTREAM_STOP, "notes", 1, json!({"stop": "a newer format"}));
+        assert!(w.on_event(&up).is_empty());
+        let c = ev(event::CONFLICT, "notes", 1, json!({"open": ["old.md", "new.md"]}));
+        let n = w.on_event(&c);
+        assert_eq!(n[0].title, "lsync: a conflict in notes");
+        assert!(n[0].body.starts_with("new.md"), "{}", n[0].body);
+    }
+
     struct Fake(Mutex<Vec<Notice>>);
 
     impl Notifier for Fake {
@@ -516,7 +574,7 @@ mod tests {
     async fn the_events_reach_the_notifier_once() {
         let (tx, rx) = broadcast::channel(16);
         let fake = Arc::new(Fake(Mutex::new(vec![])));
-        let task = spawn(rx, fake.clone());
+        let task = spawn(rx, Watch::new(), fake.clone());
         for _ in 0..3 {
             tx.send(ev(event::SAFETY_STOP, "notes", 1, json!({"stop": "gone"})))
                 .unwrap();

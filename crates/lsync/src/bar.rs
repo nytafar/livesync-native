@@ -69,7 +69,7 @@ pub struct Bar {
 fn short(s: &str) -> String {
     let t = s
         .split_once(' ')
-        .filter(|(ms, _)| ms.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|(ms, _)| ms.len() >= 10 && ms.bytes().all(|b| b.is_ascii_digit()))
         .map_or(s, |(_, m)| m);
     let line = t.lines().next().unwrap_or("");
     if line.chars().count() > 120 {
@@ -486,6 +486,14 @@ mod tests {
         assert!(render(&b, Format::Swiftbar, true).starts_with("~~~\nlsync stopped"));
         let off = swiftbar(&summarise(Err("no lsync service is running".into())));
         assert_eq!(off, "lsync off | color=gray\n---\nno lsync service is running\n");
+    }
+
+    #[test]
+    fn a_recorded_time_is_left_out_and_nothing_else() {
+        assert_eq!(short("1730000000000 30 files went missing"), "30 files went missing");
+        assert_eq!(short("30 files went missing"), "30 files went missing");
+        assert_eq!(short("1730000000000 two\nlines"), "two");
+        assert_eq!(short(&"x".repeat(200)).chars().count(), 120);
     }
 
     #[test]
