@@ -337,6 +337,9 @@ pub fn spawn(
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     debug!("notifications: {n} events missed; reading the status");
+                    // The status is newer than anything still buffered:
+                    // skip the backlog, or its old events are announced again.
+                    events = events.resubscribe();
                     match read(&status).await {
                         Some(st) => watch.catch_up(&st),
                         None => vec![],
@@ -717,12 +720,18 @@ mod tests {
         *st.lock().unwrap() = status_of(json!([
             {"name": "new", "status": {"safety_stop": "z", "conflicted": [{"path": "old.md"}]}}
         ]));
+        let (read_tx, mut read_rx) = tokio::sync::mpsc::unbounded_channel();
         let task = spawn(
             rx,
             Watch::new(),
             fake.clone(),
-            Arc::new(move || Some(reader.lock().unwrap().clone())),
+            Arc::new(move || {
+                let _ = read_tx.send(());
+                Some(reader.lock().unwrap().clone())
+            }),
         );
+        // The lag's status read: what was buffered before it is skipped.
+        read_rx.recv().await.unwrap();
         // A conflict event for the vault it now knows: only the new file.
         tx.send(ev(event::CONFLICT, "new", 1, json!({"open": ["old.md", "fresh.md"]})))
             .unwrap();
@@ -734,6 +743,29 @@ mod tests {
         // new; the conflict names only fresh.md.
         assert_eq!(kinds(&got), ["conflict"], "{got:?}");
         assert!(got[0].body.starts_with("fresh.md"), "{}", got[0].body);
+    }
+
+    #[tokio::test]
+    async fn after_a_lag_the_buffered_events_are_not_announced_again() {
+        let (tx, rx) = broadcast::channel(2);
+        let fake = Arc::new(Fake(Mutex::new(vec![])));
+        let mut watch = Watch::new();
+        // `notes` is known, with nothing to show.
+        watch.catch_up(&status_of(json!([{"name": "notes", "status": {}}])));
+        let stop = |t: &str| ev(event::SAFETY_STOP, "notes", 1, json!({ "stop": t }));
+        let conflict = |p: &str| ev(event::CONFLICT, "notes", 1, json!({ "open": [p] }));
+        // Missed: stop x; still buffered: a conflict on a.md and stop y,
+        // both older than the status (which shows neither any more).
+        tx.send(stop("x")).unwrap();
+        tx.send(conflict("a.md")).unwrap();
+        tx.send(stop("y")).unwrap();
+        let st = status_of(json!([{"name": "notes", "status": {"safety_stop": "z"}}]));
+        let task = spawn(rx, watch, fake.clone(), Arc::new(move || Some(st.clone())));
+        drop(tx);
+        task.await.unwrap();
+        let got = fake.0.lock().unwrap().clone();
+        // Only the status's stop; not the stale conflict nor stop y.
+        assert_eq!(kinds(&got), ["safety-stop"], "{got:?}");
     }
 
     #[test]
