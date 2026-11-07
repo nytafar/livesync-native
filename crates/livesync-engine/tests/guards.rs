@@ -321,6 +321,33 @@ async fn an_obsidian_vault_with_the_plugin_enabled_is_refused_two_way() {
     assert!(env.pushed("mine.md"));
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_dot_folder_refuses_by_name_without_blaming_the_plugin() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new().await;
+    env.write("mine.md", b"local");
+    let s = env.vault().join(".snapshots");
+    std::fs::create_dir_all(s.join("1")).unwrap();
+    std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root reads anything; the check is moot there.
+    let blocked = std::fs::read_dir(&s).is_err();
+    let r = env.engine_with(|_| {}).sync_once().await.map(|_| ());
+    std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !blocked {
+        return;
+    }
+    match r {
+        Err(EngineError::Refused(e @ Refusal::PluginUnchecked { .. })) => {
+            let msg = e.to_string();
+            assert!(msg.contains(".snapshots could not be checked"), "{msg}");
+            assert!(!msg.contains("Disable the plugin"), "{msg}");
+        }
+        other => panic!("expected the unchecked folder refusal, got {other:?}"),
+    }
+    assert!(!env.pushed("mine.md"), "it fails closed");
+}
+
 #[tokio::test]
 async fn plain_folders_and_disabled_plugins_are_not_refused() {
     let env = Env::new().await;

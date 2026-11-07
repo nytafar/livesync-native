@@ -123,6 +123,16 @@ pub enum Refusal {
         why: String,
         handover: Option<String>,
     },
+    /// The plugin guard could not look into `folder` (a top-level
+    /// dot-folder, or the vault itself), so it fails closed. The folder may
+    /// have nothing to do with Obsidian (a root-owned `.snapshots`).
+    #[error("{folder} could not be checked for the Self-hosted LiveSync plugin ({why}), so this client does not sync {vault} two-way: make {folder} readable to this user, or move it out of the vault{}", unchecked_handover_text(.handover))]
+    PluginUnchecked {
+        vault: String,
+        folder: String,
+        why: String,
+        handover: Option<String>,
+    },
 }
 
 impl Refusal {
@@ -197,6 +207,14 @@ fn handover_text(handover: &Option<String>) -> String {
     match handover {
         Some(h) => format!(", or, for a deliberate handover, {h}"),
         None => ", then start syncing here again; this app does not run beside the plugin".into(),
+    }
+}
+
+/// The override for [`Refusal::PluginUnchecked`], where there is one.
+fn unchecked_handover_text(handover: &Option<String>) -> String {
+    match handover {
+        Some(h) => format!("; if you know the plugin does not run in this vault, {h}"),
+        None => String::new(),
     }
 }
 
@@ -817,6 +835,28 @@ mod tests {
             !app.contains("--allow-plugin") && !app.contains("allow_plugin") && !app.contains("lsync"),
             "{app}"
         );
+    }
+
+    #[test]
+    fn an_unchecked_folder_is_named_and_the_plugin_is_not_blamed() {
+        let r = |handover: Option<&str>| {
+            Refusal::PluginUnchecked {
+                vault: "/v".into(),
+                folder: "/v/.snapshots".into(),
+                why: "Permission denied".into(),
+                handover: handover.map(str::to_string),
+            }
+            .to_string()
+        };
+        for m in [r(Some("run with --allow-plugin")), r(None)] {
+            assert!(m.contains("/v/.snapshots could not be checked"), "{m}");
+            assert!(
+                !m.contains("Disable the plugin") && !m.contains("plugin enabled"),
+                "{m}"
+            );
+        }
+        assert!(r(Some("run with --allow-plugin")).contains("run with --allow-plugin"));
+        assert!(!r(None).contains("allow"));
     }
 
     #[test]

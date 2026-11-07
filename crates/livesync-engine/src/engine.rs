@@ -1049,18 +1049,22 @@ impl Engine {
         if self.inner.cfg.allow_plugin {
             return Ok(());
         }
-        match crate::folderkind::livesync_plugin_enabled(Path::new(&self.inner.vault_canon)) {
-            None => Ok(()),
-            Some(why) => {
-                let e = EngineError::Refused(Refusal::PluginEnabled {
-                    vault: self.inner.vault_canon.clone(),
-                    why,
-                    handover: self.inner.cfg.plugin_handover.clone(),
-                });
-                self.record_error(&e);
-                Err(e)
-            }
-        }
+        use crate::folderkind::PluginCheck;
+        let vault = self.inner.vault_canon.clone();
+        let handover = self.inner.cfg.plugin_handover.clone();
+        let r = match crate::folderkind::check_livesync_plugin(Path::new(&vault)) {
+            PluginCheck::Clear => return Ok(()),
+            PluginCheck::Enabled(why) => Refusal::PluginEnabled { vault, why, handover },
+            PluginCheck::Unchecked { folder, why } => Refusal::PluginUnchecked {
+                vault,
+                folder,
+                why,
+                handover,
+            },
+        };
+        let e = EngineError::Refused(r);
+        self.record_error(&e);
+        Err(e)
     }
 
     // ------------------------------------------------------------------
