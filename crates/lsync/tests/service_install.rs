@@ -182,3 +182,56 @@ fn a_system_unit_is_printed_without_root_and_installed_only_with_it() {
         assert!(m.calls().is_empty(), "{:?}", m.calls());
     }
 }
+
+#[test]
+fn doctor_reports_the_password_the_folders_and_the_service() {
+    let m = Machine::new();
+    let doctor = |m: &Machine| {
+        let out = m.cmd(&["doctor", "--json"]).output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        (out.status.code(), v)
+    };
+    let find = |v: &serde_json::Value, area: &str| -> Vec<(String, String)> {
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["area"] == area)
+            .map(|c| {
+                (
+                    c["level"].as_str().unwrap().to_string(),
+                    c["message"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    // No password yet: an error, and the exit code says so.
+    let (code, v) = doctor(&m);
+    assert_eq!(code, Some(1), "{v:#}");
+    let acct = find(&v, "account");
+    assert!(
+        acct[0].0 == "error" && acct[0].1.contains("lsync account passwd dev"),
+        "{acct:?}"
+    );
+    // The folder does not exist yet: a warning only.
+    assert_eq!(find(&v, "vault")[0].0, "warn", "{v:#}");
+    assert!(find(&v, "config")[0].1.contains("1 account(s), 1 vault(s)"));
+    // Without a session bus, the keyring is simply not available here.
+    assert!(find(&v, "secrets").iter().any(|(_, m)| m.starts_with("keyring:")));
+
+    let secrets = m.root.join("config/lsync/secrets.toml");
+    std::fs::write(&secrets, "\"dev\" = \"pw\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::create_dir_all(m.root.join("home/Notes/a/b")).unwrap();
+    let (code, v) = doctor(&m);
+    assert_eq!(code, Some(0), "{v:#}");
+    assert_eq!(find(&v, "account")[0].0, "ok");
+    assert_eq!(find(&v, "vault")[0].0, "ok");
+    if cfg!(target_os = "linux") {
+        let ino = find(&v, "inotify");
+        assert!(ino[0].1.starts_with("3 folder(s) to watch"), "{ino:?}");
+    }
+    let svc = find(&v, "service");
+    assert!(svc[0].1.contains("not installed"), "{svc:?}");
+}

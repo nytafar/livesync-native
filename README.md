@@ -358,7 +358,10 @@ lsync service install --linger   # a server: the user service starts at boot and
 lsync service status [--json]    # installed, enabled, running, lingering, and whether the socket answers
 lsync service logs [-f] [-n 100] # the journal (macOS: ~/Library/Logs/lsync/lsync.log)
 lsync service uninstall          # stops it and removes the unit; config, state and vaults stay
+lsync doctor [--json]            # what the service needs, checked (below)
 ```
+
+`lsync doctor` checks, without changing anything: the config; every secret store (ready, locked or not available here) and whether each account's password can be read; each enabled vault folder (exists, readable, writable; on macOS an EPERM says to grant Full Disk Access); on Linux, the folders an inotify watcher needs (every folder but dot-folders) against `fs.inotify.max_user_watches`, with a warning past half of it; and the service (installed, running, lingering, whether its socket answers). It exits 1 when a check fails.
 
 - **systemd user service:** `$XDG_CONFIG_HOME/systemd/user/lsync.service`. `Type=notify`: the service says `READY=1` once every vault's first start is decided (it runs, or is being retried), `RELOADING=1` and `READY=1` around a reload, and `WATCHDOG=1` from its runtime, with `WatchdogSec=60`. `systemctl --user reload lsync` is a SIGHUP (`ExecReload=`); `Restart=on-failure`; the log goes to the journal. When the installing shell sets `XDG_CONFIG_HOME`, `XDG_STATE_HOME` (to other than the defaults) or `LSYNC_RUNTIME_DIR`, the unit sets them too, so the service and the CLI agree. A user service stops at logout unless lingering is on: `--linger` runs `loginctl enable-linger`; `uninstall` leaves lingering as it is.
 - **systemd system service:** `lsync --system ...` works with the system service's own config (`/etc/lsync/lsync.toml`), state (`/var/lib/lsync/<vault>`) and socket (`/run/lsync/control.sock`).

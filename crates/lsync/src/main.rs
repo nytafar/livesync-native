@@ -3,6 +3,7 @@
 mod adopt;
 mod bar;
 mod config;
+mod doctor;
 mod handoff;
 mod import;
 mod install;
@@ -130,6 +131,13 @@ enum Cmd {
     Service {
         #[command(subcommand)]
         cmd: install::ServiceCmd,
+    },
+    /// Check what the service needs: the config, each account's secret
+    /// store, the vault folders' access, the inotify watch limit, and the
+    /// service. Exits 1 when something is wrong
+    Doctor {
+        #[arg(long)]
+        json: bool,
     },
     /// Follow the remote continuously and push local changes as they happen
     /// (one vault, from any settings; refused for a vault `lsync serve` runs)
@@ -378,6 +386,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         }
         Cmd::Probe(args) => return probe::run(args),
         Cmd::Service { cmd } => return install::run(&ctx, cmd),
+        Cmd::Doctor { json } => return doctor::run(&ctx, json),
         Cmd::Pause { json } => return service_verb(named?, method::PAUSE, "paused", json),
         Cmd::Resume { json } => return service_verb(named?, method::RESUME, "resumed", json),
         Cmd::SyncNow { json } => return service_verb(named?, method::SYNC_NOW, "syncing now", json),
@@ -629,6 +638,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         | Cmd::Vault { .. }
         | Cmd::Serve { .. }
         | Cmd::Service { .. }
+        | Cmd::Doctor { .. }
         | Cmd::Pause { .. }
         | Cmd::Resume { .. }
         | Cmd::SyncNow { .. }
