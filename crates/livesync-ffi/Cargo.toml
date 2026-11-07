@@ -25,4 +25,5 @@ uniffi = { version = "0.32.2", default-features = false }
 
 [dev-dependencies]
 axum = "0.8.9"
+futures = "0.3.34"
 tempfile = "3.27.0"

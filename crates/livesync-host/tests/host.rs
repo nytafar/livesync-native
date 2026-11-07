@@ -90,3 +90,38 @@ fn vaults_from_the_config_run_side_by_side_as_separate_nodes() {
     }
     assert!(mock.writes().is_empty(), "pull-only vaults never write");
 }
+
+#[test]
+fn the_connection_settings_are_checked_with_the_config() {
+    let d = tempfile::tempdir().unwrap();
+    let dirs = Dirs {
+        home: Some(d.path().join("home")),
+        config: d.path().join("config/lsync"),
+        state: d.path().join("state/lsync"),
+    };
+    let base = "[account.a]\nurl = \"https://couch.example.org\"\n\n[vault.v]\naccount = \"a\"\ndatabase = \"db\"\nfolder = \"~/v\"\n";
+    let ec = |extra: &str| {
+        let cfg = Config::parse(&format!("{base}{extra}"), &dirs).unwrap();
+        cfg.vault["v"]
+            .run_config("v", &cfg.account["a"], None, &dirs)
+            .unwrap()
+            .engine_config()
+            .unwrap()
+    };
+    // Only a heartbeat: the timeout follows at 2.5 heartbeats.
+    let c = ec("heartbeat_secs = 30\nclock_jump_secs = 0\n");
+    assert_eq!(c.longpoll_timeout, Duration::from_secs(75));
+    assert_eq!(c.clock_jump, None);
+    let c = ec("");
+    assert_eq!(c.heartbeat, livesync_engine::engine::connection_defaults::HEARTBEAT);
+    for (bad, says) in [
+        (
+            "heartbeat_secs = 30\nlongpoll_timeout_secs = 20\n",
+            "must be longer than heartbeat_secs",
+        ),
+        ("heartbeat_secs = 0\n", "heartbeat_secs must be at least 1"),
+    ] {
+        let e = Config::parse(&format!("{base}{bad}"), &dirs).unwrap_err();
+        assert!(e.contains("[vault.v]") && e.contains(says), "{e}");
+    }
+}

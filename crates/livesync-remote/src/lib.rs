@@ -8,7 +8,7 @@ use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use url::Url;
 
@@ -31,13 +31,17 @@ pub enum RemoteError {
     },
     #[error("unexpected response from {what}: {msg}")]
     Decode { what: String, msg: String },
+    /// The server sent nothing for this long on a request that should have
+    /// kept talking (the longpoll's heartbeats): the connection is taken for dead.
+    #[error("no data during {what} for {after:?}; the connection is taken for dead")]
+    Silent { what: String, after: Duration },
 }
 
 impl RemoteError {
     /// Worth retrying with backoff (network trouble, server errors, rate limits).
     pub fn is_transient(&self) -> bool {
         match self {
-            RemoteError::Transport { .. } => true,
+            RemoteError::Transport { .. } | RemoteError::Silent { .. } => true,
             RemoteError::Http { status, .. } => *status >= 500 || *status == 429 || *status == 408,
             RemoteError::Decode { .. } => true, // truncated bodies on flaky links
             RemoteError::Url(_) => false,
@@ -129,6 +133,11 @@ pub struct ChangesQuery {
     /// with heartbeats.
     pub longpoll: bool,
     pub heartbeat_ms: u64,
+    /// The longest the response may stay silent (no headers, no body bytes)
+    /// before the connection is taken for dead ([`RemoteError::Silent`]).
+    /// With longpoll, the heartbeats are what keeps it talking, so this
+    /// should be a few heartbeats long. `None`: the client's read timeout.
+    pub idle_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,9 +188,21 @@ pub fn changes_selector() -> Value {
     json!({"selector": {"$or": [{"type": {"$ne": "leaf"}}, {"_deleted": true}]}})
 }
 
+/// An HTTP client that several [`Couch`] clients share, and that
+/// [`Couch::reset_connections`] replaces for all of them at once.
+pub type SharedClient = Arc<RwLock<Client>>;
+
+/// A [`SharedClient`] from [`http_client`].
+pub fn shared_http_client() -> Result<SharedClient> {
+    Ok(Arc::new(RwLock::new(http_client()?)))
+}
+
 #[derive(Clone)]
 pub struct Couch {
-    http: Client,
+    /// Shared by this client's clones (and by every client made with
+    /// [`Couch::with_shared_client`] from the same one), so
+    /// [`Couch::reset_connections`] replaces the pool for all of them.
+    http: SharedClient,
     server: Url,
     db: Url,
     user: Option<String>,
@@ -204,8 +225,10 @@ pub fn http_client() -> Result<Client> {
     Client::builder()
         .user_agent(concat!("lsync/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(20))
-        // Longpoll sends a heartbeat newline every 30 s, so 90 s of silence
-        // means the connection is dead. Large chunk responses keep flowing.
+        // The longpoll has a shorter silence limit of its own
+        // (`ChangesQuery::idle_timeout`, kept talking by heartbeats). The
+        // other requests have no heartbeat, and a busy server may think for
+        // a while before answering a large `_bulk_docs` or `_all_docs`.
         .read_timeout(Duration::from_secs(90))
         .tcp_keepalive(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(60))
@@ -223,6 +246,12 @@ impl Couch {
 
     /// Like [`Couch::new`], reusing an existing client and its connection pool.
     pub fn with_client(cfg: &RemoteConfig, http: Client) -> Result<Self> {
+        Self::with_shared_client(cfg, Arc::new(RwLock::new(http)))
+    }
+
+    /// Like [`Couch::new`], on a client shared with other databases on the
+    /// same server: a reset by any of them gives all of them new connections.
+    pub fn with_shared_client(cfg: &RemoteConfig, http: SharedClient) -> Result<Self> {
         // Never the URL itself in the message: it may hold a password.
         let mut server =
             Url::parse(cfg.url.trim()).map_err(|e| RemoteError::Url(format!("the server URL is not valid: {e}")))?;
@@ -302,12 +331,88 @@ impl Couch {
         Ok(resp)
     }
 
+    /// The client all requests go through (clones share its pool).
+    fn http(&self) -> Client {
+        self.http.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Drop every pooled connection, for this client and its clones: later
+    /// requests open new ones. After the machine slept, or a connection was
+    /// found dead, the others in the pool are likely dead too, and a request
+    /// on one would hang until the read timeout. Requests in flight keep
+    /// their connection. A client given to [`Couch::with_client`] or
+    /// [`Couch::with_shared_client`] is replaced by one from [`http_client`],
+    /// for every `Couch` that shares it.
+    pub fn reset_connections(&self) {
+        match http_client() {
+            Ok(c) => *self.http.write().unwrap_or_else(|e| e.into_inner()) = c,
+            Err(e) => tracing::warn!("cannot set up a new HTTP client ({e}); keeping the old connections"),
+        }
+    }
+
+    /// `send`, waiting at most `idle` for the response headers.
+    async fn send_within(
+        &self,
+        what: &str,
+        rb: reqwest::RequestBuilder,
+        idle: Option<Duration>,
+    ) -> Result<reqwest::Response> {
+        match idle {
+            None => self.send(what, rb).await,
+            Some(after) => tokio::time::timeout(after, self.send(what, rb))
+                .await
+                .map_err(|_| RemoteError::Silent {
+                    what: what.into(),
+                    after,
+                })?,
+        }
+    }
+
+    /// The whole body, failing when no bytes arrive for `idle`.
+    async fn body_within(what: &str, mut resp: reqwest::Response, after: Duration) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(after, resp.chunk()).await {
+                Err(_) => {
+                    return Err(RemoteError::Silent {
+                        what: what.into(),
+                        after,
+                    })
+                }
+                Ok(Err(e)) => {
+                    return Err(RemoteError::Transport {
+                        what: what.into(),
+                        source: e,
+                    })
+                }
+                Ok(Ok(None)) => return Ok(out),
+                Ok(Ok(Some(b))) => out.extend_from_slice(&b),
+            }
+        }
+    }
+
     async fn json<T: serde::de::DeserializeOwned>(&self, what: &str, resp: reqwest::Response) -> Result<T> {
+        self.json_within(what, resp, None).await
+    }
+
+    async fn json_within<T: serde::de::DeserializeOwned>(
+        &self,
+        what: &str,
+        resp: reqwest::Response,
+        idle: Option<Duration>,
+    ) -> Result<T> {
         let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| RemoteError::Transport {
-            what: what.into(),
-            source: e,
-        })?;
+        let bytes = match idle {
+            None => resp
+                .bytes()
+                .await
+                .map_err(|e| RemoteError::Transport {
+                    what: what.into(),
+                    source: e,
+                })?
+                .to_vec(),
+            Some(after) => Self::body_within(what, resp, after).await?,
+        };
         self.rx_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes[..bytes.len().min(500)]).into_owned();
@@ -325,13 +430,13 @@ impl Couch {
 
     /// `GET /` on the server.
     pub async fn server_root(&self) -> Result<Value> {
-        let r = self.send("server root", self.http.get(self.server.clone())).await?;
+        let r = self.send("server root", self.http().get(self.server.clone())).await?;
         self.json("server root", r).await
     }
 
     /// `GET /{db}`.
     pub async fn db_info(&self) -> Result<DbInfo> {
-        let r = self.send("database info", self.http.get(self.db.clone())).await?;
+        let r = self.send("database info", self.http().get(self.db.clone())).await?;
         self.json("database info", r).await
     }
 
@@ -365,7 +470,7 @@ impl Couch {
             .and_then(Value::as_str)
             .ok_or_else(|| RemoteError::Url("document without _id".into()))?;
         let what = format!("PUT {id}");
-        let r = self.send(&what, self.http.put(self.id_url(id)).json(doc)).await?;
+        let r = self.send(&what, self.http().put(self.id_url(id)).json(doc)).await?;
         if r.status() == StatusCode::CONFLICT {
             return Ok(PutOutcome::Conflict);
         }
@@ -390,7 +495,7 @@ impl Couch {
         } else {
             json!({ "docs": docs, "new_edits": false })
         };
-        let r = self.send("_bulk_docs", self.http.post(url).json(&body)).await?;
+        let r = self.send("_bulk_docs", self.http().post(url).json(&body)).await?;
         self.json("_bulk_docs", r).await
     }
 
@@ -399,7 +504,7 @@ impl Couch {
     pub async fn all_docs_revs(&self, keys: &[String]) -> Result<Vec<AllDocsRow>> {
         let url = self.doc_url(&["_all_docs"]);
         let r = self
-            .send("_all_docs", self.http.post(url).json(&json!({ "keys": keys })))
+            .send("_all_docs", self.http().post(url).json(&json!({ "keys": keys })))
             .await?;
         let resp: AllDocsResponse = self.json("_all_docs", r).await?;
         Ok(resp.rows)
@@ -428,7 +533,7 @@ impl Couch {
                 qp.append_pair("end_key", &serde_json::to_string(k).unwrap());
             }
         }
-        let r = self.send("_all_docs", self.http.get(url)).await?;
+        let r = self.send("_all_docs", self.http().get(url)).await?;
         let resp: AllDocsResponse = self.json("_all_docs", r).await?;
         Ok(resp.rows)
     }
@@ -446,7 +551,7 @@ impl Couch {
 
     async fn fetch_url(&self, id: &str, url: Url) -> Result<DocFetch> {
         let what = format!("GET {id}");
-        let r = self.send(&what, self.http.get(url)).await?;
+        let r = self.send(&what, self.http().get(url)).await?;
         if r.status() == StatusCode::NOT_FOUND {
             let bytes = r.bytes().await.map_err(|e| RemoteError::Transport {
                 what: what.clone(),
@@ -485,10 +590,9 @@ impl Couch {
                     .append_pair("heartbeat", &q.heartbeat_ms.to_string());
             }
         }
-        let r = self
-            .send("_changes", self.http.post(url).json(&changes_selector()))
-            .await?;
-        self.json("_changes", r).await
+        let rb = self.http().post(url).json(&changes_selector());
+        let r = self.send_within("_changes", rb, q.idle_timeout).await?;
+        self.json_within("_changes", r, q.idle_timeout).await
     }
 
     /// `POST /{db}/_all_docs?include_docs=true` with `keys`.
@@ -498,7 +602,7 @@ impl Couch {
             .append_pair("include_docs", "true")
             .append_pair("conflicts", "true");
         let r = self
-            .send("_all_docs", self.http.post(url).json(&json!({ "keys": keys })))
+            .send("_all_docs", self.http().post(url).json(&json!({ "keys": keys })))
             .await?;
         let resp: AllDocsResponse = self.json("_all_docs", r).await?;
         Ok(resp.rows)

@@ -102,6 +102,13 @@ pub struct MockState {
     /// After the next full page of a ranged `_all_docs` read, drop the last
     /// document it returned (another client's deletion between two pages).
     pub delete_last_served_after_range_read: bool,
+    /// Answer every waiting longpoll with headers and then silence (no
+    /// heartbeat, no results): a connection that died in sleep or a network
+    /// switch. Counted in `stalled_longpolls`.
+    pub stall_longpoll: bool,
+    pub stalled_longpolls: u64,
+    /// Heartbeat newlines sent on waiting longpolls.
+    pub heartbeats_sent: u64,
 }
 
 #[derive(Clone)]
@@ -684,46 +691,88 @@ async fn changes(State((st, notify)): S, Query(q): Query<HashMap<String, String>
     let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(usize::MAX);
     let longpoll = q.get("feed").map(String::as_str) == Some("longpoll");
     let conflicts = q.get("conflicts").map(String::as_str) == Some("true");
-    // Answer from one snapshot of the log: results, and a `last_seq` that
-    // covers only what that snapshot held. A wait woken by a change the
-    // selector drops (a chunk) looks again, until the longpoll times out.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        let notified = notify.notified();
-        let (results, last, pending) = {
-            let s = st.lock().unwrap();
-            // Latest change per doc only, like CouchDB.
-            let mut latest: BTreeMap<String, u64> = BTreeMap::new();
-            for (seq, id) in &s.log {
-                if *seq > since {
-                    latest.insert(id.clone(), *seq);
+    let page = move |s: &MockState| {
+        // Latest change per doc only, like CouchDB.
+        let mut latest: BTreeMap<String, u64> = BTreeMap::new();
+        for (seq, id) in &s.log {
+            if *seq > since {
+                latest.insert(id.clone(), *seq);
+            }
+        }
+        let mut rows: Vec<(u64, String)> = latest.into_iter().map(|(id, seq)| (seq, id)).collect();
+        rows.sort();
+        let rows: Vec<(u64, String)> = rows
+            .into_iter()
+            .filter(|(_, id)| s.docs.get(id).is_some_and(selected))
+            .collect();
+        let total = rows.len();
+        let page: Vec<_> = rows.into_iter().take(limit).collect();
+        let last = page.last().map(|(seq, _)| *seq).unwrap_or(s.seq);
+        let results: Vec<Value> = page
+            .iter()
+            .map(|(seq, id)| {
+                let d = s.body_with(id, conflicts).unwrap();
+                let deleted = d.get("_deleted") == Some(&json!(true));
+                json!({"seq": format!("{seq}-x"), "id": id, "changes": [{"rev": d["_rev"]}], "deleted": deleted, "doc": d})
+            })
+            .collect();
+        (results, last, (total - page.len()) as u64)
+    };
+    let body = move |(results, last, pending): (Vec<Value>, u64, u64)| {
+        json!({"results": results, "last_seq": format!("{last}-x"), "pending": pending}).to_string()
+    };
+    let first = page(&st.lock().unwrap());
+    if !first.0.is_empty() || !longpoll {
+        return (StatusCode::OK, body(first)).into_response();
+    }
+    if st.lock().unwrap().stall_longpoll {
+        // A link that died: the headers came, then nothing ever again.
+        st.lock().unwrap().stalled_longpolls += 1;
+        let silent = futures::stream::pending::<Result<Bytes, std::io::Error>>();
+        return Response::new(axum::body::Body::from_stream(silent));
+    }
+    // Like CouchDB: a newline every `heartbeat` ms while waiting, then the
+    // results once there are any (or, here, after 40 s without any).
+    let heartbeat = q
+        .get("heartbeat")
+        .and_then(|h| h.parse::<u64>().ok())
+        .filter(|h| *h > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(60));
+    let end = tokio::time::Instant::now() + Duration::from_secs(40);
+    let stream = futures::stream::unfold(false, move |done| {
+        let (st, notify) = (st.clone(), notify.clone());
+        async move {
+            if done {
+                return None;
+            }
+            if st.lock().unwrap().stall_longpoll {
+                // The link died under a waiting longpoll: silence from now on.
+                st.lock().unwrap().stalled_longpolls += 1;
+                std::future::pending::<()>().await;
+            }
+            let notified = notify.notified();
+            let now = page(&st.lock().unwrap());
+            if !now.0.is_empty() {
+                return Some((Ok::<_, std::io::Error>(Bytes::from(body(now))), true));
+            }
+            let left = end.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Some((Ok(Bytes::from(body(now))), true));
+            }
+            match tokio::time::timeout(heartbeat.min(left), notified).await {
+                Ok(()) => {
+                    // Something changed: look again (an empty chunk keeps nothing back).
+                    Some((Ok(Bytes::new()), false))
+                }
+                Err(_) => {
+                    st.lock().unwrap().heartbeats_sent += 1;
+                    Some((Ok(Bytes::from_static(b"\n")), false))
                 }
             }
-            let mut rows: Vec<(u64, String)> = latest.into_iter().map(|(id, seq)| (seq, id)).collect();
-            rows.sort();
-            let rows: Vec<(u64, String)> = rows
-                .into_iter()
-                .filter(|(_, id)| s.docs.get(id).is_some_and(selected))
-                .collect();
-            let total = rows.len();
-            let page: Vec<_> = rows.into_iter().take(limit).collect();
-            let last = page.last().map(|(seq, _)| *seq).unwrap_or(s.seq);
-            let results: Vec<Value> = page
-                .iter()
-                .map(|(seq, id)| {
-                    let d = s.body_with(id, conflicts).unwrap();
-                    let deleted = d.get("_deleted") == Some(&json!(true));
-                    json!({"seq": format!("{seq}-x"), "id": id, "changes": [{"rev": d["_rev"]}], "deleted": deleted, "doc": d})
-                })
-                .collect();
-            (results, last, (total - page.len()) as u64)
-        };
-        if !results.is_empty() || !longpoll || tokio::time::Instant::now() >= deadline {
-            return Json(json!({"results": results, "last_seq": format!("{last}-x"), "pending": pending}))
-                .into_response();
         }
-        let _ = tokio::time::timeout_at(deadline, notified).await;
-    }
+    });
+    Response::new(axum::body::Body::from_stream(stream))
 }
 
 async fn all_docs(State((st, _)): S, Query(q): Query<HashMap<String, String>>, Json(body): Json<Value>) -> Json<Value> {

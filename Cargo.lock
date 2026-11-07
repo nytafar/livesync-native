@@ -965,6 +965,7 @@ name = "livesync-ffi"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures",
  "livesync-engine",
  "livesync-host",
  "livesync-model",
@@ -984,6 +985,7 @@ name = "livesync-host"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures",
  "libc",
  "livesync-engine",
  "livesync-model",
@@ -1054,6 +1056,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures",
  "libc",
  "livesync-engine",
  "livesync-host",

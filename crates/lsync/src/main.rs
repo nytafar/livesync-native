@@ -717,6 +717,7 @@ fn run_config_for(
         allow_mass_delete: push.allow_mass_delete,
         remove_out_of_scope_copies: push.remove_out_of_scope_copies,
         rebuild_quiet: quiet.map(Duration::from_secs),
+        tuning: sel.tuning.clone(),
     })
 }
 
@@ -1050,6 +1051,9 @@ fn engine_for(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, push: &PushOpts) ->
     if let Some(c) = r.concurrency {
         ec.concurrency = c.max(1);
     }
+    sel.tuning
+        .apply(&mut ec)
+        .map_err(|e| anyhow::anyhow!("[vault.{}]: {e}", sel.name))?;
     if ec.index_path.starts_with(&ec.vault)
         && !ec
             .index_path

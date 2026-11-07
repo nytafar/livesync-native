@@ -21,7 +21,7 @@ use livesync_engine::platform::{LockError, LockFile};
 use livesync_engine::{
     Confirmation, Engine, EngineError, FolderListing, GateReport, Index, PullReport, PushReport, Status,
 };
-use livesync_remote::{Couch, HttpClient};
+use livesync_remote::{Couch, SharedClient};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -81,8 +81,10 @@ type Access = Arc<Mutex<Option<Arc<dyn VaultAccess>>>>;
 /// One HTTP client (and so one connection pool and its TLS sessions) per
 /// server, shared by every vault on it (spec D6). Keyed by the server URL as
 /// accounts compare it; credentials go with each request, not the client.
+/// When one vault drops its connections (after sleep, or a silent longpoll,
+/// spec D8), the others on that server get new ones too, and still share.
 #[derive(Clone, Default)]
-pub(crate) struct Pool(Arc<Mutex<HashMap<String, HttpClient>>>);
+pub(crate) struct Pool(Arc<Mutex<HashMap<String, SharedClient>>>);
 
 impl Pool {
     fn couch(&self, cfg: &RunConfig) -> Result<Couch, HostError> {
@@ -93,13 +95,13 @@ impl Pool {
             match clients.get(&key) {
                 Some(c) => c.clone(),
                 None => {
-                    let c = livesync_remote::http_client().map_err(invalid)?;
+                    let c = livesync_remote::shared_http_client().map_err(invalid)?;
                     clients.insert(key, c.clone());
                     c
                 }
             }
         };
-        Couch::with_client(&cfg.remote(), client).map_err(invalid)
+        Couch::with_shared_client(&cfg.remote(), client).map_err(invalid)
     }
 
     /// How many servers have a client (for tests).

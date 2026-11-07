@@ -19,7 +19,7 @@
 //! with a message, never ignored.
 
 use crate::paths::{comparable, nested_under, normalise, paths_overlap};
-use crate::run::{check_url, split_userinfo, RunConfig, WhatSyncs};
+use crate::run::{check_url, split_userinfo, RunConfig, Tuning, WhatSyncs};
 use crate::secret::SecretRef;
 use livesync_engine::vaultfs::TrashMode;
 use livesync_model::scope::{Scope, ScopeMode};
@@ -169,6 +169,16 @@ pub struct Vault {
     /// Tuning: chunk-fetch requests in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+    /// Tuning: the longpoll's heartbeat in seconds (default 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_secs: Option<u64>,
+    /// Tuning: seconds without a heartbeat before reconnecting (default 25).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longpoll_timeout_secs: Option<u64>,
+    /// Tuning: a wall-clock jump this long past the monotonic clock is
+    /// taken for sleep: reconnect and rescan (default 10; 0 turns it off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_jump_secs: Option<u64>,
 }
 
 impl Vault {
@@ -192,6 +202,18 @@ impl Vault {
             enabled: true,
             max_size_mb: None,
             concurrency: None,
+            heartbeat_secs: None,
+            longpoll_timeout_secs: None,
+            clock_jump_secs: None,
+        }
+    }
+
+    /// The connection timings, as the host runs them.
+    pub fn tuning(&self) -> Tuning {
+        Tuning {
+            heartbeat_secs: self.heartbeat_secs,
+            longpoll_timeout_secs: self.longpoll_timeout_secs,
+            clock_jump_secs: self.clock_jump_secs,
         }
     }
 
@@ -255,6 +277,7 @@ impl Vault {
             remove_out_of_scope_copies: false,
             rebuild_quiet: None,
             what_syncs: self.what_syncs()?,
+            tuning: self.tuning(),
         })
     }
 }
@@ -460,6 +483,7 @@ impl Config {
             check_state_placement(&folder, &state).map_err(at)?;
             check_scope_lists(v).map_err(at)?;
             v.what_syncs().map_err(at)?;
+            v.tuning().check().map_err(at)?;
         }
         self.check_folders(dirs)
     }

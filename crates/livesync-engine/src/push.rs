@@ -553,7 +553,7 @@ enum NoBase {
 /// Whether an error ends the whole pass rather than just this document.
 fn pass_fatal(e: &EngineError) -> bool {
     match e {
-        EngineError::Remote(RemoteError::Transport { .. } | RemoteError::Url(_)) => true,
+        EngineError::Remote(RemoteError::Transport { .. } | RemoteError::Silent { .. } | RemoteError::Url(_)) => true,
         // The server or its proxy is down or throttling: not this document.
         EngineError::Remote(RemoteError::Http {
             status: 502 | 503 | 504 | 429 | 408,

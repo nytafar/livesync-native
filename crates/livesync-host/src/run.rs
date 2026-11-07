@@ -7,6 +7,7 @@ use livesync_engine::EngineConfig;
 use livesync_model::scope::{Scope, ScopeMode};
 use livesync_remote::RemoteConfig;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// What syncs besides the folder scope (spec D11): ignore files,
 /// `syncOnlyRegEx`, the dot-path allowlist, and where remote deletions go.
@@ -71,6 +72,64 @@ pub struct RunConfig {
     /// (`None`: the engine's default; tests shorten it).
     pub rebuild_quiet: Option<std::time::Duration>,
     pub what_syncs: WhatSyncs,
+    /// The connection timings.
+    pub tuning: Tuning,
+}
+
+/// A vault's connection settings (spec D8). `None` keeps the engine's
+/// platform default (`livesync_engine::engine::connection_defaults`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tuning {
+    /// The longpoll's heartbeat in seconds (default 10; Android 30).
+    pub heartbeat_secs: Option<u64>,
+    /// Seconds without a heartbeat before the connection is taken for dead
+    /// (default 25, or 2.5 heartbeats when only the heartbeat is set; Android 90).
+    pub longpoll_timeout_secs: Option<u64>,
+    /// A wall-clock jump of this many seconds past the monotonic clock
+    /// counts as sleep: reconnect and rescan (default 10; 0 turns it off;
+    /// Android: off).
+    pub clock_jump_secs: Option<u64>,
+}
+
+impl Tuning {
+    /// The timings as the engine takes them.
+    fn timings(&self) -> Result<(Duration, Duration, Option<Duration>), String> {
+        use livesync_engine::engine::connection_defaults as d;
+        let heartbeat = self.heartbeat_secs.map_or(d::HEARTBEAT, Duration::from_secs);
+        if heartbeat < Duration::from_secs(1) {
+            return Err("heartbeat_secs must be at least 1".into());
+        }
+        let timeout = match (self.longpoll_timeout_secs, self.heartbeat_secs) {
+            (Some(t), _) => Duration::from_secs(t),
+            (None, Some(_)) => d::LONGPOLL_TIMEOUT.max(heartbeat * 5 / 2),
+            (None, None) => d::LONGPOLL_TIMEOUT,
+        };
+        if timeout <= heartbeat {
+            return Err(format!(
+                "longpoll_timeout_secs ({}) must be longer than heartbeat_secs ({}), or every longpoll is taken for dead",
+                timeout.as_secs(),
+                heartbeat.as_secs()
+            ));
+        }
+        let jump = match self.clock_jump_secs {
+            None => d::CLOCK_JUMP,
+            Some(0) => None,
+            Some(s) => Some(Duration::from_secs(s)),
+        };
+        Ok((heartbeat, timeout, jump))
+    }
+
+    pub fn check(&self) -> Result<(), String> {
+        self.timings().map(|_| ())
+    }
+
+    pub fn apply(&self, ec: &mut EngineConfig) -> Result<(), String> {
+        let (heartbeat, timeout, jump) = self.timings()?;
+        ec.heartbeat = heartbeat;
+        ec.longpoll_timeout = timeout;
+        ec.clock_jump = jump;
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for RunConfig {
@@ -93,6 +152,7 @@ impl std::fmt::Debug for RunConfig {
             .field("remove_out_of_scope_copies", &self.remove_out_of_scope_copies)
             .field("rebuild_quiet", &self.rebuild_quiet)
             .field("what_syncs", &self.what_syncs)
+            .field("tuning", &self.tuning)
             .finish()
     }
 }
@@ -161,6 +221,7 @@ impl RunConfig {
             return Err("no database name".into());
         }
         self.scope()?;
+        self.tuning.check()?;
         Ok(())
     }
 
@@ -184,6 +245,7 @@ impl RunConfig {
         if let Some(q) = self.rebuild_quiet {
             ec.rebuild_quiet = q;
         }
+        self.tuning.apply(&mut ec)?;
         Ok(ec)
     }
 }
@@ -295,6 +357,7 @@ mod tests {
             allow_mass_delete: false,
             remove_out_of_scope_copies: false,
             rebuild_quiet: None,
+            tuning: Default::default(),
         }
     }
 

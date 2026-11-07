@@ -151,6 +151,19 @@ pub struct EngineConfig {
     pub batch_limit: usize,
     /// How often the daemon re-runs the connect gate.
     pub regate_interval: Duration,
+    /// The longpoll's heartbeat: CouchDB sends a newline this often while
+    /// nothing changes.
+    pub heartbeat: Duration,
+    /// How long the longpoll may stay silent before its connection is taken
+    /// for dead and the daemon reconnects (a few heartbeats).
+    pub longpoll_timeout: Duration,
+    /// A jump of at least this much between the wall clock and the monotonic
+    /// clock means the machine slept: the daemon reconnects (with fresh
+    /// connections) and rescans at once. `None`: not watched.
+    pub clock_jump: Option<Duration>,
+    /// The wall clock the sleep check compares with the monotonic clock, in
+    /// ms since the epoch (a seam for tests). `None`: the system clock.
+    pub wall_clock: Option<WallClock>,
     /// Memory budget for in-flight chunk data, in MiB.
     pub memory_budget_mb: usize,
     /// Skip names with characters FAT-style storage refuses (`" * : < > ? \ |`
@@ -223,6 +236,46 @@ impl std::fmt::Debug for AccessCheck {
     }
 }
 
+/// A wall clock in ms since the epoch ([`EngineConfig::wall_clock`]).
+#[derive(Clone)]
+pub struct WallClock(pub Arc<dyn Fn() -> i64 + Send + Sync>);
+
+impl WallClock {
+    pub fn new(f: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        WallClock(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for WallClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WallClock(..)")
+    }
+}
+
+/// The connection defaults (spec D8). Desktops and servers: a 10 s
+/// heartbeat and 25 s of silence before reconnecting, so a link that died in
+/// sleep or a Wi-Fi switch is noticed within 25 s, and a 10 s clock jump
+/// counts as sleep. Android keeps its 30 s heartbeat and 90 s timeout (each
+/// heartbeat wakes the radio) and does not watch the clock: the app gets
+/// network callbacks from the system instead (`NetworkMonitor`).
+pub mod connection_defaults {
+    use std::time::Duration;
+
+    #[cfg(not(target_os = "android"))]
+    pub const HEARTBEAT: Duration = Duration::from_secs(10);
+    #[cfg(not(target_os = "android"))]
+    pub const LONGPOLL_TIMEOUT: Duration = Duration::from_secs(25);
+    #[cfg(not(target_os = "android"))]
+    pub const CLOCK_JUMP: Option<Duration> = Some(Duration::from_secs(10));
+
+    #[cfg(target_os = "android")]
+    pub const HEARTBEAT: Duration = Duration::from_secs(30);
+    #[cfg(target_os = "android")]
+    pub const LONGPOLL_TIMEOUT: Duration = Duration::from_secs(90);
+    #[cfg(target_os = "android")]
+    pub const CLOCK_JUMP: Option<Duration> = None;
+}
+
 impl EngineConfig {
     /// The local filters this config asks for.
     pub fn filter_settings(&self) -> FilterSettings {
@@ -250,6 +303,10 @@ impl EngineConfig {
             concurrency: 6,
             batch_limit: 250,
             regate_interval: Duration::from_secs(300),
+            heartbeat: connection_defaults::HEARTBEAT,
+            longpoll_timeout: connection_defaults::LONGPOLL_TIMEOUT,
+            clock_jump: connection_defaults::CLOCK_JUMP,
+            wall_clock: None,
             memory_budget_mb: 160,
             restrict_names: None,
             case_insensitive: None,
@@ -1094,6 +1151,7 @@ impl Engine {
                     limit: self.inner.cfg.batch_limit,
                     longpoll: false,
                     heartbeat_ms: 0,
+                    idle_timeout: None,
                 })
                 .await?;
             let n = resp.results.len();
@@ -2543,7 +2601,20 @@ impl Engine {
         format!("; accepted node(s): {}", parts.join(", "))
     }
 
+    /// The wall clock, in ms since the epoch (`EngineConfig::wall_clock`).
+    fn wall_ms(&self) -> i64 {
+        match &self.inner.cfg.wall_clock {
+            Some(c) => (c.0)(),
+            None => vaultfs::now_ms(),
+        }
+    }
+
     async fn daemon(&self, mut shutdown: watch::Receiver<bool>, two_way: bool) -> Result<()> {
+        let mut sleep_watch = self
+            .inner
+            .cfg
+            .clock_jump
+            .map(|t| SleepWatch::new(t, Instant::now(), self.wall_ms()));
         let mut backoff = Backoff::default();
         let mut prepared = false;
         let mut caught_up_once = false;
@@ -2681,21 +2752,56 @@ impl Engine {
                     since,
                     limit: self.inner.cfg.batch_limit,
                     longpoll: true,
-                    heartbeat_ms: 30_000,
+                    heartbeat_ms: self.inner.cfg.heartbeat.as_millis() as u64,
+                    idle_timeout: Some(self.inner.cfg.longpoll_timeout),
                 };
-                let res = tokio::select! {
-                    r = self.inner.couch.changes(&q) => Some(r),
-                    _ = tokio::time::sleep_until(wake_at.into()) => None,
-                    // Network change or similar: reconnect and re-check now.
-                    _ = self.inner.nudge.notified() => None,
-                    _ = shutdown.changed() => return Ok(()),
+                enum Woke<T> {
+                    Changes(T),
+                    Timer,
+                    Nudged,
+                    Slept(Duration),
+                }
+                let poll = self.inner.couch.changes(&q);
+                tokio::pin!(poll);
+                let res = loop {
+                    let tick = sleep_watch.as_ref().map(SleepWatch::every);
+                    tokio::select! {
+                        r = &mut poll => break Woke::Changes(r),
+                        _ = tokio::time::sleep_until(wake_at.into()) => break Woke::Timer,
+                        // Network change or similar: reconnect and re-check now.
+                        _ = self.inner.nudge.notified() => break Woke::Nudged,
+                        _ = shutdown.changed() => return Ok(()),
+                        // Compare the clocks now and then; the longpoll stays open.
+                        _ = async { match tick { Some(t) => tokio::time::sleep(t).await, None => std::future::pending().await } } => {
+                            if let Some(j) = sleep_watch.as_mut().and_then(|w| w.check(Instant::now(), self.wall_ms())) {
+                                break Woke::Slept(j);
+                            }
+                        }
+                    }
                 };
-                match res {
-                    None => {
+                let res = match res {
+                    Woke::Changes(r) => Some(r),
+                    Woke::Timer => {
                         if Instant::now() >= regate_at {
                             continue 'outer;
                         }
+                        None
                     }
+                    Woke::Nudged => {
+                        debug!("nudged: reconnecting and checking the remote again");
+                        continue 'outer;
+                    }
+                    Woke::Slept(j) => {
+                        info!(
+                            "the wall clock moved {j:.0?} further than the monotonic clock: the machine slept; reconnecting and rescanning"
+                        );
+                        self.inner.couch.reset_connections();
+                        self.rescan_now();
+                        continue 'outer;
+                    }
+                };
+                match res {
+                    None => {}
                     Some(Ok(resp)) => {
                         backoff.reset();
                         if resp.results.is_empty() {
@@ -2727,7 +2833,19 @@ impl Engine {
                         }
                     }
                     Some(Err(e)) => {
-                        let wait = backoff.next_delay();
+                        let mut wait = backoff.next_delay();
+                        if let RemoteError::Silent { .. } = e {
+                            // A link that died in sleep or a network switch:
+                            // the pooled connections are likely dead too. A
+                            // proxy that buffers the heartbeats looks the same,
+                            // so the wait stays short either way.
+                            self.inner.couch.reset_connections();
+                            wait = wait.min(self.inner.cfg.heartbeat);
+                            warn!(
+                                "the changes feed was silent for {:.0?} (no heartbeat); reconnecting. If this repeats while the server is up, a proxy may be buffering /_changes (nginx: proxy_buffering off), or raise longpoll_timeout_secs",
+                                self.inner.cfg.longpoll_timeout
+                            );
+                        }
                         let e = EngineError::from(e);
                         self.record_error(&e);
                         warn!("changes feed failed: {e}; reconnecting in {wait:.0?}");
@@ -2782,6 +2900,44 @@ impl Engine {
     }
 }
 
+/// Tells sleep from the clocks (spec D8): the monotonic clock stops while
+/// the machine sleeps (`CLOCK_MONOTONIC` on Linux and Android, the uptime
+/// clock on macOS), the wall clock does not. When the wall clock moved at
+/// least `threshold` further than the monotonic one between two looks, the
+/// machine slept (or the clock was set forward, which costs one reconnect).
+#[derive(Debug, Clone)]
+pub(crate) struct SleepWatch {
+    threshold: Duration,
+    mono: Instant,
+    wall_ms: i64,
+}
+
+impl SleepWatch {
+    pub(crate) fn new(threshold: Duration, mono: Instant, wall_ms: i64) -> Self {
+        SleepWatch {
+            threshold,
+            mono,
+            wall_ms,
+        }
+    }
+
+    /// How often to look: half the threshold, between 50 ms and 5 s.
+    pub(crate) fn every(&self) -> Duration {
+        (self.threshold / 2).clamp(Duration::from_millis(50), Duration::from_secs(5))
+    }
+
+    /// Look at the clocks: the jump when there was one. Either way the next
+    /// look compares with this one.
+    pub(crate) fn check(&mut self, mono: Instant, wall_ms: i64) -> Option<Duration> {
+        let mono_ms = mono.saturating_duration_since(self.mono).as_millis() as i64;
+        let wall = wall_ms - self.wall_ms;
+        self.mono = mono;
+        self.wall_ms = wall_ms;
+        let gap = wall - mono_ms;
+        (gap >= self.threshold.as_millis() as i64).then(|| Duration::from_millis(gap as u64))
+    }
+}
+
 /// Status straight from an index file (no network).
 pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<Status> {
     let num = |k: &str| -> Result<Option<i64>> { Ok(ix.get_meta(k)?.and_then(|s| s.parse().ok())) };
@@ -2829,6 +2985,7 @@ pub fn status_from_index(ix: &Index, vault: &Path, index_path: &Path) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use super::{Duration, Instant, SleepWatch};
     use crate::filters::{parse_regex_list as parse_ignore, RegexRule as IgnoreRule};
 
     #[test]
@@ -2839,6 +2996,33 @@ mod tests {
         assert!(r[1].re.is_match("private/x.md"), "case-insensitive by default");
         assert!(r[2].negate);
         assert!(parse_ignore("", false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_wall_clock_jump_past_the_monotonic_clock_is_sleep() {
+        let t0 = Instant::now();
+        let mut w = SleepWatch::new(Duration::from_secs(10), t0, 1_000_000);
+        assert_eq!(w.every(), Duration::from_secs(5));
+        // Both clocks moved alike: no sleep, however long it was.
+        assert_eq!(w.check(t0 + Duration::from_secs(60), 1_060_000), None);
+        // A little drift or an NTP step below the threshold: no sleep.
+        assert_eq!(w.check(t0 + Duration::from_secs(65), 1_069_000), None);
+        // The wall clock went 1 h further than the monotonic one.
+        assert_eq!(
+            w.check(t0 + Duration::from_secs(70), 1_069_000 + 5_000 + 3_600_000),
+            Some(Duration::from_secs(3600))
+        );
+        // The next look compares with that one, not with the start.
+        assert_eq!(
+            w.check(t0 + Duration::from_secs(75), 1_069_000 + 10_000 + 3_600_000),
+            None
+        );
+        // The wall clock set back is not sleep.
+        assert_eq!(w.check(t0 + Duration::from_secs(80), 1_000_000), None);
+        assert_eq!(
+            SleepWatch::new(Duration::from_millis(20), t0, 0).every(),
+            Duration::from_millis(50)
+        );
     }
 
     fn ignored(rules: &[IgnoreRule], path: &str) -> bool {

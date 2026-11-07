@@ -98,6 +98,7 @@ This is an independent client, not affiliated with the Self-hosted LiveSync proj
 - **Pushes local changes** the way the official clients store them: the `v3-rabin-karp` splitter ported byte for byte (so chunk IDs match and deduplicate), chunks uploaded before the metadata that names them, metadata written against the revision the file was synced at. If the remote moved on meanwhile, the local edit is stored as a child of that revision instead (a conflict the desktop plugin resolves); nothing is overwritten.
 - **Deletes are soft deletes** (`deleted: true`) against the synced revision, only for files that were in sync. A remote delete moves the local file into the trash (see "What syncs" below). A move into `.trash/` is Obsidian's delete; a move out of the synced folders (or into another dot-folder) is not a delete. A pass that would delete more than 20 files with no known destination (`MASS_DELETE_MIN`), when they are also more than half of the tracked files, stops and asks instead, as does one that finds the synced folders empty and would delete 3 or more.
 - Watches the vault (one watch per folder, never `.obsidian/` nor a folder an ignore file ignores as a whole), waits until a file has been stable for 2 s, and rescans every 15 minutes in case an event was missed.
+- **Notices a dead connection quickly.** The longpoll asks CouchDB for a heartbeat every 10 s and reconnects after 25 s without one, so a link that died in sleep or a Wi-Fi switch is noticed within 25 s. When the wall clock jumps 10 s or more past the monotonic clock, the machine slept: it drops its connections, reconnects and rescans the vault at once. The Android app keeps a 30 s heartbeat and a 90 s timeout (each heartbeat wakes the radio) and relies on the system's network callbacks instead of the clock check. All three are per-vault settings (below).
 - **The daemon judges a burst of deletes as one:** a delete with no known destination goes out only once no other file has gone missing for 10 s (or after 2 minutes of steady deleting), so a burst the watcher spreads over several passes still meets the mass-delete stop. Steady deleting that goes on past the 2 minutes stays one burst until a 10 s pause: the deletes already sent count with the ones still missing, so a slow wipe stops before more than half of the files are gone. Allowing a stopped deletion covers the files that stop listed, and only if the stop is still the one shown when you allow it; files deleted after it are checked again.
 - **Folder scope:** all folders by default, or only some (`--include`), or all but some (`--exclude`), matched case-insensitively. Files outside the scope are invisible in both directions. Widening fetches the newly visible documents; narrowing stops tracking without touching the remote.
 - Registers itself in the milestone (`node_info`, `tweak_values`, `node_chunk_info`) after a complete fetch, and marks itself resolved after a fresh start or a rebuild elsewhere, so a rebuilt and locked database is recovered from automatically.
@@ -155,6 +156,16 @@ mode = "pull-only"              # default two-way
 ```
 
 A vault also takes `state_dir` (default `$XDG_STATE_HOME/lsync/<vault>`), `device_name`, `ignore_regex` (upstream `syncIgnoreRegEx`), `sync_only_regex` (upstream `syncOnlyRegEx`), `use_ignore_files` and `ignore_files`, `sync_dot_paths`, `trash` (all under "What syncs" below), `enabled` (default true; `false` keeps it configured but out of the service), `max_size_mb` and `concurrency`. Anything else, including a password, is refused with a message rather than ignored.
+
+The connection takes these (in seconds; edit them in the file):
+
+| Key | Default | What |
+|---|---|---|
+| `heartbeat_secs` | 10 (Android 30) | the longpoll's heartbeat |
+| `longpoll_timeout_secs` | 25 (Android 90; 2.5 heartbeats when only the heartbeat is set) | silence before the connection is taken for dead; must be longer than the heartbeat |
+| `clock_jump_secs` | 10 (Android: off) | a wall-clock jump this long past the monotonic clock is sleep: reconnect and rescan; `0` turns it off |
+
+A reverse proxy that buffers responses holds the heartbeats back, and the daemon then reconnects every `longpoll_timeout_secs`. Turn buffering off for `/_changes` (nginx: `proxy_buffering off`), or raise the timeout.
 
 ```sh
 lsync account add home --url https://couch.example.net --user me   # asks for the password

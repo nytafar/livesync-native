@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use livesync_host::config::{check_name, Config, Dirs, Mode, SECRETS_FILE};
 use livesync_host::migrate;
 use livesync_host::secret::{FileStore, SecretStores};
+use livesync_host::Tuning;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -141,6 +142,8 @@ pub struct Selected {
     pub origin: Origin,
     pub file: FileConfig,
     pub mode: Mode,
+    /// The vault's plugin-guard switch and timings (defaults for a profile).
+    pub tuning: Tuning,
     /// Why the account's password could not be read, if it could not.
     pub password_error: Option<String>,
     /// Vaults there was no telling apart (nothing was named).
@@ -325,6 +328,7 @@ impl Setup {
                 origin: Origin::Profile { path },
                 file,
                 mode: Mode::TwoWay,
+                tuning: Tuning::default(),
                 password_error: None,
                 ambiguous: vec![],
             })
@@ -447,6 +451,7 @@ impl Setup {
             },
             file,
             mode: v.mode,
+            tuning: v.tuning(),
             password_error,
             ambiguous: vec![],
         })
