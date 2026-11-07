@@ -367,11 +367,10 @@ fn device_of(p: &Path) -> Option<u64> {
     None
 }
 
+/// A freedesktop trash at `base` (`files/` and `info/`, made 0700 as needed).
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
-fn system_trash(vault: &Path) -> Result<SystemTrash, String> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    let vault = fs::canonicalize(vault).map_err(|e| format!("cannot resolve the vault folder: {e}"))?;
-    let vdev = device_of(&vault).ok_or("cannot stat the vault folder")?;
+fn freedesktop_trash(base: &Path) -> Result<SystemTrash, String> {
+    use std::os::unix::fs::DirBuilderExt;
     let mk = |d: &Path| -> Result<(), String> {
         fs::DirBuilder::new()
             .recursive(true)
@@ -379,14 +378,47 @@ fn system_trash(vault: &Path) -> Result<SystemTrash, String> {
             .create(d)
             .map_err(|e| format!("cannot create {}: {e}", d.display()))
     };
-    let both = |base: PathBuf| -> Result<SystemTrash, String> {
-        mk(&base.join("files"))?;
-        mk(&base.join("info"))?;
-        Ok(SystemTrash {
-            files: base.join("files"),
-            info: Some(base.join("info")),
-        })
+    mk(&base.join("files"))?;
+    mk(&base.join("info"))?;
+    Ok(SystemTrash {
+        files: base.join("files"),
+        info: Some(base.join("info")),
+    })
+}
+
+/// A per-user trash at the top of a filesystem (`.Trash/$uid` or
+/// `.Trash-$uid`): it must be a real folder of user `uid`'s on device
+/// `dev` (freedesktop: never a link, never another user's).
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+fn user_trash(base: &Path, uid: u32, dev: u64) -> Result<SystemTrash, String> {
+    use std::os::unix::fs::MetadataExt;
+    let check = |p: &Path| -> Result<(), String> {
+        match fs::symlink_metadata(p) {
+            Ok(md) if md.is_dir() && !md.file_type().is_symlink() && md.uid() == uid && md.dev() == dev => Ok(()),
+            Ok(_) => Err(format!(
+                "{} is not a folder of this user's on the vault's filesystem",
+                p.display()
+            )),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("cannot check {}: {e}", p.display())),
+        }
     };
+    check(base)?;
+    let t = freedesktop_trash(base)?;
+    // Checked again once made, and the folders inside it too.
+    check(base)?;
+    check(&t.files)?;
+    if let Some(i) = &t.info {
+        check(i)?;
+    }
+    Ok(t)
+}
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+fn system_trash(vault: &Path) -> Result<SystemTrash, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let vault = fs::canonicalize(vault).map_err(|e| format!("cannot resolve the vault folder: {e}"))?;
+    let vdev = device_of(&vault).ok_or("cannot stat the vault folder")?;
     // The home trash, when the vault is on the same filesystem.
     let data = std::env::var_os("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
@@ -396,7 +428,7 @@ fn system_trash(vault: &Path) -> Result<SystemTrash, String> {
     if let Some(d) = data {
         let home_trash = d.join("Trash");
         if device_of(&home_trash) == Some(vdev) {
-            return both(home_trash);
+            return freedesktop_trash(&home_trash);
         }
         why = format!("{} is on another filesystem", home_trash.display());
     }
@@ -413,12 +445,12 @@ fn system_trash(vault: &Path) -> Result<SystemTrash, String> {
     if let Ok(md) = fs::symlink_metadata(&shared) {
         let sticky = md.permissions().mode() & 0o1000 != 0;
         if md.is_dir() && !md.file_type().is_symlink() && sticky && md.dev() == vdev {
-            if let Ok(t) = both(shared.join(uid.to_string())) {
+            if let Ok(t) = user_trash(&shared.join(uid.to_string()), uid, vdev) {
                 return Ok(t);
             }
         }
     }
-    match both(top.join(format!(".Trash-{uid}"))) {
+    match user_trash(&top.join(format!(".Trash-{uid}")), uid, vdev) {
         Ok(t) => Ok(t),
         Err(e) => Err(format!("no system trash for {}: {why}; {e}", vault.display())),
     }
@@ -462,13 +494,67 @@ fn numbered(name: &str, n: usize) -> String {
 ///
 /// A rename, so the source moves in one step (an editor's atomic save that
 /// lands meanwhile is either moved whole or left in place; the caller
-/// checks which file moved). The destination is a fresh name in a trash
-/// folder, so the check before it only races another trash writer.
+/// checks which file moved). The kernel refuses an existing `dst`
+/// (`renameat2` with `RENAME_NOREPLACE` on Linux and Android, `renamex_np`
+/// with `RENAME_EXCL` on macOS). Where the filesystem or the kernel cannot
+/// do that, the existence check before a plain rename only races another
+/// writer of the same fresh name in a trash folder.
 fn move_no_replace(src: &Path, dst: &Path) -> io::Result<()> {
-    if fs::symlink_metadata(dst).is_ok() {
-        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    match rename_noreplace(src, dst) {
+        Some(r) => r,
+        None => {
+            if fs::symlink_metadata(dst).is_ok() {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            fs::rename(src, dst)
+        }
     }
-    fs::rename(src, dst)
+}
+
+/// An atomic no-replace rename, or `None` when this system cannot do one.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn rename_noreplace(src: &Path, dst: &Path) -> Option<io::Result<()>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (Ok(s), Ok(d)) = (
+        CString::new(src.as_os_str().as_bytes()),
+        CString::new(dst.as_os_str().as_bytes()),
+    ) else {
+        return Some(Err(io::Error::new(io::ErrorKind::InvalidInput, "a NUL in a path")));
+    };
+    // SAFETY: both are valid NUL-terminated strings for the whole call.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let rc = unsafe {
+        // The raw syscall: libc wrappers for renameat2 are missing from
+        // older C libraries.
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            s.as_ptr(),
+            libc::AT_FDCWD,
+            d.as_ptr(),
+            1 as libc::c_uint, // RENAME_NOREPLACE
+        ) as libc::c_int
+    };
+    // SAFETY: as above.
+    #[cfg(target_os = "macos")]
+    let rc = unsafe { libc::renamex_np(s.as_ptr(), d.as_ptr(), libc::RENAME_EXCL) };
+    if rc == 0 {
+        return Some(Ok(()));
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        // No such syscall, a seccomp filter, or a filesystem without the flag.
+        Some(libc::ENOSYS | libc::EINVAL | libc::EPERM | libc::ENOTSUP) => None,
+        #[allow(unreachable_patterns)]
+        Some(libc::EOPNOTSUPP) => None,
+        _ => Some(Err(e)),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn rename_noreplace(_src: &Path, _dst: &Path) -> Option<io::Result<()>> {
+    None
 }
 
 /// Percent-encode a path for a `.trashinfo` file (RFC 2396, `/` kept).
@@ -526,11 +612,7 @@ fn move_to_trash(root: &Path, rel: &str, target: &Path, trash: &Trash) -> io::Re
                     )));
                 }
             }
-            let dir = match Path::new(rel).parent() {
-                Some(p) if !p.as_os_str().is_empty() => base.join(p),
-                _ => base,
-            };
-            fs::create_dir_all(&dir)?;
+            let dir = trash_folders(&base, Path::new(rel).parent())?;
             for n in 0..10_000 {
                 let dst = dir.join(numbered(&name, n));
                 match move_no_replace(target, &dst) {
@@ -580,6 +662,47 @@ fn move_to_trash(root: &Path, rel: &str, target: &Path, trash: &Trash) -> io::Re
             Err(io::Error::other("no free name in the system trash"))
         }
     }
+}
+
+/// The folder in the vault trash `base` for a file whose folder in the
+/// vault is `parent`, created as needed. A name taken by something that is
+/// not a real folder (an earlier trashed file without an extension, a
+/// link) is left alone, and ` 1`, ` 2`, ... is added to the folder's name.
+fn trash_folders(base: &Path, parent: Option<&Path>) -> io::Result<PathBuf> {
+    fs::create_dir_all(base)?;
+    let mut dir = base.to_path_buf();
+    for seg in parent.into_iter().flat_map(|p| p.iter()) {
+        let seg = seg.to_string_lossy();
+        let mut found = None;
+        for n in 0..10_000 {
+            let cand = dir.join(if n == 0 { seg.to_string() } else { format!("{seg} {n}") });
+            match fs::symlink_metadata(&cand) {
+                Ok(md) if md.is_dir() && !md.file_type().is_symlink() => {
+                    found = Some(cand);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(&cand) {
+                    Ok(()) => {
+                        found = Some(cand);
+                        break;
+                    }
+                    // Made meanwhile: judge it again.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match fs::symlink_metadata(&cand) {
+                        Ok(md) if md.is_dir() && !md.file_type().is_symlink() => {
+                            found = Some(cand);
+                            break;
+                        }
+                        _ => continue,
+                    },
+                    Err(e) => return Err(e),
+                },
+                Err(e) => return Err(e),
+            }
+        }
+        dir = found.ok_or_else(|| io::Error::other("no free folder name in the trash"))?;
+    }
+    Ok(dir)
 }
 
 /// Drop the `.trashinfo` record of a file moved back out of a system trash.
@@ -632,14 +755,19 @@ fn trash_if_matches_with(
     let moved = fs::symlink_metadata(&to)
         .ok()
         .and_then(|m| crate::platform::file_id(&m));
+    // Inode numbers are not stable everywhere (FUSE): a moved file with the
+    // synced content is the one we judged, or the same content saved anew,
+    // and either may go.
     if ours.is_some() && moved.is_some() && ours != moved {
         let content = fs::read(&to)?;
         let found = hash_bytes(&content);
-        if fs::symlink_metadata(&target).is_err() && fs::rename(&to, &target).is_ok() {
-            remove_trashinfo(trash, &to);
-            return Ok(RemoveOutcome::Diverged { found });
+        if found != hash {
+            if fs::symlink_metadata(&target).is_err() && fs::rename(&to, &target).is_ok() {
+                remove_trashinfo(trash, &to);
+                return Ok(RemoveOutcome::Diverged { found });
+            }
+            return Ok(RemoveOutcome::Raced { displaced: content });
         }
-        return Ok(RemoveOutcome::Raced { displaced: content });
     }
     // An edit through a handle opened before the move lands in the moved
     // file; it is returned so the caller puts it back.
@@ -938,6 +1066,103 @@ mod tests {
         .unwrap();
         assert!(matches!(out, RemoveOutcome::Diverged { .. }), "{out:?}");
         assert_eq!(fs::read(root.join("n.md")).unwrap(), b"new edit", "moved back");
+    }
+
+    #[test]
+    fn a_file_in_the_trash_does_not_block_a_folder_of_its_name() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let put = |rel: &str, c: &[u8]| atomic_write(&root.join(rel), c, 0, &Expect::Absent).unwrap().state;
+        // An earlier trashed file without an extension, and a link.
+        let s = put("notes", b"a file");
+        trash_if_matches(root, "notes", &s.hash, &Trash::Vault).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(d.path(), root.join(".trash/linked")).unwrap();
+        let s = put("notes/a.md", b"a");
+        let out = trash_if_matches(root, "notes/a.md", &s.hash, &Trash::Vault).unwrap();
+        assert_eq!(
+            out,
+            RemoveOutcome::Trashed {
+                to: root.join(".trash/notes 1/a.md")
+            }
+        );
+        assert_eq!(fs::read(root.join(".trash/notes")).unwrap(), b"a file");
+        #[cfg(unix)]
+        {
+            let s = put("linked/b.md", b"b");
+            let out = trash_if_matches(root, "linked/b.md", &s.hash, &Trash::Vault).unwrap();
+            assert_eq!(
+                out,
+                RemoveOutcome::Trashed {
+                    to: root.join(".trash/linked 1/b.md")
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_content_saved_anew_before_the_move_is_trashed() {
+        // A new inode with the synced content (an atomic save of the same
+        // text, or a filesystem without stable inode numbers): it may go.
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let s = atomic_write(&root.join("n.md"), b"synced", 0, &Expect::Absent)
+            .unwrap()
+            .state;
+        let out = trash_if_matches_with(root, "n.md", &s.hash, &Trash::Vault, || {
+            fs::write(root.join("tmp-save"), b"synced").unwrap();
+            fs::rename(root.join("tmp-save"), root.join("n.md")).unwrap();
+        })
+        .unwrap();
+        assert_eq!(
+            out,
+            RemoveOutcome::Trashed {
+                to: root.join(".trash/n.md")
+            }
+        );
+        assert!(!root.join("n.md").exists());
+    }
+
+    #[test]
+    fn a_move_never_replaces_its_destination() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("a"), b"a").unwrap();
+        fs::write(d.path().join("b"), b"b").unwrap();
+        let e = move_no_replace(&d.path().join("a"), &d.path().join("b")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(d.path().join("b")).unwrap(), b"b");
+        // The kernel's own refusal, not the fallback's check (Linux temp
+        // folders support RENAME_NOREPLACE).
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            rename_noreplace(&d.path().join("a"), &d.path().join("b")),
+            Some(Err(e)) if e.kind() == io::ErrorKind::AlreadyExists
+        ));
+        move_no_replace(&d.path().join("a"), &d.path().join("c")).unwrap();
+        assert_eq!(fs::read(d.path().join("c")).unwrap(), b"a");
+        assert!(!d.path().join("a").exists());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    #[test]
+    fn a_per_user_trash_must_be_a_real_folder_of_ours() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tempfile::tempdir().unwrap();
+        let md = fs::metadata(d.path()).unwrap();
+        let (uid, dev) = (md.uid(), md.dev());
+        // Made when missing.
+        let t = user_trash(&d.path().join(".Trash-1"), uid, dev).unwrap();
+        assert!(t.files.is_dir() && t.info.unwrap().is_dir());
+        // A link, even to a folder of ours, is refused.
+        fs::create_dir(d.path().join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(d.path().join("elsewhere"), d.path().join(".Trash-2")).unwrap();
+        assert!(user_trash(&d.path().join(".Trash-2"), uid, dev).is_err());
+        assert!(!d.path().join("elsewhere/files").exists());
+        // Another user's folder (as seen with another uid) is refused.
+        assert!(user_trash(&d.path().join(".Trash-1"), uid + 1, dev).is_err());
+        // So is a file.
+        fs::write(d.path().join(".Trash-3"), b"").unwrap();
+        assert!(user_trash(&d.path().join(".Trash-3"), uid, dev).is_err());
     }
 
     #[test]
