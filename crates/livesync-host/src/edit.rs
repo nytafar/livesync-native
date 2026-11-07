@@ -30,22 +30,10 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
+    write_then_rename(&tmp, path, |f| {
         f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+        f.sync_all()
+    })?;
     if let Some(dir) = path.parent() {
         // The rename is durable once the folder is.
         if let Ok(d) = std::fs::File::open(dir) {
@@ -53,6 +41,37 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Write `tmp` (0600, created fresh) with `fill`, then rename it to `path`.
+/// On any error the temp file is removed: it may hold secrets.
+fn write_then_rename(
+    tmp: &Path,
+    path: &Path,
+    fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // A leftover from a crashed run with the same pid: never write into a
+    // file whose mode we did not set.
+    match std::fs::remove_file(tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(tmp)?;
+    let done = fill(&mut f).and_then(|()| {
+        drop(f);
+        std::fs::rename(tmp, path)
+    });
+    if done.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    done
 }
 
 /// How long a change waits for another one to finish.
@@ -162,7 +181,7 @@ impl ConfigFile {
 
     /// The model as the edited text says, checked.
     pub fn config(&self, dirs: &Dirs) -> Result<Config, String> {
-        Config::parse(&self.doc.to_string(), dirs)
+        Config::parse(&self.text(), dirs)
     }
 
     fn section(&mut self, kind: &str) -> &mut Table {
@@ -252,29 +271,131 @@ impl ConfigFile {
         Ok(())
     }
 
+    /// Remove an account or vault. The comment block right above its header
+    /// goes with it; comments set off from it by a blank line (the file's
+    /// header, the migration note, a note on a group of entries) stay,
+    /// above the next entry or at the end of the file.
     pub fn remove(&mut self, kind: &str, name: &str) -> Result<(), String> {
+        let order = self.table_order();
+        let key_prefix = self
+            .doc
+            .get(kind)
+            .and_then(|t| t.as_table())
+            .and_then(|t| t.key(name))
+            .map(|k| decor_prefix(k.leaf_decor()))
+            .filter(|p| p.contains('\n'))
+            .unwrap_or_default();
         let removed = self
             .doc
             .get_mut(kind)
             .and_then(|t| t.as_table_mut())
             .and_then(|t| t.remove(name));
-        match removed {
-            Some(_) => Ok(()),
-            None => Err(format!("there is no {kind} named {name:?}")),
+        let Some(removed) = removed else {
+            return Err(format!("there is no {kind} named {name:?}"));
+        };
+        let table_prefix = removed.as_table().map(|t| decor_prefix(t.decor())).unwrap_or_default();
+        let kept = file_comments(&format!("{key_prefix}{table_prefix}"));
+        if kept.is_empty() {
+            return Ok(());
         }
+        let here = order.iter().position(|p| p[0] == kind && p[1] == name);
+        // Not the first entry: a blank line before the comments, as before.
+        let kept = if here.is_some_and(|i| i > 0) {
+            format!("\n{kept}")
+        } else {
+            kept
+        };
+        let next = here.and_then(|i| order.get(i + 1)).cloned();
+        let next = next.and_then(|[k, n]| {
+            let section = self.doc.get_mut(&k)?.as_table_mut()?;
+            // The writer puts a key prefix with a line break before the
+            // table's own prefix: the comments go before both.
+            let key_has_lines = section
+                .key(&n)
+                .is_some_and(|k| decor_prefix(k.leaf_decor()).contains('\n'));
+            if key_has_lines {
+                let mut key = section.key_mut(&n)?;
+                let old = decor_prefix(key.leaf_decor());
+                key.leaf_decor_mut().set_prefix(join_comments(&kept, &old));
+            } else {
+                let t = section.get_mut(&n)?.as_table_mut()?;
+                let old = decor_prefix(t.decor());
+                t.decor_mut().set_prefix(join_comments(&kept, &old));
+            }
+            Some(())
+        });
+        if next.is_none() {
+            let old = self.doc.trailing().as_str().unwrap_or("").to_string();
+            // The entry came before what is already at the end.
+            self.doc.set_trailing(format!("{kept}{old}"));
+        }
+        Ok(())
+    }
+
+    /// The `[kind.name]` tables in the order they are written.
+    fn table_order(&self) -> Vec<[String; 2]> {
+        let mut out: Vec<(isize, [String; 2])> = Vec::new();
+        let mut last = 0;
+        for (kind, item) in self.doc.iter() {
+            let Some(section) = item.as_table() else { continue };
+            if let Some(p) = section.position() {
+                last = p;
+            }
+            for (name, entry) in section.iter() {
+                if let Some(t) = entry.as_table() {
+                    if let Some(p) = t.position() {
+                        last = p;
+                    }
+                    out.push((last, [kind.to_string(), name.to_string()]));
+                }
+            }
+        }
+        // Stable, as the writer sorts them.
+        out.sort_by_key(|(p, _)| *p);
+        out.into_iter().map(|(_, n)| n).collect()
     }
 
     /// Check the whole file as it would be written, then write it.
     pub fn save(&self, dirs: &Dirs) -> Result<Config, String> {
         let cfg = self.config(dirs)?;
-        write_private(&self.path, &self.doc.to_string())
-            .map_err(|e| format!("writing {}: {e}", self.path.display()))?;
+        write_private(&self.path, &self.text()).map_err(|e| format!("writing {}: {e}", self.path.display()))?;
         Ok(cfg)
     }
 
+    /// The file as it would be written (a new file with no entry yet is
+    /// its header alone).
     pub fn text(&self) -> String {
-        self.doc.to_string()
+        match &self.header {
+            Some(h) => format!("{h}{}", self.doc),
+            None => self.doc.to_string(),
+        }
     }
+}
+
+fn decor_prefix(d: &toml_edit::Decor) -> String {
+    d.prefix().and_then(|p| p.as_str()).unwrap_or("").to_string()
+}
+
+/// Of the text above an entry's header, the part that belongs to the file
+/// rather than the entry: everything up to the last blank line, when it
+/// holds a comment ("" otherwise). Ends with one line break.
+fn file_comments(prefix: &str) -> String {
+    let lines: Vec<&str> = prefix.split_inclusive('\n').collect();
+    let Some(blank) = lines.iter().rposition(|l| l.trim().is_empty() && l.ends_with('\n')) else {
+        return String::new();
+    };
+    let head: String = lines[..blank].concat();
+    if !head.lines().any(|l| l.trim_start().starts_with('#')) {
+        return String::new();
+    }
+    let head = head.trim_start_matches(['\n', '\r']).trim_end();
+    format!("{head}\n")
+}
+
+/// `comments` above an entry whose own prefix is `own`, a blank line between.
+fn join_comments(comments: &str, own: &str) -> String {
+    let own = own.trim_start_matches(['\n', '\r']);
+    format!("{comments}\n{own}")
 }
 
 /// A string array value for `include`/`exclude`.
@@ -342,6 +463,82 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("exclude = [\"Archive\"]"), "{text}");
+    }
+
+    #[test]
+    fn removing_an_entry_keeps_the_file_comments() {
+        let d = tempfile::tempdir().unwrap();
+        let dirs = dirs(d.path());
+        let path = dirs.config_file();
+        std::fs::create_dir_all(&dirs.config).unwrap();
+        std::fs::write(
+            &path,
+            "# file header\n# second line\n\n# the home server\n[account.home]\nurl = \"https://couch.example.net\"\n\n# group note\n\n# work vault\n[vault.work]\naccount = \"home\"\ndatabase = \"work\"\nfolder = \"/srv/work\"\n\n# notes vault\n[vault.notes]\naccount = \"home\"\ndatabase = \"notes\"\nfolder = \"/srv/notes\"\n",
+        )
+        .unwrap();
+        let mut f = ConfigFile::open(&path).unwrap();
+        f.remove("vault", "work").unwrap();
+        f.save(&dirs).unwrap();
+        let text = f.text();
+        assert!(!text.contains("# work vault"), "{text}");
+        assert!(
+            text.contains("\n\n# group note\n\n# notes vault\n[vault.notes]"),
+            "{text}"
+        );
+        f.remove("vault", "notes").unwrap();
+        f.remove("account", "home").unwrap();
+        f.save(&dirs).unwrap();
+        drop(f);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# file header\n# second line\n"), "{text}");
+        assert!(text.contains("# group note"), "{text}");
+        assert!(!text.contains("home server") && !text.contains("notes vault"), "{text}");
+        assert_eq!(Config::parse(&text, &dirs).unwrap(), Config::default());
+
+        // A file lsync started: its header and migration note stay too.
+        std::fs::remove_file(&path).unwrap();
+        let mut f = ConfigFile::open(&path).unwrap();
+        f.add_header_note("Migrated from a.toml.");
+        f.add_account(
+            "home",
+            &Account {
+                id: None,
+                url: "https://couch.example.net".into(),
+                username: None,
+                secret: None,
+            },
+            Some("own comment"),
+        )
+        .unwrap();
+        f.save(&dirs).unwrap();
+        f.remove("account", "home").unwrap();
+        let text = f.text();
+        assert!(text.starts_with("# lsync accounts and vaults."), "{text}");
+        assert!(text.contains("# Migrated from a.toml.\n"), "{text}");
+        assert!(!text.contains("own comment"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_temp_file() {
+        let d = tempfile::tempdir().unwrap();
+        let tmp = d.path().join(".secrets.toml.tmp-1");
+        let path = d.path().join("secrets.toml");
+        let e = write_then_rename(&tmp, &path, |f| {
+            f.write_all(b"a = \"secret\"\n")?;
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(e.is_err());
+        assert!(!tmp.exists() && !path.exists());
+        // The rename fails: the target is a folder with something in it.
+        std::fs::create_dir_all(path.join("x")).unwrap();
+        assert!(write_then_rename(&tmp, &path, |f| f.write_all(b"a = \"secret\"\n")).is_err());
+        assert!(!tmp.exists());
+        // A leftover temp file is replaced, never written into.
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(&tmp, "old").unwrap();
+        write_then_rename(&tmp, &path, |f| f.write_all(b"new")).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert!(!tmp.exists());
     }
 
     #[test]

@@ -145,6 +145,8 @@ fn accounts_keep_passwords_in_the_secret_store_only() {
             "work",
             "--url",
             "https://couch.example.org",
+            "--user",
+            "me",
             "--secret",
             "env:LSYNC_TEST_WORK_PW",
         ],
@@ -554,4 +556,338 @@ fn vault_on_the_command_line_wins_over_lsync_profile() {
     assert!(m.fails(&["vault", "ls"], None).contains("use the same folder"));
     m.ok(&["vault", "rm", "b"], None);
     m.ok(&["vault", "ls"], None);
+}
+
+fn stderr(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+#[test]
+fn an_unmigrated_default_profile_is_never_replaced_by_another_vault() {
+    let m = Machine::new();
+    // default.toml takes its URL from LSYNC_URL, so it is not migrated;
+    // work.toml is complete and becomes the only vault.
+    std::fs::write(
+        m.config_dir().join("default.toml"),
+        format!("database = \"mine\"\nvault = \"{}\"\n", m.folder("mine")),
+    )
+    .unwrap();
+    std::fs::write(
+        m.config_dir().join("work.toml"),
+        format!(
+            "url = \"https://couch.example.net\"\ndatabase = \"work\"\nusername = \"me\"\npassword = \"pw-work\"\nvault = \"{}\"\n",
+            m.folder("work")
+        ),
+    )
+    .unwrap();
+    m.index(&m.root.join("state/lsync/work"), "node-work");
+    m.index(&m.root.join("state/lsync/default"), "node-default");
+    let env = [("LSYNC_URL", "https://other.example.org")];
+    for _ in 0..2 {
+        let out = m.run_with(&["status", "--json"], None, &env);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(node_id(&String::from_utf8_lossy(&out.stdout)), "node-default");
+    }
+    assert!(m.config().contains("[vault.work]"));
+    // Named, work is work.
+    assert_eq!(
+        node_id(&m.ok(&["--vault", "work", "status", "--json"], None)),
+        "node-work"
+    );
+}
+
+#[test]
+fn a_profile_nothing_could_migrate_is_reported_once_and_never_quoted() {
+    let m = Machine::new();
+    std::fs::write(
+        m.config_dir().join("default.toml"),
+        "url = \"https://couch.example.net\"\nmax_size_mb = \"Hunter2-Sup3rSecret\"\n",
+    )
+    .unwrap();
+    let first = m.run_with(&["vault", "ls"], None, &[]);
+    let e = stderr(&first);
+    assert!(e.contains("was not migrated"), "{e}");
+    assert!(!e.contains("Hunter2"), "{e}");
+    let second = m.run_with(&["vault", "ls"], None, &[]);
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert!(!stderr(&second).contains("migrat"), "{}", stderr(&second));
+    assert!(String::from_utf8_lossy(&second.stdout).contains("default.toml"));
+    assert!(!m.config().contains("Hunter2"));
+    // A command still reads the profile, and its error does not quote it either.
+    let out = m.run_with(&["status"], None, &[]);
+    assert!(!out.status.success());
+    assert!(!stderr(&out).contains("Hunter2"), "{}", stderr(&out));
+    // A --secret argument is not quoted back.
+    let e = m.fails(
+        &[
+            "account",
+            "add",
+            "x",
+            "--url",
+            "https://couch.example.net",
+            "--secret",
+            "Hunter2-Sup3rSecret",
+        ],
+        None,
+    );
+    assert!(e.contains("STORE:KEY") && !e.contains("Hunter2"), "{e}");
+}
+
+#[test]
+fn a_url_with_a_password_is_refused_by_account_add() {
+    let m = Machine::new();
+    let e = m.fails(
+        &[
+            "account",
+            "add",
+            "home",
+            "--url",
+            "https://me:S3cret@couch.example.net",
+            "--password-stdin",
+        ],
+        Some("pw\n"),
+    );
+    assert!(e.contains("--user") && e.contains("asked"), "{e}");
+    assert!(!e.contains("S3cret"), "{e}");
+    assert!(!m.config_dir().join("lsync.toml").exists());
+    assert!(!m.config_dir().join("secrets.toml").exists());
+}
+
+#[test]
+fn a_profile_with_the_password_in_its_url_migrates_and_keeps_it_out_of_lsync_toml() {
+    let m = Machine::new();
+    std::fs::write(
+        m.config_dir().join("notes.toml"),
+        format!(
+            "url = \"https://me:S3cret@couch.example.net\"\ndatabase = \"notes\"\nvault = \"{}\"\n",
+            m.folder("notes")
+        ),
+    )
+    .unwrap();
+    let ls = m.ok(&["account", "ls"], None);
+    assert!(
+        !ls.contains("S3cret") && ls.contains("https://couch.example.net"),
+        "{ls}"
+    );
+    assert!(ls.contains("user      me") && ls.contains("(set)"), "{ls}");
+    assert!(!m.config().contains("S3cret"));
+    let secrets = std::fs::read_to_string(m.config_dir().join("secrets.toml")).unwrap();
+    assert!(secrets.contains("S3cret"));
+}
+
+#[test]
+fn removing_every_vault_and_account_leaves_a_usable_file() {
+    let m = Machine::new();
+    std::fs::write(
+        m.config_dir().join("lsync.toml"),
+        "# my notes on this machine\n\n[account.home]\nurl = \"https://couch.example.net\"\n\n[vault.work]\naccount = \"home\"\ndatabase = \"work\"\nfolder = \"/srv/work\"\n",
+    )
+    .unwrap();
+    m.ok(&["vault", "rm", "work"], None);
+    m.ok(&["account", "rm", "home"], None);
+    assert!(m.config().starts_with("# my notes on this machine\n"), "{}", m.config());
+    let ls = m.ok(&["vault", "ls"], None);
+    assert!(ls.contains("no vaults"), "{ls}");
+    m.ok(&["account", "add", "home", "--url", "https://couch.example.net"], None);
+    assert!(m.config().contains("[account.home]"));
+}
+
+#[test]
+fn an_account_without_a_user_has_no_password() {
+    let m = Machine::new();
+    // Not asked for one (stdin is empty), and none stored.
+    m.ok(&["account", "add", "open", "--url", "http://127.0.0.1:5984"], None);
+    m.ok(
+        &["vault", "add", "notes", "--db", "notes", "--folder", &m.folder("notes")],
+        None,
+    );
+    assert!(!m.config_dir().join("secrets.toml").exists());
+    let ls = m.ok(&["account", "ls"], None);
+    assert!(ls.contains("not used: no user"), "{ls}");
+    m.index(&m.root.join("state/lsync/notes"), "node-open");
+    assert_eq!(node_id(&m.ok(&["status", "--json"], None)), "node-open");
+    let e = m.fails(
+        &[
+            "account",
+            "add",
+            "open2",
+            "--url",
+            "http://127.0.0.1:5984",
+            "--password-stdin",
+        ],
+        Some("pw\n"),
+    );
+    assert!(e.contains("no user"), "{e}");
+}
+
+#[test]
+fn one_accounts_password_is_never_overwritten_by_another_unasked() {
+    let m = Machine::new();
+    let secrets = m.config_dir().join("secrets.toml");
+    let add = |extra: &[&str], stdin: &str| {
+        let mut args = vec!["account", "add"];
+        args.extend_from_slice(extra);
+        m.run_with(&args, Some(stdin), &[])
+    };
+    let ok = |o: Output| assert!(o.status.success(), "{}", stderr(&o));
+    ok(add(
+        &[
+            "home",
+            "--url",
+            "https://couch.example.net",
+            "--user",
+            "me",
+            "--password-stdin",
+        ],
+        "pw-home\n",
+    ));
+    let out = add(
+        &[
+            "other",
+            "--url",
+            "https://couch.example.org",
+            "--user",
+            "me",
+            "--secret",
+            "file:home",
+            "--password-stdin",
+        ],
+        "pw-other\n",
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("--replace-secret") && stderr(&out).contains("home"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(std::fs::read_to_string(&secrets).unwrap().contains("pw-home"));
+    assert!(!m.config().contains("[account.other]"));
+    // Sharing it on purpose, without a new password, is fine.
+    ok(add(
+        &[
+            "shared",
+            "--url",
+            "https://couch.example.net",
+            "--user",
+            "me",
+            "--secret",
+            "file:home",
+            "--no-password",
+        ],
+        "",
+    ));
+    // A key left from before holds a password: never used or replaced unasked.
+    let mut text = std::fs::read_to_string(&secrets).unwrap();
+    text.push_str("left = \"pw-left\"\n");
+    std::fs::write(&secrets, text).unwrap();
+    let out = add(
+        &[
+            "left",
+            "--url",
+            "https://couch.example.net",
+            "--user",
+            "me",
+            "--password-stdin",
+        ],
+        "pw-new\n",
+    );
+    assert!(
+        !out.status.success() && stderr(&out).contains("already holds"),
+        "{}",
+        stderr(&out)
+    );
+    let out = add(
+        &[
+            "left",
+            "--url",
+            "https://couch.example.net",
+            "--user",
+            "me",
+            "--no-password",
+        ],
+        "",
+    );
+    assert!(
+        !out.status.success() && stderr(&out).contains("already holds"),
+        "{}",
+        stderr(&out)
+    );
+    ok(add(
+        &[
+            "left",
+            "--url",
+            "https://couch.example.net",
+            "--user",
+            "me",
+            "--password-stdin",
+            "--replace-secret",
+        ],
+        "pw-new\n",
+    ));
+    let text = std::fs::read_to_string(&secrets).unwrap();
+    assert!(
+        text.contains("pw-new") && !text.contains("pw-left") && text.contains("pw-home"),
+        "{text}"
+    );
+}
+
+#[test]
+fn configure_never_gives_a_new_account_a_password_left_in_secrets_toml() {
+    let m = Machine::new();
+    std::fs::write(
+        m.config_dir().join("lsync.toml"),
+        "[account.home]\nurl = \"https://couch.example.org\"\n",
+    )
+    .unwrap();
+    let secrets = m.config_dir().join("secrets.toml");
+    std::fs::write(&secrets, "couch-example-net = \"pw-stale\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    m.ok(
+        &[
+            "--profile",
+            "new",
+            "configure",
+            "--url",
+            "https://couch.example.net",
+            "--user",
+            "me",
+            "--db",
+            "new",
+            "--folder",
+            &m.folder("new"),
+        ],
+        None,
+    );
+    let js: serde_json::Value = serde_json::from_str(&m.ok(&["vault", "ls", "--json"], None)).unwrap();
+    let account = js["vaults"][0]["account"].as_str().unwrap().to_string();
+    assert_ne!(account, "couch-example-net");
+    let accounts: serde_json::Value = serde_json::from_str(&m.ok(&["account", "ls", "--json"], None)).unwrap();
+    let a = accounts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == account.as_str())
+        .unwrap();
+    assert_eq!(a["password"], "missing");
+    // A password in the URL goes to the store, never into lsync.toml.
+    m.ok(
+        &[
+            "--profile",
+            "new",
+            "configure",
+            "--url",
+            "https://me:pw-url@couch.example.net",
+        ],
+        None,
+    );
+    assert!(!m.config().contains("pw-url"), "{}", m.config());
+    let text = std::fs::read_to_string(&secrets).unwrap();
+    assert!(
+        text.contains(&format!("{account} = \"pw-url\"")) && text.contains("pw-stale"),
+        "{text}"
+    );
 }

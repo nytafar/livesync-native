@@ -606,7 +606,11 @@ fn engine_for(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, push: &PushOpts) ->
 
 fn print_config(c: &FileConfig) {
     let show = |o: &Option<String>| o.clone().unwrap_or_else(|| "-".into());
-    println!("  url        {}", show(&c.url));
+    // A password inside the URL is not shown either.
+    println!(
+        "  url        {}",
+        show(&c.url.as_deref().map(livesync_host::run::url_for_display))
+    );
     println!("  database   {}", show(&c.database));
     println!("  user       {}", show(&c.username));
     println!("  password   {}", if c.password.is_some() { "(set)" } else { "-" });

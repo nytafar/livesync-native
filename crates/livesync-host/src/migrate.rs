@@ -20,6 +20,7 @@
 use crate::config::{check_name, server_key, Account, Config, Dirs, Vault, CONFIG_FILE, SECRETS_FILE};
 use crate::edit::ConfigFile;
 use crate::legacy::{self, Profile};
+use crate::run::split_userinfo;
 use crate::secret::{Secret, SecretStore};
 use livesync_model::scope::ScopeMode;
 use std::path::{Path, PathBuf};
@@ -36,7 +37,8 @@ pub struct Report {
     pub skipped: Vec<(PathBuf, String)>,
     /// Accounts whose password went into the secret store.
     pub passwords: Vec<String>,
-    /// Whether `lsync.toml` was written.
+    /// Whether `lsync.toml` was written (with no vaults when none could
+    /// be migrated, so that this runs once).
     pub written: bool,
 }
 
@@ -129,7 +131,7 @@ fn incomplete(p: &Profile) -> Option<String> {
     }
     match &p.vault {
         None => Some("it has no vault folder".into()),
-        Some(v) if !v.is_absolute() => Some(format!("its vault folder {} is not an absolute path", v.display())),
+        Some(v) if !v.is_absolute() => Some("its vault folder is not an absolute path".into()),
         _ => None,
     }
 }
@@ -158,6 +160,12 @@ fn vault_from(p: &Profile, account: &str) -> Result<Vault, String> {
 /// Migrate the profile files in `dirs.config` into `lsync.toml`, putting the
 /// passwords into `secrets` (the `file` store, `secret = "file:<account>"`).
 /// `Ok(None)` when there is nothing to do.
+///
+/// `lsync.toml` is written even when no profile could become a vault (with
+/// no entries, and a note saying which profiles were left and why), so the
+/// migration runs and reports once, not on every run. The profiles left
+/// are still read as before. A migration that fails (the secret store or
+/// the file cannot be written) writes nothing and is tried again next run.
 pub fn migrate(dirs: &Dirs, secrets: &dyn SecretStore) -> Result<Option<Report>, String> {
     let path = dirs.config_file();
     if path.exists() {
@@ -173,6 +181,8 @@ pub fn migrate(dirs: &Dirs, secrets: &dyn SecretStore) -> Result<Option<Report>,
         return Ok(None);
     }
     let mut report = Report::default();
+    // Accounts get their names once every profile is placed (see below);
+    // until then they go by a placeholder.
     let mut accounts: Vec<NewAccount> = Vec::new();
     let mut cfg = Config::default();
     let mut vaults: Vec<(String, Vault, PathBuf)> = Vec::new();
@@ -193,10 +203,8 @@ pub fn migrate(dirs: &Dirs, secrets: &dyn SecretStore) -> Result<Option<Report>,
             skip(&mut report, why);
             continue;
         }
-        let url = p.url.clone().unwrap_or_default().trim().to_string();
-        let user = p.username.clone().unwrap_or_default();
+        let (url, user, password) = credentials(&p);
         let key = (server_key(&url), user.clone());
-        let password = p.password.clone().filter(|s| !s.is_empty());
         // The same server and user, and no other password: the same account.
         let found = accounts
             .iter_mut()
@@ -204,7 +212,7 @@ pub fn migrate(dirs: &Dirs, secrets: &dyn SecretStore) -> Result<Option<Report>,
         let (acc_index, created) = match found {
             Some(i) => (i, false),
             None => {
-                let name = account_name(&accounts, &url, &user, password.as_deref(), secrets)?;
+                let name = format!("new-account-{}", accounts.len());
                 accounts.push(NewAccount {
                     name: name.clone(),
                     key,
@@ -212,7 +220,7 @@ pub fn migrate(dirs: &Dirs, secrets: &dyn SecretStore) -> Result<Option<Report>,
                         id: Some(new_id()),
                         url: url.clone(),
                         username: Some(user.clone()).filter(|s| !s.is_empty()),
-                        secret: Some(format!("file:{name}")),
+                        secret: None,
                     },
                     password: None,
                 });
@@ -247,9 +255,23 @@ pub fn migrate(dirs: &Dirs, secrets: &dyn SecretStore) -> Result<Option<Report>,
         }
         vaults.push((name.clone(), vault, p_path.clone()));
     }
-    if vaults.is_empty() {
-        return Ok(Some(report));
+    // The names, now that each account's password is known: a rerun after
+    // a crash picks the same ones (a key that holds this account's password
+    // is its own).
+    let mut named: Vec<NewAccount> = Vec::new();
+    for mut a in accounts {
+        let placeholder = std::mem::take(&mut a.name);
+        let user = a.key.1.clone();
+        a.name = account_name(&named, &a.account.url, &user, a.password.as_deref(), secrets)?;
+        a.account.secret = Some(format!("file:{}", a.name));
+        for (_, v, _) in vaults.iter_mut() {
+            if v.account == placeholder {
+                v.account = a.name.clone();
+            }
+        }
+        named.push(a);
     }
+    let accounts = named;
     // 1. The passwords, so that `lsync.toml` never names one that is missing.
     for a in &accounts {
         if let Some(pw) = &a.password {
@@ -263,22 +285,33 @@ pub fn migrate(dirs: &Dirs, secrets: &dyn SecretStore) -> Result<Option<Report>,
         }
     }
     // 2. `lsync.toml`.
-    let names: Vec<String> = vaults
-        .iter()
-        .map(|(_, _, p)| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
-        .collect();
-    let note = format!(
-        "Migrated from {}.\nThose files are left as they were, for going back to an older lsync; this file\nis the one read now. They still hold their passwords: delete them once you no\nlonger need them.",
-        names.join(", ")
-    );
+    let file_name = |p: &Path| p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let mut note = String::new();
+    if !vaults.is_empty() {
+        let names: Vec<String> = vaults.iter().map(|(_, _, p)| file_name(p)).collect();
+        note.push_str(&format!(
+            "Migrated from {}.\nThose files are left as they were, for going back to an older lsync; this file\nis the one read now. They still hold their passwords: delete them once you no\nlonger need them.",
+            names.join(", ")
+        ));
+    } else {
+        note.push_str("No profile file could become a vault here.");
+    }
+    if !report.skipped.is_empty() {
+        note.push_str(
+            "\n\nNot migrated, and still read as before (with --profile NAME; default.toml when\nno vault is named):",
+        );
+        for (p, why) in &report.skipped {
+            note.push_str(&format!("\n- {}: {}", file_name(p), why.replace('\n', " ")));
+        }
+        note.push_str("\nTo migrate them after a fix, add them with `lsync vault add`, or move this file\naway while it has no vaults; it is not tried again while this file exists.");
+    }
     file.add_header_note(&note);
     for a in &accounts {
         file.add_account(&a.name, &a.account, None)?;
         report.accounts.push(a.name.clone());
     }
     for (name, v, from) in &vaults {
-        let from_name = from.file_name().unwrap_or_default().to_string_lossy().into_owned();
-        file.add_vault(name, v, Some(&format!("migrated from {from_name}")))?;
+        file.add_vault(name, v, Some(&format!("migrated from {}", file_name(from))))?;
         report.vaults.push((name.clone(), from.clone()));
     }
     let text = file.text();
@@ -286,6 +319,27 @@ pub fn migrate(dirs: &Dirs, secrets: &dyn SecretStore) -> Result<Option<Report>,
     crate::edit::write_private(&path, &text).map_err(|e| format!("writing {}: {e}", path.display()))?;
     report.written = true;
     Ok(Some(report))
+}
+
+/// The server, user and password of a profile, with a user and password
+/// written into the URL moved out of it (as the remote client reads them:
+/// the profile's own `username` and `password` win).
+fn credentials(p: &Profile) -> (String, String, Option<String>) {
+    let url = p.url.clone().unwrap_or_default().trim().to_string();
+    let mut user = p.username.clone().unwrap_or_default();
+    let mut password = p.password.clone().filter(|s| !s.is_empty());
+    match split_userinfo(&url) {
+        Some(u) => {
+            if user.is_empty() {
+                user = u.username.unwrap_or_default();
+            }
+            if password.is_none() {
+                password = u.password;
+            }
+            (u.url, user, password)
+        }
+        None => (url, user, password),
+    }
 }
 
 /// A name for a new account that no other new account has, and whose
@@ -300,7 +354,11 @@ fn account_name(
     let base = account_base(url);
     let mut candidates = vec![base.clone()];
     let u = sanitize(user);
-    let stem = if u.is_empty() { base } else { format!("{base}-{u}") };
+    let stem = if u.is_empty() {
+        base.clone()
+    } else {
+        format!("{base}-{u}")
+    };
     if !u.is_empty() {
         candidates.push(stem.clone());
     }
@@ -316,7 +374,7 @@ fn account_name(
             _ => return Ok(c),
         }
     }
-    Err(format!("no free account name for {url}"))
+    Err(format!("no free account name for the server {base}"))
 }
 
 /// Where the profile a name refers to lives.

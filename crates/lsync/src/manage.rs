@@ -7,10 +7,11 @@ use crate::prompt;
 use crate::service::{self, Change};
 use anyhow::{anyhow, bail, Result};
 use clap::Subcommand;
-use livesync_host::config::{check_name, server_key, Account, Config, Mode, Vault};
+use livesync_host::config::{check_name, server_key, Account, Config, Mode, Vault, USERINFO};
 use livesync_host::edit::{string_array, ConfigFile};
 use livesync_host::migrate;
-use livesync_host::secret::{Availability, Secret, SecretRef, StoreKind};
+use livesync_host::run::split_userinfo;
+use livesync_host::secret::{Availability, Secret, SecretRef, SecretStores, StoreKind};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -28,9 +29,15 @@ pub enum AccountCmd {
         /// Read the password from stdin instead of asking
         #[arg(long)]
         password_stdin: bool,
-        /// No password (a server without authentication, or set it later)
+        /// No password now (set it later with `lsync account passwd`). An
+        /// account without --user is a server without authentication and
+        /// never has one
         #[arg(long, conflicts_with = "password_stdin")]
         no_password: bool,
+        /// Store the password even though the file: key already holds one,
+        /// or is another account's (whose password then changes too)
+        #[arg(long, conflicts_with = "no_password")]
+        replace_secret: bool,
     },
     /// List the accounts, where each password is kept, and which vaults use them
     Ls {
@@ -149,6 +156,7 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
             secret,
             password_stdin,
             no_password,
+            replace_secret,
         } => {
             given.refuse_password()?;
             check_name("account", &name).map_err(|e| anyhow!(e))?;
@@ -157,43 +165,89 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
                 .then(|| given.o.url.clone())
                 .flatten()
                 .ok_or_else(|| anyhow!("give the server with --url"))?;
-            let username = given.has("username").then(|| given.o.username.clone()).flatten();
+            if split_userinfo(&url).is_some() {
+                bail!("{USERINFO}");
+            }
+            let username = given
+                .has("username")
+                .then(|| given.o.username.clone())
+                .flatten()
+                .filter(|u| !u.is_empty());
             let r = match &secret {
-                Some(s) => SecretRef::parse(s).map_err(|e| anyhow!(e))?,
+                Some(s) => SecretRef::parse(s).map_err(|e| anyhow!("--secret: {e}"))?,
                 None => SecretRef::file(&name),
             };
             let mut file = open(ctx)?;
             let account = Account {
                 id: Some(new_id()),
                 url: url.trim().to_string(),
-                username,
+                username: username.clone(),
                 secret: Some(r.to_string()),
             };
             file.add_account(&name, &account, None).map_err(|e| anyhow!(e))?;
             // Checked before any password is stored.
-            file.config(&ctx.dirs).map_err(|e| anyhow!(e))?;
+            let cfg = file.config(&ctx.dirs).map_err(|e| anyhow!(e))?;
             let stores = ctx.secrets();
-            let mut stored = false;
-            if r.kind == StoreKind::File && !no_password {
-                let pw = prompt::new_password(password_stdin, &format!("password for {name}"))?;
-                stores.set(&r, &pw)?;
-                stored = true;
-            } else if password_stdin {
+            if username.is_none() && password_stdin {
+                bail!("account {name} has no user, so no password (a server without authentication); give --user USER for an account with one");
+            }
+            if r.kind != StoreKind::File && password_stdin {
                 bail!(
                     "account {name}'s password comes from the {}; lsync does not store it",
                     stores.describe(&r)
                 );
             }
+            // A file: key another account uses, or one that already holds a
+            // password, is never taken over unasked.
+            let mut previous = None;
+            if r.kind == StoreKind::File && username.is_some() {
+                let others: Vec<&str> = cfg
+                    .account
+                    .iter()
+                    .filter(|(n, a)| *n != &name && a.secret_ref(n).ok().as_ref() == Some(&r))
+                    .map(|(n, _)| n.as_str())
+                    .collect();
+                previous = stores.get(&r)?;
+                let shares_on_purpose = secret.is_some() && !others.is_empty();
+                let taken = !others.is_empty() || previous.is_some();
+                if !no_password && taken && !replace_secret {
+                    if others.is_empty() {
+                        bail!("the key {r} already holds a password that no account uses (left from an earlier account?); give this account another key with --secret file:KEY, or --replace-secret to replace it");
+                    }
+                    bail!(
+                        "the key {r} is the password of account(s) {}; give this account a key of its own with --secret file:KEY, or --replace-secret to change the password they share",
+                        others.join(", ")
+                    );
+                }
+                if no_password && previous.is_some() && !shares_on_purpose {
+                    bail!(
+                        "the key {r} already holds a password{}, which this account would use; give it another key with --secret file:KEY, or leave out --no-password and give --replace-secret",
+                        if others.is_empty() { String::new() } else { format!(" (account(s) {}'s)", others.join(", ")) }
+                    );
+                }
+            }
+            let mut stored = false;
+            if r.kind == StoreKind::File && username.is_some() && !no_password {
+                let pw = prompt::new_password(password_stdin, &format!("password for {name}"))?;
+                stores.set(&r, &pw)?;
+                stored = true;
+            }
             if let Err(e) = file.save(&ctx.dirs) {
+                // Undo only what this command did: a key it created goes, a
+                // password it replaced comes back.
                 if stored {
-                    let _ = stores.delete(&r);
+                    undo_password(&stores, &r, previous.as_ref());
                 }
                 bail!(e);
             }
             println!("added account {name} to {}", ctx.config_file.display());
-            println!("  password  {}", stores.describe(&r));
-            if r.kind != StoreKind::File {
-                println!("            (lsync reads it from there; it does not store it)");
+            if username.is_none() {
+                println!("  password  none (no user: a server without authentication)");
+            } else {
+                println!("  password  {}", stores.describe(&r));
+                if r.kind != StoreKind::File {
+                    println!("            (lsync reads it from there; it does not store it)");
+                }
             }
             service::config_changed(&ctx.config_file, &Change::Account(name));
             Ok(0)
@@ -203,7 +257,10 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
             let mut out = vec![];
             for (name, a) in &cfg.account {
                 let r = a.secret_ref(name).map_err(|e| anyhow!(e))?;
-                let (where_, state) = store_line(ctx, &r);
+                let (where_, mut state) = store_line(ctx, &r);
+                if a.username.as_deref().is_none_or(|u| u.is_empty()) {
+                    state = "not used: no user".into();
+                }
                 out.push(json!({
                     "name": name,
                     "url": a.url,
@@ -301,6 +358,15 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
             Ok(0)
         }
     }
+}
+
+/// Undo a password this command stored: the one it replaced comes back,
+/// or the key goes if this command created it. Nothing else is touched.
+fn undo_password(stores: &SecretStores, r: &SecretRef, previous: Option<&Secret>) {
+    let _ = match previous {
+        Some(old) => stores.set(r, old),
+        None => stores.delete(r).map(|_| ()),
+    };
 }
 
 fn new_id() -> String {
@@ -575,6 +641,18 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
                 }
                 None => println!("removed vault {name}; its folder and its index are left as they are"),
             }
+            let profile = migrate::profile_path(&ctx.dirs, &name);
+            if ctx.explicit.is_none() && profile.exists() {
+                println!(
+                    "  note: the profile file {} is still there, and is read again for {}",
+                    profile.display(),
+                    if name == "default" {
+                        "a command that names no vault".to_string()
+                    } else {
+                        format!("--profile {name}")
+                    }
+                );
+            }
             service::config_changed(&ctx.config_file, &Change::Vault(name));
             Ok(0)
         }
@@ -614,7 +692,7 @@ fn print_vault(ctx: &Setup, name: &str, v: &Vault) {
 /// settings (flags and environment, as `configure` always took them) go
 /// into the vault and its account, the password into the account's store.
 /// Returns the file written.
-pub fn configure(ctx: &Setup, sel: &Selected, o: &Overrides, password: Option<Secret>) -> Result<PathBuf> {
+pub fn configure(ctx: &Setup, sel: &Selected, o: &Overrides, mut password: Option<Secret>) -> Result<PathBuf> {
     let name = sel.name.clone();
     check_name("vault", &name).map_err(|e| anyhow!(e))?;
     let mut file = open(ctx)?;
@@ -623,15 +701,28 @@ pub fn configure(ctx: &Setup, sel: &Selected, o: &Overrides, password: Option<Se
     let old_account = old
         .as_ref()
         .map(|v| (v.account.clone(), cfg.account[&v.account].clone()));
-    let url = o
+    let mut url = o
         .url
         .clone()
         .or_else(|| old_account.as_ref().map(|(_, a)| a.url.clone()))
         .ok_or_else(|| anyhow!("a new vault needs --url, --db and --folder"))?;
-    let user = match &o.username {
+    let mut user = match &o.username {
         Some(u) => Some(u.clone()).filter(|s| !s.is_empty()),
         None => old_account.as_ref().and_then(|(_, a)| a.username.clone()),
     };
+    // A user and password in the URL go where lsync.toml keeps them (the
+    // account and its secret store), as the remote client would read them:
+    // --user and the password given win.
+    if let Some(u) = split_userinfo(&url) {
+        url = u.url;
+        if o.username.as_deref().is_none_or(|s| s.is_empty()) {
+            user = u.username.or(user);
+        }
+        if password.is_none() {
+            password = u.password.map(Secret::new);
+        }
+    }
+    let stores = ctx.secrets();
     let wanted = (server_key(&url), user.clone().unwrap_or_default());
     let key_of = |a: &Account| (a.server_key(), a.username.clone().unwrap_or_default());
     // The account: unchanged, another one for this server and user, the
@@ -649,11 +740,23 @@ pub fn configure(ctx: &Setup, sel: &Selected, o: &Overrides, password: Option<Se
                     n.clone()
                 }
                 _ => {
+                    // A name whose key holds nothing yet: never a password
+                    // left in secrets.toml by an earlier account.
                     let base = migrate::account_base(&url);
-                    let n = (1..100)
-                        .map(|i| if i == 1 { base.clone() } else { format!("{base}-{i}") })
-                        .find(|n| !cfg.account.contains_key(n))
-                        .ok_or_else(|| anyhow!("no free account name for {url}"))?;
+                    let mut n = None;
+                    for c in (1..100).map(|i| if i == 1 { base.clone() } else { format!("{base}-{i}") }) {
+                        let r = SecretRef::file(&c);
+                        let used = cfg.account.contains_key(&c)
+                            || cfg
+                                .account
+                                .iter()
+                                .any(|(an, a)| a.secret_ref(an).ok().as_ref() == Some(&r));
+                        if !used && stores.get(&r)?.is_none() {
+                            n = Some(c);
+                            break;
+                        }
+                    }
+                    let n = n.ok_or_else(|| anyhow!("no free account name for the server {base}"))?;
                     file.add_account(
                         &n,
                         &Account {
@@ -730,7 +833,7 @@ pub fn configure(ctx: &Setup, sel: &Selected, o: &Overrides, password: Option<Se
     }
     let checked = file.config(&ctx.dirs).map_err(|e| anyhow!(e))?;
     let r = checked.account[&account].secret_ref(&account).map_err(|e| anyhow!(e))?;
-    let stores = ctx.secrets();
+    let mut previous = None;
     if let Some(pw) = &password {
         if !stores.writable(&r) {
             bail!(
@@ -738,9 +841,39 @@ pub fn configure(ctx: &Setup, sel: &Selected, o: &Overrides, password: Option<Se
                 stores.describe(&r)
             );
         }
+        previous = Some(stores.get(&r)?);
         stores.set(&r, pw)?;
     }
-    file.save(&ctx.dirs).map_err(|e| anyhow!(e))?;
+    if let Err(e) = file.save(&ctx.dirs) {
+        // Undo the password: back to what it was, or gone if it is new.
+        if let Some(previous) = previous {
+            undo_password(&stores, &r, previous.as_ref());
+        }
+        bail!(e);
+    }
     service::config_changed(&ctx.config_file, &Change::Vault(name));
     Ok(ctx.config_file.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use livesync_host::secret::FileStore;
+
+    #[test]
+    fn a_rollback_restores_a_replaced_password_and_removes_only_a_new_key() {
+        let d = tempfile::tempdir().unwrap();
+        let stores = SecretStores::new(vec![Box::new(FileStore::new(d.path().join("secrets.toml")))]);
+        let (home, new) = (SecretRef::file("home"), SecretRef::file("new"));
+        stores.set(&home, &Secret::new("pw-home")).unwrap();
+        // Replaced, then the command failed: the old password is back.
+        stores.set(&home, &Secret::new("pw-other")).unwrap();
+        undo_password(&stores, &home, Some(&Secret::new("pw-home")));
+        assert_eq!(stores.get(&home).unwrap().unwrap().expose(), "pw-home");
+        // Created, then failed: only that key goes.
+        stores.set(&new, &Secret::new("pw-new")).unwrap();
+        undo_password(&stores, &new, None);
+        assert_eq!(stores.get(&new).unwrap(), None);
+        assert_eq!(stores.get(&home).unwrap().unwrap().expose(), "pw-home");
+    }
 }

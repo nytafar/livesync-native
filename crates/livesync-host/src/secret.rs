@@ -73,38 +73,41 @@ impl SecretRef {
         }
     }
 
+    /// Errors never quote the value: a password typed into `secret` by
+    /// mistake must not come back in a message.
     pub fn parse(s: &str) -> Result<SecretRef, String> {
+        const FORM: &str =
+            "secret must be STORE:KEY: file:KEY (secrets.toml), credential:NAME (systemd credentials) or env:VAR";
         let Some((store, key)) = s.split_once(':') else {
-            return Err(format!(
-                "secret {s:?} is not STORE:KEY (file:KEY, credential:NAME or env:VAR)"
-            ));
+            return Err(FORM.into());
         };
         let kind = match store {
             "file" => StoreKind::File,
             "credential" => StoreKind::Credential,
             "env" => StoreKind::Env,
-            other => {
-                return Err(format!(
-                    "unknown secret store {other:?} in {s:?} (use file, credential or env)"
-                ))
-            }
+            _ => return Err(format!("unknown secret store; {FORM}")),
         };
-        let ok = match kind {
-            StoreKind::File => !key.is_empty() && !key.chars().any(|c| c.is_control()),
-            StoreKind::Credential => {
+        let (ok, form) = match kind {
+            StoreKind::File => (
+                !key.is_empty() && !key.chars().any(|c| c.is_control()),
+                "a key that is not empty",
+            ),
+            StoreKind::Credential => (
                 !key.is_empty()
                     && !key.contains('/')
                     && key != "."
                     && key != ".."
-                    && !key.chars().any(|c| c.is_control())
-            }
-            StoreKind::Env => {
+                    && !key.chars().any(|c| c.is_control()),
+                "a credential name without '/'",
+            ),
+            StoreKind::Env => (
                 key.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            }
+                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "a variable name of letters, digits and '_', not starting with a digit",
+            ),
         };
         if !ok {
-            return Err(format!("secret {s:?}: {key:?} is not a valid {store} key"));
+            return Err(format!("secret {}:KEY needs {form}", kind.prefix()));
         }
         Ok(SecretRef {
             kind,
@@ -491,6 +494,17 @@ mod tests {
         assert!(SecretRef::parse("credential:../x").is_err());
         assert!(SecretRef::parse("file:").is_err());
         assert_eq!(SecretRef::parse("env:X").unwrap().to_string(), "env:X");
+        // A password typed in by mistake is never quoted back.
+        for leaky in [
+            "Hunter2-Sup3rSecret",
+            "Hunter2:Sup3rSecret",
+            "env:Hunter2-Sup3rSecret",
+            "credential:Hunter2/Sup3rSecret",
+        ] {
+            let e = SecretRef::parse(leaky).unwrap_err();
+            assert!(!e.contains("Hunter2") && !e.contains("Sup3r"), "{e}");
+            assert!(e.contains("STORE:KEY") || e.contains(":KEY needs"), "{e}");
+        }
     }
 
     #[test]

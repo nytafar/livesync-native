@@ -54,13 +54,26 @@ impl Profile {
             "all" | "" => Ok(ScopeMode::All),
             "include" => Ok(ScopeMode::Include),
             "exclude" => Ok(ScopeMode::Exclude),
-            other => Err(format!("unknown scope_mode {other:?} (use all, include or exclude)")),
+            _ => Err("unknown scope_mode (use all, include or exclude)".into()),
         }
     }
 
     /// The folder scope this profile describes.
     pub fn scope(&self) -> Result<Scope, String> {
-        Scope::new(self.scope_mode()?, self.scope_folders.as_deref().unwrap_or_default())
+        let mode = self.scope_mode()?;
+        let folders = self.scope_folders.as_deref().unwrap_or_default();
+        if mode != ScopeMode::All {
+            // Which entry, never what it holds.
+            for (i, f) in folders.iter().enumerate() {
+                if Scope::new(mode, std::slice::from_ref(f)).is_err() {
+                    return Err(format!(
+                        "entry {} of the folder scope is not a folder that can sync: give a folder relative to the vault, not empty, without . or .. and not a dot-folder",
+                        i + 1
+                    ));
+                }
+            }
+        }
+        Scope::new(mode, folders)
     }
 }
 
@@ -91,5 +104,15 @@ mod tests {
         assert!(e.starts_with("line 2") && !e.contains("leaky"), "{e}");
         let p = super::parse("password = \"leaky-secret\"\n").unwrap();
         assert!(!format!("{p:?}").contains("leaky"));
+        // A password of the wrong type, or in the wrong key.
+        let e = super::parse("url = \"https://couch.example.net\"\npassword = 98765432\n").unwrap_err();
+        assert!(e.starts_with("line 2") && !e.contains("98765432"), "{e}");
+        let e = super::parse("max_size_mb = \"leaky-secret\"\n").unwrap_err();
+        assert!(!e.contains("leaky"), "{e}");
+        let p = super::parse("scope_mode = \"leaky-secret\"\n").unwrap();
+        assert!(!p.scope().unwrap_err().contains("leaky"));
+        let p = super::parse("scope_mode = \"include\"\nscope_folders = [\"../leaky-secret\"]\n").unwrap();
+        let e = p.scope().unwrap_err();
+        assert!(!e.contains("leaky") && e.contains("entry 1"), "{e}");
     }
 }

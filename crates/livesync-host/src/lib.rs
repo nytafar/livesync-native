@@ -71,7 +71,8 @@ impl From<EngineError> for HostError {
 /// the parser's own rendering quotes: a config or profile file may hold a
 /// password on that line.
 pub fn toml_error(text: &str, message: &str, span: Option<std::ops::Range<usize>>) -> String {
-    let message = message.trim();
+    let message = without_values(message.trim());
+    let message = message.as_str();
     match span {
         Some(r) => {
             let before = &text[..r.start.min(text.len())];
@@ -81,6 +82,54 @@ pub fn toml_error(text: &str, message: &str, span: Option<std::ops::Range<usize>
         }
         None => message.to_string(),
     }
+}
+
+/// A serde message without the value it rejects: "invalid type: integer
+/// `98765432`, expected a string" becomes "invalid type: an integer,
+/// expected a string", and "unknown variant `x`, expected ..." becomes
+/// "unknown value, expected ...". A misplaced password must not come back
+/// in an error. Keys (unknown field `x`) stay: they are not values.
+pub fn without_values(message: &str) -> String {
+    let mut out = String::new();
+    for (i, line) in message.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&line_without_values(line));
+    }
+    out
+}
+
+fn line_without_values(line: &str) -> String {
+    for lead in ["invalid type: ", "invalid value: "] {
+        if let Some(at) = line.find(lead) {
+            let rest = &line[at + lead.len()..];
+            let (unexpected, tail) = match rest.find(", expected") {
+                Some(e) => (&rest[..e], &rest[e..]),
+                None => (rest, ""),
+            };
+            // `Unexpected` reads "integer `1`", "string \"x\"", "map", ...:
+            // keep the kind, drop what follows it.
+            let kind = unexpected
+                .split([' ', '`', '"', '\''])
+                .next()
+                .filter(|k| !k.is_empty())
+                .unwrap_or("value");
+            let kind = match kind {
+                "floating" => "a floating point number".to_string(),
+                "unit" | "other" => "a value of another type".to_string(),
+                k if k.starts_with(['a', 'e', 'i', 'o', 'u']) => format!("an {k}"),
+                k => format!("a {k}"),
+            };
+            return format!("{}{lead}{kind}{tail}", &line[..at]);
+        }
+    }
+    if let Some(at) = line.find("unknown variant ") {
+        let rest = &line[at..];
+        let tail = rest.find(", expected").map_or("", |e| &rest[e..]);
+        return format!("{}unknown value{tail}", &line[..at]);
+    }
+    line.to_string()
 }
 
 /// [`toml_error`] for `toml::from_str`.
@@ -99,5 +148,49 @@ pub fn explain_remote(e: &RemoteError) -> String {
         }
         RemoteError::Transport { .. } => format!("cannot reach the server: {e}"),
         _ => e.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serde_messages_lose_the_values_they_reject() {
+        #[derive(serde::Deserialize, Debug)]
+        #[allow(dead_code)]
+        struct T {
+            a: Option<String>,
+            m: Option<crate::config::Mode>,
+            n: Option<u64>,
+        }
+        for text in [
+            "a = 98765432\n",
+            "a = true\n",
+            "a = 1.5\n",
+            "a = [\"leaky\"]\n",
+            "m = \"Hunter2Leaky\"\n",
+            "n = \"Hunter2Leaky\"\n",
+            "n = -98765432\n",
+        ] {
+            let e = toml::from_str::<T>(text).unwrap_err();
+            let msg = toml_de_error(text, &e);
+            for leak in ["98765432", "true", "1.5", "leaky", "Leaky"] {
+                assert!(!msg.contains(leak), "{text:?} gave {msg:?}");
+            }
+            assert!(msg.starts_with("line 1"), "{msg}");
+        }
+        assert_eq!(
+            without_values("invalid type: integer `98765432`, expected a string"),
+            "invalid type: an integer, expected a string"
+        );
+        assert_eq!(
+            without_values("unknown variant `x`, expected `two-way` or `pull-only`"),
+            "unknown value, expected `two-way` or `pull-only`"
+        );
+        assert_eq!(
+            without_values("unknown field `x`, expected `a`"),
+            "unknown field `x`, expected `a`"
+        );
     }
 }

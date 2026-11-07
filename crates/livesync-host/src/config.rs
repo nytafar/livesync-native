@@ -19,7 +19,7 @@
 //! with a message, never ignored.
 
 use crate::paths::{comparable, nested_under, normalise, paths_overlap};
-use crate::run::{check_url, RunConfig};
+use crate::run::{check_url, split_userinfo, RunConfig};
 use crate::secret::SecretRef;
 use livesync_model::scope::{Scope, ScopeMode};
 use serde::{Deserialize, Serialize};
@@ -76,7 +76,7 @@ impl Mode {
         match s {
             "two-way" => Ok(Mode::TwoWay),
             "pull-only" => Ok(Mode::PullOnly),
-            other => Err(format!("unknown mode {other:?} (use two-way or pull-only)")),
+            _ => Err("unknown mode (use two-way or pull-only)".into()),
         }
     }
 }
@@ -312,9 +312,8 @@ impl Config {
                 }
             }
         }
-        let cfg: Config = toml::Value::Table(table)
-            .try_into()
-            .map_err(|e: toml::de::Error| e.to_string())?;
+        // From the text again, for the line of a wrong type (and never the value).
+        let cfg: Config = toml::from_str(text).map_err(|e| crate::toml_de_error(text, &e))?;
         cfg.validate(dirs)?;
         Ok(cfg)
     }
@@ -336,6 +335,9 @@ impl Config {
         for (name, a) in &self.account {
             check_name("account", name)?;
             check_url(&a.url).map_err(|e| format!("[account.{name}]: {e}"))?;
+            if split_userinfo(&a.url).is_some() {
+                return Err(format!("[account.{name}]: {USERINFO}"));
+            }
             a.secret_ref(name).map_err(|e| format!("[account.{name}]: {e}"))?;
         }
         for (name, v) in &self.vault {
@@ -354,20 +356,17 @@ impl Config {
             }
             let folder = v.folder_path(dirs);
             if v.folder.trim().is_empty() || !folder.is_absolute() {
-                return Err(at(format!(
-                    "folder must be an absolute path or start with ~/: {:?}",
-                    v.folder
-                )));
+                return Err(at("folder must be an absolute path or start with ~/".into()));
             }
             if folder.parent().is_none() {
                 return Err(at("the folder cannot be the filesystem root".into()));
             }
             let state = v.state_path(name, dirs);
             if !state.is_absolute() {
-                return Err(at(format!("state_dir must be an absolute path: {:?}", v.state_dir)));
+                return Err(at("state_dir must be an absolute path or start with ~/".into()));
             }
             check_state_placement(&folder, &state).map_err(at)?;
-            v.scope().map_err(at)?;
+            check_scope_lists(v).map_err(at)?;
         }
         self.check_folders(dirs)
     }
@@ -464,6 +463,28 @@ impl Config {
             .map(|(n, _)| n.as_str())
             .collect()
     }
+}
+
+/// The message for a server URL with a user or password in it.
+pub const USERINFO: &str = "the server URL has a user name or password in it; give the URL without them, the user with --user, and the password when asked (`lsync account add NAME --url URL --user USER`)";
+
+/// The folder scope, with errors that say which entry is wrong but not what
+/// it holds.
+fn check_scope_lists(v: &Vault) -> Result<(), String> {
+    for (key, mode, list) in [
+        ("include", ScopeMode::Include, &v.include),
+        ("exclude", ScopeMode::Exclude, &v.exclude),
+    ] {
+        for (i, entry) in list.iter().flatten().enumerate() {
+            if Scope::new(mode, std::slice::from_ref(entry)).is_err() {
+                return Err(format!(
+                    "entry {} of {key} is not a folder that can sync: give a folder relative to the vault, not empty, without . or .. and not a dot-folder",
+                    i + 1
+                ));
+            }
+        }
+    }
+    v.scope().map(|_| ())
 }
 
 /// The state folder may be inside the vault only in a dot-folder (which
@@ -577,9 +598,48 @@ exclude = ["Archive"]
         assert!(e.contains("not both"), "{e}");
         let e = with("[vault.x]\naccount = \"home\"\ndatabase = \"d\"\nfolder = \"/x\"\nmode = \"push-only\"\n")
             .unwrap_err();
-        assert!(e.contains("push-only"), "{e}");
+        // The value is not quoted back: the line and the choices are.
+        assert!(
+            !e.contains("push-only") && e.contains("line ") && e.contains("pull-only"),
+            "{e}"
+        );
         let e = with("[vault.\"a b\"]\naccount = \"home\"\ndatabase = \"d\"\nfolder = \"/x\"\n").unwrap_err();
         assert!(e.contains("not valid"), "{e}");
+    }
+
+    #[test]
+    fn errors_never_quote_the_values_they_refuse() {
+        let leaky = "Hunter2-Sup3rSecret";
+        for (text, says) in [
+            (format!("[account.x]\nurl = \"https://couch.example.org\"\nsecret = \"{leaky}\"\n"), "STORE:KEY"),
+            (format!("[account.x]\nurl = \"https://couch.example.org\"\nsecret = \"env:{leaky}\"\n"), "env:KEY"),
+            (format!("[account.x]\nurl = \"https://couch.example.org\"\nusername = {}\n", 98765432), "line "),
+            (format!("[account.x]\nurl = \"{leaky}\"\n"), "https://"),
+            (format!("[vault.x]\naccount = \"home\"\ndatabase = \"d\"\nfolder = \"{leaky}\"\n"), "absolute"),
+            (format!("[vault.x]\naccount = \"home\"\ndatabase = \"d\"\nfolder = \"/x\"\nstate_dir = \"{leaky}\"\n"), "absolute"),
+            (format!("[vault.x]\naccount = \"home\"\ndatabase = \"d\"\nfolder = \"/x\"\ninclude = [\"a\", \"../{leaky}\"]\n"), "entry 2 of include"),
+            (format!("[vault.x]\naccount = \"home\"\ndatabase = \"d\"\nfolder = \"/x\"\nmode = \"{leaky}\"\n"), "pull-only"),
+            (format!("[vault.x]\naccount = \"home\"\ndatabase = \"d\"\nfolder = \"/x\"\nenabled = \"{leaky}\"\n"), "line "),
+        ] {
+            let e = with(&text).unwrap_err();
+            assert!(!e.contains("Hunter2") && !e.contains("98765432"), "{e}");
+            assert!(e.contains(says), "{text}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_url_with_a_user_or_password_is_refused() {
+        for url in [
+            "https://me:S3cret@couch.example.org",
+            "https://me@couch.example.org/",
+            "http://:S3cret@127.0.0.1:8411",
+        ] {
+            let e = with(&format!("[account.x]\nurl = \"{url}\"\n")).unwrap_err();
+            assert!(e.contains("--user") && e.contains("[account.x]"), "{e}");
+            assert!(!e.contains("S3cret") && !e.contains("me@"), "{e}");
+        }
+        // An @ in the path is not a user.
+        with("[account.x]\nurl = \"https://couch.example.org/a@b\"\n").unwrap();
     }
 
     #[test]

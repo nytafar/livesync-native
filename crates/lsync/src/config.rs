@@ -161,7 +161,11 @@ impl Selector {
 }
 
 /// The format of a config file's text: accounts and vaults, or a profile.
-fn is_accounts_file(text: &str, path: &Path) -> Result<bool> {
+/// A file with no keys at all is an accounts file when `empty_is_accounts`
+/// (lsync's own `lsync.toml`, emptied by `vault rm` and `account rm` or
+/// written by a migration with nothing to migrate); for `--config FILE` it
+/// stays the empty profile it always was.
+fn is_accounts_file(text: &str, path: &Path, empty_is_accounts: bool) -> Result<bool> {
     let table: toml::Table = toml::from_str(text)
         .map_err(|e| anyhow!("parsing {}: {}", path.display(), livesync_host::toml_de_error(text, &e)))?;
     // A profile's `vault` is its folder (a string); here it is a table.
@@ -174,7 +178,7 @@ fn is_accounts_file(text: &str, path: &Path) -> Result<bool> {
             table.iter().filter(|(k, v)| !section(k, v)).map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ")
         );
     }
-    Ok(new > 0)
+    Ok(new > 0 || (empty_is_accounts && table.is_empty()))
 }
 
 /// The config and secrets locations for this run.
@@ -229,7 +233,12 @@ impl Setup {
                         p.file_stem().unwrap_or_default().to_string_lossy()
                     );
                 }
-                if r.written {
+                if r.written && r.vaults.is_empty() {
+                    warn!(
+                        "no profile file could be migrated; {} records which and why (see also `lsync vault ls`), and the migration is not tried again while it exists",
+                        self.dirs.config_file().display()
+                    );
+                } else if r.written {
                     info!(
                         "migrated {} profile(s) into {}: vaults {}; accounts {}; passwords in {}",
                         r.vaults.len(),
@@ -258,7 +267,7 @@ impl Setup {
     pub fn is_accounts_file(&self) -> Result<bool> {
         let text = std::fs::read_to_string(&self.config_file)
             .with_context(|| format!("reading {}", self.config_file.display()))?;
-        is_accounts_file(&text, &self.config_file)
+        is_accounts_file(&text, &self.config_file, self.explicit.is_none())
     }
 
     /// The accounts-and-vaults file, when there is one.
@@ -268,7 +277,7 @@ impl Setup {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("reading {}", self.config_file.display())),
         };
-        if !is_accounts_file(&text, &self.config_file)? {
+        if !is_accounts_file(&text, &self.config_file, self.explicit.is_none())? {
             if self.explicit.is_none() {
                 bail!(
                     "{} is not an accounts-and-vaults file (it has profile keys); move it to another name, such as default.toml, to use it as a profile",
@@ -329,6 +338,12 @@ impl Setup {
             }
             None => {
                 let implicit = cfg.implicit_vault().map(str::to_string);
+                let default_profile = migrate::profile_path(&self.dirs, "default");
+                if self.explicit.is_none() && !cfg.vault.contains_key("default") && default_profile.exists() {
+                    // `default.toml` was not migrated: with no name, it is read
+                    // as before, never another vault in its place.
+                    return profile("default".into(), default_profile);
+                }
                 match implicit {
                     // The folder given without a vault: flags and
                     // environment only, as before (never another vault's index).
@@ -349,7 +364,10 @@ impl Setup {
         let v = &cfg.vault[&chosen];
         let a = &cfg.account[&v.account];
         let scope = v.scope().map_err(|e| anyhow!("[vault.{chosen}]: {e}"))?;
+        let no_user = a.username.as_deref().is_none_or(|u| u.is_empty());
         let (password, password_error) = match a.secret_ref(&v.account) {
+            // No user: a server without authentication, no password needed.
+            _ if no_user => (None, None),
             Ok(r) => match self.secrets().get(&r) {
                 Ok(Some(s)) => (Some(s.expose().to_string()), None),
                 Ok(None) => (
@@ -489,7 +507,7 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
-    const TWO: &str = "[account.home]\nurl = \"https://couch.example.net\"\nsecret = \"env:LSYNC_TEST_UNSET_PASSWORD_VAR\"\n\n[vault.notes]\naccount = \"home\"\ndatabase = \"notes\"\nfolder = \"/srv/notes\"\n\n[vault.work]\naccount = \"home\"\ndatabase = \"work\"\nfolder = \"/srv/work\"\nmode = \"pull-only\"\n";
+    const TWO: &str = "[account.home]\nurl = \"https://couch.example.net\"\nusername = \"me\"\nsecret = \"env:LSYNC_TEST_UNSET_PASSWORD_VAR\"\n\n[vault.notes]\naccount = \"home\"\ndatabase = \"notes\"\nfolder = \"/srv/notes\"\n\n[vault.work]\naccount = \"home\"\ndatabase = \"work\"\nfolder = \"/srv/work\"\nmode = \"pull-only\"\n";
 
     #[test]
     fn a_vault_path_is_read_as_the_folder_with_a_warning() {
@@ -560,6 +578,91 @@ mod tests {
     }
 
     #[test]
+    fn an_unmigrated_default_profile_is_read_when_no_vault_is_named() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(d.path());
+        // default.toml was skipped (its URL comes from LSYNC_URL); work migrated.
+        write(
+            &c.dirs.config.join("default.toml"),
+            "database = \"mine\"\nvault = \"/srv/mine\"\n",
+        );
+        write(
+            &c.config_file,
+            "[account.home]\nurl = \"https://couch.example.net\"\nusername = \"me\"\n\n[vault.work]\naccount = \"home\"\ndatabase = \"work\"\nfolder = \"/srv/work\"\n",
+        );
+        let o = Overrides {
+            url: Some("https://other.example.org".into()),
+            ..Default::default()
+        };
+        let s = c.select(None, &o).unwrap();
+        assert_eq!(s.name, "default");
+        assert_eq!(
+            s.origin,
+            Origin::Profile {
+                path: c.dirs.config.join("default.toml")
+            }
+        );
+        assert_eq!(s.file.database.as_deref(), Some("mine"));
+        let r = resolve(&s, &merged(s.file.clone(), &o), &c.dirs, true).unwrap();
+        assert_eq!(r.state_dir, c.dirs.state.join("default"));
+        assert_eq!(r.remote.password, None);
+        // Named, work is work; a [vault.default] wins over the profile.
+        assert_eq!(c.select(Some("work".into()), &o).unwrap().name, "work");
+        write(
+            &c.config_file,
+            "[account.home]\nurl = \"https://couch.example.net\"\n\n[vault.default]\naccount = \"home\"\ndatabase = \"d\"\nfolder = \"/srv/d\"\n\n[vault.work]\naccount = \"home\"\ndatabase = \"work\"\nfolder = \"/srv/work\"\n",
+        );
+        let s = c.select(None, &o).unwrap();
+        assert!(matches!(s.origin, Origin::Vault { .. }));
+        assert_eq!(s.file.database.as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn a_vault_migrated_from_a_url_with_a_password_runs_with_it() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(d.path());
+        write(
+            &c.dirs.config.join("notes.toml"),
+            "url = \"https://me:S3cret@couch.example.net\"\ndatabase = \"notes\"\nvault = \"/srv/notes\"\n",
+        );
+        c.migrate_if_needed();
+        let o = Overrides::default();
+        let s = c.select(None, &o).unwrap();
+        assert!(matches!(s.origin, Origin::Vault { .. }));
+        let r = resolve(&s, &merged(s.file.clone(), &o), &c.dirs, true).unwrap();
+        assert_eq!(r.remote.url, "https://couch.example.net");
+        assert_eq!(r.remote.username.as_deref(), Some("me"));
+        assert_eq!(r.remote.password.as_deref(), Some("S3cret"));
+    }
+
+    #[test]
+    fn an_account_without_a_user_needs_no_password() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(d.path());
+        write(
+            &c.config_file,
+            "[account.open]\nurl = \"http://127.0.0.1:5984\"\n\n[vault.notes]\naccount = \"open\"\ndatabase = \"notes\"\nfolder = \"/srv/notes\"\n",
+        );
+        let o = Overrides::default();
+        let s = c.select(None, &o).unwrap();
+        assert_eq!(s.password_error, None);
+        let r = resolve(&s, &merged(s.file.clone(), &o), &c.dirs, true).unwrap();
+        assert_eq!((r.remote.username, r.remote.password), (None, None));
+    }
+
+    #[test]
+    fn an_empty_lsync_toml_is_an_empty_accounts_file() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(d.path());
+        for text in ["", "# only comments\n\n# more\n"] {
+            write(&c.config_file, text);
+            assert_eq!(c.load_accounts().unwrap(), Some(Config::default()));
+            let s = c.select(None, &Overrides::default()).unwrap();
+            assert_eq!(s.file, FileConfig::default());
+        }
+    }
+
+    #[test]
     fn profiles_still_work_without_and_beside_lsync_toml() {
         let d = tempfile::tempdir().unwrap();
         let c = ctx(d.path());
@@ -603,6 +706,9 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("at once"));
+        // Empty: an empty profile, as before (configure writes it).
+        write(&p, "");
+        assert!(matches!(c.select(None, &Overrides::default()).unwrap().origin, Origin::Profile { path } if path == p));
         // Missing: an empty profile, as before.
         let c = explicit(d.path().join("missing.toml"));
         assert_eq!(

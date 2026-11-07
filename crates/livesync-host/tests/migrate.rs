@@ -257,14 +257,95 @@ fn profiles_that_cannot_be_vaults_are_left_and_reported() {
 }
 
 #[test]
-fn nothing_to_migrate_writes_nothing() {
+fn nothing_to_migrate_is_recorded_once_without_the_values() {
     let m = Machine::new();
     assert_eq!(migrate(&m.dirs, &m.store()).unwrap(), None);
     assert!(!m.dirs.config_file().exists());
-    // Only incomplete profiles: still nothing written, so they are retried.
+    // Only profiles that cannot become vaults, one with a password where a
+    // number goes: an lsync.toml with no entries says which and why, once.
     m.profile("partial", "vault = \"/srv/p\"\n");
+    m.profile(
+        "typo",
+        "url = \"https://couch.example.net\"\nmax_size_mb = \"Hunter2-Sup3rSecret\"\n",
+    );
     let r = migrate(&m.dirs, &m.store()).unwrap().unwrap();
-    assert!(!r.written);
-    assert!(!m.dirs.config_file().exists());
+    assert!(r.written && r.vaults.is_empty() && r.accounts.is_empty());
+    assert_eq!(r.skipped.len(), 2);
+    for (_, why) in &r.skipped {
+        assert!(!why.contains("Hunter2"), "{why}");
+    }
+    let text = std::fs::read_to_string(m.dirs.config_file()).unwrap();
+    assert!(text.contains("- partial.toml: it has no url"), "{text}");
+    assert!(text.contains("- typo.toml: parsing"), "{text}");
+    assert!(!text.contains("Hunter2"), "{text}");
+    assert_eq!(m.config(), Config::default());
     assert!(!m.dirs.secrets_file().exists());
+    // Not tried (nor reported) again.
+    assert!(!migrate::needed(&m.dirs));
+    assert_eq!(migrate(&m.dirs, &m.store()).unwrap(), None);
+}
+
+#[test]
+fn a_user_and_password_in_the_url_move_to_the_account_and_the_store() {
+    let m = Machine::new();
+    m.profile(
+        "notes",
+        "url = \"https://me:S3cret%40x@couch.example.net/\"\ndatabase = \"notes\"\nvault = \"@ROOT@/vaults/notes\"\n",
+    );
+    // The profile's own user wins over the URL's, as the remote client reads it.
+    m.profile(
+        "work",
+        "url = \"https://other:pw-url@couch.example.org\"\nusername = \"me\"\ndatabase = \"work\"\nvault = \"@ROOT@/vaults/work\"\n",
+    );
+    let r = migrate(&m.dirs, &m.store()).unwrap().unwrap();
+    assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+    let c = m.config();
+    let a = &c.account[&c.vault["notes"].account];
+    assert_eq!(a.url, "https://couch.example.net/");
+    assert_eq!(a.username.as_deref(), Some("me"));
+    let w = &c.account[&c.vault["work"].account];
+    assert_eq!(w.url, "https://couch.example.org");
+    assert_eq!(w.username.as_deref(), Some("me"));
+    let text = std::fs::read_to_string(m.dirs.config_file()).unwrap();
+    assert!(
+        !text.contains("S3cret") && !text.contains("pw-url") && !text.contains('@'),
+        "{text}"
+    );
+    let s = m.store();
+    assert_eq!(s.get(&c.vault["notes"].account).unwrap().unwrap().expose(), "S3cret@x");
+    assert_eq!(s.get(&c.vault["work"].account).unwrap().unwrap().expose(), "pw-url");
+}
+
+#[test]
+fn a_rerun_after_a_crash_names_accounts_the_same_when_the_first_profile_has_no_password() {
+    let m = Machine::new();
+    // The first profile of the group has no password; the second has one.
+    m.profile(
+        "a",
+        &NOTES
+            .replace("password = \"pw-home\"\n", "")
+            .replace("vaults/notes", "vaults/a"),
+    );
+    m.profile("b", &NOTES.replace("vaults/notes", "vaults/b"));
+    let r = migrate(&m.dirs, &m.store()).unwrap().unwrap();
+    assert_eq!(r.accounts, vec!["couch-example-net".to_string()]);
+    std::fs::remove_file(m.dirs.config_file()).unwrap();
+    let again = migrate(&m.dirs, &m.store()).unwrap().unwrap();
+    assert_eq!(again.accounts, r.accounts);
+    // No second key with the same password left behind.
+    assert_eq!(m.store().keys().unwrap(), vec!["couch-example-net".to_string()]);
+}
+
+#[test]
+fn a_profile_with_neither_user_nor_password_migrates() {
+    let m = Machine::new();
+    m.profile(
+        "open",
+        "url = \"http://127.0.0.1:5984\"\ndatabase = \"open\"\nvault = \"@ROOT@/vaults/open\"\n",
+    );
+    let r = migrate(&m.dirs, &m.store()).unwrap().unwrap();
+    assert_eq!(r.vaults.len(), 1);
+    assert!(r.passwords.is_empty());
+    let c = m.config();
+    assert_eq!(c.account[&c.vault["open"].account].username, None);
 }

@@ -221,13 +221,15 @@ impl Couch {
 
     /// Like [`Couch::new`], reusing an existing client and its connection pool.
     pub fn with_client(cfg: &RemoteConfig, http: Client) -> Result<Self> {
-        let mut server = Url::parse(cfg.url.trim()).map_err(|e| RemoteError::Url(format!("{}: {e}", cfg.url)))?;
+        // Never the URL itself in the message: it may hold a password.
+        let mut server =
+            Url::parse(cfg.url.trim()).map_err(|e| RemoteError::Url(format!("the server URL is not valid: {e}")))?;
         match server.scheme() {
             "http" | "https" => {}
-            s => {
-                return Err(RemoteError::Url(format!(
-                    "unsupported scheme {s:?}; use http:// or https://"
-                )))
+            _ => {
+                return Err(RemoteError::Url(
+                    "the server URL must start with http:// or https://".into(),
+                ))
             }
         }
         // Credentials embedded in the URL are moved into basic auth.
@@ -499,6 +501,20 @@ impl Couch {
         let resp: AllDocsResponse = self.json("_all_docs", r).await?;
         Ok(resp.rows)
     }
+}
+
+/// The user name and password written into a server URL
+/// (`https://user:password@host/`), decoded as [`Couch::new`] reads them;
+/// `None` when it has neither (or does not parse).
+pub fn url_userinfo(url: &str) -> Option<(Option<String>, Option<String>)> {
+    let u = Url::parse(url.trim()).ok()?;
+    if u.username().is_empty() && u.password().is_none() {
+        return None;
+    }
+    Some((
+        Some(decode(u.username())).filter(|s| !s.is_empty()),
+        u.password().map(decode),
+    ))
 }
 
 fn decode(s: &str) -> String {

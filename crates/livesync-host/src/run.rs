@@ -131,9 +131,83 @@ pub fn check_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A user name and password written into a server URL
+/// (`https://user:password@host/`), as the remote client reads them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UrlUserinfo {
+    /// The URL without them.
+    pub url: String,
+    /// Percent-decoded; `None` when empty.
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for UrlUserinfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UrlUserinfo")
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
+
+/// The user name and password in `url`, if it has any (`None` otherwise),
+/// decoded as the remote client decodes them.
+pub fn split_userinfo(url: &str) -> Option<UrlUserinfo> {
+    let url = url.trim();
+    let (scheme, rest) = url.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (userinfo, host) = rest[..end].rsplit_once('@')?;
+    let (username, password) = livesync_remote::url_userinfo(url).unwrap_or_else(|| match userinfo.split_once(':') {
+        Some((u, p)) => (Some(u.to_string()), Some(p.to_string())),
+        None => (Some(userinfo.to_string()), None),
+    });
+    Some(UrlUserinfo {
+        url: format!("{scheme}://{host}{}", &rest[end..]),
+        username: username.filter(|s| !s.is_empty()),
+        password: password.filter(|s| !s.is_empty()),
+    })
+}
+
+/// A URL as it may be shown: a user name and password in it become `***@`.
+pub fn url_for_display(url: &str) -> String {
+    match split_userinfo(url) {
+        Some(u) => match u.url.split_once("://") {
+            Some((scheme, rest)) => format!("{scheme}://***@{rest}"),
+            None => u.url,
+        },
+        None => url.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_user_and_password_come_out_of_a_url() {
+        let u = split_userinfo(" https://me:p%40ss%2Bw@couch.example.org:6984/base?x=1 ").unwrap();
+        assert_eq!(u.url, "https://couch.example.org:6984/base?x=1");
+        assert_eq!(u.username.as_deref(), Some("me"));
+        assert_eq!(u.password.as_deref(), Some("p@ss+w"));
+        assert!(!format!("{u:?}").contains("p@ss"));
+        let u = split_userinfo("http://me@127.0.0.1:8411").unwrap();
+        assert_eq!(
+            (u.url.as_str(), u.username.as_deref(), u.password),
+            ("http://127.0.0.1:8411", Some("me"), None)
+        );
+        assert_eq!(split_userinfo("https://couch.example.org/a@b"), None);
+        assert_eq!(split_userinfo("https://couch.example.org"), None);
+        assert_eq!(
+            url_for_display("https://me:pw@couch.example.org/"),
+            "https://***@couch.example.org/"
+        );
+        assert_eq!(
+            url_for_display("https://couch.example.org/"),
+            "https://couch.example.org/"
+        );
+    }
 
     fn cfg() -> RunConfig {
         RunConfig {
