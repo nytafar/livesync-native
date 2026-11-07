@@ -125,8 +125,14 @@ pub fn serve(ctx: &Setup, only: Option<String>, opts: &ServeOpts, version: &str)
         secrets: ctx.secrets(),
         only: only.clone(),
     };
-    // Refuse before anything starts when the config is unusable.
-    source.load().map_err(|e| anyhow!(e))?;
+    // Refuse before anything starts when the config is unusable, or has no
+    // such vault (later, a vault gone from the file is stopped instead).
+    let vaults = source.load().map_err(|e| anyhow!(e))?;
+    if let Some(n) = &only {
+        if !vaults.iter().any(|v| &v.name == n) {
+            bail!("no vault named {n:?} in {}", ctx.config_file.display());
+        }
+    }
     let kind = if opts.system { Kind::System } else { Kind::User };
     let policy = policy(opts)?;
     let dir = control::service_dir(kind).map_err(|e| anyhow!(e))?;

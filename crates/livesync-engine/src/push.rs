@@ -63,6 +63,7 @@ const MAX_ORPHAN_PATHS: usize = 100;
 
 /// Counters for push passes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PushReport {
     pub passes: u64,
     /// Files looked at (stat).

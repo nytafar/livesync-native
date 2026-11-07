@@ -8,7 +8,7 @@
 //! config file is left alone, and no service is not an error: the change
 //! applies at its next start.
 
-use livesync_host::control::Client;
+use livesync_host::control::{Client, ClientError};
 use livesync_host::protocol::{method, Hello};
 use serde_json::json;
 use std::path::Path;
@@ -49,10 +49,20 @@ pub fn config_changed(config_file: &Path, change: &Change) {
         }
     };
     client.set_timeout(Some(Duration::from_secs(5)));
-    let hello: Option<Hello> = client
-        .call(method::HELLO, json!({}))
-        .ok()
-        .and_then(|v| serde_json::from_value(v).ok());
+    let hello: Option<Hello> = match client.hello(&[method::RELOAD]) {
+        Ok(h) => Some(h),
+        Err(e @ ClientError::Version(_)) => {
+            warn!(
+                "{} changed, but the lsync service was not told: {e}",
+                config_file.display()
+            );
+            return;
+        }
+        Err(e) => {
+            debug!("hello: {e}");
+            None
+        }
+    };
     match hello {
         Some(h) if same_file(Path::new(&h.config), config_file) => {}
         Some(h) => {

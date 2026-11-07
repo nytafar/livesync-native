@@ -315,7 +315,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             let r = config::resolve(&sel, &cfg, &ctx.dirs, false)?;
             let index_path = r.state_dir.join("index.sqlite");
             let st = match route::route(&r, "status", false)? {
-                Route::Service { mut client, vault } => {
+                Route::Service { mut client, vault, .. } => {
                     let view = route::status_of(&mut client, Some(&vault))?.vaults.into_iter().next();
                     let Some(mut st) = view.and_then(|v| v.status) else {
                         bail!("no index at {} yet; run `lsync pull` first", index_path.display());
@@ -343,8 +343,8 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         Cmd::Folders { json } => rt()?.block_on(folders(&sel, &cfg, &ctx.dirs, json)),
         Cmd::Connect { adopt_tweaks, json } => rt()?.block_on(async {
             let gate = match routed(&sel, &cfg, &ctx.dirs, "connect")? {
-                Some((mut client, vault)) => {
-                    let p = json!({"vault": vault, "adopt_tweaks": adopt_tweaks});
+                Some((mut client, vault, fingerprint)) => {
+                    let p = json!({"vault": vault, "adopt_tweaks": adopt_tweaks, "fingerprint": fingerprint});
                     match command(&mut client, method::CONNECT, p)? {
                         Ok(r) => Ok(serde_json::from_value::<GateReport>(r.report)?),
                         Err(refusal) => Err(refusal),
@@ -392,8 +392,9 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             }
         }),
         Cmd::Pull { json } => rt()?.block_on(async {
-            if let Some((mut client, vault)) = routed(&sel, &cfg, &ctx.dirs, "pull")? {
-                return match command(&mut client, method::PULL, json!({ "vault": vault }))? {
+            if let Some((mut client, vault, fingerprint)) = routed(&sel, &cfg, &ctx.dirs, "pull")? {
+                let p = json!({ "vault": vault, "fingerprint": fingerprint });
+                return match command(&mut client, method::PULL, p)? {
                     Ok(r) => print_pull(
                         &serde_json::from_value(r.report)?,
                         Duration::from_millis(r.wall_ms),
@@ -420,23 +421,23 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         }),
         Cmd::Sync { json, push } => rt()?.block_on(async {
             two_way_allowed(&sel, "sync")?;
-            if let Some((mut client, vault)) = routed(&sel, &cfg, &ctx.dirs, "sync")? {
-                return run_routed(&mut client, method::SYNC, &vault, &push, json);
+            if let Some((mut client, vault, fingerprint)) = routed(&sel, &cfg, &ctx.dirs, "sync")? {
+                return run_routed(&mut client, method::SYNC, &vault, fingerprint, &push, json);
             }
             let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             run_sync(&engine, json, false).await
         }),
         Cmd::Fetch { json, push } => rt()?.block_on(async {
             two_way_allowed(&sel, "fetch")?;
-            if let Some((mut client, vault)) = routed(&sel, &cfg, &ctx.dirs, "fetch")? {
-                return run_routed(&mut client, method::FETCH, &vault, &push, json);
+            if let Some((mut client, vault, fingerprint)) = routed(&sel, &cfg, &ctx.dirs, "fetch")? {
+                return run_routed(&mut client, method::FETCH, &vault, fingerprint, &push, json);
             }
             let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             run_sync(&engine, json, true).await
         }),
         Cmd::Daemon { pull_only, push } => {
             let pull_only = pull_only || sel.mode == Mode::PullOnly;
-            if let Some((client, vault)) = routed(&sel, &cfg, &ctx.dirs, "daemon")? {
+            if let Some((client, vault, _)) = routed(&sel, &cfg, &ctx.dirs, "daemon")? {
                 bail!(
                     "vault {vault} is already run by the lsync service (socket {}); follow it with `lsync --vault {vault} events`, sync it now with `lsync --vault {vault} sync-now`, or stop the service to run it here",
                     client.path().display()
@@ -486,7 +487,7 @@ fn vault_names(v: &serde_json::Value) -> String {
 
 /// `pause`, `resume`, `sync-now`: one request to the service.
 fn service_verb(vault: Option<String>, m: &str, done: &str, json: bool) -> Result<u8> {
-    let mut c = route::require()?;
+    let mut c = route::require(&[m])?;
     let v = c
         .call(m, json!({ "vault": vault }))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -499,7 +500,7 @@ fn service_verb(vault: Option<String>, m: &str, done: &str, json: bool) -> Resul
 }
 
 fn reload(json: bool) -> Result<u8> {
-    let mut c = route::require()?;
+    let mut c = route::require(&[method::RELOAD])?;
     let v = c.call(method::RELOAD, json!({})).map_err(|e| anyhow::anyhow!("{e}"))?;
     let r: livesync_host::protocol::ReloadReport = serde_json::from_value(v.clone())?;
     if json {
@@ -545,7 +546,7 @@ fn event_summary(data: &serde_json::Value) -> String {
 
 fn events(vault: Option<String>, json: bool) -> Result<u8> {
     use std::io::Write;
-    let mut c = route::require()?;
+    let mut c = route::require(&[method::EVENTS])?;
     let mut out = std::io::stdout();
     c.subscribe(vault.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
     loop {
@@ -570,7 +571,7 @@ fn events(vault: Option<String>, json: bool) -> Result<u8> {
 
 /// `lsync status --all`: the service's view of every vault.
 fn status_all(json: bool) -> Result<u8> {
-    let mut c = route::require()?;
+    let mut c = route::require(&[method::STATUS])?;
     let st = route::status_of(&mut c, None)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&st)?);
@@ -602,17 +603,25 @@ fn status_all(json: bool) -> Result<u8> {
     Ok(0)
 }
 
-/// The service and the vault name, when the service holds this command's
-/// vault (see `route`).
-fn routed(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, what: &str) -> Result<Option<(Client, String)>> {
+/// The service, the vault name and its settings' fingerprint, when the
+/// service holds this command's vault (see `route`).
+type Routed = (Client, String, Option<String>);
+
+fn routed(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, what: &str) -> Result<Option<Routed>> {
     let r = config::resolve(sel, cfg, dirs, true)?;
     Ok(match route::route(&r, what, true)? {
         Route::Local => None,
-        Route::Service { client, vault } => Some((client, vault)),
+        Route::Service {
+            client,
+            vault,
+            fingerprint,
+        } => Some((client, vault, fingerprint)),
     })
 }
 
 /// Run a command in the service. `Ok(Err(refusal))` when a gate refused.
+/// It waits as long as the command runs and the service answers (see
+/// `Client`), so a long fetch is not cut off.
 fn command(c: &mut Client, m: &str, p: serde_json::Value) -> Result<std::result::Result<CommandResult, String>> {
     c.set_timeout(None);
     match c.call(m, p) {
@@ -623,9 +632,17 @@ fn command(c: &mut Client, m: &str, p: serde_json::Value) -> Result<std::result:
 }
 
 /// `sync` or `fetch` in the service, printed as the one-shot prints it.
-fn run_routed(c: &mut Client, m: &str, vault: &str, push: &PushOpts, json: bool) -> Result<u8> {
+fn run_routed(
+    c: &mut Client,
+    m: &str,
+    vault: &str,
+    fingerprint: Option<String>,
+    push: &PushOpts,
+    json: bool,
+) -> Result<u8> {
     let p = json!({
         "vault": vault,
+        "fingerprint": fingerprint,
         "allow_mass_delete": push.allow_mass_delete,
         "remove_out_of_scope_copies": push.remove_out_of_scope_copies,
     });

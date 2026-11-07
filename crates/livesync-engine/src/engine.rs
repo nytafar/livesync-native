@@ -258,7 +258,8 @@ impl EngineError {
 type Result<T> = std::result::Result<T, EngineError>;
 
 /// Outcome of the connect gate.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GateReport {
     pub remote: String,
     pub node_id: String,
@@ -281,6 +282,7 @@ pub struct GateReport {
 
 /// Result of [`Engine::sync_once`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SyncReport {
     pub pull: PullReport,
     pub push: crate::push::PushReport,
@@ -288,6 +290,7 @@ pub struct SyncReport {
 
 /// Counters for one pull (or one daemon session).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PullReport {
     pub batches: u64,
     pub changes: u64,
@@ -343,7 +346,11 @@ impl PullReport {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The reports above and this status are also read by clients of the
+/// control socket, from services of other versions: a missing field takes
+/// its default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Status {
     pub remote: Option<String>,
     pub vault: String,
@@ -2602,6 +2609,14 @@ impl Engine {
     // ------------------------------------------------------------------
     // Status
     // ------------------------------------------------------------------
+
+    /// The safety stop and the last error recorded (as in [`Engine::status`]),
+    /// and nothing else: two reads of the index's meta table, for watchers
+    /// that look often.
+    pub fn alerts(&self) -> Result<(Option<String>, Option<String>)> {
+        let ix = self.inner.index.lock().unwrap();
+        Ok((ix.get_meta(meta::SAFETY_STOP)?, ix.get_meta(meta::LAST_ERROR)?))
+    }
 
     pub fn status(&self) -> Result<Status> {
         status_from_index(

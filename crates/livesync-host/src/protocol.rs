@@ -18,6 +18,13 @@
 //! ignores parameters it doesn't know. A request whose `v` is another major
 //! version gets `unsupported_version` (with the versions spoken here); one
 //! without `v` is read as version 1.
+//!
+//! **Reading replies.** Every type here that a client decodes takes a
+//! missing field as its default (`#[serde(default)]` on the struct), and so
+//! do the engine's reports and status they carry: a client reads an older
+//! service's replies, which lack the fields added since. A client checks
+//! `hello` first ([`check_hello`]): the major version, and that the methods
+//! it is about to use are there.
 
 use livesync_engine::{PullReport, PushReport, Status};
 use serde::{Deserialize, Serialize};
@@ -82,6 +89,26 @@ pub mod code {
     pub const FORBIDDEN: &str = "forbidden";
     /// The service is stopping.
     pub const SHUTTING_DOWN: &str = "shutting_down";
+    /// A command's `fingerprint` is not the vault's: its settings changed
+    /// (a reload) since the client compared them. Nothing was run.
+    pub const CHANGED: &str = "changed";
+
+    /// Every code above, for clients mapping a code to a constant.
+    pub const ALL: &[&str] = &[
+        BAD_REQUEST,
+        UNSUPPORTED_VERSION,
+        UNKNOWN_METHOD,
+        UNKNOWN_VAULT,
+        NOT_RUNNING,
+        PAUSED,
+        BUSY,
+        REFUSED,
+        INVALID_CONFIG,
+        FAILED,
+        FORBIDDEN,
+        SHUTTING_DOWN,
+        CHANGED,
+    ];
 }
 
 /// Event kinds. Counts in `pulled`, `pushed` and `conflict` are what
@@ -128,7 +155,8 @@ fn protocol() -> u32 {
     PROTOCOL
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
@@ -137,7 +165,9 @@ pub struct ErrorBody {
 /// A response to one request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
+    #[serde(default = "protocol")]
     pub v: u32,
+    #[serde(default)]
     pub id: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -169,7 +199,8 @@ impl Response {
 }
 
 /// One event line.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Event {
     pub v: u32,
     pub event: String,
@@ -177,7 +208,6 @@ pub struct Event {
     pub vault: Option<String>,
     /// When, in milliseconds since the Unix epoch.
     pub ts: i64,
-    #[serde(default)]
     pub data: Value,
 }
 
@@ -245,10 +275,16 @@ pub struct CommandParams {
     /// `connect`: accept changed PREFERRED tweaks.
     #[serde(default)]
     pub adopt_tweaks: bool,
+    /// The vault's `fingerprint` from the `status` the client compared its
+    /// settings with. When given and the vault's settings are no longer
+    /// those, the command is not run (`changed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// The result of `sync`, `pull`, `fetch` and `connect`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CommandResult {
     /// The engine's report: a sync report (`sync`, `fetch`), a pull report
     /// (`pull`) or the gate's (`connect`), as `lsync ... --json` prints it.
@@ -267,6 +303,7 @@ pub struct ReloadParams {
 
 /// What a reload changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReloadReport {
     pub started: Vec<String>,
     pub stopped: Vec<String>,
@@ -276,7 +313,8 @@ pub struct ReloadReport {
     pub failed: Vec<VaultError>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VaultError {
     pub vault: String,
     pub message: String,
@@ -284,12 +322,14 @@ pub struct VaultError {
 
 /// The vault names a `pause`, `resume` or `sync-now` acted on.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VaultsResult {
     pub vaults: Vec<String>,
 }
 
 /// The result of `hello`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Hello {
     pub protocol: u32,
     /// The service's `lsync` version.
@@ -301,7 +341,8 @@ pub struct Hello {
 }
 
 /// A vault's settings as the service runs them, without the password.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub url: String,
     pub username: String,
@@ -319,7 +360,8 @@ pub struct Settings {
 }
 
 /// One vault in `status`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VaultView {
     pub name: String,
     /// `starting`, `running`, `failed` (retrying), `stopped`, `paused`,
@@ -343,12 +385,52 @@ pub struct VaultView {
     pub push: Option<PushReport>,
     pub deletes_waiting: u64,
     pub mass_delete_allowed: bool,
+    /// Names the settings the service runs the vault with (opaque; changes
+    /// whenever `settings` does). A client that compared `settings` sends it
+    /// back with a command (see [`CommandParams::fingerprint`]).
+    pub fingerprint: Option<String>,
 }
 
 /// The result of `status`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StatusResult {
     pub vaults: Vec<VaultView>,
+}
+
+/// Whether a client speaking [`PROTOCOL`] can use the service that sent
+/// this `hello` for `needs` (the methods it is about to call). `Err` says
+/// what to do, for people.
+pub fn check_hello(h: &Hello, needs: &[&str]) -> Result<(), String> {
+    let theirs = if h.version.is_empty() {
+        "an unknown version".to_string()
+    } else {
+        h.version.clone()
+    };
+    if h.protocol > PROTOCOL {
+        return Err(format!(
+            "the running lsync service ({theirs}) speaks protocol version {}, newer than this lsync's ({PROTOCOL}); update this lsync, or restart the service with this one",
+            h.protocol
+        ));
+    }
+    if h.protocol < PROTOCOL {
+        return Err(format!(
+            "the running lsync service ({theirs}) speaks protocol version {}, older than this lsync's ({PROTOCOL}); restart it, so that it runs this lsync",
+            h.protocol
+        ));
+    }
+    let missing: Vec<&str> = needs
+        .iter()
+        .copied()
+        .filter(|m| !h.methods.iter().any(|x| x == m))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "the running lsync service ({theirs}) is older than this lsync and has no `{}`; restart it, so that it runs this lsync",
+            missing.join("`, `")
+        ));
+    }
+    Ok(())
 }
 
 /// Milliseconds since the Unix epoch.
@@ -389,6 +471,78 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(Incoming::parse("nope").is_err());
+    }
+
+    #[test]
+    fn replies_with_fields_missing_are_read_with_defaults() {
+        // As an older service sends them: fields added since are missing,
+        // in this crate's types and in the engine's reports and status.
+        let st: StatusResult = serde_json::from_value(json!({
+            "vaults": [{
+                "name": "notes",
+                "state": "running",
+                "settings": {"folder": "/v", "state_dir": "/s"},
+                "status": {"vault": "/v", "dirty": [{"path": "a.md"}], "pending": [{}], "local_issues": [{}]},
+                "session": {"written": 1},
+                "push": {}
+            }]
+        }))
+        .unwrap();
+        let v = &st.vaults[0];
+        assert_eq!(
+            (v.name.as_str(), v.paused, v.fingerprint.as_deref()),
+            ("notes", false, None)
+        );
+        assert_eq!(v.settings.as_ref().unwrap().scope_folders, Vec::<String>::new());
+        let status = v.status.as_ref().unwrap();
+        assert!(!status.needs_full_fetch && status.counts.is_empty());
+        assert_eq!(status.dirty[0].path, "a.md");
+        assert_eq!(v.session.as_ref().unwrap().written, 1);
+        assert_eq!(v.push.as_ref().unwrap().passes, 0);
+        assert!(serde_json::from_value::<StatusResult>(json!({}))
+            .unwrap()
+            .vaults
+            .is_empty());
+
+        let r: CommandResult = serde_json::from_value(json!({"report": {"pull": {"changes": 2}}})).unwrap();
+        let sync: livesync_engine::SyncReport = serde_json::from_value(r.report).unwrap();
+        assert_eq!((sync.pull.changes, sync.push.pushed), (2, 0));
+        let gate: livesync_engine::GateReport = serde_json::from_value(json!({"remote": "r"})).unwrap();
+        assert!(!gate.fetch_to_resolve && gate.node_id.is_empty());
+        let pull: PullReport = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(pull.restored_edits, 0);
+        let push: PushReport = serde_json::from_value(json!({"pushed": 3})).unwrap();
+        assert_eq!(push.pushed, 3);
+        let reload: ReloadReport =
+            serde_json::from_value(json!({"restarted": ["a"], "failed": [{"vault": "b"}]})).unwrap();
+        assert_eq!((reload.restarted.len(), reload.failed[0].message.as_str()), (1, ""));
+        let hello: Hello = serde_json::from_value(json!({"protocol": 1})).unwrap();
+        assert!(hello.methods.is_empty());
+        let resp: Response = serde_json::from_str(r#"{"id":1,"error":{"code":"busy"}}"#).unwrap();
+        assert_eq!((resp.v, resp.error.unwrap().message.as_str()), (PROTOCOL, ""));
+        let ev = Incoming::parse(r#"{"event":"pulled"}"#).unwrap();
+        assert!(matches!(ev, Incoming::Event(e) if e.vault.is_none() && e.data.is_null()));
+    }
+
+    #[test]
+    fn hello_says_when_the_service_cannot_be_used() {
+        let hello = |protocol: u32, methods: &[&str]| Hello {
+            protocol,
+            version: "0.9.0".into(),
+            methods: methods.iter().map(|m| m.to_string()).collect(),
+            ..Default::default()
+        };
+        assert!(check_hello(&hello(PROTOCOL, method::ALL), method::ALL).is_ok());
+        let e = check_hello(&hello(PROTOCOL + 1, method::ALL), &[]).unwrap_err();
+        assert!(e.contains("newer") && e.contains("update this lsync"), "{e}");
+        let e = check_hello(&hello(0, &[]), &[]).unwrap_err();
+        assert!(e.contains("older") && e.contains("restart"), "{e}");
+        let e = check_hello(
+            &hello(PROTOCOL, &[method::HELLO, method::STATUS]),
+            &[method::STATUS, "flush"],
+        )
+        .unwrap_err();
+        assert!(e.contains("no `flush`") && e.contains("0.9.0"), "{e}");
     }
 
     #[test]

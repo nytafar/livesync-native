@@ -8,12 +8,17 @@
 //! profile file that says otherwise) would silently not apply, so such a
 //! command is refused with what to do instead. The password is not
 //! compared; the service uses its own.
+//!
+//! A socket the CLI cannot connect to is no service (see
+//! [`livesync_host::control`]): the command runs here. A service that is
+//! there but does not let this user in, or speaks another protocol, is an
+//! error that says what to do.
 
 use crate::config::Resolved;
 use anyhow::{anyhow, bail, Result};
-use livesync_host::control::{client_sockets, Client, ClientError};
+use livesync_host::control::{client_sockets, current_uid, Client, ClientError};
 use livesync_host::paths::comparable;
-use livesync_host::protocol::{method, Settings, StatusResult, VaultView};
+use livesync_host::protocol::{code, method, Settings, StatusResult, VaultView};
 use livesync_host::service::same_server;
 use std::path::Path;
 use std::time::Duration;
@@ -24,18 +29,46 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum Route {
     /// No service holds the vault: open the engine here.
     Local,
-    /// The service holds it, under this name.
-    Service { client: Client, vault: String },
+    /// The service holds it, under this name; `fingerprint` names the
+    /// settings this command was compared with.
+    Service {
+        client: Client,
+        vault: String,
+        fingerprint: Option<String>,
+    },
 }
 
-/// A running service, or `None`.
-pub fn connect() -> Result<Option<Client>> {
-    Client::connect_default().map_err(|e| anyhow!("{e}"))
+/// Check that the service lets this user in and can do `needs` (methods).
+fn handshake(client: &mut Client, needs: &[&str]) -> Result<()> {
+    client.set_timeout(Some(STATUS_TIMEOUT));
+    let r = client.hello(needs);
+    client.set_timeout(None);
+    match r {
+        Ok(_) => Ok(()),
+        Err(e) if e.code() == Some(code::FORBIDDEN) => bail!(
+            "the lsync service at {} does not let this user (uid {}) use it: {e}. Run lsync as the service's user, or join the service's socket group; or set LSYNC_RUNTIME_DIR to a folder of your own to run commands without it",
+            client.path().display(),
+            current_uid()
+        ),
+        Err(e @ ClientError::Version(_)) => bail!("{e}"),
+        Err(e) => bail!("the lsync service at {}: {e}", client.path().display()),
+    }
 }
 
-/// A running service, or an error saying there is none.
-pub fn require() -> Result<Client> {
-    match connect()? {
+/// A running service that can do `needs`, or `None` when there is none.
+pub fn connect(needs: &[&str]) -> Result<Option<Client>> {
+    match Client::connect_default().map_err(|e| anyhow!("{e}"))? {
+        Some(mut c) => {
+            handshake(&mut c, needs)?;
+            Ok(Some(c))
+        }
+        None => Ok(None),
+    }
+}
+
+/// A running service that can do `needs`, or an error saying there is none.
+pub fn require(needs: &[&str]) -> Result<Client> {
+    match connect(needs)? {
         Some(c) => Ok(c),
         None => bail!(
             "no lsync service is running (looked for {}); start one with `lsync serve`",
@@ -167,6 +200,16 @@ pub fn route(r: &Resolved, what: &str, settings: bool) -> Result<Route> {
         Err(e @ ClientError::Unsafe(_)) => bail!("{e}"),
         Err(e) => bail!("cannot reach the lsync service: {e}"),
     };
+    // The method `what` runs as, when the service holds the vault.
+    let runs = match what {
+        "sync" => Some(method::SYNC),
+        "pull" => Some(method::PULL),
+        "fetch" => Some(method::FETCH),
+        "connect" => Some(method::CONNECT),
+        _ => None,
+    };
+    let needs: Vec<&str> = std::iter::once(method::STATUS).chain(runs).collect();
+    handshake(&mut client, &needs)?;
     let st = status_of(&mut client, None)?;
     let Some(v) = find(&st, r) else {
         return Ok(Route::Local);
@@ -192,5 +235,6 @@ pub fn route(r: &Resolved, what: &str, settings: bool) -> Result<Route> {
     Ok(Route::Service {
         client,
         vault: v.name.clone(),
+        fingerprint: v.fingerprint.clone(),
     })
 }

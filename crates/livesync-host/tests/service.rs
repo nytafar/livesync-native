@@ -10,14 +10,16 @@ use common::{Mock, DB};
 use livesync_engine::platform::LockFile;
 use livesync_host::config::Dirs;
 use livesync_host::control::{self, BindError, Client, ClientError, Policy};
+use livesync_host::protocol::CommandParams;
 use livesync_host::protocol::{code, method, Event, ReloadReport, StatusResult};
 use livesync_host::secret::SecretStores;
-use livesync_host::service::{ConfigSource, Service};
+use livesync_host::service::{Command, ConfigSource, Service};
 use livesync_host::Host;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -72,13 +74,18 @@ impl Fixture {
     }
 
     fn service(&self) -> Arc<Service> {
+        self.service_of(None)
+    }
+
+    /// As `lsync serve --vault NAME` with `only`.
+    fn service_of(&self, only: Option<&str>) -> Arc<Service> {
         let host = Arc::new(Host::on_runtime(self.rt.handle().clone()));
         host.set_stop_timeouts_for_tests(Duration::from_secs(5), Duration::from_secs(5));
         let source = ConfigSource {
             path: self.dirs.config_file(),
             dirs: self.dirs.clone(),
             secrets: SecretStores::standard(self.dirs.config.join("secrets.toml")),
-            only: None,
+            only: only.map(str::to_string),
         };
         let _rt = self.rt.enter();
         let svc = Service::new(host, Box::new(source), "test");
@@ -519,5 +526,284 @@ fn a_change_just_before_a_pause_is_still_reported() {
         pulled |= e.event == "pulled" && e.data["written"].as_u64() >= Some(1);
     }
     assert!(pulled, "the pull before the pause was reported");
+    f.rt.block_on(svc.shutdown());
+}
+
+fn params(vault: &str) -> CommandParams {
+    CommandParams {
+        vault: vault.into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_socket_that_cannot_be_reached_is_no_service() {
+    let d = tempfile::tempdir().unwrap();
+    let mode = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    // A directory this user may not look into (a system service's, say).
+    let closed = d.path().join("closed");
+    std::fs::create_dir(&closed).unwrap();
+    let _l = std::os::unix::net::UnixListener::bind(closed.join(control::SOCKET_NAME)).unwrap();
+    mode(&closed, 0o000);
+    let r = Client::connect(&closed.join(control::SOCKET_NAME));
+    mode(&closed, 0o700);
+    assert!(matches!(r, Ok(None)), "{:?}", r.err());
+    // A socket this user may not connect to, in a directory of its own.
+    let sock = closed.join(control::SOCKET_NAME);
+    mode(&sock, 0o000);
+    let r = Client::connect(&sock);
+    assert!(matches!(r, Ok(None)), "{:?}", r.err());
+    // Not when this process runs as root, which may connect anyway.
+    if control::current_uid() != 0 {
+        mode(&sock, 0o600);
+        assert!(Client::connect(&sock).unwrap().is_some(), "reachable again");
+    }
+}
+
+#[test]
+fn a_panic_in_a_command_fails_it_and_restores_the_vault() {
+    let f = Fixture::new();
+    f.mock.put_text("Notes/a.md", &["a"]);
+    f.write_config(&vault("notes", "dev", "notes", ""));
+    let svc = f.service();
+    f.reload(&svc);
+    wait_until("running", || state_of(&svc, "notes") == "running");
+    let (path, stop) = f.serve(&svc, Policy::own_user());
+    let first = Arc::new(AtomicBool::new(true));
+    let once = first.clone();
+    svc.set_command_hook_for_tests(Some(Arc::new(move |_, _| {
+        if once.swap(false, Ordering::SeqCst) {
+            panic!("a bug in the command");
+        }
+    })));
+    // Over the socket: the client gets an answer, not silence.
+    let mut c = Client::connect(&path).unwrap().unwrap();
+    c.set_timeout(Some(Duration::from_secs(60)));
+    let e = c.call(method::SYNC, json!({"vault": "notes"})).unwrap_err();
+    assert_eq!(e.code(), Some(code::FAILED), "{e}");
+    assert!(e.to_string().contains("a bug in the command"), "{e}");
+    // The vault is back: its engine runs, no command is left on it, and it
+    // takes the next command and a sync-now.
+    let v = svc.status(Some("notes")).unwrap().vaults.remove(0);
+    assert!(v.command.is_none(), "{:?}", v.command);
+    wait_until("running again", || state_of(&svc, "notes") == "running");
+    svc.sync_now(Some("notes")).unwrap();
+    let r = c.call(method::SYNC, json!({"vault": "notes"})).unwrap();
+    assert!(r["report"]["pull"].is_object(), "{r}");
+    wait_until("running after the sync", || state_of(&svc, "notes") == "running");
+    let _ = stop.send(true);
+    f.rt.block_on(svc.shutdown());
+}
+
+/// A fake service at `dir/control.sock` that reads requests and answers
+/// only `hello` (as a live service does while a command runs), and the
+/// command after `answer_after`, or never.
+fn fake_service(dir: &Path, answer_after: Option<Duration>) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.join(control::SOCKET_NAME);
+    let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        let mut r = BufReader::new(s);
+        let t0 = Instant::now();
+        let mut held: Option<Value> = None;
+        let _ = w.set_nonblocking(false);
+        loop {
+            let mut line = String::new();
+            r.get_ref().set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            match r.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) => {
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    if req["method"] == "hello" {
+                        if answer_after.is_some() {
+                            let out = json!({"v": 1, "id": req["id"], "result": {"protocol": 1}});
+                            let _ = writeln!(w, "{out}");
+                        }
+                    } else {
+                        held = Some(req["id"].clone());
+                    }
+                }
+                Err(_) => {}
+            }
+            if let (Some(after), Some(id)) = (answer_after, &held) {
+                if t0.elapsed() >= after {
+                    let out = json!({"v": 1, "id": id, "result": {"done": true}});
+                    let _ = writeln!(w, "{out}");
+                    held = None;
+                }
+            }
+        }
+    });
+    path
+}
+
+#[test]
+fn a_client_waits_for_a_long_command_but_not_for_a_silent_service() {
+    let d = tempfile::tempdir().unwrap();
+    let every = Duration::from_millis(200);
+    // Alive, and slow: answered after many liveness intervals.
+    let path = fake_service(&d.path().join("slow"), Some(every * 8));
+    let mut c = Client::connect(&path).unwrap().unwrap();
+    c.set_liveness(every);
+    let r = c.call(method::FETCH, json!({"vault": "v"})).unwrap();
+    assert_eq!(r["done"], true);
+    // Silent: given up on after about two intervals, not waited for forever.
+    let path = fake_service(&d.path().join("silent"), None);
+    let mut c = Client::connect(&path).unwrap().unwrap();
+    c.set_liveness(every);
+    let t0 = Instant::now();
+    let e = c.call(method::FETCH, json!({"vault": "v"})).unwrap_err();
+    assert!(e.to_string().contains("stopped answering"), "{e}");
+    assert!(t0.elapsed() < every * 10, "{:?}", t0.elapsed());
+}
+
+#[test]
+fn one_vault_services_stop_their_vault_when_it_is_removed_or_disabled() {
+    let f = Fixture::new();
+    let two = |a_extra: &str| {
+        format!(
+            "{}{}",
+            vault("a", "dev", "a", &format!("mode = \"pull-only\"\n{a_extra}")),
+            vault("b", "dev", "b", "mode = \"pull-only\"")
+        )
+    };
+    f.write_config(&two(""));
+    let svc = f.service_of(Some("a"));
+    assert_eq!(f.reload(&svc).started, ["a"]);
+    assert_eq!(svc.names(), ["a"]);
+    wait_until("a running", || state_of(&svc, "a") == "running");
+    // Disabled: stopped, still listed.
+    f.write_config(&two("enabled = false"));
+    assert_eq!(f.reload(&svc).stopped, ["a"]);
+    assert_eq!(state_of(&svc, "a"), "disabled");
+    f.write_config(&two(""));
+    assert_eq!(f.reload(&svc).started, ["a"]);
+    wait_until("a running again", || state_of(&svc, "a") == "running");
+    // An unreadable file changes nothing.
+    std::fs::write(f.dirs.config_file(), "[vault.a]\nnot valid").unwrap();
+    assert_eq!(f.rt.block_on(svc.reload()).unwrap_err().code, code::INVALID_CONFIG);
+    assert_eq!(state_of(&svc, "a"), "running");
+    // Removed: stopped and gone; b is never taken up.
+    f.write_config(&vault("b", "dev", "b", "mode = \"pull-only\""));
+    let r = f.reload(&svc);
+    assert_eq!(r.stopped, ["a"]);
+    assert!(svc.names().is_empty(), "{:?}", svc.names());
+    assert!(svc.host().state("a").is_none());
+    f.rt.block_on(svc.shutdown());
+}
+
+#[test]
+fn a_reload_keeps_vaults_running_while_it_waits_for_another_vaults_command() {
+    let f = Fixture::new();
+    let both = |extra: &str| {
+        format!(
+            "{}{}",
+            vault("a", "dev", "a", &format!("mode = \"pull-only\"\n{extra}")),
+            vault("z", "dev", "z", &format!("mode = \"pull-only\"\n{extra}"))
+        )
+    };
+    f.write_config(&both(""));
+    let svc = f.service();
+    f.reload(&svc);
+    wait_until("both running", || {
+        state_of(&svc, "a") == "running" && state_of(&svc, "z") == "running"
+    });
+    // A long command on z, held until released.
+    let (entered, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    {
+        let (entered, release) = (entered.clone(), release.clone());
+        svc.set_command_hook_for_tests(Some(Arc::new(move |_, id| {
+            if id == "z" {
+                entered.store(true, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        })));
+    }
+    let cmd = {
+        let svc = svc.clone();
+        f.rt.spawn(async move { svc.command(Command::Pull, params("z")).await })
+    };
+    wait_until("z's command", || entered.load(Ordering::SeqCst));
+    // Both change; the reload waits for z's command, and a runs meanwhile.
+    f.write_config(&both("device_name = \"desk\""));
+    let reload = {
+        let svc = svc.clone();
+        f.rt.spawn(async move { svc.reload().await })
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!reload.is_finished());
+    assert_eq!(
+        state_of(&svc, "a"),
+        "running",
+        "a is not stopped while the reload waits"
+    );
+    assert!(svc.host().state("a").is_some());
+    release.store(true, Ordering::SeqCst);
+    f.rt.block_on(cmd).unwrap().unwrap();
+    let r = f.rt.block_on(reload).unwrap().unwrap();
+    assert_eq!(r.restarted, ["a", "z"]);
+    wait_until("both running again", || {
+        state_of(&svc, "a") == "running" && state_of(&svc, "z") == "running"
+    });
+    f.rt.block_on(svc.shutdown());
+}
+
+#[test]
+fn a_command_runs_only_on_the_settings_the_client_compared() {
+    let f = Fixture::new();
+    f.write_config(&vault("notes", "dev", "notes", "mode = \"pull-only\""));
+    let svc = f.service();
+    f.reload(&svc);
+    wait_until("running", || state_of(&svc, "notes") == "running");
+    let seen = svc.status(Some("notes")).unwrap().vaults[0].fingerprint.clone();
+    assert!(seen.is_some());
+    let with = |fp: Option<String>| CommandParams {
+        fingerprint: fp,
+        ..params("notes")
+    };
+    f.rt.block_on(svc.command(Command::Pull, with(seen.clone()))).unwrap();
+    // Without one (an older client), it runs as before.
+    f.rt.block_on(svc.command(Command::Pull, with(None))).unwrap();
+    // A reload in between changed the vault: the command is not run.
+    f.write_config(&vault("notes", "dev", "elsewhere", "mode = \"pull-only\""));
+    assert_eq!(f.reload(&svc).restarted, ["notes"]);
+    let e =
+        f.rt.block_on(svc.command(Command::Pull, with(seen.clone())))
+            .unwrap_err();
+    assert_eq!(e.code, code::CHANGED, "{}", e.message);
+    let v = svc.status(Some("notes")).unwrap().vaults.remove(0);
+    assert!(v.command.is_none());
+    assert_ne!(v.fingerprint, seen);
+    wait_until("still running", || state_of(&svc, "notes") == "running");
+    f.rt.block_on(svc.shutdown());
+}
+
+#[test]
+fn an_engine_error_is_an_event() {
+    let f = Fixture::new();
+    f.write_config(&vault("notes", "dev", "notes", "mode = \"pull-only\""));
+    let svc = f.service();
+    f.reload(&svc);
+    wait_until("running", || state_of(&svc, "notes") == "running");
+    std::thread::sleep(livesync_host::service::ACTIVITY_POLL * 3);
+    let mut rx = svc.subscribe();
+    f.mock.state.lock().unwrap().fail_changes = 1000;
+    f.mock.put_text("x.md", &["x"]);
+    let mut got = None;
+    wait_until("the error event", || {
+        while let Ok(e) = rx.try_recv() {
+            if e.event == "error" {
+                got = Some(e);
+            }
+        }
+        got.is_some()
+    });
+    assert_eq!(got.unwrap().vault.as_deref(), Some("notes"));
+    f.mock.state.lock().unwrap().fail_changes = 0;
     f.rt.block_on(svc.shutdown());
 }

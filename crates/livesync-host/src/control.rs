@@ -23,12 +23,16 @@
 //! no other process can take the path meanwhile.
 //!
 //! **The client checks the service too.** It uses a socket only in a
-//! directory no one but its owner can write to, and only when the process
-//! at the other end runs as that owner.
+//! directory no one but its owner can write to, owned by the client's own
+//! user (another owner only for the system service's [`SYSTEM_DIR`]), and
+//! only when the process at the other end runs as that owner. A socket it
+//! cannot connect to (none, a stale one, no permission) is no service: it
+//! tries the next one, and the CLI then runs the command itself (the
+//! engine's own locks still keep it off a vault a service holds).
 
 use crate::protocol::{
-    code, event, method, CommandParams, CtlError, Event, Incoming, ReloadParams, Request, Response, VaultParam,
-    MAX_LINE, PROTOCOL,
+    check_hello, code, event, method, CommandParams, CtlError, Event, Hello, Incoming, ReloadParams, Request, Response,
+    VaultParam, MAX_LINE, PROTOCOL,
 };
 use crate::service::{Command, Service};
 use livesync_engine::platform::{read_holder, Holder, LockError, LockFile};
@@ -38,6 +42,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
@@ -553,12 +558,24 @@ async fn connection(stream: tokio::net::UnixStream, service: Arc<Service>, polic
         // Each request on its own task: a long command does not hold up
         // the connection's other requests, and it runs to its end (the
         // vault is restored) even when the client goes away.
+        // A panic while handling it is a `failed` answer: the client never
+        // waits for a response that will not come.
         let (svc, tx) = (service.clone(), tx.clone());
         tokio::spawn(async move {
             let id = req.id.clone();
-            let resp = match handle(&svc, req).await {
-                Ok(v) => Response::ok(id, v),
-                Err(e) => Response::err(id, e),
+            let m = req.method.clone();
+            let handled = tokio::spawn(async move { handle(&svc, req).await }).await;
+            let resp = match handled {
+                Ok(Ok(v)) => Response::ok(id, v),
+                Ok(Err(e)) => Response::err(id, e),
+                Err(e) => {
+                    let why = crate::service::panic_message(e);
+                    warn!("control socket: `{m}` failed: {why}");
+                    Response::err(
+                        id,
+                        CtlError::new(code::FAILED, format!("`{m}` failed inside the lsync service: {why}")),
+                    )
+                }
             };
             let _ = tx.send(line(&resp)).await;
         });
@@ -674,12 +691,26 @@ async fn handle(svc: &Arc<Service>, req: Request) -> Result<Value, CtlError> {
 
 /// A connection to a running service, for the CLI and other Rust clients.
 /// Blocking.
+///
+/// A call waits for its answer as long as the service is alive: while it
+/// waits, it sends a `hello` every [`Client::set_liveness`] interval (on the
+/// same connection; requests run concurrently there), and gives up when one
+/// goes unanswered for a whole interval, or the connection closes. So a long
+/// `fetch` is never cut off, and a service that stopped answering is never
+/// waited for forever. [`Client::set_timeout`] bounds a call outright.
 pub struct Client {
     stream: std::os::unix::net::UnixStream,
     reader: BufReader<std::os::unix::net::UnixStream>,
     path: PathBuf,
     next_id: u64,
+    /// A line read in part before a read timed out.
+    partial: Vec<u8>,
+    timeout: Option<Duration>,
+    liveness: Duration,
 }
+
+/// How often a waiting client checks that the service still answers.
+pub const LIVENESS: Duration = Duration::from_secs(20);
 
 /// Why a client could not use a socket.
 #[derive(Debug, thiserror::Error)]
@@ -692,6 +723,10 @@ pub enum ClientError {
     /// The service answered with an error.
     #[error("{0}")]
     Service(CtlError),
+    /// The service speaks another version of the protocol, or lacks a
+    /// method this client needs (the message says what to do).
+    #[error("{0}")]
+    Version(String),
 }
 
 impl ClientError {
@@ -704,11 +739,23 @@ impl ClientError {
     }
 }
 
-/// Whether a client may trust the socket at `path`: a directory only its
-/// owner can write to, and the owner's uid, which the service must have.
-fn trusted_owner(path: &Path) -> Result<u32, ClientError> {
-    let dir = path.parent().unwrap_or(Path::new("/"));
-    let md = std::fs::symlink_metadata(dir).map_err(|e| ClientError::Io(format!("{}: {e}", dir.display())))?;
+/// Whether a socket directory with this owner may be trusted by user `me`:
+/// its own, or the system service's directory, whoever owns it (the
+/// service's user; the peer check then wants that user behind the socket).
+fn owner_allowed(dir: &Path, owner: u32, me: u32) -> Result<(), ClientError> {
+    if owner == me || dir == Path::new(SYSTEM_DIR) {
+        return Ok(());
+    }
+    Err(ClientError::Unsafe(format!(
+        "{} belongs to uid {owner}, not to this user (uid {me}); not using the control socket in it (set LSYNC_RUNTIME_DIR to a folder of your own)",
+        dir.display()
+    )))
+}
+
+/// Whether a client may trust the socket directory `dir`: only its owner
+/// can write to it, and that owner may be trusted ([`owner_allowed`]).
+/// Returns the owner's uid, which the service must have.
+fn trusted_owner(dir: &Path, md: &std::fs::Metadata) -> Result<u32, ClientError> {
     if !md.file_type().is_dir() {
         return Err(ClientError::Unsafe(format!(
             "{} is not a directory; not using the control socket in it",
@@ -722,52 +769,49 @@ fn trusted_owner(path: &Path) -> Result<u32, ClientError> {
             md.mode() & 0o7777
         )));
     }
+    owner_allowed(dir, md.uid(), current_uid())?;
     Ok(md.uid())
 }
 
 fn code_of(s: &str) -> &'static str {
     // The codes this client knows, as 'static; others read as `failed`.
-    [
-        code::BAD_REQUEST,
-        code::UNSUPPORTED_VERSION,
-        code::UNKNOWN_METHOD,
-        code::UNKNOWN_VAULT,
-        code::NOT_RUNNING,
-        code::PAUSED,
-        code::BUSY,
-        code::REFUSED,
-        code::INVALID_CONFIG,
-        code::FAILED,
-        code::FORBIDDEN,
-        code::SHUTTING_DOWN,
-    ]
-    .into_iter()
-    .find(|c| *c == s)
-    .unwrap_or(code::FAILED)
+    code::ALL.iter().copied().find(|c| *c == s).unwrap_or(code::FAILED)
+}
+
+fn timed_out(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
 impl Client {
-    /// Connect to the socket at `path`. `Ok(None)` when no service is
-    /// listening there (no socket, or a stale one).
+    /// Connect to the socket at `path`. `Ok(None)` when no service can be
+    /// reached there (no socket, a stale one, no permission to it): not an
+    /// error, the caller tries elsewhere or runs locally. `Err` only when
+    /// something is there that must not be trusted.
     pub fn connect(path: &Path) -> Result<Option<Client>, ClientError> {
-        let owner = match trusted_owner(path) {
-            Ok(o) => o,
-            Err(ClientError::Io(_)) => return Ok(None),
-            Err(e) => return Err(e),
+        let dir = path.parent().unwrap_or(Path::new("/"));
+        let Ok(dir_md) = std::fs::symlink_metadata(dir) else {
+            return Ok(None);
         };
+        // Nothing there (or nothing this user may look at): no service.
+        if let Err(e) = std::fs::symlink_metadata(path) {
+            debug!("no control socket at {}: {e}", path.display());
+            return Ok(None);
+        }
+        let owner = trusted_owner(dir, &dir_md)?;
         let stream = match std::os::unix::net::UnixStream::connect(path) {
             Ok(s) => s,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                return Ok(None)
+            Err(e) => {
+                debug!("no lsync service at {}: {e}", path.display());
+                return Ok(None);
             }
-            Err(e) => return Err(ClientError::Io(format!("connecting to {}: {e}", path.display()))),
         };
-        let peer = peer_of(stream.as_raw_fd()).map_err(|e| ClientError::Io(e.to_string()))?;
+        let peer = match peer_of(stream.as_raw_fd()) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("no peer credentials from {}: {e}", path.display());
+                return Ok(None);
+            }
+        };
         if peer.uid != owner {
             return Err(ClientError::Unsafe(format!(
                 "the process behind {} runs as uid {}, but the directory belongs to uid {owner}; not using it",
@@ -781,10 +825,13 @@ impl Client {
             reader,
             path: path.to_path_buf(),
             next_id: 1,
+            partial: Vec::new(),
+            timeout: None,
+            liveness: LIVENESS,
         }))
     }
 
-    /// The first service listening at [`client_sockets`].
+    /// The first service that can be reached at [`client_sockets`].
     pub fn connect_default() -> Result<Option<Client>, ClientError> {
         for p in client_sockets() {
             if let Some(c) = Client::connect(&p)? {
@@ -798,10 +845,35 @@ impl Client {
         &self.path
     }
 
-    /// Give up on a reply after `t` (`None`: wait as long as it takes).
-    pub fn set_timeout(&self, t: Option<std::time::Duration>) {
-        let _ = self.stream.set_read_timeout(t);
-        let _ = self.stream.set_write_timeout(t);
+    /// Give up on a call after `t` (`None`: wait as long as the service is
+    /// alive).
+    pub fn set_timeout(&mut self, t: Option<Duration>) {
+        self.timeout = t;
+    }
+
+    /// How often a waiting call checks that the service still answers, and
+    /// how long it gives it to answer (default [`LIVENESS`]).
+    pub fn set_liveness(&mut self, every: Duration) {
+        self.liveness = every.max(Duration::from_millis(10));
+    }
+
+    /// `hello`, checked: the service speaks this client's protocol and has
+    /// the methods in `needs` ([`crate::protocol::check_hello`]).
+    pub fn hello(&mut self, needs: &[&str]) -> Result<Hello, ClientError> {
+        let v = match self.call(method::HELLO, Value::Null) {
+            Ok(v) => v,
+            Err(e) if e.code() == Some(code::UNSUPPORTED_VERSION) => {
+                return Err(ClientError::Version(format!(
+                    "the running lsync service at {} does not speak this lsync's protocol (version {PROTOCOL}): {e}; update this lsync, or restart the service with this one",
+                    self.path.display()
+                )))
+            }
+            Err(e) => return Err(e),
+        };
+        let h: Hello = serde_json::from_value(v)
+            .map_err(|e| ClientError::Io(format!("the service at {}: hello: {e}", self.path.display())))?;
+        check_hello(&h, needs).map_err(ClientError::Version)?;
+        Ok(h)
     }
 
     fn send(&mut self, method: &str, params: Value) -> Result<Value, ClientError> {
@@ -813,50 +885,116 @@ impl Client {
             method: method.into(),
             params,
         };
+        let _ = self
+            .stream
+            .set_write_timeout(Some(self.liveness.max(Duration::from_secs(5))));
         self.stream
             .write_all(line(&req).as_bytes())
             .map_err(|e| ClientError::Io(format!("writing to {}: {e}", self.path.display())))?;
         Ok(id)
     }
 
+    /// The next line, waiting at most `wait` (`Ok(None)` when it ran out).
+    fn read_for(&mut self, wait: Option<Duration>) -> Result<Option<Incoming>, ClientError> {
+        let _ = self
+            .stream
+            .set_read_timeout(wait.map(|w| w.max(Duration::from_millis(1))));
+        loop {
+            match self.reader.read_until(b'\n', &mut self.partial) {
+                Ok(0) => {
+                    return Err(ClientError::Io(format!(
+                        "the service at {} closed the connection",
+                        self.path.display()
+                    )))
+                }
+                Ok(_) if self.partial.ends_with(b"\n") => {
+                    let l = std::mem::take(&mut self.partial);
+                    let text = String::from_utf8_lossy(&l);
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    return Incoming::parse(&text).map(Some).map_err(ClientError::Io);
+                }
+                // The end of the stream in the middle of a line.
+                Ok(_) => continue,
+                Err(e) if timed_out(&e) => return Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(ClientError::Io(format!("reading from {}: {e}", self.path.display()))),
+            }
+        }
+    }
+
     fn read(&mut self) -> Result<Incoming, ClientError> {
-        let mut s = String::new();
-        match self.reader.read_line(&mut s) {
-            Ok(0) => Err(ClientError::Io(format!(
-                "the service at {} closed the connection",
-                self.path.display()
-            ))),
-            Ok(_) => Incoming::parse(&s).map_err(ClientError::Io),
-            Err(e) => Err(ClientError::Io(format!("reading from {}: {e}", self.path.display()))),
+        loop {
+            if let Some(i) = self.read_for(None)? {
+                return Ok(i);
+            }
         }
     }
 
     /// Send a request and wait for its response (events in between are
-    /// dropped).
+    /// dropped), checking that the service is alive meanwhile (see the
+    /// type's docs).
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, ClientError> {
         let id = match self.send(method, params) {
             Ok(id) => id,
             // A service that refused this connection may have closed it
             // before the request went out: its refusal is still there to read.
-            Err(e) => match self.read() {
-                Ok(Incoming::Response(Response {
+            Err(e) => match self.read_for(Some(self.liveness)) {
+                Ok(Some(Incoming::Response(Response {
                     id: Value::Null,
                     error: Some(e),
                     ..
-                })) => return Err(ClientError::Service(CtlError::new(code_of(&e.code), e.message))),
+                }))) => return Err(ClientError::Service(CtlError::new(code_of(&e.code), e.message))),
                 _ => return Err(e),
             },
         };
+        let deadline = self.timeout.map(|t| Instant::now() + t);
+        // The `hello` sent to see whether the service is alive, and when.
+        let mut ping: Option<(Value, Instant)> = None;
+        let mut quiet_since = Instant::now();
         loop {
-            match self.read()? {
-                Incoming::Response(r) if r.id == id || r.id.is_null() => {
+            let now = Instant::now();
+            if deadline.is_some_and(|d| now >= d) {
+                return Err(ClientError::Io(format!(
+                    "the service at {} did not answer `{method}` within {}s",
+                    self.path.display(),
+                    self.timeout.unwrap_or_default().as_secs()
+                )));
+            }
+            let next_check = match &ping {
+                Some((_, sent)) => *sent + self.liveness,
+                None => quiet_since + self.liveness,
+            };
+            let until = deadline.map_or(next_check, |d| d.min(next_check));
+            match self.read_for(Some(until.saturating_duration_since(now)))? {
+                Some(Incoming::Response(r)) if r.id == id || r.id.is_null() => {
                     return match (r.result, r.error) {
                         (_, Some(e)) => Err(ClientError::Service(CtlError::new(code_of(&e.code), e.message))),
                         (Some(v), None) => Ok(v),
                         (None, None) => Ok(Value::Null),
                     };
                 }
-                _ => continue,
+                Some(Incoming::Response(r)) if ping.as_ref().is_some_and(|(p, _)| *p == r.id) => {
+                    ping = None;
+                    quiet_since = Instant::now();
+                }
+                Some(_) => {}
+                None => match &ping {
+                    Some((_, sent)) if sent.elapsed() >= self.liveness => {
+                        return Err(ClientError::Io(format!(
+                            "the service at {} stopped answering (no answer to a check in {}s) while `{method}` ran; see its log",
+                            self.path.display(),
+                            self.liveness.as_secs()
+                        )))
+                    }
+                    Some(_) => {}
+                    None if quiet_since.elapsed() >= self.liveness => {
+                        let p = self.send(method::HELLO, Value::Null)?;
+                        ping = Some((p, Instant::now()));
+                    }
+                    None => {}
+                },
             }
         }
     }
@@ -900,6 +1038,21 @@ mod tests {
         assert!(g.admits_with(Peer { uid: 1002, gid: 500 }, none), "primary group");
         assert!(g.admits_with(Peer { uid: 1003, gid: 7 }, |u, gid| u == 1003 && gid == 500));
         assert!(!g.admits_with(Peer { uid: 1004, gid: 7 }, |u, _| u == 1003));
+    }
+
+    #[test]
+    fn only_the_system_directory_may_be_someone_elses() {
+        let user = Path::new("/run/user/1000/lsync");
+        assert!(owner_allowed(user, 1000, 1000).is_ok());
+        let e = owner_allowed(user, 1001, 1000).unwrap_err();
+        assert!(matches!(e, ClientError::Unsafe(_)), "{e}");
+        assert!(e.to_string().contains("uid 1001"), "{e}");
+        // LSYNC_RUNTIME_DIR, pre-made by another user.
+        assert!(owner_allowed(Path::new("/tmp/lsync"), 1001, 1000).is_err());
+        // The system service's directory belongs to the service's user.
+        assert!(owner_allowed(Path::new(SYSTEM_DIR), 0, 1000).is_ok());
+        assert!(owner_allowed(Path::new(SYSTEM_DIR), 998, 1000).is_ok());
+        assert!(owner_allowed(Path::new("/run/lsync-other"), 998, 1000).is_err());
     }
 
     #[test]

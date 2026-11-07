@@ -49,7 +49,8 @@ use tracing::{info, warn};
 /// How often the engines' counters are looked at for events.
 pub const ACTIVITY_POLL: Duration = Duration::from_millis(500);
 /// How often each engine's safety stop and last error are read when its
-/// counters did not move (they are read at once when they did).
+/// counters did not move (they are read at once when they did). Only those
+/// two meta values are read, never the full status, which scans the index.
 pub const STATUS_POLL: Duration = Duration::from_secs(10);
 /// Events kept for a subscriber that is slow to read.
 const EVENT_BUFFER: usize = 1024;
@@ -90,7 +91,8 @@ pub struct ConfigSource {
     pub path: PathBuf,
     pub dirs: Dirs,
     pub secrets: SecretStores,
-    /// Only this vault (`lsync serve --vault NAME`).
+    /// Only this vault (`lsync serve --vault NAME`). When it is no longer
+    /// in the file, `load` gives no vaults, and a reload stops it.
     pub only: Option<String>,
 }
 
@@ -102,11 +104,9 @@ impl Source for ConfigSource {
                 self.path.display()
             ));
         };
-        if let Some(only) = &self.only {
-            if !cfg.vault.contains_key(only) {
-                return Err(format!("no vault named {only:?} in {}", self.path.display()));
-            }
-        }
+        // With `only`, a vault no longer in the file is a removed vault (it
+        // stops), not an unreadable config; `lsync serve --vault` checks
+        // that it is there before it starts.
         let mut out = Vec::new();
         for (name, v) in &cfg.vault {
             if self.only.as_ref().is_some_and(|o| o != name) {
@@ -293,6 +293,47 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     }
 }
 
+/// As [`blocking`], with a panic as an `Err` with its message.
+async fn caught<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    tokio::task::spawn_blocking(f).await.map_err(panic_message)
+}
+
+/// What a task that ended without a result said: its panic's message.
+pub fn panic_message(e: tokio::task::JoinError) -> String {
+    if !e.is_panic() {
+        return "it was cancelled".into();
+    }
+    let p = e.into_panic();
+    if let Some(s) = p.downcast_ref::<&str>() {
+        format!("it panicked: {s}")
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        format!("it panicked: {s}")
+    } else {
+        "it panicked".into()
+    }
+}
+
+/// A name for the settings a vault runs with (see `VaultView::fingerprint`):
+/// a hash of them, as this process computes it.
+pub fn fingerprint(s: &Settings) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(s).unwrap_or_default().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// See [`Service::set_command_hook_for_tests`].
+pub type CommandHook = Arc<dyn Fn(Command, &str) + Send + Sync>;
+
+/// Clears a vault's running command when dropped.
+struct ClearCommand<'a>(&'a Entry);
+
+impl Drop for ClearCommand<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.view).command = None;
+    }
+}
+
 pub struct Service {
     host: Arc<Host>,
     source: Box<dyn Source>,
@@ -303,6 +344,7 @@ pub struct Service {
     version: String,
     /// What the activity poll last saw of each running engine.
     activity: Mutex<HashMap<String, Seen>>,
+    command_hook: Mutex<Option<CommandHook>>,
 }
 
 impl Service {
@@ -320,6 +362,7 @@ impl Service {
             stopping: AtomicBool::new(false),
             version: version.to_string(),
             activity: Mutex::new(HashMap::new()),
+            command_hook: Mutex::new(None),
         })
     }
 
@@ -395,7 +438,7 @@ impl Service {
         let svc = self.clone();
         let id = name.to_string();
         blocking(move || {
-            svc.poll_vault(&id);
+            svc.poll_vault(&id, true);
             let released = svc.host.stop(&id);
             lock(&svc.activity).remove(&id);
             released
@@ -405,7 +448,7 @@ impl Service {
 
     async fn start_engine(&self, cfg: RunConfig) -> Result<(), String> {
         let host = self.host.clone();
-        blocking(move || host.start(cfg)).await.map_err(|e| e.to_string())
+        caught(move || host.start(cfg)).await?.map_err(|e| e.to_string())
     }
 
     /// Reread the config and make the host match it. On a config that
@@ -429,30 +472,21 @@ impl Service {
         names.sort();
         names.dedup();
 
-        // Phase 1: take each changed vault's lock (in name order) and stop
-        // its engine, so that phase 2 starts every engine with the other
-        // vaults' old engines already gone (two vaults may swap folders).
-        struct Change {
-            name: String,
-            entry: Arc<Entry>,
-            _guard: tokio::sync::OwnedMutexGuard<()>,
-            new: Planned,
-            ran: bool,
+        // Phase 1: take the lock of every vault that changes, all of them
+        // (in name order) before any engine is stopped, so a vault waiting
+        // for its turn (a long command on another one) keeps running
+        // meanwhile. Then stop their engines, so that phase 2 starts every
+        // engine with the other vaults' old engines already gone (two vaults
+        // may swap folders).
+        enum Action {
+            Remove,
+            Change(Planned),
+            Add(Planned),
         }
-        let mut changes: Vec<Change> = Vec::new();
+        let mut plan: Vec<(String, Arc<Entry>, Action)> = Vec::new();
         for name in &names {
             match (current.get(name), wanted.remove(name)) {
-                (Some(entry), None) => {
-                    let guard = entry.ctl.clone().lock_owned().await;
-                    if self.has_slot(name) {
-                        self.stop_engine(name).await;
-                    }
-                    lock(&entry.view).removed = true;
-                    lock(&self.vaults).remove(name);
-                    info!("vault {name}: removed from the config; stopped");
-                    report.stopped.push(name.clone());
-                    drop(guard);
-                }
+                (Some(entry), None) => plan.push((name.clone(), entry.clone(), Action::Remove)),
                 (Some(entry), Some(new)) => {
                     if entry.view().planned == new {
                         report.unchanged.push(name.clone());
@@ -464,18 +498,7 @@ impl Service {
                         }
                         continue;
                     }
-                    let guard = entry.ctl.clone().lock_owned().await;
-                    let ran = self.has_slot(name);
-                    if ran {
-                        self.stop_engine(name).await;
-                    }
-                    changes.push(Change {
-                        name: name.clone(),
-                        entry: entry.clone(),
-                        _guard: guard,
-                        new,
-                        ran,
-                    });
+                    plan.push((name.clone(), entry.clone(), Action::Change(new)));
                 }
                 (None, Some(new)) => {
                     let entry = Arc::new(Entry {
@@ -488,17 +511,58 @@ impl Service {
                             removed: false,
                         }),
                     });
-                    let guard = entry.ctl.clone().lock_owned().await;
+                    plan.push((name.clone(), entry, Action::Add(new)));
+                }
+                (None, None) => {}
+            }
+        }
+        let mut guards = Vec::with_capacity(plan.len());
+        for (_, entry, _) in &plan {
+            guards.push(entry.ctl.clone().lock_owned().await);
+        }
+        struct Change {
+            name: String,
+            entry: Arc<Entry>,
+            _guard: tokio::sync::OwnedMutexGuard<()>,
+            new: Planned,
+            ran: bool,
+        }
+        let mut changes: Vec<Change> = Vec::new();
+        for ((name, entry, action), guard) in plan.into_iter().zip(guards) {
+            match action {
+                Action::Remove => {
+                    if self.has_slot(&name) {
+                        self.stop_engine(&name).await;
+                    }
+                    lock(&entry.view).removed = true;
+                    lock(&self.vaults).remove(&name);
+                    info!("vault {name}: removed from the config; stopped");
+                    report.stopped.push(name);
+                    drop(guard);
+                }
+                Action::Change(new) => {
+                    let ran = self.has_slot(&name);
+                    if ran {
+                        self.stop_engine(&name).await;
+                    }
+                    changes.push(Change {
+                        name,
+                        entry,
+                        _guard: guard,
+                        new,
+                        ran,
+                    });
+                }
+                Action::Add(new) => {
                     lock(&self.vaults).insert(name.clone(), entry.clone());
                     changes.push(Change {
-                        name: name.clone(),
+                        name,
                         entry,
                         _guard: guard,
                         new,
                         ran: false,
                     });
                 }
-                (None, None) => {}
             }
         }
 
@@ -699,6 +763,7 @@ impl Service {
                 account: v.planned.account.clone(),
                 command: v.command.map(|c| c.name().to_string()),
                 settings: v.planned.run.as_ref().ok().map(settings_of),
+                fingerprint: v.planned.run.as_ref().ok().map(|c| fingerprint(&settings_of(c))),
                 status: st.snapshot,
                 session: st.session,
                 push: st.push,
@@ -711,7 +776,8 @@ impl Service {
 
     /// Run a command for a client on a vault the service holds (see the
     /// module docs). The vault's engine is back as it was afterwards,
-    /// whatever the command's outcome.
+    /// whatever the command's outcome, a panic included (that is a
+    /// `failed` command).
     pub async fn command(self: &Arc<Self>, cmd: Command, p: CommandParams) -> Result<CommandResult, CtlError> {
         self.check_running()?;
         let name = p.vault.clone();
@@ -726,6 +792,19 @@ impl Service {
             Some(c) => c.clone(),
             None => return Err(self.not_running(&name, &v)),
         };
+        // What the client compared may be older than what a reload made of
+        // the vault since: then it runs nothing.
+        if let Some(seen) = &p.fingerprint {
+            if *seen != fingerprint(&settings_of(&cfg)) {
+                return Err(CtlError::new(
+                    code::CHANGED,
+                    format!(
+                        "vault {name}'s settings in the service changed after this `{}` compared them; nothing was run, run it again",
+                        cmd.name()
+                    ),
+                ));
+            }
+        }
         if cmd.writes() && cfg.pull_only {
             return Err(CtlError::new(
                 code::FAILED,
@@ -736,25 +815,55 @@ impl Service {
             ));
         }
         lock(&entry.view).command = Some(cmd);
+        // `command` is cleared on every way out, an unwinding one included.
+        let _clear = ClearCommand(&entry);
         self.emit(
             event::COMMAND,
             Some(&name),
             json!({"command": cmd.name(), "phase": "started"}),
         );
         let had_engine = self.has_slot(&name);
-        let released = !had_engine || self.stop_engine(&name).await;
-        let outcome = if released {
+        // Stopping the engine and running the command on a task of their
+        // own: a panic there ends that task, not this restore below.
+        let work = {
+            let svc = self.clone();
+            let name = name.clone();
             let mut run = cfg.clone();
             run.allow_mass_delete = p.allow_mass_delete;
             run.remove_out_of_scope_copies = p.remove_out_of_scope_copies;
-            self.run_command(cmd, run, p.adopt_tweaks).await
-        } else {
-            Err(CtlError::new(
-                code::BUSY,
-                format!("vault {name}'s engine did not let go of its folders in time; try again"),
-            ))
+            let adopt = p.adopt_tweaks;
+            tokio::spawn(async move {
+                let released = !had_engine || svc.stop_engine(&name).await;
+                if !released {
+                    return Err(CtlError::new(
+                        code::BUSY,
+                        format!("vault {name}'s engine did not let go of its folders in time; try again"),
+                    ));
+                }
+                svc.run_command(cmd, run, adopt).await
+            })
         };
-        if had_engine && !self.stopping.load(Ordering::SeqCst) {
+        let outcome = match work.await {
+            Ok(r) => r,
+            Err(e) => {
+                let why = panic_message(e);
+                warn!("vault {name}: `{}` for a client failed: {why}", cmd.name());
+                // Whatever engine the command had open went with its task;
+                // its folders are let go before the vault's engine starts.
+                let dir = cfg.state_dir.clone();
+                if !caught(move || wait_released(&dir, RELEASE_TIMEOUT))
+                    .await
+                    .unwrap_or(false)
+                {
+                    warn!("vault {name}: the command's engine still holds its state folder");
+                }
+                Err(CtlError::new(
+                    code::FAILED,
+                    format!("`{}` failed inside the lsync service: {why}", cmd.name()),
+                ))
+            }
+        };
+        if had_engine && !self.stopping.load(Ordering::SeqCst) && !self.has_slot(&name) {
             if let Err(e) = self.start_engine(cfg).await {
                 warn!("vault {name}: not started again after `{}`: {e}", cmd.name());
                 lock(&entry.view).start_error = Some(e);
@@ -779,6 +888,11 @@ impl Service {
         let open = cfg.clone();
         let engine = blocking(move || host.open_engine(&open)).await.map_err(host_error)?;
         info!("vault {}: running `{}` for a client", cfg.id, cmd.name());
+        let hook = lock(&self.command_hook).clone();
+        if let Some(hook) = hook {
+            let id = cfg.id.clone();
+            blocking(move || hook(cmd, &id)).await;
+        }
         let t0 = Instant::now();
         let report = match cmd {
             Command::Sync => engine.sync_once().await.map(|r| serde_json::to_value(&r)),
@@ -808,6 +922,13 @@ impl Service {
             wall_ms: wall.as_millis() as u64,
             peak_rss_kib: livesync_engine::platform::peak_rss_kib(),
         })
+    }
+
+    /// Tests only: run `hook` in every command for a client, after its
+    /// engine is opened and before it runs (to make one slow, or panic).
+    #[doc(hidden)]
+    pub fn set_command_hook_for_tests(&self, hook: Option<CommandHook>) {
+        *lock(&self.command_hook) = hook;
     }
 
     /// For `lsync daemon`: wait until a vault's first start is decided.
@@ -853,7 +974,7 @@ impl Service {
         let svc = self.clone();
         blocking(move || {
             for name in svc.names() {
-                svc.poll_vault(&name);
+                svc.poll_vault(&name, true);
             }
             svc.host.stop_all();
         })
@@ -878,7 +999,7 @@ impl Service {
                     let names = svc.names();
                     lock(&svc.activity).retain(|n, _| names.contains(n));
                     for name in names {
-                        svc.poll_vault(&name);
+                        svc.poll_vault(&name, false);
                     }
                 })
                 .await;
@@ -886,8 +1007,10 @@ impl Service {
         })
     }
 
-    /// One activity poll of one vault. Blocks (an index read now and then).
-    fn poll_vault(&self, name: &str) {
+    /// One activity poll of one vault. Blocks (two meta reads now and
+    /// then). `final_read`: the engine is about to stop, so its safety stop
+    /// and last error are read now.
+    fn poll_vault(&self, name: &str, final_read: bool) {
         let mut seen = lock(&self.activity);
         let Some(engine) = self.host.engine(name) else {
             // The next engine starts its counters at zero.
@@ -897,9 +1020,9 @@ impl Service {
         let s = seen.entry(name.to_string()).or_default();
         let (pull, push) = (engine.report(), engine.push_report());
         let moved = s.counters(self, name, &pull, &push);
-        if moved || s.status_at.is_none_or(|t| t.elapsed() >= STATUS_POLL) {
-            if let Ok(st) = engine.status() {
-                s.status(self, name, st.safety_stop, st.last_error);
+        if moved || final_read || s.status_at.is_none_or(|t| t.elapsed() >= STATUS_POLL) {
+            if let Ok((stop, error)) = engine.alerts() {
+                s.status(self, name, stop, error);
             }
             s.status_at = Some(Instant::now());
         }

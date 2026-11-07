@@ -398,3 +398,45 @@ fn serve_needs_an_lsync_toml() {
     assert!(e.contains("lsync vault add"), "{e}");
     assert!(!m.socket().exists());
 }
+
+#[test]
+fn a_socket_this_user_cannot_reach_means_running_here() {
+    use std::os::unix::fs::PermissionsExt;
+    let rt = runtime();
+    let mock = rt.block_on(Mock::start());
+    mock.put_text("Notes/a.md", &["note a"]);
+    let m = Machine::with_vault(&mock);
+    // As a system service's folder looks to a user outside its group.
+    let run = m.root.join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let synced = m.run(&["--vault", "notes", "sync"]);
+    let status = m.run(&["--vault", "notes", "status"]);
+    let pause = m.run(&["pause"]);
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let err = |o: &Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    assert!(synced.status.success(), "{}", err(&synced));
+    assert!(m.folder("notes/Notes/a.md").exists());
+    assert!(status.status.success(), "{}", err(&status));
+    assert!(err(&pause).contains("no lsync service is running"), "{}", err(&pause));
+}
+
+#[test]
+fn serve_with_one_vault_stops_it_when_it_is_removed() {
+    let rt = runtime();
+    let mock = rt.block_on(Mock::start());
+    let m = Machine::with_vault(&mock);
+    let e = m.fails(&["serve", "--vault", "nope"]);
+    assert!(e.contains("no vault named \"nope\""), "{e}");
+    let svc = m.spawn(&["serve", "--vault", "notes"], "serve.log");
+    wait_until("the vault running in the service", || {
+        m.served_state("notes").as_deref() == Some("running")
+    });
+    m.ok(&["vault", "rm", "notes"]);
+    wait_until("the vault gone from the service", || {
+        m.run(&["status", "--all", "--json"]).status.success() && m.served_state("notes").is_none()
+    });
+    let r = m.ok(&["reload"]);
+    assert!(r.contains("unchanged  -"), "{r}");
+    assert_eq!(svc.stop(), Some(0));
+}

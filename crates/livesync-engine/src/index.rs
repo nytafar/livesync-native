@@ -6,9 +6,10 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
+    #[default]
     Clean,
     Dirty,
     Conflicted,
@@ -40,7 +41,8 @@ impl State {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct FileRow {
     pub path: String,
     pub doc_id: String,
@@ -59,7 +61,8 @@ pub struct FileRow {
 
 /// A local file the push side cannot sync (no document involved), such as a
 /// case collision between two local names or a file over the size limit.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct LocalIssue {
     pub path: String,
     pub kind: String,
@@ -67,7 +70,8 @@ pub struct LocalIssue {
     pub seen_ms: i64,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PendingRow {
     pub doc_id: String,
     pub rev: Option<String>,
