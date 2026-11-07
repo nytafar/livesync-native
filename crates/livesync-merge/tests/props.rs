@@ -2,10 +2,19 @@
 //! (or a JSON value) that either side added, nor brings back one a side
 //! deleted; changes are placed by base position; two runs inserted at one
 //! point come out whole, the older first; `merge3` agrees with `merge`; and a
-//! merge is symmetric up to the order the mtimes give. Every clean line merge
-//! is also checked against the oracle (`oracle/mod.rs`), and a placement fuzz
-//! checks merges against the ground truth its generator knows.
+//! merge is symmetric up to the order the mtimes give.
+//!
+//! The primary oracle for line merges is ground truth (`truth/mod.rs`):
+//! streams build a base and apply a known edit script to each side, so the
+//! true merge comes from what each side did to each line, not from the
+//! texts. A clean merge must be the true merge, or fall in one of the named
+//! history-ambiguous classes, each with its own exact check. The streams are
+//! the reviewers' (review 5's truth and notes streams, review 6's dup fuzz)
+//! and the lost-update guard's, with a writer that saw R2 and a stale one.
+//! Every clean line merge is also checked against the secondary oracles
+//! (`oracle/mod.rs`), which read the texts alone.
 mod oracle;
+mod truth;
 
 use livesync_merge::{
     line_merge_trace, merge, merge3, upstream_line_merge, Input, Kind, Labels, Merge, Outcome, Overlap, Reason, Rule,
@@ -1207,141 +1216,29 @@ proptest! {
     }
 }
 
-/// A stale writer: R2 and L are each R1 with edits of their own (L never saw
-/// R2). Lines from `---`, blank lines, a recurring `- x` and unique lines;
-/// each side inserts (fresh lines or copies), deletes, edits and moves lines.
-fn stale_case() -> impl Strategy<Value = (Case, bool)> {
-    const POOL: &[&str] = &["", "", "---", "- x", "- x", "u", "u", "u", "u", "u"];
-    type Edits = Vec<(u8, prop::sample::Index, &'static str, prop::sample::Index)>;
-    let edits = || {
-        prop::collection::vec(
-            (
-                0..5u8,
-                any::<prop::sample::Index>(),
-                prop::sample::select(POOL),
-                any::<prop::sample::Index>(),
-            ),
-            1..4,
-        )
-    };
-    (
-        prop::collection::vec(prop::sample::select(POOL), 0..10),
-        edits(),
-        edits(),
-        any::<bool>(),
-    )
-        .prop_map(|(r1, remote, writer, l_newer): (Vec<&str>, Edits, Edits, bool)| {
-            let mut fresh = 0;
-            let mut word = |w: &str, who: &str| {
-                if w == "u" {
-                    fresh += 1;
-                    format!("{who} {fresh}")
-                } else {
-                    w.to_string()
-                }
-            };
-            let r1: Vec<String> = r1.iter().map(|w| word(w, "line")).collect();
-            let mut side = |edits: &Edits, who: &str| -> Vec<String> {
-                let mut v = r1.clone();
-                for (op, i, w, j) in edits {
-                    match op {
-                        0 => {
-                            let at = i.index(v.len() + 1);
-                            v.insert(at, word(w, who));
-                        }
-                        1 if !v.is_empty() => {
-                            v.remove(i.index(v.len()));
-                        }
-                        2 if !v.is_empty() => {
-                            let at = i.index(v.len());
-                            if !v[at].trim().is_empty() {
-                                v[at] = format!("{} {who}", v[at]);
-                            }
-                        }
-                        3 if !v.is_empty() => {
-                            let copy = v[j.index(v.len())].clone();
-                            v.insert(i.index(v.len() + 1), copy);
-                        }
-                        4 if v.len() > 1 => {
-                            let l = v.remove(j.index(v.len()));
-                            v.insert(i.index(v.len() + 1), l);
-                        }
-                        _ => {}
-                    }
-                }
-                v
-            };
-            let r2 = side(&remote, "remote");
-            let l = side(&writer, "writer");
-            let c = Case {
-                base: join(&r1, "\n", true),
-                ours: join(&l, "\n", true),
-                theirs: join(&r2, "\n", true),
-            };
-            (c, l_newer)
-        })
-}
+// ---------- ground truth: the primary oracle ----------
 
-/// Whether the writer's file `l` already has the change from `r1` to `r2`, by
-/// its text: every line (not blank) R2 has more often than R1, at least as
-/// often; every line R2 has less often, at most as often; two lines next to
-/// each other in R1 (blank lines aside, each once in every file) that R2
-/// parted with a paragraph break or joined, the same where L has them next to
-/// each other; and two lines
-/// each file has once, that R2 put in the other order, in R2's order.
-fn holds_change(r1: &str, l: &str, r2: &str) -> Result<(), String> {
-    let count = |s: &str| -> HashMap<String, usize> {
-        let mut n = HashMap::new();
-        for x in oracle::shape(s) {
-            *n.entry(x.1).or_default() += 1;
-        }
-        n
-    };
-    let (a, b, c) = (count(r1), count(l), count(r2));
-    let get = |n: &HashMap<String, usize>, k: &str| n.get(k).copied().unwrap_or(0);
-    for k in a.keys().chain(c.keys()) {
-        let (x, y, z) = (get(&a, k), get(&b, k), get(&c, k));
-        if (z > x && y < z) || (z < x && y > z) {
-            return Err(format!("the line {k:?}: R1 {x}x, R2 {z}x, L {y}x"));
-        }
+/// Every clean line merge of a history (`truth::judge`), in each side and
+/// mtime order, and the secondary oracles (`passes_oracle`) on each.
+fn right_by_history(h: &truth::History) -> Result<(), TestCaseError> {
+    if h.artifact() {
+        return Ok(());
     }
-    // Two lines next to each other, each once in all three files: whether a
-    // paragraph break parts them.
-    let all = [r1, l, r2].map(count);
-    let unique = |x: &str| all.iter().all(|n| n.get(x) == Some(&1));
-    let pairs = |s: &str| -> HashMap<(String, String), bool> {
-        let sh = oracle::shape(s);
-        sh.windows(2)
-            .filter(|w| unique(&w[0].1) && unique(&w[1].1))
-            .map(|w| ((w[0].1.clone(), w[1].1.clone()), w[1].0))
-            .collect()
-    };
-    let (pa, pb, pc) = (pairs(r1), pairs(l), pairs(r2));
-    for (k, gap) in &pc {
-        if let (Some(was), Some(now)) = (pa.get(k), pb.get(k)) {
-            if was != gap && now == was {
-                return Err(format!("R2 changed the paragraph break between {k:?}; L has R1's"));
-            }
-        }
+    let [b, o, t] = h.texts();
+    if o == t || o == b || t == b {
+        return Ok(());
     }
-    let once = |s: &str| -> HashMap<String, usize> {
-        let sh = oracle::shape(s);
-        let mut n: HashMap<String, (usize, usize)> = HashMap::new();
-        for (i, x) in sh.iter().enumerate() {
-            let e = n.entry(x.1.clone()).or_insert((0, i));
-            e.0 += 1;
-        }
-        n.into_iter().filter(|(_, v)| v.0 == 1).map(|(k, v)| (k, v.1)).collect()
+    if let Err(e) = judged(h, Kind::Text) {
+        prop_assert!(false, "{}", e);
+    }
+    let c = Case {
+        base: b,
+        ours: o,
+        theirs: t,
     };
-    let (a, b, c) = (once(r1), once(l), once(r2));
-    for (p, &pc) in &c {
-        for (q, &qc) in &c {
-            if let (Some(&pa), Some(&qa), Some(&pb), Some(&qb)) = (a.get(p), a.get(q), b.get(p), b.get(q)) {
-                if pc < qc && pa > qa && pb > qb {
-                    return Err(format!("R2 put {p:?} before {q:?}; L has R1's order"));
-                }
-            }
-        }
+    for (mo, mt) in [(2000, 3000), (3000, 2000)] {
+        passes_oracle(&c, mo, mt)?;
+        passes_oracle(&swapped(&c), mo, mt)?;
     }
     Ok(())
 }
@@ -1349,388 +1246,44 @@ fn holds_change(r1: &str, l: &str, r2: &str) -> Result<(), String> {
 proptest! {
     #![proptest_config(config())]
 
-    /// The lost-update guard's silent path: a writer that never saw R2. A
-    /// clean merge equal to L reads as "L already holds R2", so R2's change
-    /// would be lost without a word. It may be so only where L's text already
-    /// has R2's change (see `holds_change`). Every clean merge also passes
-    /// the oracles.
+    /// Review 5's truth stream (repeated lines, moves, copies, line ends,
+    /// final newlines): every clean merge is the true merge of the edit
+    /// history, or falls in a named history-ambiguous class.
     #[test]
-    fn a_stale_writer_is_never_taken_for_one_that_saw_the_change((c, l_newer) in stale_case()) {
-        let (mo, mt) = if l_newer { (3000, 2000) } else { (2000, 3000) };
-        passes_oracle(&c, mo, mt)?;
-        for kind in [Kind::Text, Kind::Markdown] {
-            if let Outcome::Write(out) = run(kind, &c, mo, mt).outcome {
-                if out == c.ours.as_bytes() {
-                    if let Err(e) = holds_change(&c.base, &c.ours, &c.theirs) {
-                        prop_assert!(false, "clean and L, but R2's change is lost: {}\n{:?}", e, c);
-                    }
-                }
-            }
-        }
+    fn clean_merges_are_the_true_merge_of_the_history(seed in any::<u64>()) {
+        right_by_history(&truth::truth_stream(seed))?;
     }
-}
 
-// ---------- the reviewers' streams ----------
-
-/// A small deterministic generator (SplitMix64), so the reviewers' streams
-/// run as they were written, one proptest seed per case.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        if n == 0 {
-            0
-        } else {
-            (self.next() % n as u64) as usize
-        }
-    }
-    fn chance(&mut self, p: f64) -> bool {
-        (self.next() % 1_000_000) as f64 / 1e6 < p
-    }
-}
-
-/// A line with an identity, to know what really happened to it.
-#[derive(Clone, Debug)]
-struct Line {
-    id: usize,
-    text: String,
-    crlf: bool,
-}
-
-fn render(v: &[Line], fin: bool) -> String {
-    let mut s = String::new();
-    for (k, l) in v.iter().enumerate() {
-        s.push_str(&l.text);
-        if k + 1 < v.len() || fin {
-            s.push_str(if l.crlf { "\r\n" } else { "\n" });
-        }
-    }
-    s
-}
-
-/// What each side did, by identity: base lines `a..b` became `items`; `None`
-/// where a line moved.
-fn truth_changes(base: &[Line], side: &[Line]) -> Option<Vec<(usize, usize, Vec<Line>)>> {
-    let pos: HashMap<usize, usize> = base.iter().enumerate().map(|(i, l)| (l.id, i)).collect();
-    let mut out = Vec::new();
-    let (mut pb, mut items): (usize, Vec<Line>) = (0, Vec::new());
-    for l in side {
-        if let Some(&i) = pos.get(&l.id) {
-            if i < pb {
-                return None;
-            }
-            if i > pb || !items.is_empty() {
-                out.push((pb, i, std::mem::take(&mut items)));
-            }
-            pb = i + 1;
-        } else {
-            items.push(l.clone());
-        }
-    }
-    if base.len() > pb || !items.is_empty() {
-        out.push((pb, base.len(), items));
-    }
-    Some(out)
-}
-
-/// The right merge where the two sides' changes are apart (no change of one
-/// touches one of the other, nothing moved): every change in place.
-fn apart_truth(base: &[Line], o: &[Line], t: &[Line]) -> Option<Vec<Line>> {
-    let (co, ct) = (truth_changes(base, o)?, truth_changes(base, t)?);
-    if co.iter().any(|a| ct.iter().any(|b| a.0 <= b.1 && b.0 <= a.1)) {
-        return None;
-    }
-    let mut all: Vec<&(usize, usize, Vec<Line>)> = co.iter().chain(ct.iter()).collect();
-    all.sort_by_key(|c| (c.0, c.1));
-    let mut v = Vec::new();
-    let mut p = 0;
-    for c in all {
-        v.extend(base[p..c.0].iter().cloned());
-        v.extend(c.2.iter().cloned());
-        p = c.1;
-    }
-    v.extend(base[p..].iter().cloned());
-    Some(v)
-}
-
-/// Review 5's truth stream: lines from a pool (`- x`, tasks, `---`, blank
-/// lines, fences, headings, table rows) or unique; each side inserts, deletes,
-/// edits, moves and copies lines, toggles CRLF and the final newline.
-fn truth_stream(seed: u64) -> (Vec<Line>, bool, Vec<Line>, bool, Vec<Line>, bool, bool) {
-    const REP: &[&str] = &["- x", "- [ ] gym", "---", "", "", "```", "## Notes", "  ", "| a | b |"];
-    let mut r = Rng(seed);
-    let rep = [0.15, 0.45, 0.7][r.below(3)];
-    let crlf_p = if r.chance(0.25) { 0.3 } else { 0.0 };
-    let mut uq = 0;
-    let mut pool = |r: &mut Rng, tag: &str| {
-        if r.chance(rep) {
-            REP[r.below(REP.len())].to_string()
-        } else {
-            uq += 1;
-            format!("{tag}{uq}")
-        }
-    };
-    let nb = r.below(10);
-    let base: Vec<Line> = (0..nb)
-        .map(|i| Line {
-            id: i,
-            text: pool(&mut r, "line "),
-            crlf: r.chance(crlf_p),
-        })
-        .collect();
-    let fb = !r.chance(0.2);
-    let mut next = 1000;
-    let mut side = |r: &mut Rng, who: &str| -> (Vec<Line>, bool) {
-        let (mut v, mut fin) = (base.clone(), fb);
-        for _ in 0..1 + r.below(3) {
-            let n = v.len();
-            let mut fresh = |text: String, crlf: bool| {
-                next += 1;
-                Line { id: next, text, crlf }
-            };
-            match r.below(20) {
-                0..=3 => {
-                    let t = pool(r, &format!("{who} "));
-                    let c = r.chance(crlf_p);
-                    let at = r.below(n + 1);
-                    v.insert(at, fresh(t, c));
-                }
-                4 => {
-                    let t = ["new A", "new B", "- x", ""][r.below(4)].to_string();
-                    let at = r.below(n + 1);
-                    v.insert(at, fresh(t, false));
-                }
-                5..=8 if n > 0 => {
-                    v.remove(r.below(n));
-                }
-                9..=12 if n > 0 => {
-                    let at = r.below(n);
-                    if !v[at].text.trim().is_empty() {
-                        let suf = if r.chance(0.2) { " e" } else { who };
-                        let (t, c) = (format!("{} {suf}", v[at].text), v[at].crlf);
-                        v[at] = fresh(t, c);
-                    }
-                }
-                13 | 14 if n > 1 => {
-                    let a = r.below(n);
-                    if !v[a].text.trim().is_empty() {
-                        let l = v.remove(a);
-                        let b = r.below(n);
-                        v.insert(b, l);
-                    }
-                }
-                15 if n > 0 => {
-                    let a = r.below(n);
-                    let (t, c) = (v[a].text.clone(), v[a].crlf);
-                    let b = r.below(n + 1);
-                    v.insert(b, fresh(t, c));
-                }
-                16 if n > 0 && crlf_p > 0.0 => {
-                    let at = r.below(n);
-                    let (t, c) = (v[at].text.clone(), !v[at].crlf);
-                    v[at] = fresh(t, c);
-                }
-                17 => fin = !fin,
-                _ => {}
-            }
-        }
-        (v, fin)
-    };
-    let (o, fo) = side(&mut r, "o");
-    let (t, ft) = side(&mut r, "t");
-    (base, fb, o, fo, t, ft, r.chance(0.5))
-}
-
-/// Review 5's realistic notes: paragraphs, task lists (some tasks recur),
-/// headings, `---` and blank lines; each side makes one to three ordinary
-/// edits: an edit or a tick, a paragraph split or joined, a line or a
-/// paragraph added, a line deleted, a log line appended, a task added.
-fn notes_stream(seed: u64) -> (Vec<Line>, Vec<Line>, Vec<Line>, bool) {
-    let mut r = Rng(seed);
-    let flavour = r.below(4);
-    let mut ids = 0;
-    let mut base = Vec::new();
-    let mut push = |v: &mut Vec<Line>, t: String| {
-        ids += 1;
-        v.push(Line {
-            id: ids,
-            text: t,
-            crlf: false,
-        });
-    };
-    let mut pc = 0;
-    for b in 0..2 + r.below(4) {
-        if b > 0 {
-            push(&mut base, String::new());
-        }
-        let kind = match flavour {
-            3 => 0,
-            1 => [0, 1, 1, 1, 2][r.below(5)],
-            2 => [0, 0, 0, 3, 2][r.below(5)],
-            _ => r.below(5),
-        };
-        match if b == 0 && kind == 4 { 0 } else { kind } {
-            0 | 3 => {
-                pc += 1;
-                for k in 0..1 + r.below(3) {
-                    push(&mut base, format!("Para {pc} sentence {k}."));
-                }
-            }
-            1 => {
-                for k in 0..1 + r.below(4) {
-                    let t = ["- [ ] gym", "- [ ] water plants", "- [ ] call mom"];
-                    let line = if r.chance(0.5) {
-                        t[r.below(3)].to_string()
-                    } else {
-                        format!("- [ ] task {pc}{k}")
-                    };
-                    push(&mut base, line);
-                }
-            }
-            2 => {
-                let h = if r.chance(0.5) {
-                    "## Notes".to_string()
-                } else {
-                    format!("## Heading {b}")
-                };
-                push(&mut base, h);
-            }
-            _ => push(&mut base, "---".into()),
-        }
-    }
-    let mut ids = 10_000;
-    let mut edit = |r: &mut Rng, v: &mut Vec<Line>, who: &str| {
-        let n = v.len();
-        let mut fresh = |t: String| {
-            ids += 1;
-            Line {
-                id: ids,
-                text: t,
-                crlf: false,
-            }
-        };
-        let at = r.below(n.max(1));
-        match r.below(10) {
-            0 | 1 if n > 0 && !v[at].text.is_empty() => {
-                let t = if v[at].text.starts_with("- [ ]") {
-                    v[at].text.replacen("- [ ]", "- [x]", 1)
-                } else {
-                    format!("{} ({who})", v[at].text)
-                };
-                v[at] = fresh(t);
-            }
-            2 if n > 0 && !v[at].text.is_empty() && at + 1 < n && !v[at + 1].text.is_empty() => {
-                v.insert(at + 1, fresh(String::new()));
-            }
-            3 if n > 0 && v[at].text.is_empty() => {
-                v.remove(at);
-            }
-            4 => v.insert((at + 1).min(n), fresh(format!("Added by {who}."))),
-            5 if n > 0 && !v[at].text.is_empty() => {
-                let p = at + 1;
-                v.insert(p, fresh(String::new()));
-                v.insert(p + 1, fresh(format!("New paragraph by {who}.")));
-                if p + 2 < v.len() && !v[p + 2].text.is_empty() {
-                    v.insert(p + 2, fresh(String::new()));
-                }
-            }
-            6 if n > 0 && !v[at].text.is_empty() => {
-                v.remove(at);
-            }
-            7 => v.push(fresh(format!("- {who} log"))),
-            8 => {
-                let t = ["- [ ] milk", "- [ ] gym", "---"][r.below(3)].to_string();
-                v.insert((at + 1).min(n), fresh(t));
-            }
-            9 if n > 0 && v[at].text.starts_with("- [") => v.insert(at + 1, fresh(format!("- [ ] task by {who}"))),
-            _ => {}
-        }
-    };
-    let (mut o, mut t) = (base.clone(), base.clone());
-    for _ in 0..1 + r.below(3) {
-        edit(&mut r, &mut o, "ours");
-    }
-    for _ in 0..1 + r.below(3) {
-        edit(&mut r, &mut t, "theirs");
-    }
-    (base, o, t, r.chance(0.5))
-}
-
-/// Whether a clean merge `m` of a stream case is right, where the truth is
-/// known (`want`, the sides' changes apart): `m` is it, or it differs only
-/// where the texts cannot show what happened: both sides made the same change
-/// at one place (taken once), a side's only change was to add the final
-/// newline (no change, by the crate's rule), or the texts read only one way
-/// and that gives `m` (the history moved repeated lines no text tells apart).
-fn right_where_apart(b: &str, o: &str, t: &str, m: &str, want: &str, ours_first: bool) -> Result<(), String> {
-    if m == want
-        || m.trim_end_matches(['\n', '\r']) == want.trim_end_matches(['\n', '\r'])
-        || oracle::same_change(b, o, t)
-        || oracle::every_reading_gives(b, o, t, m, ours_first)
-    {
-        return Ok(());
-    }
-    Err(format!("the sides' changes are apart, the merge is not {want:?}"))
-}
-
-proptest! {
-    #![proptest_config(config())]
-
-    /// Review 5's truth stream: every clean merge passes both oracles, and
-    /// where the two sides' changes are apart it is the right merge.
+    /// Review 5's realistic notes (paragraphs, tasks, headings, `---`, blank
+    /// lines; edits, ticks, paragraph breaks, appends, moves): the same.
     #[test]
-    fn the_truth_stream_merges_right(seed in any::<u64>()) {
-        let (base, fb, o, fo, t, ft, ours_newer) = truth_stream(seed);
-        // A file that ends in an empty line without a final newline has no
-        // such line as text.
-        let artifact = |v: &[Line], f: bool| !f && v.last().is_some_and(|l| l.text.is_empty());
-        if artifact(&base, fb) || artifact(&o, fo) || artifact(&t, ft) {
-            return Ok(());
-        }
-        let c = Case { base: render(&base, fb), ours: render(&o, fo), theirs: render(&t, ft) };
-        if c.ours == c.theirs || c.ours == c.base || c.theirs == c.base {
-            return Ok(());
-        }
-        let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
-        passes_oracle(&c, mo, mt)?;
-        if let Outcome::Write(m) = run(Kind::Text, &c, mo, mt).outcome {
-            let m = String::from_utf8(m).unwrap();
-            if let Some(want) = apart_truth(&base, &o, &t) {
-                let fin = if fo == fb { ft } else { fo };
-                if let Err(e) = right_where_apart(&c.base, &c.ours, &c.theirs, &m, &render(&want, fin), !ours_newer) {
-                    prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, m);
-                }
-            }
-        }
+    fn notes_merge_to_the_true_merge_of_the_history(seed in any::<u64>()) {
+        right_by_history(&truth::notes_stream(seed))?;
     }
 
-    /// Review 5's realistic notes stream: every clean merge passes both
-    /// oracles, and where the two sides' changes are apart it is the right
-    /// merge.
+    /// Review 6's dup fuzz: no line both sides added is taken twice where
+    /// the history has it once, and every clean merge is right.
     #[test]
-    fn the_notes_stream_merges_right(seed in any::<u64>()) {
-        let (base, o, t, ours_newer) = notes_stream(seed);
-        let c = Case { base: render(&base, true), ours: render(&o, true), theirs: render(&t, true) };
-        if c.ours == c.theirs || c.ours == c.base || c.theirs == c.base {
-            return Ok(());
-        }
-        let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
-        passes_oracle(&c, mo, mt)?;
-        if let Outcome::Write(m) = run(Kind::Markdown, &c, mo, mt).outcome {
-            let m = String::from_utf8(m).unwrap();
-            if let Some(want) = apart_truth(&base, &o, &t) {
-                if let Err(e) = right_where_apart(&c.base, &c.ours, &c.theirs, &m, &render(&want, true), !ours_newer) {
-                    prop_assert!(false, "{}\n{:?}\nmerged {:?}", e, c, m);
-                }
-            }
-        }
+    fn the_dup_fuzz_merges_to_the_true_merge(seed in any::<u64>()) {
+        right_by_history(&truth::dup_stream(seed).0)?;
+    }
+
+    /// The lost-update guard, a writer that saw R2 (L is R2 with the
+    /// writer's script): a clean merge is the true merge, which is L unless
+    /// the writer reverted or moved R2's own lines (no text shows that).
+    #[test]
+    fn a_writer_that_saw_the_change_gets_the_true_merge(seed in any::<u64>()) {
+        right_by_history(&truth::guard_stream(seed, Some(true)).0)?;
+    }
+
+    /// The guard's silent path, a stale writer (L is R1 with the writer's
+    /// script, never having seen R2): a clean merge equal to L reads as "L
+    /// already holds R2", so R2's change would be lost without a word. It may
+    /// be L only where the true merge is L, or the texts cannot show the
+    /// difference (a named class).
+    #[test]
+    fn a_stale_writer_is_never_taken_for_one_that_saw_the_change(seed in any::<u64>()) {
+        right_by_history(&truth::guard_stream(seed, Some(false)).0)?;
     }
 }
 
@@ -2243,12 +1796,39 @@ fn generators_reach_merges() {
         Rule::Lines,
         0.3,
     );
+    let history = |f: fn(u64) -> truth::History| {
+        any::<u64>().prop_map(move |seed| {
+            let [base, ours, theirs] = f(seed).texts();
+            Case { base, ours, theirs }
+        })
+    };
     share(
-        "stale writer",
-        stale_case().prop_map(|(c, _)| c).boxed(),
+        "truth stream",
+        history(truth::truth_stream).boxed(),
         Kind::Text,
         Rule::Lines,
-        0.3,
+        0.2,
+    );
+    share(
+        "notes stream",
+        history(truth::notes_stream).boxed(),
+        Kind::Markdown,
+        Rule::Lines,
+        0.5,
+    );
+    share(
+        "dup stream",
+        history(|s| truth::dup_stream(s).0).boxed(),
+        Kind::Text,
+        Rule::Lines,
+        0.2,
+    );
+    share(
+        "stale writer",
+        history(|s| truth::guard_stream(s, Some(false)).0).boxed(),
+        Kind::Text,
+        Rule::Lines,
+        0.2,
     );
     share(
         "ordinary notes",
@@ -2257,22 +1837,125 @@ fn generators_reach_merges() {
         Rule::Lines,
         0.99,
     );
-    let notes = any::<u64>().prop_map(|seed| {
-        let (b, o, t, _) = notes_stream(seed);
-        Case {
-            base: render(&b, true),
-            ours: render(&o, true),
-            theirs: render(&t, true),
+}
+
+// ---------- ground truth: tallies ----------
+
+/// Every clean line merge of a history in each side and mtime order, judged
+/// against its ground truth (`truth::judge`); `Err` with the first wrong one.
+fn judged(h: &truth::History, kind: Kind) -> Result<Vec<Option<truth::Class>>, String> {
+    let [b, o, t] = h.texts();
+    let mut out = Vec::new();
+    for swap in [false, true] {
+        let hs = if swap {
+            truth::History {
+                base: h.base.clone(),
+                ours: h.theirs.clone(),
+                theirs: h.ours.clone(),
+            }
+        } else {
+            h.clone()
+        };
+        let c = if swap {
+            Case {
+                base: b.clone(),
+                ours: t.clone(),
+                theirs: o.clone(),
+            }
+        } else {
+            Case {
+                base: b.clone(),
+                ours: o.clone(),
+                theirs: t.clone(),
+            }
+        };
+        for ours_newer in [false, true] {
+            let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
+            let m = run(kind, &c, mo, mt);
+            let got = match m.outcome {
+                Outcome::Write(w) => Some(String::from_utf8(w).unwrap()),
+                Outcome::Identical => Some(c.ours.clone()),
+                _ => None,
+            };
+            match got {
+                None => out.push(None),
+                Some(m) => match truth::judge(&hs, &m, !ours_newer) {
+                    Ok(k) => out.push(Some(k)),
+                    Err(e) => {
+                        return Err(format!(
+                            "{e}\nbase {:?}\nours {:?}\ntheirs {:?}\nmerged {m:?} (ours_first {})\n{}",
+                            c.base,
+                            c.ours,
+                            c.theirs,
+                            !ours_newer,
+                            hs.describe()
+                        ))
+                    }
+                },
+            }
         }
-    });
-    share("notes stream", notes.boxed(), Kind::Markdown, Rule::Lines, 0.5);
-    let truth = any::<u64>().prop_map(|seed| {
-        let (b, fb, o, fo, t, ft, _) = truth_stream(seed);
-        Case {
-            base: render(&b, fb),
-            ours: render(&o, fo),
-            theirs: render(&t, ft),
+    }
+    Ok(out)
+}
+
+/// Tallies of the ground-truth judge over the streams: `N` seeds (default
+/// 100k) from `SEED`, printed. Not part of the gate:
+/// `cargo test --release -p livesync-merge --test props tallies -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn tallies() {
+    let n: u64 = std::env::var("N").ok().and_then(|x| x.parse().ok()).unwrap_or(100_000);
+    let seed: u64 = std::env::var("SEED").ok().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let show: usize = std::env::var("SHOW").ok().and_then(|x| x.parse().ok()).unwrap_or(3);
+    let streams: [(&str, &dyn Fn(u64) -> truth::History); 5] = [
+        ("truth", &truth::truth_stream),
+        ("notes", &truth::notes_stream),
+        ("dup", &|s| truth::dup_stream(s).0),
+        ("guard-fresh", &|s| truth::guard_stream(s, Some(true)).0),
+        ("guard-stale", &|s| truth::guard_stream(s, Some(false)).0),
+    ];
+    for (name, gen) in streams {
+        let mut tally: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut wrong: Vec<String> = Vec::new();
+        for k in 0..n {
+            let h = gen(seed.wrapping_mul(1_000_003).wrapping_add(k));
+            if h.artifact() {
+                continue;
+            }
+            let [b, o, t] = h.texts();
+            if o == t || o == b || t == b {
+                continue;
+            }
+            if name == "guard-fresh" {
+                if let Some(w) = h.truth(true) {
+                    if w != o {
+                        *tally.entry("fresh: truth is not L".into()).or_default() += 1;
+                    }
+                }
+            }
+            match judged(&h, Kind::Text) {
+                Ok(v) => {
+                    let truth_clean = h.truth(true).is_some();
+                    for x in v {
+                        let key = match x {
+                            None if truth_clean => "open, truth clean".to_string(),
+                            None => "open, truth conflict".to_string(),
+                            Some(c) => format!("{c:?}"),
+                        };
+                        *tally.entry(key).or_default() += 1;
+                    }
+                }
+                Err(e) => {
+                    *tally.entry("WRONG".into()).or_default() += 1;
+                    if wrong.len() < show {
+                        wrong.push(e);
+                    }
+                }
+            }
         }
-    });
-    share("truth stream", truth.boxed(), Kind::Text, Rule::Lines, 0.2);
+        println!("== {name}: {tally:?}");
+        for w in &wrong {
+            println!("{w}\n");
+        }
+    }
 }

@@ -930,6 +930,113 @@ fn review_5s_inputs() {
     }
 }
 
+/// Review 6's inputs. Finding 1: a line both sides inserted, read at two
+/// places with only blank lines (or lines the other side deleted) between,
+/// came out twice. Finding 3: a line both inserted on either side of a kept
+/// line, in one stretch, came out twice. Finding 4: one side rewrote every
+/// line end while the other appended, and the merge mixed line ends. Each is
+/// open, in every side and mtime order, as git's merge leaves it.
+#[test]
+fn review_6s_inputs() {
+    for (b, o, t) in [
+        (
+            "# Todo\n\n- call Bob\n# Done\n",
+            "# Todo\n- call Bob (done)\n- buy milk\n\n# Done\n",
+            "# Todo\n\n- call Bob\n- buy milk\n# Done\n",
+        ),
+        (
+            "Intro\n\nOld para.\nEnd\n",
+            "Intro\nOld para, edited.\nNew para.\n\nEnd\n",
+            "Intro\n\nOld para.\nNew para.\nEnd\n",
+        ),
+        (
+            "# A\nold\n\n---\nend\n",
+            "# A\nold\n--- edited\nend edited\nnew\n\n",
+            "# A\nold\n---\nend\nnew\n",
+        ),
+        (
+            "# Day\n\n",
+            "# Day\n- call\n- gym\n\n- lunch\n",
+            "# Day\n\n- call\n- lunch\n",
+        ),
+        (
+            "line 1\n---\nline 2\n---",
+            "line 1\n---\nline 2\n---\nline 3\n",
+            "line 1\n---\nline 2\nline 3\n---\n",
+        ),
+        ("a\r\nb\r\nc\r\n", "a\nb\nc\n", "a\r\nb\r\nc\r\nd\r\n"),
+    ] {
+        for m in both_ways(b, o, t) {
+            assert!(m.outcome.is_open(), "{b:?} {o:?} {t:?}: {m:?}");
+        }
+        for kind in [Kind::Text, Kind::Markdown] {
+            for ours_newer in [false, true] {
+                assert!(run(kind, Some(b), o, t, ours_newer).outcome.is_open());
+                assert!(run(kind, Some(b), t, o, ours_newer).outcome.is_open());
+            }
+        }
+    }
+}
+
+/// Shapes the ground-truth streams found merging clean to something other
+/// than what the edit history makes them. Each can be read two ways that
+/// merge differently, so each is open, in every side and mtime order.
+#[test]
+fn shapes_two_histories_read_differently_stay_open() {
+    for (b, o, t) in [
+        // Theirs moved `line 1` up (or `- x` down); ours inserted where the
+        // line arrives.
+        (
+            "- x\nline 1\nline 2\n- x\n",
+            "- x\nline 1\n- [ ] task\nline 2\n\n- x\n",
+            "line 1\n- x\nline 2\n- x\n",
+        ),
+        // Ours ticked one copy and moved another past a unique line: no count
+        // shows the move.
+        (
+            "- [ ] a\n- [ ] b\n- [ ] gym\n- [ ] c\n\n- [ ] a\n- [ ] b\n- [ ] d\n- [ ] c\n",
+            "- [ ] a\n- [ ] b\n- [ ] gym\n- [x] c\n\n- [ ] a\n- [ ] b\n- [ ] c\n- [ ] d\n- log\n",
+            "- [ ] a\n- [ ] b\n- [ ] gym\n- [ ] c\n- [ ] a\n- [ ] b\n\n- [ ] milk\n- [ ] d\n- [ ] c\n",
+        ),
+        // `line 1` may be the line that moved (no line each file has once
+        // stays put).
+        (
+            "---\nline 1\n\n---\n- x\n",
+            "line 1\n\n---\n- x\n",
+            "line 1\n---\n\n- x\n",
+        ),
+        // Two unique lines moved together past two others.
+        (
+            "S0.\nS1.\nS2.\n\nP0.\nP1.\n",
+            "S0.\n\nNew.\n\nS1.\nS2.\n\nP0.\nP1.\n- log\n",
+            "S2.\nAdded.\n\nS0.\nS1.\nP0.\nP1.\n",
+        ),
+        (
+            "line 1\n- x\n\n\n",
+            "\n\nremote 2 writer\nline 1\n- x\n",
+            "\n\nremote 2\nline 1\n- x\n",
+        ),
+        // A line of spaces moved across a unique line, where the other side
+        // inserted.
+        (
+            "```\n\n  \nline 1\n\n",
+            "```\n\nline 1\n  \n",
+            "```\n\n  \n- [ ] gym\nline 1\n\n",
+        ),
+        // Which copy of the last line (without its newline) took the other
+        // side's newline is open.
+        ("```\nline 1\n```", "```", "```\nline 1\n```\n"),
+        ("line 1", "line 1\n- [ ] task\nline 1", "line 1\n"),
+    ] {
+        for ours_newer in [false, true] {
+            for (x, y) in [(o, t), (t, o)] {
+                let m = run(Kind::Text, Some(b), x, y, ours_newer);
+                assert!(m.outcome.is_open(), "{b:?} {x:?} {y:?}: {m:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn insertions_either_side_of_a_kept_blank_line_are_never_taken_twice() {
     // R2 added a blank line, which the diff puts before the base's blank

@@ -104,9 +104,15 @@
 //!   conflict hunk of its own. It is also open where a side may be the other
 //!   side's file with lines of its own on top, or with a line the other
 //!   deleted typed back right beside its own change (both readings are
-//!   plausible, and they disagree); where a line one side moved meets the
-//!   other side's change of it; where a line would be there more often (or
-//!   less often) than any side's change explains. A lost-update guard reads
+//!   plausible, and they disagree); where a line one side moved (or the
+//!   lines it passed, a line each file has once among them) meets a change
+//!   of the other side in the stretch it left or reached; where a line both
+//!   sides added would be there more often than either side has it, from the
+//!   two sides at two places in one stretch (one insertion read at two
+//!   points: a paragraph break or a deleted line between); where a line
+//!   would be there more often (or less often) than any side's change
+//!   explains; where the merge would mix `\r\n` and `\n` line ends that no
+//!   file mixes. A lost-update guard reads
 //!   "clean and equal to L" as "L holds R2", so a line taken twice, dropped or
 //!   brought back must never be clean. The price: a line one side deleted
 //!   right beside the other side's change (an append after it, an edit of the

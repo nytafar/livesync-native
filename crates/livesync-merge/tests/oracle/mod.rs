@@ -436,48 +436,62 @@ fn stretches(t: [&[&str]; 3], an: &[[usize; 3]]) -> Vec<[Range<usize>; 3]> {
 
 /// The anchors left once two stretches around an anchor are judged as one:
 /// where a side has fewer blank lines than the base on one side of the anchor
-/// and more on the other (the anchor may have moved across a blank line).
+/// and more on the other (in all, or of one text), or where a longest common
+/// subsequence of a side's lines around the anchor (two anchors each way)
+/// with the base's is as long without matching the anchor.
 fn joined(t: [&[&str]; 3], an: &[[usize; 3]]) -> Vec<[usize; 3]> {
     let st = stretches(t, an);
-    let blanks = |g: usize, x: usize| t[x][st[g][x].clone()].iter().filter(|l| blank(l)).count() as isize;
+    let blanks = |g: usize, x: usize, w: Option<&str>| {
+        t[x][st[g][x].clone()]
+            .iter()
+            .filter(|l| blank(l) && w.is_none_or(|w| content(l) == w))
+            .count() as isize
+    };
+    let kinds: Vec<Option<&str>> = std::iter::once(None)
+        .chain(
+            t.iter()
+                .flat_map(|x| x.iter())
+                .filter(|l| blank(l))
+                .map(|l| Some(content(l))),
+        )
+        .collect();
+    let lcs = |b: &[&str], s: &[&str], skip: Option<(usize, usize)>| -> usize {
+        let mut l = vec![vec![0usize; s.len() + 1]; b.len() + 1];
+        for i in (0..b.len()).rev() {
+            for j in (0..s.len()).rev() {
+                l[i][j] = if same_line(b[i], s[j]) && skip != Some((i, j)) {
+                    l[i + 1][j + 1] + 1
+                } else {
+                    l[i + 1][j].max(l[i][j + 1])
+                };
+            }
+        }
+        l[0][0]
+    };
+    let weak = |k: usize, x: usize| {
+        let (lo, hi) = (k.saturating_sub(2), (k + 3).min(an.len()));
+        let (rb, rs) = (st[lo][0].start..st[hi][0].end, st[lo][x].start..st[hi][x].end);
+        let (b, s) = (&t[0][rb.clone()], &t[x][rs.clone()]);
+        if b == s {
+            return false;
+        }
+        lcs(b, s, Some((an[k][0] - rb.start, an[k][x] - rs.start))) == lcs(b, s, None)
+    };
     (0..an.len())
         .filter(|&k| {
             ![1, 2].iter().any(|&x| {
-                let (a, c) = (blanks(k, x) - blanks(k, 0), blanks(k + 1, x) - blanks(k + 1, 0));
-                a * c < 0
+                weak(k, x)
+                    || kinds.iter().any(|&w| {
+                        let (a, c) = (
+                            blanks(k, x, w) - blanks(k, 0, w),
+                            blanks(k + 1, x, w) - blanks(k + 1, 0, w),
+                        );
+                        a * c < 0
+                    })
             })
         })
         .map(|k| an[k])
         .collect()
-}
-
-/// Whether both sides made the same change somewhere: a stretch between
-/// anchors (see [`independent`]) where ours and theirs are the same text and
-/// the base's is not. The merge takes it once; no text shows whether it was
-/// one change or two (both added the same copy next to a copy, or each
-/// removed one of two copies).
-pub fn same_change(base: &str, ours: &str, theirs: &str) -> bool {
-    let (b, o, t) = (lines(base), lines(ours), lines(theirs));
-    let an = anchors([&b, &o, &t]);
-    let an = joined([&b, &o, &t], &an);
-    stretches([&b, &o, &t], &an)
-        .into_iter()
-        .any(|[rb, ro, rt]| o[ro.clone()] == t[rt] && o[ro] != b[rb])
-}
-
-/// Whether the texts read only one way, as `merged`: every pair of longest
-/// common subsequences of each whole side with the base (no anchors) merges
-/// by the placement rules to it. Where they do, no merge of these texts could
-/// tell a different history.
-pub fn every_reading_gives(base: &str, ours: &str, theirs: &str, merged: &str, ours_first: bool) -> bool {
-    let (b, o, t) = (lines(base), lines(ours), lines(theirs));
-    let (Some(ro), Some(rt)) = (all_readings(&b, &o, 64), all_readings(&b, &t, 64)) else {
-        return false;
-    };
-    ro.iter().all(|ao| {
-        rt.iter()
-            .all(|at| plain_merge(&b, [(&o, ao), (&t, at)], ours_first).as_deref() == Some(merged))
-    })
 }
 
 /// How often each line (not blank) is in `x`, by content.
@@ -694,7 +708,7 @@ fn contested(
             if (0..b.len()).any(|i| ao[i].is_none() && at[i].is_none() && (moved(o, ao, i) || moved(t, at, i))) {
                 return Err("a line one side moved, the other removed".into());
             }
-            match plain_merge(b, [(o, ao), (t, at)], ours_first) {
+            match plain_merge(b, [(o, ao), (t, at)], ours_first, true) {
                 Some(x) if x == m.concat() => {}
                 Some(x) => return Err(format!("a reading merges to {x:?}, not to the merge")),
                 None => return Err("a reading conflicts".into()),
@@ -892,7 +906,12 @@ fn changes<'a>(n: usize, s: &[&'a str], al: &[Option<usize>]) -> Changes<'a> {
 ///   last line), or that has one where the base's lacks it (two different
 ///   ones: a conflict).
 /// - a line after a line without its newline: a conflict.
-fn plain_merge<'a>(b: &[&'a str], sides: [(&[&'a str], &[Option<usize>]); 2], ours_first: bool) -> Option<String> {
+fn plain_merge<'a>(
+    b: &[&'a str],
+    sides: [(&[&'a str], &[Option<usize>]); 2],
+    ours_first: bool,
+    one_stretch: bool,
+) -> Option<String> {
     let n = b.len();
     let mut all: Vec<(Range<usize>, Vec<&str>, usize)> = Vec::new();
     for (x, (s, al)) in sides.iter().enumerate() {
@@ -1024,18 +1043,37 @@ fn plain_merge<'a>(b: &[&'a str], sides: [(&[&'a str], &[Option<usize>]); 2], ou
         }
         k += 1;
     }
-    // Only blank lines between two insertions of the two sides: they meet
-    // too, and may not share a line that is not blank.
-    for w in pieces.windows(2) {
-        let (u, v) = (&w[0], &w[1]);
-        let two = u.0.is_empty() && v.0.is_empty() && u.2.is_some() && v.2.is_some() && u.2 != v.2;
-        if two && u.0.end < v.0.start && b[u.0.end..v.0.start].iter().all(|l| blank(l)) {
-            let shared =
-                u.1.iter()
-                    .filter(|p| !blank(p))
-                    .any(|p| v.1.iter().any(|q| content(p) == content(q)));
-            if shared {
-                return None;
+    // Within one stretch between anchors: a line (not blank) the merge would
+    // have more often than either side, from pieces of the two sides at two
+    // places, one an insertion: one insertion read at two places.
+    if one_stretch {
+        let lines_of = |x: &[&str]| count(x);
+        let (no, nt) = (lines_of(sides[0].0), lines_of(sides[1].0));
+        let mut nm: HashMap<String, usize> = HashMap::new();
+        for p in &pieces {
+            for l in p.1.iter().filter(|l| !blank(l)) {
+                *nm.entry(content(l).to_string()).or_default() += 1;
+            }
+        }
+        for (i, l) in b.iter().enumerate() {
+            if sides[0].1[i].is_some() && sides[1].1[i].is_some() && !blank(l) {
+                *nm.entry(content(l).to_string()).or_default() += 1;
+            }
+        }
+        let get = |n: &HashMap<String, usize>, l: &str| n.get(l).copied().unwrap_or(0);
+        for (x, u) in pieces.iter().enumerate() {
+            for v in &pieces[x + 1..] {
+                let one_side = u.2.is_some() && u.2 == v.2;
+                if one_side || !(u.0.is_empty() || v.0.is_empty()) {
+                    continue;
+                }
+                let twice = u.1.iter().filter(|p| !blank(p)).any(|p| {
+                    let c = content(p);
+                    v.1.iter().any(|q| content(q) == c) && get(&nm, c) > get(&no, c).max(get(&nt, c))
+                });
+                if twice {
+                    return None;
+                }
             }
         }
     }
@@ -1142,7 +1180,7 @@ pub fn guard(base: &str, l: &str, r2: &str, merged: &str, l_first: bool) -> Resu
     let all = |s: &[&str]| all_readings(&b, s, 64).unwrap_or_default();
     for ao in all(&o) {
         for at in all(&t) {
-            if let Some(r) = plain_merge(&b, [(&o, &ao), (&t, &at)], l_first) {
+            if let Some(r) = plain_merge(&b, [(&o, &ao), (&t, &at)], l_first, false) {
                 let same = shape(&r) == sm;
                 stale = (stale.0 || same, stale.1 && same);
             }

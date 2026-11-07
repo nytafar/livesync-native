@@ -45,3 +45,6 @@ cc f693c9d1c784dded01dceb6ae264ccabadd8bbd7872142eb19ac83713e4728ea # shrinks to
 cc 60d5eb6ac06f6f4c5dea48c0a0441d0a27b75657b23c80b9c3ce243a3a97257e # shrinks to (c, l_newer) = (Case { base: "\n---\n---\n\nline 1\n\nline 2\n---\n\n", ours: "\n--- r\n---\n\nline 1\n\nline 2 w\n\n- x\n---\n\n", theirs: "\n--- r\n---\n\nline 1\n\nline 2\n\n---\n\n" }, false)
 cc 7cd06d781acb6116d0e502e540291d5aa11dec89577de01111f1039f8a21daa5 # shrinks to (c, l_newer) = (Case { base: "- x\nline 1\n\n\n\n\nline 2", ours: "- x w\nline 3\n- x\n---\nline 1\n\n\nline 2\n", theirs: "- x\nline 3\nline 1\n\n\nline 2\n" }, false)
 cc c19cd886327ed83752b4c68b4b2e35ce31ba5dd642bb66a7d2abdf94b91baa47 # shrinks to seed = 15709546803081538809
+cc 0c0009a04152f5c86067df5ec994556fac48b74bf8cae3847a092fff9b3a7dd6 # shrinks to seed = 11291955159593680744
+cc fb52fce282d254006da767694da235b624dae08660e2fb998dfb8283cef298e0 # shrinks to seed = 16277968376789425069
+cc 32b22d56680164731e99caee04de945e6101166859c6677c66106cdb5494ecfb # shrinks to seed = 11401134939312124540
