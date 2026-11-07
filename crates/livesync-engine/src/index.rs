@@ -285,7 +285,9 @@ CREATE INDEX IF NOT EXISTS revisions_path ON revisions(path, seen_ms);
 pub const SCHEMA_VERSION: &str = "3";
 
 /// The key two paths collide on when the vault's filesystem folds case and
-/// Unicode normalisation: JavaScript lower-casing, then NFC.
+/// Unicode normalisation: JavaScript lower-casing, then NFC. It is the widest
+/// folding, so the index finds every candidate with it; callers keep those
+/// the probed filesystem really takes for one name (`FsRules::same_name`).
 pub fn fold_key(path: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     livesync_model::path::js_to_lower_case(path).nfc().collect()

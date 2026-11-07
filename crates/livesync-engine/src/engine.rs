@@ -250,6 +250,11 @@ pub struct EngineConfig {
     /// Treat the vault's filesystem as folding case and Unicode
     /// normalisation (`Some(true)`) or not. `None`: as probed.
     pub case_insensitive: Option<bool>,
+    /// How the vault's filesystem is measured at open. `None`:
+    /// [`FsRules::probe`], which looks at the folder itself. A seam, so tests
+    /// can run the engine as on APFS or HFS+ (which fold Unicode
+    /// normalisation) from any filesystem.
+    pub fs_probe: Option<FsProbe>,
     /// Folder scope (spec "Folder scope"). Changing it means opening a new
     /// engine; the change is reconciled at the next sync.
     pub scope: Scope,
@@ -309,6 +314,24 @@ impl AccessCheck {
 impl std::fmt::Debug for AccessCheck {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("AccessCheck(..)")
+    }
+}
+
+type ProbeFn = dyn Fn(&Path) -> std::io::Result<FsRules> + Send + Sync;
+
+/// Measures a vault folder's filesystem ([`EngineConfig::fs_probe`]).
+#[derive(Clone)]
+pub struct FsProbe(pub Arc<ProbeFn>);
+
+impl FsProbe {
+    pub fn new(f: impl Fn(&Path) -> std::io::Result<FsRules> + Send + Sync + 'static) -> Self {
+        FsProbe(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for FsProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FsProbe(..)")
     }
 }
 
@@ -415,6 +438,7 @@ impl EngineConfig {
             memory_budget_mb: 160,
             restrict_names: None,
             case_insensitive: None,
+            fs_probe: None,
             scope: Scope::all(),
             remove_out_of_scope_copies: false,
             settle: Duration::from_secs(2),
@@ -808,7 +832,10 @@ impl Engine {
             }
             let _ = sink.send(ev);
         }));
-        let probed = FsRules::probe(&canon);
+        let probed = match &cfg.fs_probe {
+            Some(p) => (p.0)(&canon),
+            None => FsRules::probe(&canon),
+        };
         let probe_ok = probed.is_ok();
         let mut fs = match probed {
             Ok(r) => r,
@@ -2410,10 +2437,10 @@ impl Engine {
         let _fold = self.inner.fs.folds().then(|| self.inner.fold_lock.lock().unwrap());
         if self.inner.fs.folds() {
             let others = self.with_index(|ix| ix.fold_collisions(&doc.path, &doc.id))?;
-            if let Some(o) = others
-                .iter()
-                .find(|o| matches!(o.state, State::Clean | State::Dirty | State::Conflicted))
-            {
+            if let Some(o) = others.iter().find(|o| {
+                matches!(o.state, State::Clean | State::Dirty | State::Conflicted)
+                    && self.inner.fs.same_name(&o.path, &doc.path)
+            }) {
                 return self.apply_skip(&doc, &Skip::Collision(o.path.clone()));
             }
         }

@@ -56,6 +56,29 @@ impl FsRules {
         self.case_insensitive || self.normalization_insensitive
     }
 
+    /// The key under which this filesystem finds `path`: JavaScript
+    /// lower-casing where it folds case, NFC where it folds Unicode
+    /// normalisation (APFS, HFS+), the path itself where it folds neither.
+    /// Two paths with one key name one file here.
+    pub fn fold_key(&self, path: &str) -> String {
+        use unicode_normalization::UnicodeNormalization;
+        let cased = if self.case_insensitive {
+            livesync_model::path::js_to_lower_case(path)
+        } else {
+            path.to_string()
+        };
+        if self.normalization_insensitive {
+            cased.nfc().collect()
+        } else {
+            cased
+        }
+    }
+
+    /// Whether `a` and `b` name the same file on this filesystem.
+    pub fn same_name(&self, a: &str, b: &str) -> bool {
+        a == b || (self.folds() && self.fold_key(a) == self.fold_key(b))
+    }
+
     /// Measure the rules in a hidden scratch directory under `root`.
     pub fn probe(root: &Path) -> io::Result<FsRules> {
         let dir = root.join(format!(".lsync-probe-{:08x}", rand::random::<u32>()));
@@ -154,5 +177,54 @@ mod tests {
         assert!(p.unwritable_reason("a:b.md").is_none());
         assert!(p.unwritable_reason(&"x".repeat(300)).is_some());
         assert!(fat.folds() && !p.folds());
+    }
+
+    /// The probe's verdict on NFD and NFC agrees with the filesystem the
+    /// tests run on (Linux: two names; APFS and HFS+: one file).
+    #[test]
+    fn the_probe_sees_how_this_filesystem_treats_nfd_names() {
+        let d = tempfile::tempdir().unwrap();
+        let r = FsRules::probe(d.path()).unwrap();
+        for (nfc, nfd) in [
+            ("\u{e5}.md", "a\u{30a}.md"),
+            ("\u{e9}.md", "e\u{301}.md"),
+            ("\u{fc}.md", "u\u{308}.md"),
+        ] {
+            fs::write(d.path().join(nfd), b"x").unwrap();
+            assert_eq!(r.normalization_insensitive, exists(&d.path().join(nfc)), "{nfc}");
+            fs::remove_file(d.path().join(nfd)).unwrap();
+        }
+    }
+
+    #[test]
+    fn fold_keys_follow_the_probed_rules() {
+        let (nfc, nfd) = ("Caf\u{e9}/\u{c5}r.md", "Cafe\u{301}/A\u{30a}r.md");
+        // APFS (default) and HFS+: case and normalisation fold.
+        let apfs = FsRules {
+            case_insensitive: true,
+            normalization_insensitive: true,
+            ..FsRules::permissive()
+        };
+        assert!(apfs.same_name(nfc, nfd));
+        assert!(apfs.same_name(nfc, &nfd.to_lowercase()));
+        // Case-sensitive APFS: normalisation folds, case does not.
+        let apfs_cs = FsRules {
+            normalization_insensitive: true,
+            ..FsRules::permissive()
+        };
+        assert!(apfs_cs.same_name(nfc, nfd));
+        assert!(!apfs_cs.same_name("Note.md", "note.md"));
+        assert_eq!(apfs_cs.fold_key(nfd), nfc);
+        // ext4: every spelling is its own file.
+        let ext4 = FsRules::permissive();
+        assert!(!ext4.same_name(nfc, nfd));
+        assert!(ext4.same_name(nfc, nfc));
+        // A filesystem that folds case only (some FUSE and network mounts).
+        let ci = FsRules {
+            case_insensitive: true,
+            ..FsRules::permissive()
+        };
+        assert!(ci.same_name("Note.md", "note.md"));
+        assert!(!ci.same_name(nfc, nfd));
     }
 }

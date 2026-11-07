@@ -999,7 +999,7 @@ impl Engine {
     /// and on folding filesystems by the folded name.
     pub(crate) fn row_for_local(&self, rel: &str) -> Result<Option<FileRow>> {
         let id = self.doc_id_for(rel);
-        let folds = self.inner.fs.folds();
+        let fs = &self.inner.fs;
         self.with_index(|ix| {
             if let Some(r) = ix.by_path(rel)? {
                 return Ok(Some(r));
@@ -1007,8 +1007,11 @@ impl Engine {
             if let Some(r) = ix.by_doc(&id)? {
                 return Ok(Some(r));
             }
-            if folds {
-                return Ok(ix.fold_collisions(rel, "")?.into_iter().next());
+            if fs.folds() {
+                return Ok(ix
+                    .fold_collisions(rel, "")?
+                    .into_iter()
+                    .find(|r| fs.same_name(&r.path, rel)));
             }
             Ok(None)
         })
@@ -1144,7 +1147,7 @@ impl Engine {
         let row_by_id: HashMap<String, FileRow> = rows.iter().map(|r| (r.doc_id.clone(), r.clone())).collect();
         let row_by_fold: HashMap<String, FileRow> = if self.inner.fs.folds() {
             rows.iter()
-                .map(|r| (crate::index::fold_key(&r.path), r.clone()))
+                .map(|r| (self.inner.fs.fold_key(&r.path), r.clone()))
                 .collect()
         } else {
             HashMap::new()
@@ -1157,7 +1160,7 @@ impl Engine {
             let row = row_by_id
                 .get(&id)
                 .cloned()
-                .or_else(|| row_by_fold.get(&crate::index::fold_key(&files[0].rel)).cloned());
+                .or_else(|| row_by_fold.get(&self.inner.fs.fold_key(&files[0].rel)).cloned());
             if files.len() > 1 {
                 files.sort_by(|a, b| a.rel.cmp(&b.rel));
                 let keep = row
@@ -1487,9 +1490,7 @@ impl Engine {
         };
         // Keep the remote spelling when the filesystem says it is the same file.
         let doc_path = match &row {
-            Some(r) if self.inner.fs.folds() && crate::index::fold_key(&r.path) == crate::index::fold_key(rel) => {
-                r.path.clone()
-            }
+            Some(r) if self.inner.fs.same_name(&r.path, rel) => r.path.clone(),
             _ => rel.to_string(),
         };
         if let Some(r) = &row {
@@ -1537,7 +1538,7 @@ impl Engine {
         ctx.attempt = Some((doc_path.clone(), hash.clone()));
         let doc_id = row
             .as_ref()
-            .filter(|r| r.path == doc_path || crate::index::fold_key(&r.path) == crate::index::fold_key(&doc_path))
+            .filter(|r| self.inner.fs.same_name(&r.path, &doc_path))
             .map(|r| r.doc_id.clone())
             .unwrap_or_else(|| self.doc_id_for(&doc_path));
         let split = self.inner.runtime.lock().unwrap().split;

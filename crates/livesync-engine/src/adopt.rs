@@ -359,13 +359,29 @@ impl Engine {
                 ..Default::default()
             });
         }
+        // On a filesystem that folds names (APFS and HFS+ fold Unicode
+        // normalisation), a local name the filesystem takes for a remote
+        // document's (NFD here, NFC there) is that document's file: the
+        // first pull writes into it, so it is compared with it, never
+        // refused as a second file.
+        let fs = self.inner.fs.clone();
+        let live_by_fold: HashMap<String, String> = if fs.folds() {
+            live.values().map(|d| (fs.fold_key(&d.path), d.id.clone())).collect()
+        } else {
+            HashMap::new()
+        };
         let mut by_id: BTreeMap<String, Vec<Found>> = BTreeMap::new();
         for f in walk.found {
-            by_id.entry(self.doc_id_for(&f.rel)).or_default().push(f);
+            let mut id = self.doc_id_for(&f.rel);
+            if !live.contains_key(&id) && !deleted.contains_key(&id) && !skipped_ids.contains_key(&id) {
+                if let Some(other) = live_by_fold.get(&fs.fold_key(&f.rel)) {
+                    id = other.clone();
+                }
+            }
+            by_id.entry(id).or_default().push(f);
         }
         let max = self.inner.runtime.lock().unwrap().max_size_bytes;
         let split = self.inner.runtime.lock().unwrap().split;
-        let folds = self.inner.fs.folds();
 
         let mut identical: Vec<(FileDoc, DiskState)> = Vec::new();
         let mut candidates: Vec<Candidate> = Vec::new();
@@ -431,9 +447,7 @@ impl Engine {
             }
             if let Some(doc) = live.get(&id) {
                 seen_remote.insert(id.clone());
-                let same_name = doc.path == found.rel
-                    || (folds && crate::index::fold_key(&doc.path) == crate::index::fold_key(&found.rel));
-                if !same_name {
+                if !fs.same_name(&doc.path, &found.rel) {
                     rep.name_case.push(AdoptEntry {
                         path: doc.path.clone(),
                         local_path: Some(found.rel.clone()),
