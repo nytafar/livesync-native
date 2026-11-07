@@ -1063,7 +1063,9 @@ dependencies = [
  "livesync-model",
  "livesync-remote",
  "notify",
+ "percent-encoding",
  "rand 0.8.8",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
@@ -1072,6 +1074,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

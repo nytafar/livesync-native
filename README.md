@@ -360,6 +360,17 @@ notes/.gitignore:1:drafts/	notes/drafts/d.md
 
 Only a file that still matches its synced version is moved; an edited one is kept and reported as `dirty`. Folders the move leaves empty are removed, as upstream does, but never the vault folder itself nor a folder holding anything. Our own move is never reported back as a local delete, and it never counts toward the mass-delete stop.
 
+**From the LiveSync plugin or the official CLI.** `lsync import FILE` reads the plugin's `data.json` (`<vault>/.obsidian/plugins/obsidian-livesync/data.json`) or the official CLI's `settings.json` (`<vault>/.livesync/settings.json`) and adds an account and a vault for it: the server, user and database, `syncIgnoreRegEx`, `syncOnlyRegEx` and the ignore files. The password goes into the secret store. An account for the same server and user is reused (and an import that brings another password for it is refused). The folder is the one the file lies in, or `--folder`; the name is the folder's, or `--name`. The connection in these files is encrypted with the configuration passphrase: `*` unless the plugin keeps one on the device or asks for it, and then `--config-passphrase-stdin` gives it. Settings lsync cannot honour stop the import with the reason: another kind of remote, end-to-end encryption, path obfuscation, JWT or custom headers. So do the ones lsync leaves out on purpose (hidden-file sync, customisation sync, resolving conflicts by the newer file, writing conflicted documents, P2P), unless `--accept KEY` says to go on without them. `--dry-run` shows what would be added. The vault is added disabled.
+
+`lsync adopt` then takes the folder over, before its first sync here. It compares every file with the server's version by its chunks, the way a push splits it, and by content where those differ (another client's splitter), and says what the first sync does with each file: identical files are adopted with no transfer and no write; differing ones are pushed as roots of their own beside the server's version, which makes conflicts with no common ancestor; files only here are pushed, files only on the server are written; files the server deleted are put back, removed or kept as conflicts, as the first sync's reconcile rules decide. `--dry-run` only reports, on a throwaway index; without it, the identical files are recorded and the first sync runs. It refuses a vault whose index already tracks files, a folder the server shares no file with, names that differ from the server's only in case, folders it cannot read, and a folder whose LiveSync plugin is still enabled (`--allow-plugin` for a deliberate handover).
+
+```sh
+lsync import ~/Notes/.obsidian/plugins/obsidian-livesync/data.json   # adds vault "notes", disabled
+lsync --vault notes adopt --dry-run    # identical, differing, only here, only on the server, deleted
+lsync --vault notes adopt              # adopt the identical files, then the first sync
+lsync vault enable notes               # let the service run it
+```
+
 **Dot-paths** stay out of sync, except the ones in `sync_dot_paths`. Each entry names a dot-folder or dot-file itself (`.tool-notes`, `notes/.drafts`); a dot-folder deeper inside it needs an entry of its own. `.obsidian`, `.trash`, `.git` and lsync's own `.lsync*` files can never be listed (settings sync is its own feature).
 
 </details>
@@ -379,6 +390,8 @@ lsync status                # index summary, last gate result, files needing att
 lsync check-ignore PATH...  # which ignore file and rule (or other filter) decides each path
 lsync sync --allow-plugin   # (also fetch, daemon) a handover from the plugin in this Obsidian vault
 lsync connect --adopt-tweaks  # accept changed or new PREFERRED tweaks after checking them
+lsync import FILE           # the plugin's data.json or the official CLI's settings.json -> account and vault
+lsync adopt [--dry-run]     # take over a folder that is already in sync, before its first sync here
 
 lsync folders               # the server's top-level folders (files, size) against the folder scope;
                             # reads file metadata only, never chunks, and never writes
@@ -395,7 +408,7 @@ Exit codes:
 
 - 0: OK (`check-ignore`: some path is not synced).
 - 1: error (`check-ignore`: every path syncs).
-- 2: refused by a gate.
+- 2: refused by a gate (`adopt`: also a take-over that must not go ahead).
 - 3: pull or sync finished, but something needs attention (dirty or pending files, local files that cannot sync, a safety stop); for `reload`, a vault that cannot run.
 - 4: probe failed or was inconclusive.
 - 5: `allow-deletes`: the stop shown is not the one given; nothing was allowed. (`allow-deletes` exits 1 when no safety stop is shown.)

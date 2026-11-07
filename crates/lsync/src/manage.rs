@@ -105,7 +105,7 @@ pub struct Given<'a> {
 }
 
 impl Given<'_> {
-    fn has(&self, id: &str) -> bool {
+    pub(crate) fn has(&self, id: &str) -> bool {
         (self.on_command_line)(id)
     }
 
@@ -117,7 +117,7 @@ impl Given<'_> {
     }
 }
 
-fn open(ctx: &Setup) -> Result<ConfigFile> {
+pub(crate) fn open(ctx: &Setup) -> Result<ConfigFile> {
     // Only the format here: a file that is invalid as a whole can still be
     // mended (`vault rm`); every change is checked as a whole when saved.
     if ctx.config_file.exists() && !ctx.is_accounts_file()? {
@@ -363,20 +363,20 @@ pub fn account(ctx: &Setup, cmd: AccountCmd, given: &Given) -> Result<u8> {
 
 /// Undo a password this command stored: the one it replaced comes back,
 /// or the key goes if this command created it. Nothing else is touched.
-fn undo_password(stores: &SecretStores, r: &SecretRef, previous: Option<&Secret>) {
+pub(crate) fn undo_password(stores: &SecretStores, r: &SecretRef, previous: Option<&Secret>) {
     let _ = match previous {
         Some(old) => stores.set(r, old),
         None => stores.delete(r).map(|_| ()),
     };
 }
 
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     use rand::Rng;
     format!("{:016x}", rand::thread_rng().gen::<u64>())
 }
 
 /// A folder as written to the file: `~/...` kept, anything else absolute.
-fn folder_value(p: &Path) -> Result<String> {
+pub(crate) fn folder_value(p: &Path) -> Result<String> {
     let s = p.display().to_string();
     if s == "~" || s.starts_with("~/") {
         return Ok(s);
@@ -723,7 +723,7 @@ fn set_enabled(ctx: &Setup, name: &str, on: bool) -> Result<u8> {
     Ok(0)
 }
 
-fn print_vault(ctx: &Setup, name: &str, v: &Vault) {
+pub(crate) fn print_vault(ctx: &Setup, name: &str, v: &Vault) {
     println!("{name}{}", if v.enabled { "" } else { "  (disabled)" });
     println!("  account   {}", v.account);
     println!("  database  {}", v.database);

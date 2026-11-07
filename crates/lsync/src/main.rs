@@ -1,6 +1,8 @@
 //! `lsync`: Linux/Termux CLI over the LiveSync engine.
 
+mod adopt;
 mod config;
+mod import;
 mod manage;
 mod probe;
 mod prompt;
@@ -195,10 +197,33 @@ enum Cmd {
         #[command(subcommand)]
         cmd: manage::VaultCmd,
     },
+    /// Turn the LiveSync plugin's data.json or the official CLI's
+    /// settings.json into an account and a vault in lsync.toml (the
+    /// password into the secret store). Settings lsync cannot honour stop
+    /// it. The vault is added disabled: take its folder over with `adopt`
+    Import(import::ImportArgs),
+    /// Take over a folder another client kept in sync, before its first
+    /// sync here: files identical to the server's are adopted with no
+    /// transfer, and the first sync runs. --dry-run only compares and says
+    /// what that sync would do with every file. Never writes to the server
+    /// beyond that sync
+    Adopt {
+        /// Compare and report; change nothing
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+        /// Take over a folder whose LiveSync plugin is still enabled (a
+        /// deliberate handover; disable it on this device first)
+        #[arg(long)]
+        allow_plugin: bool,
+        #[command(flatten)]
+        push: PushOpts,
+    },
 }
 
 #[derive(clap::Args, Debug, Clone, Default)]
-struct PushOpts {
+pub(crate) struct PushOpts {
     /// Allow one pass to delete files en masse remotely: more than 20 with no
     /// known destination (a move into .trash/ or a rename doesn't count) that
     /// are also more than half of the tracked files, or 3 or more when the
@@ -270,6 +295,11 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             bail!("the account and vault commands take the name as an argument, not --vault or --profile");
         }
     }
+    if let Cmd::Import(_) = &cli.cmd {
+        if cli.vault.is_some() || on_command_line(matches, "profile") {
+            bail!("`lsync import` names the new vault with --name, not --vault or --profile");
+        }
+    }
     // Checked only by the verbs that take a vault name of the service.
     let named = cli_vault(&cli, matches);
     let cmd = match cli.cmd {
@@ -286,6 +316,13 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
                 on_command_line: &|id| on_command_line(matches, id),
             };
             return manage::vault(&ctx, cmd, &given);
+        }
+        Cmd::Import(args) => {
+            let given = manage::Given {
+                o: &overrides,
+                on_command_line: &|id| on_command_line(matches, id),
+            };
+            return import::run(&ctx, args, &given);
         }
         Cmd::Probe(args) => return probe::run(args),
         Cmd::Pause { json } => return service_verb(named?, method::PAUSE, "paused", json),
@@ -482,6 +519,30 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             run_sync(&engine, json, true).await
         }),
         Cmd::AllowDeletes { stop, json } => rt()?.block_on(allow_deletes(&sel, &cfg, &ctx.dirs, stop, json)),
+        Cmd::Adopt {
+            dry_run,
+            json,
+            allow_plugin,
+            push,
+        } => {
+            if let Some((client, vault, _)) = routed(&sel, &cfg, &ctx.dirs, "adopt")? {
+                bail!(
+                    "vault {vault} is run by the lsync service (socket {}); adopt takes a folder over before its first sync, so stop the service, or disable the vault (`lsync vault disable {vault}`), first",
+                    client.path().display()
+                );
+            }
+            rt()?.block_on(adopt::run(
+                &sel,
+                &cfg,
+                &ctx.dirs,
+                adopt::Opts {
+                    dry_run,
+                    json,
+                    allow_plugin,
+                    push,
+                },
+            ))
+        }
         Cmd::Daemon { pull_only, push } => {
             let pull_only = pull_only || sel.mode == Mode::PullOnly;
             if let Some((client, vault, _)) = routed(&sel, &cfg, &ctx.dirs, "daemon")? {
@@ -494,6 +555,7 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             serve::daemon(serve::planned(run), VERSION)
         }
         Cmd::Probe(_)
+        | Cmd::Import(_)
         | Cmd::Account { .. }
         | Cmd::Vault { .. }
         | Cmd::Serve { .. }
@@ -1172,6 +1234,18 @@ fn check_ignore(
 }
 
 fn engine_for(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, push: &PushOpts) -> Result<Engine> {
+    engine_with_index(sel, cfg, dirs, push, None)
+}
+
+/// `engine_for`, with the index somewhere else than the vault's state
+/// folder when `index` is given (a dry run's throwaway index).
+fn engine_with_index(
+    sel: &Selected,
+    cfg: &FileConfig,
+    dirs: &Dirs,
+    push: &PushOpts,
+    index: Option<PathBuf>,
+) -> Result<Engine> {
     // After a rebuild elsewhere, how long the remote must stay unchanged
     // before the refetch counts as complete (default 30 s; tests shorten it).
     let quiet = std::env::var("LSYNC_REBUILD_QUIET_SECS")
@@ -1179,7 +1253,8 @@ fn engine_for(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, push: &PushOpts) ->
         .and_then(|v| v.parse::<u64>().ok());
     let r = config::resolve(sel, cfg, dirs, true)?;
     let couch = Couch::new(&r.remote)?;
-    let mut ec = EngineConfig::new(absolute(&r.vault)?, r.state_dir.join("index.sqlite"));
+    let index = index.unwrap_or_else(|| r.state_dir.join("index.sqlite"));
+    let mut ec = EngineConfig::new(absolute(&r.vault)?, index);
     ec.ignore_regex = r.ignore_regex;
     ec.max_size_mb = r.max_size_mb;
     ec.scope = r.scope;

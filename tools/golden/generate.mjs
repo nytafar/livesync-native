@@ -10,6 +10,8 @@
 //   splitter.json     v3-rabin-karp splits (ContentSplitter, as EntryManager uses it):
 //                     inputs are recipes both sides regenerate, outputs are piece
 //                     lengths (in UTF-8 bytes) and chunk IDs
+//   import_settings.json  plugin data.json and CLI settings.json files as
+//                     upstream's SettingService saves them; see settings.mjs
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
@@ -18,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { path2id_base, shouldBeIgnored, isPlainText } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/path";
 import { HashManager } from "@vrtmrz/livesync-commonlib/hashing";
 import { generateIgnore } from "./ignore.mjs";
+import { generateSettings } from "./settings.mjs";
 
 // compress.js is not in the package's export map; import it by file URL.
 const here = dirname(fileURLToPath(import.meta.url));
@@ -312,3 +315,9 @@ for (const c of splitCases) {
 emit("splitter.json", splitOut);
 
 await generateIgnore(emit);
+
+{
+    const { extra, files } = await generateSettings();
+    const cases = Object.entries(files).map(([name, data]) => ({ name, data }));
+    emit("import_settings.json", cases, extra);
+}
