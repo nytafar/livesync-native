@@ -24,7 +24,7 @@ npm ci                           # installs the pinned commonlib (see package.js
 node generate.mjs ../../fixtures/golden
 ```
 
-Bump the pinned version in `tools/golden/package.json`, and the version assertion in `crates/livesync-model/tests/golden.rs`, together.
+Bump the pinned version in `tools/golden/package.json`, and the version assertions in `crates/livesync-model/tests/golden.rs` and `crates/livesync-model/tests/golden_ignore.rs`, together.
 
 ## Android app (APK)
 
