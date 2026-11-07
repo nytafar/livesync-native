@@ -492,11 +492,38 @@ fn the_same_insertion_on_both_sides_is_taken_once() {
 }
 
 #[test]
-fn the_same_lines_inserted_in_another_order_go_in_whole() {
-    // Upstream pairs them to the same lines.
+fn the_same_lines_inserted_in_another_order_stay_open() {
+    // Upstream pairs them to "a P Q Q P": each line twice. Both whole would
+    // do the same; they are likely one run reordered, so it is open.
     let m = md("a\n", "a\nP\nQ\n", "a\nQ\nP\n");
-    assert_eq!(written(&m), "a\nP\nQ\nQ\nP\n");
-    assert!(m.deviations.is_empty());
+    assert!(m.outcome.is_open(), "{m:?}");
+    assert!(m.deviations.is_empty(), "open is stricter, not a deviation");
+    // One run holding the other's lines with a line between them (a writer
+    // that saw R2's two appended lines and put one between): open, not both
+    // whole with R2's lines twice.
+    let m = md("a\n", "a\nr1\nw\nr2\n", "a\nr1\nr2\n");
+    assert!(m.outcome.is_open(), "{m:?}");
+}
+
+#[test]
+fn runs_that_may_be_cut_another_way_stay_open() {
+    // R2 appended a second "---" and a line; L's diff keeps the base "---"
+    // where R2's keeps the other, so its run holds a copy of the line before
+    // the point.
+    assert!(md("---\n", "---\n--- w\nline 1\n", "---\n---\nline 1\n")
+        .outcome
+        .is_open());
+    // Runs sharing a line beside a blank base line: the diffs cut R2's
+    // appended block at different blank lines.
+    let m = md("\n\n", "\n---\n---\n\n- x\n---\n", "\n\n---\n\n- x\n");
+    assert!(m.outcome.is_open(), "{m:?}");
+    // A run holding a copy of a base line its side's diff deleted (it kept
+    // "- x" where it could have kept "---").
+    let m = md("---\n- x\n", "- x\n\n---\n- x\n- x r\n---\n", "- x\n\n---\n- x r\n");
+    assert!(m.outcome.is_open(), "{m:?}");
+    // Two fenced blocks at a firm point still go in whole.
+    let m = md("x\n", "x\n```\nA\n```\n", "x\n```\nB\n```\n");
+    assert_eq!(written(&m), "x\n```\nA\n```\n```\nB\n```\n");
 }
 
 #[test]
@@ -806,6 +833,40 @@ fn insertions_either_side_of_a_kept_blank_line_are_taken_once() {
     let r2 = "\n\n- 00 entry\n";
     let l = "\n\n- writer\n- 00 entry\n";
     assert_eq!(guard(r1, l, r2).as_deref(), Some(l));
+}
+
+#[test]
+fn repeated_lines_never_merge_to_a_line_twice_or_back() {
+    // Where blank lines or copies let the two diffs line up lines
+    // differently: these merged clean, with a line twice or a changed line
+    // back. Base R1, L (which saw R2), R2: the guard must get L or open.
+    let cases = [
+        // "- c" inserted by both, at two points across blank lines.
+        (
+            "# Day\n- a\n- b\n\n\n",
+            "# Day\n- a done\n\n- c\n- d\n",
+            "# Day\n- a done\n\n- c\n\n",
+        ),
+        (
+            "line 1\n\nline 2\n\nline 3\n",
+            "line 1\n\n\nline 4\n\n\nline 3 r\n",
+            "line 1\n\nline 4\nline 2\n\nline 3 r\n",
+        ),
+        // R2's diff keeps a blank line, not "line 1": its "line 1" is an
+        // insertion, and came back next to L's "line 1 w".
+        ("\n\nline 1\nline 2", "line 1 w\n\n", "line 1\n\nline 2\n"),
+        ("\nline 1\nline 2", "line 2\nline 3\nline 4\n\n", "line 2\nline 3\n"),
+        // A copy R2 inserted next to the line it copies, at the other end of
+        // it from where L's diff puts it.
+        ("A\n- x\nB\n", "A'\n- x\n- x\nB\n", "A\n- x\n- x\nB\n"),
+        ("B\nC\nB\n", "B\nC r\nB\nC\n", "B\nC r\nB\n"),
+    ];
+    for (r1, l, r2) in cases {
+        assert!(guard(r1, l, r2).is_none_or(|m| m == l), "{r1:?} {l:?} {r2:?}");
+        for m in both_ways(r1, l, r2) {
+            assert!(m.outcome.is_open(), "{r1:?} {l:?} {r2:?}: {m:?}");
+        }
+    }
 }
 
 #[test]

@@ -18,6 +18,12 @@
 //!    change there begins or ends with exactly those lines; any other line the
 //!    two pieces share leaves them one conflict, never a line taken twice.
 //!
+//! Each step trusts the two diffs' alignments with the base, and where lines
+//! repeat (blank lines, `---`, copies) the two diffs can line up the same
+//! lines differently. So a clean result is checked last by line counts alone
+//! ([`counts_hold`]), which no alignment enters, and is open where they are
+//! not counts a right merge can have.
+//!
 //! Every merged line records where it comes from ([`Src`]), which lets the
 //! tests check a merge against an oracle that knows nothing of how it was
 //! made.
@@ -27,7 +33,7 @@
 
 use crate::dmp::{self, Budget, Op, OutOfBudget};
 use crate::{Deviation, LineOverlap};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 /// Where a merged line comes from (by 0-based line index): a base line both
@@ -164,6 +170,40 @@ fn held(long: &[&str], short: &[&str], prefer_end: bool) -> Option<usize> {
     } else {
         start.or(end)
     }
+}
+
+/// A line with nothing but white space on it.
+fn blank(line: &str) -> bool {
+    line.trim().is_empty()
+}
+
+/// Whether `long` has every line of `short` that is not blank (at least one),
+/// as often, in any order, by content.
+fn among(long: &[&str], short: &[&str]) -> bool {
+    let mut n: HashMap<&str, isize> = HashMap::new();
+    for l in long.iter().filter(|l| !blank(l)) {
+        *n.entry(content(l)).or_insert(0) += 1;
+    }
+    let mut any = false;
+    for l in short.iter().filter(|l| !blank(l)) {
+        any = true;
+        let k = n.entry(content(l)).or_insert(0);
+        *k -= 1;
+        if *k < 0 {
+            return false;
+        }
+    }
+    any
+}
+
+/// What two runs inserted at one point become.
+enum Runs {
+    /// One held the other: the longer, the shared lines once.
+    Once(Vec<Src>),
+    /// Both whole, the first first.
+    Whole(Vec<Src>),
+    /// One holds the other's lines with lines between them: open.
+    Open,
 }
 
 // ---------- the merge ----------
@@ -442,6 +482,8 @@ struct Events {
     absorbed: bool,
     /// Pieces of both sides placed by position at a seam.
     placed: bool,
+    /// Two runs at one point that went in whole: (side, lines) of each.
+    whole: Vec<[(usize, Range<usize>); 2]>,
 }
 
 /// What a group of changes becomes.
@@ -469,6 +511,9 @@ struct Merger<'a> {
     base: Vec<&'a str>,
     sides: [SideDiff<'a>; 2],
     ours_first: bool,
+    /// For each side, the base lines its diff deleted that are not blank, by
+    /// content.
+    deleted: [HashSet<&'a str>; 2],
 }
 
 /// The side lines of one side's piece.
@@ -540,7 +585,31 @@ impl<'a> Merger<'a> {
         if changes.len() == 2 && changes.iter().all(|(_, c)| c.inserts()) {
             let run = |s: usize| changes.iter().find(|(x, _)| *x == s).unwrap().1.side.clone();
             let (fs, ss) = if self.ours_first { (0, 1) } else { (1, 0) };
-            let (out, once) = self.runs(fs, run(fs), ss, run(ss));
+            let (out, once) = match self.runs(fs, run(fs), ss, run(ss), start) {
+                Runs::Once(out) => (out, true),
+                Runs::Whole(out) => {
+                    ev.whole.push([(fs, run(fs)), (ss, run(ss))]);
+                    (out, false)
+                }
+                Runs::Open => {
+                    let text = |s: usize| self.sides[s].lines[run(s)].concat();
+                    return Ok(Unit {
+                        at: start..start,
+                        piece: Piece::Conflict(Hunk {
+                            at: LineOverlap {
+                                base: start..start,
+                                ours: run(0),
+                                theirs: run(1),
+                            },
+                            base: String::new(),
+                            ours: text(0),
+                            theirs: text(1),
+                        }),
+                        alone: None,
+                        member,
+                    });
+                }
+            };
             // A run line without its newline (the end of a file) not last.
             if out.iter().rev().skip(1).any(|l| !self.text(*l).ends_with('\n')) {
                 return Err(WholeFile { glued: true });
@@ -627,10 +696,43 @@ impl<'a> Merger<'a> {
 
     /// Two runs inserted at one point, side `fs`'s first. The same run, or one
     /// holding the other as a whole prefix or suffix, is taken once (the
-    /// longer); otherwise both whole, the first first. The flag: taken once.
-    fn runs(&self, fs: usize, first: Range<usize>, ss: usize, second: Range<usize>) -> (Vec<Src>, bool) {
+    /// longer); otherwise both whole, the first first, two separate blocks
+    /// (two fenced code blocks, each whole). But both whole puts the lines
+    /// they share in twice, so it is open wherever which lines are the runs is
+    /// not sure, or they are likely one run:
+    ///
+    /// - one has all the other's lines that are not blank (in any order): one
+    ///   run with lines put in it or moved (a writer that saw the other side's
+    ///   run and added to it);
+    /// - a run holds a copy of a base line its side deleted: the diff may have
+    ///   kept the wrong copy (a blank line instead of the line);
+    /// - a run holds a copy of the base line before or after the point (the
+    ///   nearest that is not blank: blank lines align any way): the diff could
+    ///   as well have kept that copy and split the run around it;
+    /// - they share a line (not blank) at a point beside a blank base line:
+    ///   the diffs could have cut either side's lines at another blank line.
+    fn runs(&self, fs: usize, first: Range<usize>, ss: usize, second: Range<usize>, at: usize) -> Runs {
         let lines = |s: usize, r: &Range<usize>| &self.sides[s].lines[r.clone()];
         let (a, b) = (lines(fs, &first), lines(ss, &second));
+        let base = &self.base;
+        let beside: Vec<&str> = [
+            base[..at].iter().rev().find(|l| !blank(l)),
+            base[at..].iter().find(|l| !blank(l)),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|l| content(l))
+        .collect();
+        let splits = a.iter().chain(b).any(|l| beside.contains(&content(l)));
+        let moved = |s: usize, run: &[&str]| run.iter().any(|l| self.deleted[s].contains(content(l)));
+        let loose = [at.checked_sub(1), Some(at)]
+            .into_iter()
+            .flatten()
+            .any(|i| base.get(i).is_some_and(|l| blank(l)));
+        let shared = a
+            .iter()
+            .any(|l| !blank(l) && b.iter().any(|m| content(m) == content(l)));
+        let unsure = among(a, b) || among(b, a) || moved(fs, a) || moved(ss, b) || splits || (shared && loose);
         // `long` of side `ls` holds `short` of the other side at offset `at`.
         let once = |ls: usize, long: &Range<usize>, short: &Range<usize>, at: usize| -> Vec<Src> {
             long.clone()
@@ -645,12 +747,13 @@ impl<'a> Merger<'a> {
                 .collect()
         };
         if let Some(at) = held(b, a, false) {
-            (once(ss, &second, &first, at), true)
+            Runs::Once(once(ss, &second, &first, at))
         } else if let Some(at) = held(a, b, false) {
-            (once(fs, &first, &second, at), true)
+            Runs::Once(once(fs, &first, &second, at))
+        } else if unsure {
+            Runs::Open
         } else {
-            let out = first.map(|i| tag(fs, i)).chain(second.map(|k| tag(ss, k))).collect();
-            (out, false)
+            Runs::Whole(first.map(|i| tag(fs, i)).chain(second.map(|k| tag(ss, k))).collect())
         }
     }
 
@@ -862,7 +965,9 @@ impl<'a> Merger<'a> {
 ///   whole change.
 /// - Two insertions at one point: taken once where they are the same, or one
 ///   holds the other as a whole prefix or suffix (then the longer); otherwise
-///   both whole, the older side's first.
+///   both whole, the older side's first, or a conflict where both whole would
+///   put a shared line in twice and the runs are likely one (see
+///   [`Merger::runs`]).
 /// - An insertion beside the other side's change (at its start or end) is
 ///   taken once where the change's lines begin or end with exactly those
 ///   lines.
@@ -874,7 +979,8 @@ impl<'a> Merger<'a> {
 ///   a conflict hunk covering the base lines involved, and so are two pieces
 ///   of the two sides that meet at one point and share a line otherwise.
 /// - A result that would join a line without its newline to the next one is
-///   one whole-file conflict.
+///   one whole-file conflict, and so is a result whose line counts no right
+///   merge can have ([`counts_hold`]).
 ///
 /// Out of budget: the diffs or the merge would do more work than `budget`.
 pub(crate) fn walk(
@@ -895,10 +1001,18 @@ pub(crate) fn walk(
         keep_unterminated_last(&base_lines, side);
     }
     peel(&base_lines, &mut sides, budget)?;
+    budget.spend(2 * nb)?;
+    let deleted = [0, 1].map(|s| {
+        (0..nb)
+            .filter(|&i| sides[s].equal_at[i].is_none() && !blank(base_lines[i]))
+            .map(|i| content(base_lines[i]))
+            .collect()
+    });
     let m = Merger {
         base: base_lines,
         sides,
         ours_first,
+        deleted,
     };
     let (no, nt) = (m.sides[0].changes.len(), m.sides[1].changes.len());
     budget.spend(m.sides[0].lines.len() + m.sides[1].lines.len() + nb + no + nt)?;
@@ -1011,6 +1125,23 @@ pub(crate) fn walk(
         w = whole(true)?;
         w.align = align;
     }
+    // Safety net: a clean merge whose line counts no right merge can have
+    // (see [`counts_hold`]) is one conflict.
+    if w.is_clean() {
+        budget.spend(m.base.len() + m.sides[0].lines.len() + m.sides[1].lines.len() + w.trace.len())?;
+        let merged: Vec<&str> = w.trace.iter().map(|l| m.text(*l)).collect();
+        let texts = [&m.base[..], &m.sides[0].lines[..], &m.sides[1].lines[..], &merged[..]];
+        let pairs: Vec<[(usize, Range<usize>); 2]> = ev
+            .whole
+            .iter()
+            .map(|[(a, r), (b, q)]| [(a + 1, r.clone()), (b + 1, q.clone())])
+            .collect();
+        if !counts_hold(texts, &pairs) {
+            let align = w.align;
+            w = whole(false)?;
+            w.align = align;
+        }
+    }
 
     let up = upstream_from(dl, dr, ours_first);
     let mine = w.text();
@@ -1038,6 +1169,101 @@ pub(crate) fn walk(
         }
     }
     Ok(w)
+}
+
+/// Whether a clean merge's line counts are ones a right merge can have.
+/// `texts` are the base `B`, ours `O`, theirs `T` and the merge `M`, as
+/// lines; `whole` the runs (by text and lines) that went in whole in pairs.
+///
+/// This knows nothing of how the merge was made: not how each side's diff
+/// aligned its lines with the base, which is where repeated lines go wrong
+/// (a line taken twice because the two diffs put it at different points, a
+/// deleted line come back because a diff kept another copy of it). It counts
+/// how often each line that is not blank is in each text, by content, and
+/// asks what a right merge can have. A right merge takes each side's added
+/// lines and drops each side's deleted ones; it cannot tell whether a line
+/// both sides added (or deleted) is one line or two, so where that decides
+/// the count, the merge stays open:
+///
+/// - `M <= max(O, T)`: more than either side has means both sides added the
+///   line, each its own copy. Two runs at one point that went in whole are
+///   the one exception, by design: their shared lines are there twice.
+/// - Where neither side has the line more often than the base, `M <=
+///   min(O, T)`: more is a deleted line come back (one side moved it, the
+///   other deleted it: open).
+/// - `M >= min(O, T)`: fewer means each side deleted another copy. Counted
+///   over the whole file, two copies far apart (each side ticking another of
+///   two tasks with the same text) would look like that. So for this one the
+///   texts are cut at anchors, lines that are not blank and are in each of
+///   the four texts exactly once, in the same order (as patience diff's), and
+///   each stretch between anchors is counted on its own; the rule above is
+///   checked per stretch too.
+fn counts_hold(texts: [&[&str]; 4], whole: &[[(usize, Range<usize>); 2]]) -> bool {
+    let c: [Vec<&str>; 4] = texts.map(|t| t.iter().map(|l| content(l)).collect());
+    let mut total: HashMap<&str, [usize; 4]> = HashMap::new();
+    for (k, t) in c.iter().enumerate() {
+        for l in t.iter().filter(|l| !blank(l)) {
+            total.entry(l).or_insert([0; 4])[k] += 1;
+        }
+    }
+    let mut twice: HashMap<&str, usize> = HashMap::new();
+    for [(a, r), (b, q)] in whole {
+        let tally = |k: usize, r: &Range<usize>| {
+            let mut h: HashMap<&str, usize> = HashMap::new();
+            for l in c[k][r.clone()].iter().filter(|l| !blank(l)) {
+                *h.entry(l).or_insert(0) += 1;
+            }
+            h
+        };
+        let (x, y) = (tally(*a, r), tally(*b, q));
+        for (l, m) in x {
+            *twice.entry(l).or_insert(0) += m.min(y.get(l).copied().unwrap_or(0));
+        }
+    }
+    let come_back = |[nb, no, nt, nm]: [usize; 4]| no <= nb && nt <= nb && nm > no.min(nt);
+    let whole_file = total.iter().all(|(l, &n)| {
+        let [_, no, nt, nm] = n;
+        nm <= no.max(nt) + twice.get(l).copied().unwrap_or(0) && !come_back(n)
+    });
+    if !whole_file {
+        return false;
+    }
+    // Where each line that is once in all four texts is in each.
+    let mut pos: HashMap<&str, [usize; 4]> = HashMap::new();
+    for (k, t) in c.iter().enumerate() {
+        for (i, l) in t.iter().enumerate() {
+            if total.get(l) == Some(&[1; 4]) {
+                pos.entry(l).or_insert([0; 4])[k] = i;
+            }
+        }
+    }
+    // In base order, an anchor where it comes after the last in every text.
+    let mut anchors: Vec<[usize; 4]> = Vec::new();
+    for l in &c[0] {
+        if let Some(p) = pos.get(l) {
+            if anchors.last().is_none_or(|a| (0..4).all(|k| p[k] > a[k])) {
+                anchors.push(*p);
+            }
+        }
+    }
+    // Each text's lines by stretch: (stretch, content) -> count per text.
+    let mut n: HashMap<(usize, &str), [usize; 4]> = HashMap::new();
+    for (k, t) in c.iter().enumerate() {
+        let mut at = 0;
+        for (i, l) in t.iter().enumerate() {
+            while at < anchors.len() && anchors[at][k] < i {
+                at += 1;
+            }
+            if blank(l) || anchors.get(at).is_some_and(|a| a[k] == i) {
+                continue;
+            }
+            n.entry((at, l)).or_insert([0; 4])[k] += 1;
+        }
+    }
+    n.values().all(|&x| {
+        let [_, no, nt, nm] = x;
+        nm >= no.min(nt) && !come_back(x)
+    })
 }
 
 /// The walk's result as it is put together.

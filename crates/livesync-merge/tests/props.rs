@@ -436,7 +436,10 @@ proptest! {
 
     /// Both sides insert a run at one point: the merge is clean and holds the
     /// older side's run whole, then the newer side's; a run the other holds as
-    /// a whole prefix or suffix (or the same run) once.
+    /// a whole prefix or suffix (or the same run) once. Where one run has all
+    /// the other's lines that are not blank (at least one), in any order, it
+    /// is open: likely one run with lines put in it, and both whole would put
+    /// them in twice.
     #[test]
     fn inserted_runs_stay_whole_older_first(r in runs_case()) {
         let c = Case {
@@ -446,6 +449,19 @@ proptest! {
         };
         let (older, newer) = if r.ours_newer { (&r.theirs, &r.ours) } else { (&r.ours, &r.theirs) };
         let holds = |long: &[String], short: &[String]| long.starts_with(short) || long.ends_with(short);
+        let solid = |v: &[String]| -> Vec<String> { v.iter().filter(|l| !l.trim().is_empty()).cloned().collect() };
+        let within = |long: &[String], short: &[String]| {
+            let (mut long, short) = (solid(long), solid(short));
+            !short.is_empty()
+                && short.iter().all(|s| match long.iter().position(|l| l == s) {
+                    Some(i) => {
+                        long.remove(i);
+                        true
+                    }
+                    None => false,
+                })
+        };
+        let open = !holds(newer, older) && !holds(older, newer) && (within(newer, older) || within(older, newer));
         let want = if holds(newer, older) {
             r.side(newer, r.ours_change, &[], r.theirs_change)
         } else if holds(older, newer) {
@@ -457,8 +473,11 @@ proptest! {
         passes_oracle(&c, mo, mt)?;
         for kind in [Kind::Text, Kind::Markdown] {
             match run(kind, &c, mo, mt).outcome {
-                Outcome::Write(out) => prop_assert_eq!(std::str::from_utf8(&out).unwrap(), want.as_str(), "{:?}", c),
+                Outcome::Write(out) if !open => {
+                    prop_assert_eq!(std::str::from_utf8(&out).unwrap(), want.as_str(), "{:?}", c)
+                }
                 Outcome::Identical => prop_assert_eq!(&c.ours, &want),
+                Outcome::Open(_) if open => {}
                 other => prop_assert!(false, "{other:?}\n{c:?}"),
             }
         }
