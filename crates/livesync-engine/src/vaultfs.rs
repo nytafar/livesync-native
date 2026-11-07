@@ -762,7 +762,7 @@ fn trash_if_matches_with(
         let content = fs::read(&to)?;
         let found = hash_bytes(&content);
         if found != hash {
-            if fs::symlink_metadata(&target).is_err() && fs::rename(&to, &target).is_ok() {
+            if move_no_replace(&to, &target).is_ok() {
                 remove_trashinfo(trash, &to);
                 return Ok(RemoveOutcome::Diverged { found });
             }
