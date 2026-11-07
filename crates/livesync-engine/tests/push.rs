@@ -1394,14 +1394,15 @@ async fn a_one_shot_sync_counts_a_burst_the_daemon_left_open() {
     let stop = env.meta("safety_stop").unwrap();
     assert!(stop.contains("72 of 100") && stop.contains("in one burst"), "{stop}");
     assert!(env.meta("delete_burst_sent").is_some());
-    // Within bounds, a one-shot decision ends the burst.
+    // Within bounds, the deletion goes; it joins the burst, which a
+    // one-shot pass does not end (#11, see the next test).
     for i in 0..27 {
         env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
     }
     std::fs::remove_file(env.vault().join("f00.md")).unwrap();
     let rep = env.engine().sync_once().await.unwrap();
     assert_eq!(rep.push.deleted, 1, "{:?}", rep.push);
-    assert!(env.meta("delete_burst_sent").is_none());
+    assert!(env.meta("delete_burst_sent").is_some_and(|b| b.contains("f00.md")));
     assert!(env.meta("safety_stop").is_none());
 }
 
@@ -2447,4 +2448,271 @@ async fn a_slow_wipe_over_several_maximum_holds_stops_before_half_is_gone() {
     assert!(env.meta("delete_burst_sent").is_none());
     tx.send(true).unwrap();
     task.await.unwrap().unwrap();
+}
+
+/// #11: a stop saved by v0.2.1 (no list of its files), with some of its
+/// files under a folder that cannot be read. Which files it is about is not
+/// known, so every file the pass cannot check counts as missing: the
+/// readable 15 do not go as "15 of 40", the stop is recorded anew with its
+/// list, and once the folder is readable the new stop is the same and can
+/// be confirmed.
+#[tokio::test]
+async fn an_old_format_stop_counts_every_file_it_cannot_check() {
+    let env = Env::new().await;
+    for i in 0..10 {
+        env.write(&format!("sub/f{i:02}.md"), format!("sub {i}").as_bytes());
+    }
+    for i in 0..30 {
+        env.write(&format!("g{i:02}.md"), format!("g {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    for i in 0..10 {
+        std::fs::remove_file(env.vault().join(format!("sub/f{i:02}.md"))).unwrap();
+    }
+    for i in 0..15 {
+        std::fs::remove_file(env.vault().join(format!("g{i:02}.md"))).unwrap();
+    }
+    // As v0.2.1 left it: the text only.
+    let old = "1 25 of 40 tracked files are missing from the vault; not deleting them remotely (allow mass deletes if this is intended)";
+    Index::open(&env.index_path())
+        .unwrap()
+        .set_meta("safety_stop", old)
+        .unwrap();
+    let locked = Unreadable::new(env.vault().join("sub"));
+    let e = env.engine();
+    let rep = e.sync_once().await;
+    let (stop, docs) = (env.meta("safety_stop"), env.meta("safety_stop_docs"));
+    drop(locked);
+    let rep = rep.unwrap();
+    assert_eq!(rep.push.deleted, 0, "the readable files went: {:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 1, "{:?}", rep.push);
+    let stop = stop.expect("a stop");
+    assert!(
+        stop.contains("25 of 40") && stop.contains("10 of them cannot be checked now"),
+        "{stop}"
+    );
+    let docs: Vec<String> = serde_json::from_str(&docs.expect("the stop's list")).unwrap();
+    assert_eq!(docs.len(), 25);
+    // Readable again: the same 25 are missing, so it is the same stop.
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0);
+    assert_eq!(env.meta("safety_stop").as_deref(), Some(stop.as_str()));
+    assert_eq!(
+        e.allow_mass_delete_once(&stop).unwrap(),
+        livesync_engine::Confirmation::Allowed
+    );
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 25, "{:?}", rep.push);
+    assert!(env.meta("safety_stop").is_none());
+}
+
+/// #11: an old-format stop beside an unrelated folder that cannot be read.
+/// Once its files are back it clears, as long as the unreadable files could
+/// not make a stop on their own. A confirmation of it that cannot be
+/// applied (something is unchecked) does not wait for ever: the pass
+/// records the stop anew with its list, and the old confirmation is
+/// dropped, so the app asks again instead of showing "deleting at the next
+/// full pass".
+#[tokio::test]
+async fn an_old_format_stop_does_not_hang_on_an_unrelated_unreadable_folder() {
+    let env = Env::new().await;
+    for i in 0..5 {
+        env.write(&format!("locked/l{i}.md"), format!("locked {i}").as_bytes());
+    }
+    for i in 0..40 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let old = "1 25 of 45 tracked files are missing from the vault; not deleting them remotely (allow mass deletes if this is intended)";
+    let set_old = || {
+        let ix = Index::open(&env.index_path()).unwrap();
+        ix.set_meta("safety_stop", old).unwrap();
+        ix.delete_meta("safety_stop_docs").unwrap();
+    };
+    let locked = Unreadable::new(env.vault().join("locked"));
+    let e = env.engine();
+    // Nothing is missing any more: the stop clears.
+    set_old();
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0);
+    assert!(env.meta("safety_stop").is_none(), "the old stop stayed");
+
+    // 25 missing and the old stop confirmed: it cannot be applied while
+    // anything is unchecked, so the pass shows the stop anew, with a list.
+    for i in 0..25 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    set_old();
+    assert_eq!(
+        e.allow_mass_delete_once(old).unwrap(),
+        livesync_engine::Confirmation::Allowed
+    );
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0, "{:?}", rep.push);
+    let stop = env.meta("safety_stop").expect("a stop");
+    assert_ne!(stop, old);
+    assert!(
+        stop.contains("30 of 45") && stop.contains("5 of them cannot be checked now"),
+        "{stop}"
+    );
+    assert!(env.meta("safety_stop_docs").is_some());
+    assert!(!e.mass_delete_allowed(), "the old confirmation still waits");
+    assert!(!e.mass_delete_waits());
+    // Confirming the new stop waits while its unreadable files cannot be
+    // checked, and says so.
+    assert_eq!(
+        e.allow_mass_delete_once(&stop).unwrap(),
+        livesync_engine::Confirmation::Allowed
+    );
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0);
+    assert!(e.mass_delete_allowed() && e.mass_delete_waits());
+    assert_eq!(env.meta("safety_stop").as_deref(), Some(stop.as_str()));
+    drop(locked);
+    let rep = e.sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 25, "{:?}", rep.push);
+    assert!(!e.mass_delete_allowed() && !e.mass_delete_waits());
+    assert!(env.meta("safety_stop").is_none());
+    assert!((0..5).all(|i| !env.deleted(&format!("locked/l{i}.md"))));
+}
+
+/// #11: deletions the daemon holds are kept in the index. Killed with 20
+/// held (no stop yet, 45 of the burst already sent) and their folder then
+/// unreadable, a one-shot sync neither ends the burst nor forgets them; once
+/// readable, they are judged with the burst: "65 of 100", not "20 of 55".
+#[tokio::test]
+async fn held_deletions_survive_a_restart_while_they_cannot_be_checked() {
+    let env = Env::new().await;
+    for i in 0..20 {
+        env.write(&format!("sub/f{i:02}.md"), format!("sub {i}").as_bytes());
+    }
+    for i in 0..35 {
+        env.write(&format!("g{i:02}.md"), format!("g {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let sent: Vec<String> = (0..45).map(|i| format!("sent{i:02}.md")).collect();
+    Index::open(&env.index_path())
+        .unwrap()
+        .set_meta("delete_burst_sent", &serde_json::to_string(&sent).unwrap())
+        .unwrap();
+    let engine = env.engine_with(|c| {
+        c.settle = Duration::from_millis(150);
+        c.rescan_interval = Duration::from_secs(3600);
+        c.delete_hold = Duration::from_secs(30);
+        c.delete_hold_max = Duration::from_secs(60);
+    });
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    wait_until("daemon up", || env.meta("registered_ms").is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for i in 0..20 {
+        std::fs::remove_file(env.vault().join(format!("sub/f{i:02}.md"))).unwrap();
+    }
+    wait_until("20 deletes held", || engine.deletes_waiting() == 20).await;
+    wait_until("the held deletes saved", || {
+        env.meta("delete_held")
+            .is_some_and(|h| serde_json::from_str::<Vec<String>>(&h).unwrap().len() == 20)
+    })
+    .await;
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    drop(engine);
+    assert!((0..20).all(|i| !env.deleted(&format!("sub/f{i:02}.md"))));
+
+    let locked = Unreadable::new(env.vault().join("sub"));
+    let rep = env.engine().sync_once().await;
+    let kept = (env.meta("delete_burst_sent"), env.meta("delete_held"));
+    drop(locked);
+    assert_eq!(rep.unwrap().push.deleted, 0);
+    assert!(kept.0.is_some(), "the burst was ended");
+    assert!(kept.1.is_some(), "the held deletions were forgotten");
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0, "{:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 1);
+    let stop = env.meta("safety_stop").unwrap();
+    assert!(stop.contains("65 of 100") && stop.contains("in one burst"), "{stop}");
+}
+
+/// #11: a one-shot sync does not end a burst a daemon left open. 45 of 100
+/// sent, then `lsync sync` with 4 more missing: they go and join the burst,
+/// so a wipe that goes on afterwards is counted from the burst's start
+/// ("74 of 100"), not from 51. A one-shot pass that finds nothing missing,
+/// a quiet period after the burst's last deletion, ends it.
+#[tokio::test]
+async fn a_one_shot_sync_does_not_end_an_open_burst() {
+    let env = Env::new().await;
+    for i in 0..55 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    env.engine().sync_once().await.unwrap();
+    let sent: Vec<String> = (0..45).map(|i| format!("sent{i:02}.md")).collect();
+    Index::open(&env.index_path())
+        .unwrap()
+        .set_meta("delete_burst_sent", &serde_json::to_string(&sent).unwrap())
+        .unwrap();
+    for i in 0..4 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 4, "{:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 0);
+    let burst: Vec<String> = serde_json::from_str(&env.meta("delete_burst_sent").expect("the burst ended")).unwrap();
+    assert_eq!(burst.len(), 49);
+    // The wipe goes on: 25 more of the 51 left.
+    for i in 4..29 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0, "{:?}", rep.push);
+    assert_eq!(rep.push.safety_stops, 1);
+    let stop = env.meta("safety_stop").unwrap();
+    assert!(stop.contains("74 of 100") && stop.contains("in one burst"), "{stop}");
+    // The files come back; right after, the burst is not over yet.
+    for i in 4..29 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    let rep = env.engine().sync_once().await.unwrap();
+    assert_eq!(rep.push.deleted, 0);
+    assert!(env.meta("safety_stop").is_none());
+    assert!(env.meta("delete_burst_sent").is_some());
+    // After a quiet period, a pass with nothing missing ends it.
+    Index::open(&env.index_path())
+        .unwrap()
+        .set_meta("delete_burst_at", "1")
+        .unwrap();
+    env.engine().sync_once().await.unwrap();
+    assert!(env.meta("delete_burst_sent").is_none());
+    assert!(env.meta("delete_burst_at").is_none());
+}
+
+/// A wipe beside a folder an ignore file hid since the last pass is judged
+/// against what still syncs: the newly ignored files are untracked by the
+/// pass, so they do not make the wipe look small ("25 of 40", not "25 of
+/// 100").
+#[tokio::test]
+async fn a_wipe_beside_newly_ignored_files_still_stops() {
+    let env = Env::new().await;
+    for i in 0..60 {
+        env.write(&format!("big/b{i:02}.md"), format!("big {i}").as_bytes());
+    }
+    for i in 0..40 {
+        env.write(&format!("f{i:02}.md"), format!("note {i}").as_bytes());
+    }
+    let ignoring = |c: &mut EngineConfig| c.use_ignore_files = true;
+    env.engine_with(ignoring).sync_once().await.unwrap();
+    env.write(".gitignore", b"big/\n");
+    for i in 0..25 {
+        std::fs::remove_file(env.vault().join(format!("f{i:02}.md"))).unwrap();
+    }
+    // A pass without the filter catch-up before it (as when the ignore
+    // file changes just before the walk).
+    let rep = env.engine_with(ignoring).push_all(false).await.unwrap();
+    assert_eq!(rep.deleted, 0, "{rep:?}");
+    assert_eq!(rep.safety_stops, 1);
+    let stop = env.meta("safety_stop").unwrap();
+    assert!(stop.contains("25 of 40"), "{stop}");
+    assert!((0..60).all(|i| !env.deleted(&format!("big/b{i:02}.md"))));
 }

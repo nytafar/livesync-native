@@ -88,6 +88,15 @@ pub(crate) mod meta_keys {
     /// to stands, later parts are judged together with them (`DeleteHold`).
     /// Kept here so a restart does not forget them.
     pub const DELETE_BURST: &str = "delete_burst_sent";
+    /// When a deletion last joined the burst or the daemon's hold (ms since
+    /// the epoch): a one-shot pass ends a burst a previous run left open
+    /// only once that is at least `delete_hold` ago.
+    pub const DELETE_BURST_AT: &str = "delete_burst_at";
+    /// The deletions the daemon holds (seen missing with no known
+    /// destination, not decided yet, or refused by the stop; JSON list of
+    /// IDs), so a restart or a one-shot pass in between still knows them
+    /// while they cannot be checked (`DeleteHold`).
+    pub const DELETE_HELD: &str = "delete_held";
     /// The local filters (ignore files included) the index last synced
     /// with (JSON `FilterState`), to catch up what they stop hiding.
     pub const FILTERS: &str = "filters";
@@ -627,6 +636,9 @@ pub(crate) struct Inner {
     /// The next full push pass that gets to the deletions may delete what
     /// a stop refused and the user confirmed (`allow_mass_delete_once`).
     pub(crate) mass_delete_once: Mutex<Option<crate::push::Confirmed>>,
+    /// The last full pass did not apply that confirmation because some of
+    /// the files it covers could not be checked: it waits for them.
+    pub(crate) mass_delete_waits: std::sync::atomic::AtomicBool,
     /// Deletions the daemon holds until their burst is over (`DeleteHold`).
     pub(crate) deletes_waiting: std::sync::atomic::AtomicU64,
     pub(crate) nudge: Notify,
@@ -820,6 +832,7 @@ impl Engine {
                 report: Mutex::new(PullReport::default()),
                 push_report: Mutex::new(crate::push::PushReport::default()),
                 mass_delete_once: Mutex::new(None),
+                mass_delete_waits: std::sync::atomic::AtomicBool::new(false),
                 deletes_waiting: std::sync::atomic::AtomicU64::new(0),
                 nudge: Notify::new(),
                 rescan: Notify::new(),
