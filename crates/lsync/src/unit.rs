@@ -54,15 +54,12 @@ fn environment(k: &str, v: &str) -> String {
     format!("Environment={}", quoted(&format!("{k}={}", v.replace('%', "%%"))))
 }
 
-/// A path in a space-separated list (`ReadWritePaths=`): quoted when it
-/// has a space, `-` first so a folder that does not exist yet is no error.
+/// A path in a space-separated list (`ReadWritePaths=`): always quoted,
+/// `-` first so a folder that does not exist is no start failure. systemd
+/// splits such a list like a shell: an unquoted `'` or `"` in one path
+/// drops that path and every later one, so a quote is never left to chance.
 fn listed_path(p: &Path) -> String {
-    let s = p.display().to_string().replace('%', "%%");
-    if s.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\') {
-        format!("-{}", quoted(&s))
-    } else {
-        format!("-{s}")
-    }
+    quoted(&format!("-{}", p.display().to_string().replace('%', "%%")))
 }
 
 /// What the service runs, and the environment it needs to agree with the
@@ -71,19 +68,24 @@ fn listed_path(p: &Path) -> String {
 pub struct Exec {
     /// The program and its arguments.
     pub argv: Vec<String>,
+    /// `ExecReload=`: `lsync [--system] reload`, which returns once the
+    /// service has reread its config (empty: none).
+    pub reload: Vec<String>,
     pub env: Vec<(String, String)>,
 }
 
-impl Exec {
-    fn exec_start(&self) -> String {
-        self.argv.iter().map(|a| exec_arg(a)).collect::<Vec<_>>().join(" ")
-    }
+fn command_line(argv: &[String]) -> String {
+    argv.iter().map(|a| exec_arg(a)).collect::<Vec<_>>().join(" ")
 }
 
 fn service_common(exec: &Exec, out: &mut String) {
     out.push_str("Type=notify\nNotifyAccess=main\n");
-    out.push_str(&format!("ExecStart={}\n", exec.exec_start()));
-    out.push_str("ExecReload=/bin/kill -HUP $MAINPID\n");
+    out.push_str(&format!("ExecStart={}\n", command_line(&exec.argv)));
+    // Through the control socket, not a signal: `systemctl reload` returns
+    // when the reload is done, and two reloads never overlap.
+    if !exec.reload.is_empty() {
+        out.push_str(&format!("ExecReload={}\n", command_line(&exec.reload)));
+    }
     out.push_str("Restart=on-failure\nRestartSec=10\n");
     out.push_str("WatchdogSec=60\n");
     for (k, v) in &exec.env {
@@ -123,8 +125,9 @@ pub fn system_unit(u: &SystemService) -> String {
     s.push_str(&format!("User={}\nGroup={}\n", u.user, u.group));
     service_common(&u.exec, &mut s);
     s.push_str(&format!(
-        "# Files the service writes are group-writable, for vaults shared with a group.\n\
-         UMask=0002\n\
+        "# Files the service writes are group-writable, for vaults shared with a group,\n\
+         # and not readable by other users.\n\
+         UMask=0007\n\
          ConfigurationDirectory=lsync\n\
          StateDirectory=lsync\nStateDirectoryMode=0700\n\
          RuntimeDirectory=lsync\nRuntimeDirectoryMode={}\n\
@@ -220,8 +223,12 @@ mod tests {
     use super::*;
 
     fn exec(argv: &[&str]) -> Exec {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let mut reload: Vec<String> = argv.iter().take_while(|a| *a != "serve").cloned().collect();
+        reload.push("reload".into());
         Exec {
-            argv: argv.iter().map(|s| s.to_string()).collect(),
+            argv,
+            reload,
             env: vec![],
         }
     }
@@ -245,7 +252,7 @@ mod tests {
         for line in [
             "Type=notify",
             "ExecStart=/home/u/.local/bin/lsync serve",
-            "ExecReload=/bin/kill -HUP $MAINPID",
+            "ExecReload=/home/u/.local/bin/lsync reload",
             "Restart=on-failure",
             "WatchdogSec=60",
             "Environment=\"XDG_STATE_HOME=/data/state 1\"",
@@ -268,7 +275,8 @@ mod tests {
             "User=lsync",
             "Group=notes",
             "ExecStart=/usr/local/bin/lsync --system serve --socket-group notes",
-            "UMask=0002",
+            "ExecReload=/usr/local/bin/lsync --system reload",
+            "UMask=0007",
             "ConfigurationDirectory=lsync",
             "StateDirectory=lsync",
             "RuntimeDirectory=lsync",
@@ -297,10 +305,26 @@ mod tests {
             ],
         );
         assert!(is_ours(&d));
-        assert!(d.contains("ReadWritePaths=-/srv/notes -\"/srv/my notes\"\n"), "{d}");
+        assert!(d.contains("ReadWritePaths=\"-/srv/notes\" \"-/srv/my notes\"\n"), "{d}");
         assert!(d.contains("LoadCredentialEncrypted=lsync-home:/etc/credstore.encrypted/lsync-home\n"));
         assert!(d.contains("LoadCredential=lsync-work:/etc/credstore/lsync-work\n"));
         assert!(!system_dropin(&[], &[]).contains("ReadWritePaths"));
+        // A quote or a backslash in one path never cuts the list short.
+        let d = system_dropin(
+            &[
+                PathBuf::from("/srv/Lasse's notes"),
+                PathBuf::from("/srv/a \"b\" c\\d"),
+                PathBuf::from("/srv/100%"),
+                PathBuf::from("/srv/later"),
+            ],
+            &[],
+        );
+        assert!(
+            d.contains(
+                "ReadWritePaths=\"-/srv/Lasse's notes\" \"-/srv/a \\\"b\\\" c\\\\d\" \"-/srv/100%%\" \"-/srv/later\"\n"
+            ),
+            "{d}"
+        );
     }
 
     #[test]
@@ -359,9 +383,19 @@ mod tests {
         verify("system", &sys, &[]);
         let dir = d.path().join("system");
         std::fs::create_dir_all(dir.join("lsync.service.d")).unwrap();
+        // Paths with a quote, a space or a backslash: systemd reads the whole
+        // list (an unquoted `'` made it drop that path and the later ones).
         std::fs::write(
             dir.join("lsync.service.d").join(DROPIN_NAME),
-            system_dropin(&[PathBuf::from("/tmp")], &[]),
+            system_dropin(
+                &[
+                    PathBuf::from("/tmp"),
+                    PathBuf::from("/srv/Lasse's notes"),
+                    PathBuf::from("/srv/a \"b\" c\\d"),
+                    PathBuf::from("/srv/later"),
+                ],
+                &[],
+            ),
         )
         .unwrap();
         verify("system", &sys, &[]);

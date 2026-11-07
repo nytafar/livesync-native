@@ -33,8 +33,10 @@ pub enum ServiceCmd {
         /// Print what would be written, and change nothing
         #[arg(long)]
         print: bool,
-        /// With --system: the user the service runs as (default: the user
-        /// who ran sudo). The config folder is handed to this user
+        /// With --system (required there): the user the service runs as, a
+        /// user of its own or the one whose vaults these are. The config
+        /// folder, which holds the passwords kept in secrets.toml, is
+        /// handed to this user
         #[arg(long, value_name = "USER")]
         run_as: Option<String>,
         /// With --system: the service's group. Its members may use the
@@ -142,8 +144,6 @@ pub struct Ctx<'a> {
     /// This user's name and uid.
     pub user: String,
     pub uid: u32,
-    /// `$SUDO_USER`, the default user of a system service.
-    pub sudo_user: Option<String>,
     /// The binary the service runs.
     pub exe: PathBuf,
     /// The environment the user service needs to find what this CLI finds.
@@ -246,7 +246,6 @@ pub fn real_ctx<'a>(setup: &'a Setup, runner: &'a dyn Runner) -> Result<Ctx<'a>>
         euid: geteuid(),
         user: user_name(uid).unwrap_or_else(|| uid.to_string()),
         uid,
-        sudo_user: var("SUDO_USER"),
         exe,
         env,
         ask_socket: true,
@@ -484,6 +483,10 @@ fn exec_for(ctx: &Ctx, socket_group: Option<&str>) -> Exec {
     if ctx.setup.system {
         argv.push("--system".into());
     }
+    // `lsync [--system] reload` finds the service's socket as the service
+    // does (the unit's environment); it needs no config.
+    let mut reload = argv.clone();
+    reload.push("reload".into());
     if let Some(p) = &ctx.setup.explicit {
         argv.push("--config".into());
         argv.push(
@@ -500,29 +503,51 @@ fn exec_for(ctx: &Ctx, socket_group: Option<&str>) -> Exec {
     }
     Exec {
         argv,
+        reload,
         // A system service has its own folders; never the installer's.
         env: if ctx.setup.system { vec![] } else { ctx.env.clone() },
     }
 }
 
-/// What the system unit's drop-in lists for this config: the folders the
-/// service may write (vault folders, and state folders outside its own
-/// state folder), and its systemd credentials, for `home` as `~`.
-pub fn dropin_for(ctx: &Ctx, cfg: &Config, home: Option<&Path>) -> (String, Vec<String>) {
+/// A folder the system service may write: a vault folder, or a vault's
+/// state folder outside the service's own state folder.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Writable {
+    pub path: PathBuf,
+    /// A vault folder (shared with the group), not a state folder.
+    pub vault: bool,
+}
+
+/// The folders the system service may write, for `home` as `~`.
+pub fn writable_for(ctx: &Ctx, cfg: &Config, home: Option<&Path>) -> Vec<Writable> {
     let mut dirs = ctx.setup.dirs.clone();
     if let Some(h) = home {
         dirs.home = Some(h.to_path_buf());
     }
-    let mut writable: Vec<PathBuf> = vec![];
+    let mut writable: Vec<Writable> = vec![];
     for (name, v) in &cfg.vault {
-        writable.push(v.folder_path(&dirs));
+        writable.push(Writable {
+            path: v.folder_path(&dirs),
+            vault: true,
+        });
         let state = v.state_path(name, &dirs);
         if !state.starts_with(&dirs.state) {
-            writable.push(state);
+            writable.push(Writable {
+                path: state,
+                vault: false,
+            });
         }
     }
     writable.sort();
-    writable.dedup();
+    writable.dedup_by(|a, b| a.path == b.path);
+    writable
+}
+
+/// What the system unit's drop-in lists for this config: the folders the
+/// service may write (see [`writable_for`]), and its systemd credentials,
+/// for `home` as `~`.
+pub fn dropin_for(ctx: &Ctx, cfg: &Config, home: Option<&Path>) -> (String, Vec<String>) {
+    let writable: Vec<PathBuf> = writable_for(ctx, cfg, home).into_iter().map(|w| w.path).collect();
     let mut creds = vec![];
     let mut missing = vec![];
     for (name, a) in &cfg.account {
@@ -559,25 +584,174 @@ pub fn credential_file(etc: &Path, r: &SecretRef) -> Option<Credential> {
     None
 }
 
-/// Hand the system config folder, and the files root left in it, to the
-/// service's user (who must read them); the folder stays 0700.
-fn hand_over_config(dir: &Path, user: &User, gid: u32) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+/// The files of the system config folder that the service's user gets:
+/// nothing else in it is ever touched.
+pub const CONFIG_FILES: [&str; 3] = [
+    livesync_host::config::CONFIG_FILE,
+    livesync_host::config::SECRETS_FILE,
+    ".lsync.toml.lock",
+];
+
+/// The system service's config folder (`ConfigurationDirectory=lsync`):
+/// `/etc/lsync`, and nothing else. `--config`, or a `$CONFIGURATION_DIRECTORY`
+/// that names another folder, is refused: the service would not read that
+/// config, and install would hand that folder to the service's user.
+fn system_config_dir(ctx: &Ctx, print: bool) -> Result<(PathBuf, Option<String>)> {
+    let dir = ctx.etc.join("lsync");
+    if let Some(p) = &ctx.setup.explicit {
+        bail!(
+            "--config ({}) is not for the system service: it reads {}, which `sudo lsync --system account add ...` and `vault add ...` write; drop --config (and LSYNC_CONFIG)",
+            p.display(),
+            dir.join(livesync_host::config::CONFIG_FILE).display()
+        );
+    }
+    if ctx.euid != 0 && !print {
+        bail!("a system service is installed as root: sudo lsync service install --system --run-as USER");
+    }
+    if ctx.setup.dirs.config != dir {
+        let why = format!(
+            "the system service reads its config from {}, but this lsync uses {} ($CONFIGURATION_DIRECTORY)",
+            dir.display(),
+            ctx.setup.dirs.config.display()
+        );
+        if !print {
+            bail!("{why}; unset CONFIGURATION_DIRECTORY");
+        }
+        return Ok((dir, Some(why)));
+    }
+    Ok((dir, None))
+}
+
+/// Hand the system config folder (0700) and its known files ([`CONFIG_FILES`],
+/// whoever owns them now) to the service's user, who must read them. Never
+/// anything else: another file, a symlink or a hard link in the folder is
+/// left as it is. The lines to print.
+fn hand_over_config(dir: &Path, user: &User, gid: u32) -> Result<Vec<String>> {
+    use std::os::unix::fs::PermissionsExt;
     let md = std::fs::symlink_metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
     if !md.is_dir() {
         bail!("{} is not a folder", dir.display());
     }
-    std::os::unix::fs::lchown(dir, Some(user.uid), Some(gid)).with_context(|| format!("chown {}", dir.display()))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    for e in std::fs::read_dir(dir)? {
-        let e = e?;
-        let md = std::fs::symlink_metadata(e.path())?;
-        if md.is_file() && md.uid() == 0 {
-            std::os::unix::fs::lchown(e.path(), Some(user.uid), Some(gid))
-                .with_context(|| format!("chown {}", e.path().display()))?;
+    // A folder in root's /etc, so its name cannot be swapped meanwhile.
+    let d = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
+    // Taken back first (root's, 0700), so that a previous service user can
+    // no longer change its entries: a file checked to have one link keeps
+    // it (a planted hard link cannot be unlinked between the check and the
+    // chown).
+    std::os::unix::fs::fchown(&d, Some(geteuid()), None).with_context(|| format!("chown {}", dir.display()))?;
+    d.set_permissions(std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod {}", dir.display()))?;
+    let mut out = vec![];
+    for name in CONFIG_FILES {
+        let handed = livesync_host::edit::chown_plain_file(dir, name, user.uid, gid)
+            .with_context(|| format!("chown {}", dir.join(name).display()))?;
+        if !handed && std::fs::symlink_metadata(dir.join(name)).is_ok() {
+            out.push(format!(
+                "warning: {} is not a plain file with one link; it was left alone, and the service may not read it",
+                dir.join(name).display()
+            ));
         }
     }
-    Ok(())
+    std::os::unix::fs::fchown(&d, Some(user.uid), Some(gid)).with_context(|| format!("chown {}", dir.display()))?;
+    Ok(out)
+}
+
+/// Create the folders the service may write that do not exist yet (it
+/// cannot: `ProtectSystem=strict` leaves a missing path read-only), owned
+/// by the service's user and group: vault folders 0770, state folders 0700.
+/// Folders that exist are left as they are. The lines to print.
+fn create_writable(writable: &[Writable], uid: u32, gid: u32) -> Vec<String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut out = vec![];
+    for w in writable {
+        if std::fs::symlink_metadata(&w.path).is_ok() {
+            continue;
+        }
+        // Each missing folder from the top, so the ones made here are known.
+        let mut missing = vec![];
+        let mut p = w.path.as_path();
+        while std::fs::symlink_metadata(p).is_err() {
+            missing.push(p.to_path_buf());
+            match p.parent() {
+                Some(q) => p = q,
+                None => break,
+            }
+        }
+        let mode = if w.vault { 0o770 } else { 0o700 };
+        let made = missing.iter().rev().try_for_each(|m| {
+            std::fs::DirBuilder::new().mode(mode).create(m)?;
+            std::os::unix::fs::lchown(m, Some(uid), Some(gid))?;
+            // The umask does not narrow it.
+            std::fs::set_permissions(m, std::os::unix::fs::PermissionsExt::from_mode(mode))
+        });
+        match made {
+            Ok(()) => out.push(format!("created {} for the service", w.path.display())),
+            Err(e) => out.push(format!(
+                "warning: could not create {} ({e}); the service cannot create it itself, so that vault will not start until it exists",
+                w.path.display()
+            )),
+        }
+    }
+    out
+}
+
+/// Vaults with `trash = "system"`, which the system service cannot run:
+/// the home trash is read-only to it, and a move across its bind mounts fails.
+fn system_trash_vaults(cfg: &Config) -> Vec<String> {
+    cfg.vault
+        .iter()
+        .filter(|(_, v)| v.enabled)
+        .filter(|(_, v)| {
+            v.what_syncs()
+                .is_ok_and(|w| w.trash == livesync_engine::vaultfs::TrashMode::System)
+        })
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
+pub fn system_trash_message(names: &[String]) -> String {
+    format!(
+        "vault(s) {} use trash = \"system\", which the system service cannot use (the home trash is read-only to it); set trash = \"vault\" (`sudo lsync --system vault edit NAME --trash vault`) or \"none\"",
+        names.join(", ")
+    )
+}
+
+/// Accounts whose password is in secrets.toml, a plain-text file in the
+/// config folder that the service's user owns.
+fn file_store_accounts(cfg: &Config) -> Vec<String> {
+    cfg.account
+        .iter()
+        .filter(|(_, a)| a.username.as_deref().is_some_and(|u| !u.is_empty()))
+        .filter(|(n, a)| a.secret_ref(n).is_ok_and(|r| r.kind == StoreKind::File))
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
+/// Why the system unit should not run `exe`: it, or a folder above it, can
+/// be changed by a user other than root (who could then run code as the
+/// service's user, at every start and reload). `None` when only root can.
+pub fn exe_not_roots(exe: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut p = Some(exe);
+    while let Some(here) = p {
+        let md = match std::fs::symlink_metadata(here) {
+            Ok(m) => m,
+            Err(e) => return Some(format!("cannot be checked: {}: {e}", here.display())),
+        };
+        if md.uid() != 0 {
+            return Some(format!("{} belongs to uid {}, not root", here.display(), md.uid()));
+        }
+        let sticky_dir = md.is_dir() && md.mode() & 0o1000 != 0;
+        if md.mode() & 0o022 != 0 && !sticky_dir {
+            return Some(format!(
+                "{} can be written by its group or by everyone (mode {:o})",
+                here.display(),
+                md.mode() & 0o7777
+            ));
+        }
+        p = here.parent();
+    }
+    None
 }
 
 pub fn run(setup: &Setup, cmd: ServiceCmd) -> Result<u8> {
@@ -644,19 +818,67 @@ pub fn install(ctx: &Ctx, o: &InstallOpts) -> Result<Vec<String>> {
     if o.linger && ctx.manager != Manager::SystemdUser {
         bail!("--linger is for a systemd user service; a system service starts at boot anyway");
     }
+    // Before the config is even read: --config is never the system's.
+    let system_dir = match ctx.manager {
+        Manager::SystemdSystem => Some(system_config_dir(ctx, o.print)?),
+        _ => None,
+    };
     let cfg = service_config(ctx)?;
     match ctx.manager {
         Manager::SystemdUser => install_user(ctx, o),
-        Manager::SystemdSystem => install_system(ctx, o, &cfg),
+        Manager::SystemdSystem => install_system(ctx, o, &cfg, system_dir.expect("set above")),
         Manager::Launchd => install_launchd(ctx, o),
     }
+}
+
+/// Whether the user's service manager reads units from `dir` (`None`: it
+/// could not be asked). It reads `$XDG_CONFIG_HOME/systemd/user` with *its*
+/// `XDG_CONFIG_HOME`, which a shell's own (the testbed's) need not be.
+fn manager_reads(ctx: &Ctx, dir: &Path) -> Option<(bool, Vec<String>)> {
+    let r = ctx.may("systemctl", &ctx.systemctl(&["show", "--property=UnitPath", "--value"]))?;
+    let paths: Vec<String> = r
+        .stdout
+        .split_whitespace()
+        .filter(|p| p.starts_with('/'))
+        .map(str::to_string)
+        .collect();
+    if !r.ok || paths.is_empty() {
+        return None;
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let want = canon(dir);
+    let reads = paths.iter().any(|p| canon(Path::new(p)) == want);
+    Some((reads, paths))
+}
+
+fn unread_unit_dir(dir: &Path, paths: &[String]) -> String {
+    format!(
+        "the user's service manager does not read units from {} (this shell's XDG_CONFIG_HOME is not the manager's); it reads {}. Install from a shell without that XDG_CONFIG_HOME (give --config, XDG_STATE_HOME or LSYNC_RUNTIME_DIR for other folders), or run `systemctl --user set-environment XDG_CONFIG_HOME=...` first",
+        dir.display(),
+        paths
+            .iter()
+            .filter(|p| p.contains("/.config/") || p.ends_with("/systemd/user"))
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn install_user(ctx: &Ctx, o: &InstallOpts) -> Result<Vec<String>> {
     let text = unit::user_unit(&exec_for(ctx, None));
     let path = ctx.unit_file();
+    let unread = match manager_reads(ctx, &ctx.unit_dir) {
+        Some((false, paths)) => Some(unread_unit_dir(&ctx.unit_dir, &paths)),
+        _ => None,
+    };
     if o.print {
-        return Ok(vec![format!("# {}", path.display()), text]);
+        let mut out = vec![format!("# {}", path.display()), text];
+        out.extend(unread.map(|u| format!("# warning: {u}")));
+        return Ok(out);
+    }
+    if let Some(u) = unread {
+        bail!("{u}");
     }
     let mut out = vec![];
     write_service_file(&path, &text, o.force)?;
@@ -687,20 +909,48 @@ fn install_user(ctx: &Ctx, o: &InstallOpts) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn install_system(ctx: &Ctx, o: &InstallOpts, cfg: &Config) -> Result<Vec<String>> {
-    if ctx.euid != 0 && !o.print {
-        bail!("a system service is installed as root: sudo lsync service install --system");
-    }
-    let name = match (&o.run_as, &ctx.sudo_user) {
-        (Some(n), _) => n.clone(),
-        (None, Some(n)) if n != "root" => n.clone(),
-        _ => bail!("which user should the system service run as? Give --run-as USER (a user of its own, or the one whose vaults these are)"),
+fn install_system(
+    ctx: &Ctx,
+    o: &InstallOpts,
+    cfg: &Config,
+    (config_dir, elsewhere): (PathBuf, Option<String>),
+) -> Result<Vec<String>> {
+    // Root, and no --config: checked in `system_config_dir`.
+    // Never a default: the user who ran sudo would get the config folder,
+    // and the passwords in it.
+    let Some(name) = &o.run_as else {
+        bail!("which user should the system service run as? Give --run-as USER (a user of its own, or the one whose vaults these are); it gets {} and the passwords kept there", config_dir.display());
     };
-    let user = user_named(&name).ok_or_else(|| anyhow!("no user named {name:?}"))?;
+    let user = user_named(name).ok_or_else(|| anyhow!("no user named {name:?}"))?;
     let (group_name, gid) = match &o.group {
         Some(g) => group(Some(g), 0).ok_or_else(|| anyhow!("no group named {g:?}"))?,
         None => group(None, user.gid).unwrap_or_else(|| (user.gid.to_string(), user.gid)),
     };
+    let trash = system_trash_vaults(cfg);
+    if !trash.is_empty() {
+        bail!("{}", system_trash_message(&trash));
+    }
+    let mut warnings: Vec<String> = elsewhere.into_iter().collect();
+    if let Some(why) = exe_not_roots(&ctx.exe) {
+        let what = format!(
+            "the service would run {}, but {why}; install the binary where only root can change it (`sudo install -m755 {} /usr/local/bin/lsync`) and run that one",
+            ctx.exe.display(),
+            ctx.exe.display()
+        );
+        if !o.print {
+            bail!("{what}");
+        }
+        warnings.push(what);
+    }
+    let files = file_store_accounts(cfg);
+    if !files.is_empty() {
+        warnings.push(format!(
+            "account(s) {} keep the password in plain text in {} (the service's user owns it); systemd credentials keep it encrypted: set `secret = \"credential:lsync-NAME\"` for the account in {}, then `sudo lsync --system account passwd NAME`",
+            files.join(", "),
+            config_dir.join(livesync_host::config::SECRETS_FILE).display(),
+            config_dir.join(livesync_host::config::CONFIG_FILE).display()
+        ));
+    }
     let svc = SystemService {
         exec: exec_for(ctx, o.group.as_deref()),
         user: user.name.clone(),
@@ -709,6 +959,7 @@ fn install_system(ctx: &Ctx, o: &InstallOpts, cfg: &Config) -> Result<Vec<String
     };
     let text = unit::system_unit(&svc);
     let (dropin, missing) = dropin_for(ctx, cfg, Some(&user.home));
+    warnings.extend(missing);
     let (path, dpath) = (ctx.unit_file(), ctx.dropin_file());
     let mut out = vec![];
     if o.print {
@@ -716,19 +967,24 @@ fn install_system(ctx: &Ctx, o: &InstallOpts, cfg: &Config) -> Result<Vec<String
         out.push(text);
         out.push(format!("# {}", dpath.display()));
         out.push(dropin);
-        out.extend(missing.into_iter().map(|m| format!("# warning: {m}")));
+        out.extend(warnings.into_iter().map(|m| format!("# warning: {m}")));
         return Ok(out);
     }
-    hand_over_config(&ctx.setup.dirs.config, &user, gid)?;
+    out.extend(hand_over_config(&config_dir, &user, gid)?);
     out.push(format!(
         "{} belongs to {} now (the service reads it)",
-        ctx.setup.dirs.config.display(),
+        config_dir.display(),
         user.name
+    ));
+    out.extend(create_writable(
+        &writable_for(ctx, cfg, Some(&user.home)),
+        user.uid,
+        gid,
     ));
     write_service_file(&path, &text, o.force)?;
     write_service_file(&dpath, &dropin, o.force)?;
     out.push(format!("wrote {} and {}", path.display(), dpath.display()));
-    for m in missing {
+    for m in warnings {
         out.push(format!("warning: {m}"));
     }
     ctx.must("systemctl", &ctx.systemctl(&["daemon-reload"]))?;
@@ -1053,23 +1309,44 @@ pub fn refresh_dropin(ctx: &Ctx) -> Vec<String> {
     if !unit::is_ours(&old) {
         return vec![];
     }
+    // Only the config the service reads lists its folders.
+    let dir = ctx.etc.join("lsync");
+    if ctx.setup.explicit.is_some() || ctx.setup.dirs.config != dir {
+        return vec![format!(
+            "note: the system service reads {}, not {}; its drop-in was left as it is",
+            dir.join(livesync_host::config::CONFIG_FILE).display(),
+            ctx.setup.config_file.display()
+        )];
+    }
     let Ok(Some(cfg)) = ctx.setup.load_accounts() else {
         return vec![];
     };
-    // `~` is the service user's home, as at install.
-    let home = std::fs::read_to_string(ctx.unit_file())
-        .ok()
-        .and_then(|u| u.lines().find_map(|l| l.strip_prefix("User=").map(str::to_string)))
-        .and_then(|n| user_named(&n))
-        .map(|u| u.home);
+    // `~` is the service user's home, as at install; new folders are theirs.
+    let unit_text = std::fs::read_to_string(ctx.unit_file()).unwrap_or_default();
+    let setting = |k: &str| unit_text.lines().find_map(|l| l.strip_prefix(k).map(str::to_string));
+    let user = setting("User=").and_then(|n| user_named(&n));
+    let gid = setting("Group=")
+        .and_then(|g| group(Some(&g), 0))
+        .map(|(_, gid)| gid)
+        .or(user.as_ref().map(|u| u.gid));
+    let home = user.as_ref().map(|u| u.home.clone());
     let (text, missing) = dropin_for(ctx, &cfg, home.as_deref());
     let mut out: Vec<String> = missing.into_iter().map(|m| format!("warning: {m}")).collect();
+    let trash = system_trash_vaults(&cfg);
+    if !trash.is_empty() {
+        out.push(format!("warning: {}", system_trash_message(&trash)));
+    }
+    if ctx.euid == 0 {
+        if let (Some(u), Some(gid)) = (&user, gid) {
+            out.extend(create_writable(&writable_for(ctx, &cfg, home.as_deref()), u.uid, gid));
+        }
+    }
     if text == old {
         return out;
     }
     if ctx.euid != 0 {
         out.push(format!(
-            "the system service's folders or credentials changed; run `sudo lsync service install --system` to update {}",
+            "the system service's folders or credentials changed; run `sudo lsync service install --system --run-as USER` to update {}",
             dpath.display()
         ));
         return out;
@@ -1101,6 +1378,18 @@ mod tests {
         answers: Vec<(String, String, bool)>,
     }
 
+    impl Fake {
+        /// The commands that change something (not `show` queries).
+        fn changes(&self) -> Vec<String> {
+            self.calls
+                .borrow()
+                .iter()
+                .filter(|c| !c.contains(" show"))
+                .cloned()
+                .collect()
+        }
+    }
+
     impl Runner for Fake {
         fn run(&self, prog: &str, args: &[&str], _stdin: Option<&[u8]>) -> std::io::Result<Ran> {
             let line = format!("{prog} {}", args.join(" "));
@@ -1124,18 +1413,25 @@ mod tests {
         setup: Setup,
     }
 
+    /// A machine in a temp folder: the system service's config in
+    /// `etc/lsync`, a user's in `config/lsync`; every vault and state folder
+    /// under `srv/`, so nothing outside the temp folder is ever created.
     fn home(system: bool) -> Home {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().to_path_buf();
         let dirs = Dirs {
             home: Some(root.join("home")),
-            config: root.join("config/lsync"),
+            config: root.join(if system { "etc/lsync" } else { "config/lsync" }),
             state: root.join("state/lsync"),
         };
         std::fs::create_dir_all(&dirs.config).unwrap();
+        let srv = root.join("srv");
         std::fs::write(
             dirs.config.join("lsync.toml"),
-            "[account.home]\nurl = \"http://127.0.0.1:5984\"\nusername = \"u\"\nsecret = \"credential:lsync-home\"\n\n[vault.notes]\naccount = \"home\"\ndatabase = \"notes\"\nfolder = \"~/Notes\"\n\n[vault.work]\naccount = \"home\"\ndatabase = \"work\"\nfolder = \"/srv/work notes\"\nstate_dir = \"/srv/state/work\"\n",
+            format!(
+                "[account.home]\nurl = \"http://127.0.0.1:5984\"\nusername = \"u\"\nsecret = \"credential:lsync-home\"\n\n[vault.notes]\naccount = \"home\"\ndatabase = \"notes\"\nfolder = \"{srv}/Notes\"\n\n[vault.work]\naccount = \"home\"\ndatabase = \"work\"\nfolder = \"{srv}/work notes\"\nstate_dir = \"{srv}/state/work\"\n",
+                srv = srv.display()
+            ),
         )
         .unwrap();
         let setup = Setup {
@@ -1145,6 +1441,11 @@ mod tests {
             system,
         };
         Home { _d: d, root, setup }
+    }
+
+    /// A binary only root can change, as the system unit wants.
+    fn roots_exe() -> PathBuf {
+        std::fs::canonicalize("/bin/sh").unwrap()
     }
 
     fn ctx<'a>(h: &'a Home, runner: &'a Fake, manager: Manager) -> Ctx<'a> {
@@ -1159,11 +1460,47 @@ mod tests {
             euid: 0,
             user: user_name(me).unwrap(),
             uid: me,
-            sudo_user: user_name(me),
-            exe: PathBuf::from("/opt/lsync/bin/lsync"),
+            exe: if manager == Manager::SystemdSystem {
+                roots_exe()
+            } else {
+                PathBuf::from("/opt/lsync/bin/lsync")
+            },
             env: vec![("XDG_STATE_HOME".into(), "/data/state".into())],
             ask_socket: false,
         }
+    }
+
+    fn me() -> String {
+        user_name(livesync_host::control::current_uid()).unwrap()
+    }
+
+    fn as_me() -> InstallOpts {
+        InstallOpts {
+            run_as: Some(me()),
+            ..Default::default()
+        }
+    }
+
+    /// A group of this user's other than its primary one, when it has
+    /// one: the group a chown without root can still change files to.
+    fn another_group() -> Option<(String, u32)> {
+        // SAFETY: getgroups with a buffer of the size it reports.
+        let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut gs = vec![0 as libc::gid_t; n.max(0) as usize];
+        let n = unsafe { libc::getgroups(gs.len() as i32, gs.as_mut_ptr()) };
+        gs.truncate(n.max(0) as usize);
+        let primary = unsafe { libc::getegid() };
+        gs.into_iter().filter(|g| *g != primary).find_map(|g| group(None, g))
+    }
+
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn gid_of(p: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(p).unwrap().gid()
     }
 
     #[test]
@@ -1179,11 +1516,9 @@ mod tests {
         assert!(unit.contains("ExecStart=/opt/lsync/bin/lsync serve\n"), "{unit}");
         assert!(unit.contains("Environment=\"XDG_STATE_HOME=/data/state\"\n"));
         assert_eq!(
-            f.calls
-                .borrow()
-                .iter()
+            f.changes()
+                .into_iter()
                 .filter(|c| c.starts_with("systemctl"))
-                .cloned()
                 .collect::<Vec<_>>(),
             [
                 "systemctl --user daemon-reload",
@@ -1223,7 +1558,7 @@ mod tests {
         let e = install(&c, &InstallOpts::default()).unwrap_err().to_string();
         assert!(e.contains("not written by lsync") && e.contains("--force"), "{e}");
         assert!(uninstall(&c, false).is_err());
-        assert!(f.calls.borrow().is_empty(), "{:?}", f.calls.borrow());
+        assert!(f.changes().is_empty(), "{:?}", f.calls.borrow());
         install(
             &c,
             &InstallOpts {
@@ -1253,7 +1588,7 @@ mod tests {
         .join("\n");
         assert!(printed.contains("Type=notify"));
         assert!(!h.root.join("units").exists());
-        assert!(f.calls.borrow().is_empty());
+        assert!(f.changes().is_empty());
         std::fs::remove_file(&h.setup.config_file).unwrap();
         let e = install(&c, &InstallOpts::default()).unwrap_err().to_string();
         assert!(e.contains("lsync vault add"), "{e}");
@@ -1267,21 +1602,19 @@ mod tests {
         let f = Fake::default();
         let c = ctx(&h, &f, Manager::SystemdSystem);
         let me = c.user.clone();
-        let out = install(&c, &InstallOpts::default()).unwrap().join("\n");
+        let out = install(&c, &as_me()).unwrap().join("\n");
         let unit = std::fs::read_to_string(h.root.join("units/lsync.service")).unwrap();
         assert!(unit.contains(&format!("User={me}\n")), "{unit}");
-        assert!(
-            unit.contains("ExecStart=/opt/lsync/bin/lsync --system serve\n"),
-            "{unit}"
-        );
+        let exe = roots_exe().display().to_string();
+        assert!(unit.contains(&format!("ExecStart={exe} --system serve\n")), "{unit}");
+        assert!(unit.contains(&format!("ExecReload={exe} --system reload\n")), "{unit}");
         // The installer's environment is not the system service's.
         assert!(!unit.contains("XDG_STATE_HOME"), "{unit}");
         let dropin = std::fs::read_to_string(h.root.join("units/lsync.service.d/lsync-vaults.conf")).unwrap();
-        let home_notes = user_named(&me).unwrap().home.join("Notes");
+        let srv = h.root.join("srv").display().to_string();
         assert!(
             dropin.contains(&format!(
-                "ReadWritePaths=-{} -/srv/state/work -\"/srv/work notes\"\n",
-                home_notes.display()
+                "ReadWritePaths=\"-{srv}/Notes\" \"-{srv}/state/work\" \"-{srv}/work notes\"\n"
             )),
             "{dropin}"
         );
@@ -1301,12 +1634,17 @@ mod tests {
 
         // A new vault: the drop-in follows.
         let mut text = std::fs::read_to_string(&h.setup.config_file).unwrap();
-        text.push_str("\n[vault.more]\naccount = \"home\"\ndatabase = \"more\"\nfolder = \"/srv/more\"\n");
+        text.push_str(&format!(
+            "\n[vault.more]\naccount = \"home\"\ndatabase = \"more\"\nfolder = \"{srv}/more\"\n"
+        ));
         std::fs::write(&h.setup.config_file, text).unwrap();
         let said = refresh_dropin(&c).join("\n");
         assert!(said.contains("restart"), "{said}");
         let dropin = std::fs::read_to_string(h.root.join("units/lsync.service.d/lsync-vaults.conf")).unwrap();
-        assert!(dropin.contains("-/srv/more "), "{dropin}");
+        assert!(dropin.contains(&format!("\"-{srv}/more\" ")), "{dropin}");
+        // Root made the new vault's folder, as the service cannot.
+        assert!(said.contains(&format!("created {srv}/more")), "{said}");
+        assert_eq!(mode(&h.root.join("srv/more")), 0o770);
         assert!(refresh_dropin(&c).is_empty(), "nothing changed: nothing said");
 
         let out = uninstall(&c, false).unwrap().join("\n");
@@ -1320,27 +1658,17 @@ mod tests {
         let f = Fake::default();
         let mut c = ctx(&h, &f, Manager::SystemdSystem);
         c.euid = 1000;
-        assert!(install(&c, &InstallOpts::default())
-            .unwrap_err()
-            .to_string()
-            .contains("sudo"));
+        assert!(install(&c, &as_me()).unwrap_err().to_string().contains("sudo"));
         c.euid = 0;
-        c.sudo_user = None;
-        assert!(install(&c, &InstallOpts::default())
-            .unwrap_err()
-            .to_string()
-            .contains("--run-as"));
+        // No default user, not even the one who ran sudo.
+        let e = install(&c, &InstallOpts::default()).unwrap_err().to_string();
+        assert!(e.contains("--run-as") && e.contains("passwords"), "{e}");
         let o = InstallOpts {
             run_as: Some("no-such-user-here".into()),
             ..Default::default()
         };
         assert!(install(&c, &o).unwrap_err().to_string().contains("no user"));
-        let me = user_name(c.uid).unwrap();
-        let o = InstallOpts {
-            run_as: Some(me),
-            print: true,
-            ..Default::default()
-        };
+        let o = InstallOpts { print: true, ..as_me() };
         let printed = install(&c, &o).unwrap().join("\n");
         assert!(
             printed.contains("warning: account home: no credential \"lsync-home\""),
@@ -1350,9 +1678,259 @@ mod tests {
         assert!(f.calls.borrow().is_empty());
         let o = InstallOpts {
             linger: true,
-            ..Default::default()
+            ..as_me()
         };
         assert!(install(&c, &o).unwrap_err().to_string().contains("--linger"));
+        assert!(!h.root.join("units").exists());
+    }
+
+    /// Finding 1 of the review: `install --system` hands a folder to the
+    /// service's user, so it must only ever be the system config folder,
+    /// and in it only the files lsync keeps there.
+    #[test]
+    fn a_system_install_refuses_config_and_touches_only_the_known_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = home(true);
+        let f = Fake::default();
+
+        // `sudo lsync --system --config /etc/lsync.toml service install
+        // --system`: refused before anything is read or changed, with
+        // --print too. Setup::new makes the file's folder the config folder.
+        let elsewhere = h.root.join("etc-like");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::copy(&h.setup.config_file, elsewhere.join("lsync.toml")).unwrap();
+        std::fs::write(elsewhere.join("shadow"), "root's").unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let before: Vec<(u32, u32)> = ["", "lsync.toml", "shadow"]
+            .iter()
+            .map(|n| (mode(&elsewhere.join(n)), gid_of(&elsewhere.join(n))))
+            .collect();
+        let explicit = Setup {
+            config_file: elsewhere.join("lsync.toml"),
+            dirs: Dirs {
+                config: elsewhere.clone(),
+                ..h.setup.dirs.clone()
+            },
+            explicit: Some(elsewhere.join("lsync.toml")),
+            system: true,
+        };
+        let mut c = ctx(&h, &f, Manager::SystemdSystem);
+        c.setup = &explicit;
+        for print in [false, true] {
+            let o = InstallOpts {
+                print,
+                group: another_group().map(|g| g.0),
+                ..as_me()
+            };
+            let e = install(&c, &o).unwrap_err().to_string();
+            assert!(
+                e.contains("--config") && e.contains("not for the system service"),
+                "{e}"
+            );
+        }
+        // A $CONFIGURATION_DIRECTORY elsewhere: refused too (printed with a warning).
+        let env_dir = Setup {
+            config_file: explicit.config_file.clone(),
+            dirs: explicit.dirs.clone(),
+            explicit: None,
+            system: true,
+        };
+        c.setup = &env_dir;
+        let e = install(&c, &as_me()).unwrap_err().to_string();
+        assert!(e.contains("CONFIGURATION_DIRECTORY"), "{e}");
+        let printed = install(&c, &InstallOpts { print: true, ..as_me() }).unwrap().join("\n");
+        assert!(
+            printed.contains("# warning: the system service reads its config from"),
+            "{printed}"
+        );
+        let after: Vec<(u32, u32)> = ["", "lsync.toml", "shadow"]
+            .iter()
+            .map(|n| (mode(&elsewhere.join(n)), gid_of(&elsewhere.join(n))))
+            .collect();
+        assert_eq!(before, after, "nothing elsewhere changed");
+        assert!(f.calls.borrow().is_empty() && !h.root.join("units").exists());
+
+        // The system config folder: its known files are handed over, hard
+        // links, symlinks and other files are not.
+        let etc = h.setup.dirs.config.clone();
+        let shadow = h.root.join("shadow");
+        std::fs::write(&shadow, "root's").unwrap();
+        std::fs::hard_link(&shadow, etc.join("secrets.toml")).unwrap();
+        std::fs::write(etc.join(".lsync.toml.lock"), "").unwrap();
+        std::fs::write(etc.join("stranger"), "").unwrap();
+        std::os::unix::fs::symlink(&shadow, etc.join("link")).unwrap();
+        std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let untouched = |p: &Path| (gid_of(p), mode(p));
+        let shadow_was = untouched(&shadow);
+        let stranger_was = untouched(&etc.join("stranger"));
+        let link_was = untouched(&etc.join("link"));
+        c.setup = &h.setup;
+        let other = another_group();
+        let o = InstallOpts {
+            group: other.as_ref().map(|g| g.0.clone()),
+            ..as_me()
+        };
+        let out = install(&c, &o).unwrap().join("\n");
+        assert!(
+            out.contains(&format!(
+                "warning: {} is not a plain file",
+                etc.join("secrets.toml").display()
+            )),
+            "{out}"
+        );
+        assert_eq!(mode(&etc), 0o700);
+        assert_eq!(untouched(&shadow), shadow_was);
+        assert_eq!(untouched(&etc.join("stranger")), stranger_was);
+        assert_eq!(untouched(&etc.join("link")), link_was);
+        if let Some((_, gid)) = &other {
+            for n in ["", "lsync.toml", ".lsync.toml.lock"] {
+                assert_eq!(gid_of(&etc.join(n)), *gid, "{n} handed over");
+            }
+            // Again with the user's own group (finding 5: whatever the
+            // files' owner now, they follow the service's user).
+            let primary = user_named(&me()).unwrap().gid;
+            install(&c, &as_me()).unwrap();
+            for n in ["", "lsync.toml", ".lsync.toml.lock"] {
+                assert_eq!(gid_of(&etc.join(n)), primary, "{n} handed over again");
+            }
+            assert_eq!(untouched(&shadow), shadow_was);
+        } else {
+            eprintln!("this user has one group only: the owners were not compared");
+        }
+    }
+
+    #[test]
+    fn a_system_install_wants_a_binary_only_root_can_change() {
+        let h = home(true);
+        let f = Fake::default();
+        let mut c = ctx(&h, &f, Manager::SystemdSystem);
+        c.exe = std::env::current_exe().unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let e = install(&c, &as_me()).unwrap_err().to_string();
+        assert!(e.contains("not root") && e.contains("sudo install -m755"), "{e}");
+        let printed = install(&c, &InstallOpts { print: true, ..as_me() }).unwrap().join("\n");
+        assert!(printed.contains("# warning: the service would run"), "{printed}");
+        assert!(exe_not_roots(Path::new("/no/such/lsync")).is_some());
+        assert_eq!(exe_not_roots(&roots_exe()), None);
+        let d = tempfile::tempdir().unwrap();
+        assert!(exe_not_roots(d.path()).unwrap().contains("not root"));
+        assert!(!h.root.join("units").exists());
+    }
+
+    #[test]
+    fn a_system_install_refuses_the_system_trash_and_warns_of_plain_passwords() {
+        let h = home(true);
+        let f = Fake::default();
+        let c = ctx(&h, &f, Manager::SystemdSystem);
+        let text = std::fs::read_to_string(&h.setup.config_file).unwrap();
+        std::fs::write(
+            &h.setup.config_file,
+            text.replace("database = \"work\"\n", "database = \"work\"\ntrash = \"system\"\n"),
+        )
+        .unwrap();
+        let e = install(&c, &as_me()).unwrap_err().to_string();
+        assert!(e.contains("work") && e.contains("trash = \"system\""), "{e}");
+        assert!(!h.root.join("units").exists());
+
+        // A password in secrets.toml: installed, with a warning.
+        std::fs::write(
+            &h.setup.config_file,
+            text.replace("secret = \"credential:lsync-home\"\n", ""),
+        )
+        .unwrap();
+        let out = install(&c, &as_me()).unwrap().join("\n");
+        assert!(
+            out.contains("warning: account(s) home keep the password in plain text"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_system_install_creates_the_missing_folders_for_the_service() {
+        let h = home(true);
+        let f = Fake::default();
+        let c = ctx(&h, &f, Manager::SystemdSystem);
+        // `work notes` exists, with a mode of its own; the others do not.
+        let srv = h.root.join("srv");
+        std::fs::create_dir_all(srv.join("work notes")).unwrap();
+        std::fs::set_permissions(
+            srv.join("work notes"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let out = install(&c, &as_me()).unwrap().join("\n");
+        assert!(
+            out.contains(&format!("created {}", srv.join("Notes").display())),
+            "{out}"
+        );
+        assert_eq!(mode(&srv.join("Notes")), 0o770);
+        assert_eq!(mode(&srv.join("state/work")), 0o700);
+        assert_eq!(mode(&srv.join("work notes")), 0o755, "left as it was");
+        assert!(
+            !out.contains(&format!("created {}", srv.join("work notes").display())),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_vault_home_is_the_service_users() {
+        let h = home(true);
+        let f = Fake::default();
+        let c = ctx(&h, &f, Manager::SystemdSystem);
+        let mut cfg = c.setup.load_accounts().unwrap().unwrap();
+        cfg.vault.get_mut("notes").unwrap().folder = "~/Notes".into();
+        let (dropin, _) = dropin_for(&c, &cfg, Some(Path::new("/var/lib/lsync-home")));
+        assert!(dropin.contains("\"-/var/lib/lsync-home/Notes\""), "{dropin}");
+    }
+
+    #[test]
+    fn a_user_unit_goes_only_where_the_user_manager_reads() {
+        let h = home(false);
+        let unit_dir = h.root.join("units");
+        let f = Fake {
+            answers: vec![(
+                "systemctl --user show --property=UnitPath".into(),
+                "/home/u/.config/systemd/user.control /home/u/.config/systemd/user /usr/lib/systemd/user\n".into(),
+                true,
+            )],
+            ..Default::default()
+        };
+        let c = ctx(&h, &f, Manager::SystemdUser);
+        let e = install(&c, &InstallOpts::default()).unwrap_err().to_string();
+        assert!(
+            e.contains(&format!("does not read units from {}", unit_dir.display()))
+                && e.contains("/home/u/.config/systemd/user"),
+            "{e}"
+        );
+        assert!(!unit_dir.exists());
+        let printed = install(
+            &c,
+            &InstallOpts {
+                print: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .join("\n");
+        assert!(
+            printed.contains("# warning: the user's service manager does not read"),
+            "{printed}"
+        );
+
+        // Where it does read: installed.
+        let f = Fake {
+            answers: vec![(
+                "systemctl --user show --property=UnitPath".into(),
+                format!("/home/u/.config/systemd/user {}\n", unit_dir.display()),
+                true,
+            )],
+            ..Default::default()
+        };
+        let c = ctx(&h, &f, Manager::SystemdUser);
+        install(&c, &InstallOpts::default()).unwrap();
+        assert!(unit_dir.join(UNIT_NAME).exists());
     }
 
     #[test]

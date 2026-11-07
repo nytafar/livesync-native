@@ -94,6 +94,50 @@ pub fn folder_owner_for_root(dir: &Path) -> Option<(u32, u32)> {
     (md.uid() != 0).then(|| (md.uid(), md.gid()))
 }
 
+/// Give the plain file `name` in `dir` to `uid:gid`, as root may safely do
+/// in a folder another user can write: the name is opened without following
+/// a symlink, and only a regular file with a single link is changed, so a
+/// hard link that user planted to a file of root's (`ln /etc/shadow x`) is
+/// left alone. `Ok(false)` when there is no such file, or it is not one to
+/// change.
+#[cfg(unix)]
+pub fn chown_plain_file(dir: &Path, name: &str, uid: u32, gid: u32) -> std::io::Result<bool> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a file name: {name:?}"),
+        ));
+    }
+    let cname = std::ffi::CString::new(name).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let d = std::fs::File::open(dir)?;
+    // SAFETY: a valid folder fd and a NUL-terminated name. O_NONBLOCK: a
+    // FIFO planted under the name does not block the open.
+    let fd = unsafe {
+        libc::openat(
+            d.as_raw_fd(),
+            cname.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENOENT) | Some(libc::ELOOP) => Ok(false),
+            _ => Err(e),
+        };
+    }
+    // SAFETY: openat returned a new fd that nothing else owns.
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let md = f.metadata()?;
+    if !md.file_type().is_file() || md.nlink() != 1 {
+        return Ok(false);
+    }
+    std::os::unix::fs::fchown(&f, Some(uid), Some(gid))?;
+    Ok(true)
+}
+
 #[cfg(unix)]
 fn hand_to_folder_owner(f: &std::fs::File, dir: &Path) -> std::io::Result<()> {
     if let Some((uid, gid)) = folder_owner_for_root(dir) {
@@ -127,14 +171,19 @@ impl ConfigLock {
                 write_private_dir(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
             }
         }
+        // Root hands over only a lock file it creates here, never one that
+        // was there (the folder's owner could have made it a hard link).
+        let existed = std::fs::symlink_metadata(&lock_path).is_ok();
         let end = Instant::now() + LOCK_WAIT;
         loop {
             match LockFile::try_acquire(&lock_path) {
                 Ok(l) => {
                     // As the files beside it (see `folder_owner_for_root`).
                     #[cfg(unix)]
-                    if let Some((uid, gid)) = path.parent().and_then(folder_owner_for_root) {
-                        let _ = std::os::unix::fs::lchown(&lock_path, Some(uid), Some(gid));
+                    if let (false, Some(dir)) = (existed, path.parent()) {
+                        if let Some((uid, gid)) = folder_owner_for_root(dir) {
+                            let _ = chown_plain_file(dir, &format!(".{name}.lock"), uid, gid);
+                        }
                     }
                     return Ok(ConfigLock { _lock: l });
                 }
@@ -464,6 +513,46 @@ pub fn string_array(items: &[String]) -> toml_edit::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A group of this user's other than its own, when it has one: the
+    /// group a chown without root can still change files to.
+    #[cfg(unix)]
+    fn another_group() -> Option<u32> {
+        // SAFETY: getgroups with a buffer of the size it reports.
+        let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut gs = vec![0 as libc::gid_t; n.max(0) as usize];
+        let n = unsafe { libc::getgroups(gs.len() as i32, gs.as_mut_ptr()) };
+        let primary = unsafe { libc::getegid() };
+        gs.truncate(n.max(0) as usize);
+        gs.into_iter().find(|g| *g != primary)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_hands_over_only_plain_single_link_files() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("conf");
+        std::fs::create_dir(&dir).unwrap();
+        let outside = d.path().join("shadow");
+        std::fs::write(&outside, "root's").unwrap();
+        std::fs::write(dir.join("lsync.toml"), "x").unwrap();
+        // What the folder's owner could plant for root to chown.
+        std::os::unix::fs::symlink(&outside, dir.join("secrets.toml")).unwrap();
+        std::fs::hard_link(&outside, dir.join("hard")).unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = another_group().unwrap_or_else(|| unsafe { libc::getegid() });
+        let before = std::fs::metadata(&outside).unwrap().gid();
+        assert!(chown_plain_file(&dir, "lsync.toml", uid, gid).unwrap());
+        assert!(!chown_plain_file(&dir, "secrets.toml", uid, gid).unwrap(), "a symlink");
+        assert!(!chown_plain_file(&dir, "hard", uid, gid).unwrap(), "a second link");
+        assert!(!chown_plain_file(&dir, "sub", uid, gid).unwrap(), "a folder");
+        assert!(!chown_plain_file(&dir, "missing", uid, gid).unwrap());
+        assert!(chown_plain_file(&dir, "../shadow", uid, gid).is_err());
+        assert_eq!(std::fs::metadata(dir.join("lsync.toml")).unwrap().gid(), gid);
+        assert_eq!(std::fs::metadata(&outside).unwrap().gid(), before, "untouched");
+    }
 
     fn dirs(d: &Path) -> Dirs {
         Dirs {

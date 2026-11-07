@@ -408,7 +408,15 @@ impl SecretStore for CredentialStore {
                 "systemd credential {key:?} is set in the service unit (systemd-creds encrypt), or by root with `sudo lsync --system account passwd`"
             )));
         };
-        std::fs::create_dir_all(&w.dir)
+        // 0700, as systemd makes it: only root reads the credentials.
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        b.create(&w.dir)
             .map_err(|e| SecretError::Failed(format!("creating {}: {e}", w.dir.display())))?;
         // Into a new file first: a failed encryption leaves the old one.
         let path = w.dir.join(key);
@@ -693,6 +701,15 @@ mod tests {
         c.set("lsync-home", &Secret::new("pw1")).unwrap();
         let file = d.path().join("credstore.encrypted/lsync-home");
         assert!(!std::fs::read_to_string(&file).unwrap().contains("pw1"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(d.path().join("credstore.encrypted"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "only root reads the credentials");
+        }
         assert_eq!(c.get("lsync-home").unwrap().unwrap().expose(), "pw1");
         // A failed encryption keeps the old credential and leaves no temp file.
         assert!(c.set("lsync-home", &Secret::new("fail")).is_err());

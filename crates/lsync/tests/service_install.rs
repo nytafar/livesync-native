@@ -61,12 +61,27 @@ impl Machine {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// The commands run, but the read-only `systemctl show` queries.
     fn calls(&self) -> Vec<String> {
         std::fs::read_to_string(self.root.join("calls.log"))
             .unwrap_or_default()
             .lines()
+            .filter(|l| !l.contains(" show "))
             .map(str::to_string)
             .collect()
+    }
+
+    /// `systemctl --user show --property=UnitPath` answers `paths`.
+    fn manager_reads(&self, paths: &str) {
+        let p = self.root.join("bin/systemctl");
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\necho \"systemctl $*\" >> '{}'\ncase \"$*\" in *UnitPath*) echo '{paths}';; *) echo enabled;; esac\n",
+                self.root.join("calls.log").display()
+            ),
+        )
+        .unwrap();
     }
 
     fn unit(&self) -> PathBuf {
@@ -94,6 +109,28 @@ fn verify(path: &Path) {
 }
 
 #[test]
+fn a_user_unit_is_not_written_where_the_user_manager_does_not_look() {
+    // The testbed's machines set XDG_CONFIG_HOME; the user's manager reads
+    // its own (finding 13 of the review).
+    let m = Machine::new();
+    m.manager_reads("/home/u/.config/systemd/user /usr/lib/systemd/user");
+    let out = m.cmd(&["service", "install"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("does not read units from"),
+        "{err}"
+    );
+    assert!(!m.unit().exists());
+    assert!(m.calls().is_empty(), "{:?}", m.calls());
+    m.manager_reads(&format!(
+        "/usr/lib/systemd/user {}",
+        m.root.join("config/systemd/user").display()
+    ));
+    m.ok(&["service", "install", "--no-start"]);
+    assert!(m.unit().exists());
+}
+
+#[test]
 fn a_user_service_installs_into_the_config_home_and_uninstalls() {
     let m = Machine::new();
     let out = m.ok(&["service", "install"]);
@@ -102,6 +139,10 @@ fn a_user_service_installs_into_the_config_home_and_uninstalls() {
     let unit = std::fs::read_to_string(m.unit()).unwrap();
     let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_lsync")).unwrap();
     assert!(unit.contains(&format!("ExecStart={} serve\n", exe.display())), "{unit}");
+    assert!(
+        unit.contains(&format!("ExecReload={} reload\n", exe.display())),
+        "{unit}"
+    );
     // The service finds the same config, state and socket as this CLI.
     for k in ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "LSYNC_RUNTIME_DIR"] {
         assert!(unit.contains(&format!("Environment=\"{k}=")), "{k}: {unit}");
@@ -157,7 +198,11 @@ fn a_system_unit_is_printed_without_root_and_installed_only_with_it() {
     let text = print(&[]);
     assert!(text.contains(&format!("User={me}\n")), "{text}");
     assert!(text.contains(" --system serve\n"), "{text}");
-    assert!(text.contains("ReadWritePaths=-"), "{text}");
+    assert!(text.contains(" --system reload\n"), "{text}");
+    assert!(text.contains("UMask=0007\n"), "{text}");
+    assert!(text.contains("ReadWritePaths=\"-"), "{text}");
+    // This test binary is the user's, not root's: said, and refused below.
+    assert!(text.contains("# warning: the service would run"), "{text}");
     assert!(!text.contains("XDG_CONFIG_HOME"), "{text}");
     // The unit as printed passes systemd-analyze.
     let unit = m.root.join("print/lsync.service");
@@ -172,6 +217,32 @@ fn a_system_unit_is_printed_without_root_and_installed_only_with_it() {
         .collect();
     std::fs::write(&unit, body).unwrap();
     verify(&unit);
+
+    // --config with --system (finding 1 of the review): refused before
+    // anything is read, so a config file's folder (/etc for
+    // /etc/lsync.toml) is never handed to the service's user.
+    let parent = m.root.join("etc");
+    let before = std::fs::metadata(&parent).unwrap().permissions();
+    for extra in [&[][..], &["--print"][..]] {
+        let config = parent.join("lsync.toml");
+        std::fs::copy(etc.join("lsync.toml"), &config).unwrap();
+        let mut args = vec!["--system", "--config", config.to_str().unwrap(), "service", "install"];
+        args.extend_from_slice(&["--run-as", me]);
+        args.extend_from_slice(extra);
+        let out = m.cmd(&args).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && err.contains("--config") && err.contains("not for the system service"),
+            "{err}"
+        );
+        // LSYNC_CONFIG is --config too.
+        let mut c = m.cmd(&["--system", "service", "install", "--run-as", me]);
+        c.env("LSYNC_CONFIG", &config);
+        let out = c.output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not for the system service"));
+    }
+    assert_eq!(std::fs::metadata(&parent).unwrap().permissions(), before);
+    assert!(m.calls().is_empty(), "{:?}", m.calls());
 
     if unsafe { libc::geteuid() } != 0 {
         let mut c = m.cmd(&["--system", "service", "install", "--run-as", me]);
@@ -234,4 +305,34 @@ fn doctor_reports_the_password_the_folders_and_the_service() {
     }
     let svc = find(&v, "service");
     assert!(svc[0].1.contains("not installed"), "{svc:?}");
+}
+
+#[test]
+fn doctor_for_the_system_service_wants_the_folder_and_no_system_trash() {
+    let m = Machine::new();
+    let etc = m.root.join("etc/lsync");
+    std::fs::create_dir_all(&etc).unwrap();
+    let folder = m.root.join("srv/notes");
+    std::fs::write(
+        etc.join("lsync.toml"),
+        format!(
+            "[account.dev]\nurl = \"http://127.0.0.1:9\"\n\n[vault.notes]\naccount = \"dev\"\ndatabase = \"notes\"\nfolder = \"{}\"\ntrash = \"system\"\n",
+            folder.display()
+        ),
+    )
+    .unwrap();
+    let mut c = m.cmd(&["--system", "doctor", "--json"]);
+    c.env("CONFIGURATION_DIRECTORY", &etc);
+    let out = c.output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let vault: Vec<String> = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["area"] == "vault" && c["level"] == "error")
+        .map(|c| c["message"].as_str().unwrap().to_string())
+        .collect();
+    assert!(vault.iter().any(|m| m.contains("cannot create it")), "{vault:?}");
+    assert!(vault.iter().any(|m| m.contains("trash = \"system\"")), "{vault:?}");
 }

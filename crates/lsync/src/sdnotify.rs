@@ -145,9 +145,105 @@ pub fn watchdog_interval_from(usec: Option<&str>, pid: Option<&str>, me: u32) ->
     Some(Duration::from_micros(usec / 2).max(Duration::from_millis(10)))
 }
 
+/// Send `WATCHDOG=1` every `every`, each time only after `alive` has
+/// returned. `alive` takes the locks the service works under, so a vault
+/// stuck holding one stops the pings and systemd restarts the service, as
+/// it would for a runtime that stopped scheduling tasks. It runs on a
+/// blocking thread: a lock that never comes free stalls this task, not a
+/// runtime worker.
+pub fn spawn_watchdog(
+    n: std::sync::Arc<Notifier>,
+    every: Duration,
+    alive: std::sync::Arc<dyn Fn() + Send + Sync>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let a = alive.clone();
+            if tokio::task::spawn_blocking(move || a()).await.is_err() {
+                warn!("watchdog: the liveness check panicked; no more pings");
+                return;
+            }
+            n.watchdog();
+        }
+    })
+}
+
+/// SIGHUP reloads in flight: `RELOADING=1` when the first one starts,
+/// `READY=1` only when the last one has ended, so two signals close
+/// together never say READY while a reload still runs.
+#[derive(Debug, Default)]
+pub struct Reloads(std::sync::atomic::AtomicUsize);
+
+impl Reloads {
+    /// A reload starts: whether to send `RELOADING=1`.
+    pub fn begin(&self) -> bool {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+    }
+
+    /// A reload ended: whether to send `READY=1`.
+    pub fn end(&self) -> bool {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapping_reloads_say_ready_once_the_last_one_ends() {
+        let r = Reloads::default();
+        assert!(r.begin());
+        assert!(!r.begin(), "already reloading");
+        assert!(!r.end(), "the other one still runs");
+        assert!(r.end());
+        assert!(r.begin(), "a new reload later");
+        assert!(r.end());
+    }
+
+    #[test]
+    fn the_watchdog_stops_pinging_while_the_service_is_stuck() {
+        use std::sync::{Arc, Mutex};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("notify");
+        let rx = UnixDatagram::bind(&path).unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let n = Arc::new(Notifier::new(path.to_str().unwrap()).unwrap().unwrap());
+        // The service's lock, as a vault would hold it forever.
+        let lock = Arc::new(Mutex::new(()));
+        let l = lock.clone();
+        let alive: Arc<dyn Fn() + Send + Sync> = Arc::new(move || drop(l.lock().unwrap()));
+        let task = {
+            let _in = rt.enter();
+            spawn_watchdog(n, Duration::from_millis(20), alive)
+        };
+        let recv = || {
+            let mut buf = [0u8; 64];
+            rx.recv(&mut buf).ok().map(|n| buf[..n].to_vec())
+        };
+        assert_eq!(recv().as_deref(), Some(&b"WATCHDOG=1"[..]));
+        let held = lock.lock().unwrap();
+        // The pings already sent (or past the lock) arrive; then silence.
+        let mut queued = 0;
+        while recv().is_some() {
+            queued += 1;
+            assert!(queued < 5, "still pinging while the lock is held");
+        }
+        for _ in 0..2 {
+            assert_eq!(recv(), None, "no ping while the lock is held");
+        }
+        drop(held);
+        assert_eq!(recv().as_deref(), Some(&b"WATCHDOG=1"[..]));
+        task.abort();
+    }
 
     #[test]
     fn messages_are_as_systemd_reads_them() {

@@ -343,10 +343,22 @@ pub fn peak_rss_kib() -> Option<u64> {
     livesync_engine::platform::peak_rss_kib()
 }
 
+/// Whether the keyring may show its dialogs (the Keychain's unlock and
+/// "allow" prompts): for a command a user runs at a terminal, never for the
+/// long-running ones, which nobody watches.
+fn keyring_may_prompt(cmd: &Cmd, terminal: bool) -> bool {
+    terminal && !matches!(cmd, Cmd::Serve { .. } | Cmd::Daemon { .. })
+}
+
 fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
     let mut overrides = cli.overrides.clone();
     if cli.system {
         livesync_host::control::use_system_service();
+    }
+    {
+        use std::io::IsTerminal;
+        let terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        livesync_host::keyring::allow_prompts(keyring_may_prompt(&cli.cmd, terminal));
     }
     let ctx = Setup::new(cli.config.clone(), cli.system);
     ctx.migrate_if_needed();
@@ -413,6 +425,14 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         }
         other => other,
     };
+    // A member of the system service's group cannot read its config (0700:
+    // it may hold passwords). A command for one of its vaults, named with
+    // --vault, goes to the service by that name.
+    if ctx.system && unreadable(&ctx.config_file) {
+        if let Some(vault) = cli.vault.clone().filter(|v| !config::looks_like_path(v)) {
+            return by_name(cmd, &vault, &ctx, matches);
+        }
+    }
     let mut selector = Selector {
         vault: cli.vault.clone(),
         // A flag wins over the environment: `--vault NAME` over `LSYNC_PROFILE`.
@@ -463,20 +483,12 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
             let index_path = r.state_dir.join("index.sqlite");
             let st = match route::route(&r, "status", false)? {
                 Route::Service { mut client, vault, .. } => {
-                    let view = route::status_of(&mut client, Some(&vault))?.vaults.into_iter().next();
-                    // A service older than these fields in the status has
-                    // them in its vault view.
-                    let confirmed = view
-                        .as_ref()
-                        .map_or((false, false), |v| (v.mass_delete_allowed, v.mass_delete_waits));
-                    let Some(mut st) = view.and_then(|v| v.status) else {
+                    let Some(mut st) = service_status(&mut client, &vault)? else {
                         bail!("no index at {} yet; run `lsync pull` first", index_path.display());
                     };
                     // As this command names them, like the one-shot status.
                     st.vault = r.vault.display().to_string();
                     st.index = index_path.display().to_string();
-                    st.mass_delete_allowed |= confirmed.0;
-                    st.mass_delete_waits |= confirmed.1;
                     st
                 }
                 Route::Local => {
@@ -583,7 +595,15 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         Cmd::Sync { json, push } => rt()?.block_on(async {
             two_way_allowed(&sel, "sync")?;
             if let Some((mut client, vault, fingerprint)) = routed(&sel, &cfg, &ctx.dirs, "sync")? {
-                return run_routed(&mut client, method::SYNC, &vault, fingerprint, &sel, &push, json);
+                return run_routed(
+                    &mut client,
+                    method::SYNC,
+                    &vault,
+                    fingerprint,
+                    sel.tuning.allow_plugin,
+                    &push,
+                    json,
+                );
             }
             let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             run_sync(&engine, json, false).await
@@ -591,7 +611,15 @@ fn run(cli: Cli, matches: &clap::ArgMatches) -> Result<u8> {
         Cmd::Fetch { json, push } => rt()?.block_on(async {
             two_way_allowed(&sel, "fetch")?;
             if let Some((mut client, vault, fingerprint)) = routed(&sel, &cfg, &ctx.dirs, "fetch")? {
-                return run_routed(&mut client, method::FETCH, &vault, fingerprint, &sel, &push, json);
+                return run_routed(
+                    &mut client,
+                    method::FETCH,
+                    &vault,
+                    fingerprint,
+                    sel.tuning.allow_plugin,
+                    &push,
+                    json,
+                );
             }
             let engine = engine_for(&sel, &cfg, &ctx.dirs, &push)?;
             run_sync(&engine, json, true).await
@@ -832,13 +860,107 @@ fn command(c: &mut Client, m: &str, p: serde_json::Value) -> Result<std::result:
     }
 }
 
+/// The status of a vault the service runs, with what the service's view
+/// adds (`None`: no index yet).
+fn service_status(client: &mut Client, vault: &str) -> Result<Option<livesync_engine::Status>> {
+    let view = route::status_of(client, Some(vault))?.vaults.into_iter().next();
+    // A service older than these fields in the status has them in its
+    // vault view.
+    let confirmed = view
+        .as_ref()
+        .map_or((false, false), |v| (v.mass_delete_allowed, v.mass_delete_waits));
+    Ok(view.and_then(|v| v.status).map(|mut st| {
+        st.mass_delete_allowed |= confirmed.0;
+        st.mass_delete_waits |= confirmed.1;
+        st
+    }))
+}
+
+/// Whether the config file is there but this user may not read it.
+fn unreadable(path: &std::path::Path) -> bool {
+    matches!(std::fs::File::open(path), Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
+/// Settings given to this command (flags or `LSYNC_*`), which a command run
+/// by the service's settings would silently ignore.
+fn settings_given(matches: &clap::ArgMatches) -> Vec<String> {
+    let probe = <config::Overrides as clap::Args>::augment_args(clap::Command::new("probe"));
+    probe
+        .get_arguments()
+        .filter(|a| {
+            matches!(
+                matches.value_source(a.get_id().as_str()),
+                Some(clap::parser::ValueSource::CommandLine | clap::parser::ValueSource::EnvVariable)
+            )
+        })
+        .map(|a| format!("--{}", a.get_long().unwrap_or(a.get_id().as_str())))
+        .collect()
+}
+
+/// `lsync --system --vault NAME status|sync|fetch|pull` for a user who may
+/// use the system service (its socket group) but not read its config: the
+/// service runs it by name, with its own settings.
+fn by_name(cmd: Cmd, vault: &str, ctx: &Setup, matches: &clap::ArgMatches) -> Result<u8> {
+    let cannot = format!(
+        "{} can be read only by the system service's user",
+        ctx.config_file.display()
+    );
+    let given = settings_given(matches);
+    if !given.is_empty() {
+        bail!(
+            "{cannot}, so this command runs with the service's settings for {vault}; {} would not apply. Leave them out",
+            given.join(", ")
+        );
+    }
+    match cmd {
+        Cmd::Status { json, .. } => {
+            let mut c = route::require(&[method::STATUS])?;
+            let Some(st) = service_status(&mut c, vault)? else {
+                bail!("the lsync service has no index of {vault} yet");
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&st)?);
+            } else {
+                print_status(&st);
+            }
+            Ok(0)
+        }
+        Cmd::Sync { json, push } => {
+            let mut c = route::require(&[method::SYNC])?;
+            run_routed(&mut c, method::SYNC, vault, None, false, &push, json)
+        }
+        Cmd::Fetch { json, push } => {
+            let mut c = route::require(&[method::FETCH])?;
+            run_routed(&mut c, method::FETCH, vault, None, false, &push, json)
+        }
+        Cmd::Pull { json } => {
+            let mut c = route::require(&[method::PULL])?;
+            match command(&mut c, method::PULL, json!({ "vault": vault }))? {
+                Ok(r) => print_pull(
+                    &serde_json::from_value(r.report)?,
+                    Duration::from_millis(r.wall_ms),
+                    r.peak_rss_kib,
+                    json,
+                ),
+                Err(refusal) => {
+                    eprintln!("pull refused: {refusal}");
+                    Ok(2)
+                }
+            }
+        }
+        _ => bail!(
+            "{cannot}; a member of its group can run `lsync --system --vault {vault} status|sync|fetch|pull`, and `status --all`, `pause`, `resume`, `sync-now`, `events` and `reload`"
+        ),
+    }
+}
+
 /// `sync` or `fetch` in the service, printed as the one-shot prints it.
 fn run_routed(
     c: &mut Client,
     m: &str,
     vault: &str,
     fingerprint: Option<String>,
-    sel: &Selected,
+    allow_plugin: bool,
     push: &PushOpts,
     json: bool,
 ) -> Result<u8> {
@@ -847,7 +969,7 @@ fn run_routed(
         "fingerprint": fingerprint,
         "allow_mass_delete": push.allow_mass_delete,
         "remove_out_of_scope_copies": push.remove_out_of_scope_copies,
-        "allow_plugin": push.allow_plugin || sel.tuning.allow_plugin,
+        "allow_plugin": push.allow_plugin || allow_plugin,
     });
     match command(c, m, p)? {
         Ok(r) => print_sync(
@@ -1543,5 +1665,22 @@ fn print_status(s: &livesync_engine::Status) {
         for p in &s.pending {
             println!("  {}  — {} (attempts {})", p.doc_id, p.reason, p.attempts);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_command_at_a_terminal_may_show_keyring_dialogs() {
+        let doctor = Cmd::Doctor { json: false };
+        assert!(keyring_may_prompt(&doctor, true));
+        assert!(!keyring_may_prompt(&doctor, false));
+        let serve = Cmd::Serve {
+            opts: serve::ServeOpts::default(),
+        };
+        assert!(!keyring_may_prompt(&serve, true), "the service never waits on a dialog");
+        assert!(!livesync_host::keyring::prompts_allowed(), "off unless allowed");
     }
 }

@@ -856,6 +856,44 @@ fn the_system_service_has_its_own_config_state_and_socket() {
         "{st}"
     );
     assert!(var.join("notes").is_dir());
+
+    // A member of the service's group may not read its config (0700): a
+    // command for one of its vaults goes to the service by name. Here the
+    // folder is made unreadable to this user instead (not as root, who
+    // reads it anyway).
+    if unsafe { libc::geteuid() } != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let st = m.run(&["--system", "--vault", "notes", "status", "--json"]);
+        let sync = m.run(&["--system", "--vault", "notes", "sync", "--json"]);
+        let given = m.run(&["--system", "--vault", "notes", "--db", "other", "sync"]);
+        let other = m.run(&["--system", "--vault", "notes", "folders"]);
+        std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let text = |o: &std::process::Output| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )
+        };
+        assert!(st.status.success(), "{}", text(&st));
+        let st: serde_json::Value = serde_json::from_slice(&st.stdout).unwrap();
+        assert!(
+            st.to_string().contains(&var.join("notes").display().to_string()),
+            "{st}"
+        );
+        assert!(sync.status.success(), "{}", text(&sync));
+        assert!(
+            !given.status.success() && text(&given).contains("--db would not apply"),
+            "{}",
+            text(&given)
+        );
+        assert!(
+            !other.status.success() && text(&other).contains("can be read only by the system service's user"),
+            "{}",
+            text(&other)
+        );
+    }
     assert_eq!(svc.stop(), Some(0));
 
     // Without LSYNC_RUNTIME_DIR, `--system` looks only at the system

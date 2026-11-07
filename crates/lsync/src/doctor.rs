@@ -66,10 +66,21 @@ pub fn count_watched_dirs(root: &Path, cap: u64) -> u64 {
     n
 }
 
-/// Whether this process may read and write a vault folder.
-pub fn folder_access(folder: &Path) -> Check {
+/// Whether this process may read and write a vault folder. `system`: the
+/// folder is the system service's, which cannot create a missing one.
+pub fn folder_access(folder: &Path, system: bool) -> Check {
     let area = "vault";
     match std::fs::metadata(folder) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && system => {
+            return check(
+                Level::Error,
+                area,
+                format!(
+                    "{} does not exist, and the system service cannot create it (ProtectSystem=strict leaves a missing folder read-only); `sudo lsync service install --system --run-as USER` creates it for the service's user",
+                    folder.display()
+                ),
+            )
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return check(
                 Level::Warn,
@@ -246,9 +257,19 @@ pub fn checks(ctx: &Setup) -> Vec<Check> {
                 continue;
             }
             let folder = v.folder_path(&ctx.dirs);
-            let mut c = folder_access(&folder);
+            let mut c = folder_access(&folder, ctx.system);
             c.message = format!("{name}: {}", c.message);
             out.push(c);
+            let system_trash = v
+                .what_syncs()
+                .is_ok_and(|w| w.trash == livesync_engine::vaultfs::TrashMode::System);
+            if ctx.system && system_trash {
+                out.push(check(
+                    Level::Error,
+                    "vault",
+                    format!("{name}: {}", install::system_trash_message(std::slice::from_ref(name))),
+                ));
+            }
             watched += count_watched_dirs(&folder, 10_000_000);
         }
     }
@@ -349,18 +370,22 @@ mod tests {
     #[test]
     fn folder_access_says_what_is_wrong() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(folder_access(d.path()).level, Level::Ok);
-        assert_eq!(folder_access(&d.path().join("missing")).level, Level::Warn);
+        assert_eq!(folder_access(d.path(), false).level, Level::Ok);
+        assert_eq!(folder_access(&d.path().join("missing"), false).level, Level::Warn);
+        // The system service never creates it: an error, and what to do.
+        let c = folder_access(&d.path().join("missing"), true);
+        assert_eq!(c.level, Level::Error);
+        assert!(c.message.contains("cannot create it"), "{}", c.message);
         let f = d.path().join("file");
         std::fs::write(&f, "x").unwrap();
-        assert_eq!(folder_access(&f).level, Level::Error);
+        assert_eq!(folder_access(&f, false).level, Level::Error);
         // Root reads everything; the mode check means nothing then.
         if unsafe { libc::geteuid() } != 0 {
             use std::os::unix::fs::PermissionsExt;
             let ro = d.path().join("ro");
             std::fs::create_dir(&ro).unwrap();
             std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
-            let c = folder_access(&ro);
+            let c = folder_access(&ro, false);
             std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(c.level, Level::Error, "{}", c.message);
             assert!(c.message.contains("cannot be written"));

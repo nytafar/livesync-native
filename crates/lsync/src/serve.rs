@@ -84,6 +84,7 @@ fn status_line(svc: &Service) -> String {
 
 /// Run until SIGTERM or SIGINT, reloading on SIGHUP and nudging on SIGUSR1.
 async fn signals(svc: &Arc<Service>, notify: &Option<Arc<Notifier>>) {
+    let reloads = Arc::new(sdnotify::Reloads::default());
     let mut term = signal(SignalKind::terminate()).ok();
     let mut hup = signal(SignalKind::hangup()).ok();
     let mut usr1 = signal(SignalKind::user_defined1()).ok();
@@ -95,18 +96,23 @@ async fn signals(svc: &Arc<Service>, notify: &Option<Arc<Notifier>>) {
                 info!("SIGHUP: rereading the config");
                 let s = svc.clone();
                 let n = notify.clone();
+                let r = reloads.clone();
                 // On its own task: a reload may wait for a running command.
-                // A unit's `systemctl reload` lasts from RELOADING=1 to the
-                // READY=1 after it.
+                // The manager hears RELOADING=1 when the first of
+                // overlapping reloads starts, READY=1 when the last ends.
                 tokio::spawn(async move {
-                    if let Some(n) = &n {
-                        n.reloading();
+                    if r.begin() {
+                        if let Some(n) = &n {
+                            n.reloading();
+                        }
                     }
                     if let Err(e) = s.reload().await {
                         warn!("reload: {e}");
                     }
-                    if let Some(n) = &n {
-                        n.ready(&status_line(&s));
+                    if r.end() {
+                        if let Some(n) = &n {
+                            n.ready(&status_line(&s));
+                        }
                     }
                 });
             }
@@ -123,19 +129,19 @@ async fn signals(svc: &Arc<Service>, notify: &Option<Arc<Notifier>>) {
 /// default start timeout (90 s), so a slow disk never fails the unit.
 const READY_WAIT: Duration = Duration::from_secs(60);
 
-/// `WATCHDOG=1` from the runtime, at half the unit's `WatchdogSec=`: a
-/// runtime that stops scheduling tasks gets the service restarted.
-fn spawn_watchdog(notify: &Option<Arc<Notifier>>) -> Option<tokio::task::JoinHandle<()>> {
+/// `WATCHDOG=1` at half the unit's `WatchdogSec=`, each after the
+/// service's vault locks could be taken: a runtime that stops scheduling
+/// tasks, or a vault stuck holding a lock, gets the service restarted.
+fn spawn_watchdog(svc: &Arc<Service>, notify: &Option<Arc<Notifier>>) -> Option<tokio::task::JoinHandle<()>> {
     let n = notify.clone()?;
     let every = sdnotify::watchdog_interval()?;
     info!("watchdog: pinging the service manager every {every:?}");
-    Some(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(every);
-        loop {
-            tick.tick().await;
-            n.watchdog();
-        }
-    }))
+    let s = svc.clone();
+    let alive = Arc::new(move || {
+        let _ = s.names();
+        let _ = s.host().active();
+    });
+    Some(sdnotify::spawn_watchdog(n, every, alive))
 }
 
 /// How often a vault waiting for a locked keyring is tried again.
@@ -169,7 +175,7 @@ async fn run(
     notifier: Option<Arc<dyn DesktopNotifier>>,
 ) {
     let notify = Notifier::from_env().map(Arc::new);
-    let watchdog = spawn_watchdog(&notify);
+    let watchdog = spawn_watchdog(&svc, &notify);
     let keyring = spawn_keyring_retry(&svc);
     let activity = svc.spawn_activity();
     let notifications = match notifier {
