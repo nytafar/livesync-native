@@ -1893,9 +1893,10 @@ proptest! {
 
 // ---------- ground truth: the judge is no rubber stamp ----------
 
-/// Review 7's three garbles, each a merge the judge once let through under a
+/// Review 7's garbles, each a merge the judge once let through under a
 /// history-ambiguous class. Each history's true merge passes; the garble
-/// does not.
+/// does not. (Its third, a stale writer's file, is right by an as short
+/// history: see `the_judge_accepts_a_line_both_put_in_once`.)
 #[test]
 fn the_judge_rejects_review_7s_garbles() {
     use truth::{edited, file, History};
@@ -1975,16 +1976,6 @@ fn the_judge_rejects_review_7s_garbles() {
                 ),
             },
             "line 1\nline 1\nline 1\nt 3\nline 1\n",
-        ),
-        // Same took a stale writer's file for the merge: R2's second `line
-        // 1`, which the true merge keeps, lost.
-        (
-            History {
-                base: file(&[(0, "---"), (1, "line 1")], true, true),
-                ours: edited(file(&[(1, "line 1"), (0, "---")], true, true), &[0]),
-                theirs: edited(file(&[(1001, "line 1"), (0, "---"), (1, "line 1")], true, true), &[]),
-            },
-            "line 1\r\n---\r\n",
         ),
     ];
     for (h, garble) in cases {
@@ -2076,6 +2067,105 @@ fn the_judge_accepts_what_two_histories_allow() {
     );
 }
 
+/// Review 8, finding 2: a line both sides put in at one point, taken once,
+/// where one side also removed a copy of it. That side's reading as putting
+/// the line in and removing another copy, where it really moved the lines
+/// around it, gives a merge with fewer copies than ours plus theirs less the
+/// base: the true merge of a history shorter than the real one, or as short.
+#[test]
+fn the_judge_accepts_a_line_both_put_in_once() {
+    use truth::{edited, file, History};
+    // Ours moved `B` and `C` down past `---` (or `---` up), theirs put a
+    // `---` in after `A`.
+    let h = History {
+        base: file(&[(0, "A"), (1, "B"), (2, "C"), (3, "---")], false, true),
+        ours: edited(file(&[(0, "A"), (3, "---"), (1, "B"), (2, "C")], false, true), &[1, 2]),
+        theirs: edited(
+            file(&[(0, "A"), (10, "---"), (1, "B"), (2, "C"), (3, "---")], false, true),
+            &[],
+        ),
+    };
+    assert_eq!(h.texts()[1], "A\n---\nB\nC\n");
+    assert_eq!(h.texts()[2], "A\n---\nB\nC\n---\n");
+    let m = "A\n---\nB\nC\n";
+    for ours_first in [true, false] {
+        assert!(
+            truth::judge(&h, m, ours_first).is_ok(),
+            "{}",
+            truth::explain(&h, m, ours_first)
+        );
+    }
+    // Ours moved a blank line and `- x` down past a `---` and turned the
+    // last `---` into `--- o` (without a final newline); theirs put a `---`
+    // in after `line 1`. The true merge has two `---`; ours read as putting
+    // one in after `line 1` (once, with theirs) has one.
+    let base = [(0, "- x"), (1, "line 1"), (2, ""), (3, "- x"), (4, "---"), (5, "---")];
+    let h = History {
+        base: file(&base, false, true),
+        ours: edited(
+            file(
+                &[
+                    (0, "- x"),
+                    (1, "line 1"),
+                    (4, "---"),
+                    (2, ""),
+                    (3, "- x"),
+                    (1001, "--- o"),
+                ],
+                false,
+                false,
+            ),
+            &[2, 3],
+        ),
+        theirs: edited(
+            file(
+                &[
+                    (0, "- x"),
+                    (1, "line 1"),
+                    (1002, "---"),
+                    (2, ""),
+                    (3, "- x"),
+                    (4, "---"),
+                    (5, "---"),
+                ],
+                false,
+                true,
+            ),
+            &[],
+        ),
+    };
+    let [b, o, t] = h.texts();
+    assert_eq!(b, "- x\nline 1\n\n- x\n---\n---\n");
+    assert_eq!(o, "- x\nline 1\n---\n\n- x\n--- o");
+    assert_eq!(t, "- x\nline 1\n---\n\n- x\n---\n---\n");
+    for ours_first in [true, false] {
+        assert!(
+            truth::judge(&h, &o, ours_first).is_ok(),
+            "{}",
+            truth::explain(&h, &o, ours_first)
+        );
+    }
+    // The first case with one line where it moved two (review 7's third
+    // garble): ours moved `---` down past `line 1`, which reads as well as
+    // `line 1` moved up, as short a history. Theirs put a `line 1` in at the
+    // top: by that reading, both put it in there, once, and ours removed the
+    // other one.
+    let h = History {
+        base: file(&[(0, "---"), (1, "line 1")], true, true),
+        ours: edited(file(&[(1, "line 1"), (0, "---")], true, true), &[0]),
+        theirs: edited(file(&[(1001, "line 1"), (0, "---"), (1, "line 1")], true, true), &[]),
+    };
+    let m = "line 1\r\n---\r\n";
+    for ours_first in [true, false] {
+        assert_eq!(
+            truth::judge(&h, m, ours_first),
+            Ok(truth::Class::Twin),
+            "{}",
+            truth::explain(&h, m, ours_first)
+        );
+    }
+}
+
 /// Lines once in every file of `files` (not blank), by content.
 fn once_in_all(files: &[&str]) -> std::collections::HashSet<String> {
     let counts: Vec<HashMap<String, usize>> = files
@@ -2138,40 +2228,28 @@ fn unmoved(files: &[&str]) -> std::collections::HashSet<String> {
     keep
 }
 
-/// How often the line `k` is in each segment of `s` between lines of `parts`
-/// (keyed by the line that starts the segment).
-fn segment_counts(s: &str, parts: &std::collections::HashSet<String>, k: &str) -> HashMap<Option<String>, usize> {
-    let mut n: HashMap<Option<String>, usize> = HashMap::new();
-    let mut at = None;
-    for l in s.split_inclusive('\n').map(|l| l.trim_end_matches(['\n', '\r'])) {
-        if parts.contains(l) {
-            at = Some(l.to_string());
-        } else if l == k {
-            *n.entry(at.clone()).or_default() += 1;
-        }
-    }
-    n
-}
-
 /// The true merge of a history, mutated: a line put in once more, a line
 /// dropped, two lines next to each other swapped. The judge rejects every
-/// mutant that changes a count or an order beyond what the named
-/// ambiguities allow:
+/// mutant no reading of the texts can give by the placement rules. These
+/// conditions come from what the rules can do with any reading, not from the
+/// judge's count bounds (which a mutant may pass and still be no reading's
+/// merge, or fail where a reading gives it):
 ///
-/// - a line (not blank) put in next to a copy of it, more often than both the
-///   true merge and either side have it, in all and in its segment between
-///   lines no side moved;
-/// - a line less often than all of the true merge, either side, and ours
-///   plus theirs less the base have it (where both removed a copy, they may
-///   be two copies);
+/// - a line (not blank) more often than ours and theirs together: every
+///   copy in a merge is a base line both sides kept or a line one side put
+///   in, and each side's copies are the ones it kept and the ones it put in;
+/// - a line less often than a side has it, less the base's copies: every
+///   line a side put in is in the merge (two sides' lines at one point taken
+///   once leave one), and of the base copies it kept, the other side can
+///   have removed at most all the base has;
+/// - a line base and both sides each have once, dropped from the merge:
+///   each side kept the base's copy or put one in, and where one side
+///   removed the base's copy, its own copy is the one it put in;
 /// - two lines (not blank) every file has once swapped, where base and both
 ///   sides have them in the same order and no side moved either, nor any
 ///   lines past them (both are in every longest run of such lines each file
 ///   keeps in the base's order: two sides' moves compose).
 ///
-/// A line put in again that the judge takes only by the placement rules'
-/// own copies (two runs at one point that go in whole, each with the line;
-/// both sides' edits of other lines to it) is within the named ambiguity.
 /// Each case tries a few mutants, from every stream.
 fn mutants_are_rejected(h: &truth::History, seed: u64) -> Result<(), TestCaseError> {
     if h.artifact() {
@@ -2215,27 +2293,17 @@ fn mutants_are_rejected(h: &truth::History, seed: u64) -> Result<(), TestCaseErr
                 if !x.ends_with('\n') {
                     x.push('\n');
                 }
-                // Next to the line it copies, more often in its segment
-                // between lines no side moved than the true merge and either
-                // side have it there (copies a segment apart are two lines).
+                // Next to the line it copies.
                 v.insert(i + r.below(2), x);
                 let m = v.concat();
-                let parts = unmoved(&[&m, &b, &o, &t, &w]);
-                let at = |s: &str| segment_counts(s, &parts, &k);
-                let (sm, sw, so, st) = (at(&m), at(&w), at(&o), at(&t));
-                let get = |x: &HashMap<Option<String>, usize>, g: &Option<String>| x.get(g).copied().unwrap_or(0);
-                let over = n(&m, &k) > n(&w, &k).max(n(&o, &k)).max(n(&t, &k))
-                    && sm
-                        .iter()
-                        .any(|(g, &c)| c > get(&sw, g).max(get(&so, g)).max(get(&st, g)));
-                ("a line put in again", over)
+                ("a line put in again", n(&m, &k) > n(&o, &k) + n(&t, &k))
             }
             1 if !line.trim().is_empty() => {
                 v.remove(i);
                 let m = v.concat();
-                let (cm, cw, cb, co, ct) = (n(&m, &k), n(&w, &k), n(&b, &k), n(&o, &k), n(&t, &k));
-                let low = cw.min(co.max(ct)).min((co + ct).saturating_sub(cb));
-                ("a line dropped", cm < low)
+                let (cm, cb, co, ct) = (n(&m, &k), n(&b, &k), n(&o, &k), n(&t, &k));
+                let every = cb == 1 && co == 1 && ct == 1 && cm == 0;
+                ("a line dropped", cm + cb < co.max(ct) || every)
             }
             _ if i + 1 < wl.len() => {
                 let q = key(&wl[i + 1]);
@@ -2258,13 +2326,9 @@ fn mutants_are_rejected(h: &truth::History, seed: u64) -> Result<(), TestCaseErr
             continue;
         }
         let m = v.concat();
-        match truth::judge_why(h, &m, ours_first) {
+        match truth::judge(h, &m, ours_first) {
             Err(_) => {}
-            // A line put in again where a reading's two runs at one point
-            // go in whole with it in each (or both sides edited other lines
-            // to it): the rule, named.
-            Ok((_, true)) if what == "a line put in again" => {}
-            Ok((c, _)) => prop_assert!(
+            Ok(c) => prop_assert!(
                 false,
                 "{what} passes as {c:?}\nbase {b:?}\nours {o:?}\ntheirs {t:?}\ntrue {w:?}\nmutant {m:?} (ours_first {ours_first})\n{}",
                 h.describe()

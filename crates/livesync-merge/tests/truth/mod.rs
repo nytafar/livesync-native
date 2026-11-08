@@ -73,7 +73,8 @@
 //!
 //! - no line less often than all of the true merge, either side, and the
 //!   count each side's own change gives (where both removed a copy, they may
-//!   be two copies; where both added one at two places, one);
+//!   be two copies; where both added one at two places, one; where the
+//!   reading's rules took a line both put in once, one less);
 //! - no line more often than the true merge and either side (where the true
 //!   merge is a conflict: than either side), but for copies the rules put in
 //!   by position: the same text from edits of different lines on both sides
@@ -85,8 +86,11 @@
 //!   both added at two places holds within one stretch between such lines).
 //!
 //! So finding 1 of review 6 (a line both added, at two places with only
-//! blank or deleted lines between), and review 7's three garbles, are in no
-//! class. Everything else that is clean and not the true merge is wrong.
+//! blank or deleted lines between), and review 7's first two garbles, are in
+//! no class. (Its third is a [`Class::Twin`]: one side moved a line down,
+//! read as the line it passed moved up, and the other side put that line in
+//! at the same point; review 8.) Everything else that is clean and not the
+//! true merge is wrong.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -607,6 +611,11 @@ struct Extra {
     /// each line both sides' edits (changes that put in no more lines than
     /// they took out) put in.
     edits: Counts,
+    /// Lines both sides put in that went in once: two runs at one point, one
+    /// within the other; the same change on both sides; an insertion taken
+    /// into the other side's change it begins or ends. How many copies of
+    /// each line that saved.
+    once: Counts,
 }
 
 /// The true merge: the placement rules (see the module docs) applied to each
@@ -616,6 +625,7 @@ struct Extra {
 fn rules_traced(b: &[String], sides: [(&[String], &Al); 2], ours_first: bool) -> Option<(String, Extra)> {
     let n = b.len();
     let mut whole: Counts = HashMap::new();
+    let mut once: Counts = HashMap::new();
     let all: Vec<Change> = (0..2)
         .flat_map(|x| changes(n, sides[x].0.len(), sides[x].1, x))
         .collect();
@@ -656,6 +666,7 @@ fn rules_traced(b: &[String], sides: [(&[String], &Al); 2], ours_first: bool) ->
             let run = |w: usize| lines(cs.iter().find(|c| c.who == w).expect("one each"));
             let (f, s) = if ours_first { (run(0), run(1)) } else { (run(1), run(0)) };
             let v = two_runs(&f, &s)?;
+            saved(&mut once, [&f, &s], &v);
             if v.len() == f.len() + s.len() {
                 let (cf, cs) = (count(&f), count(&s));
                 for (k, &x) in &cf {
@@ -678,7 +689,9 @@ fn rules_traced(b: &[String], sides: [(&[String], &Al); 2], ours_first: bool) ->
             if c.base != d.base || x.len() != y.len() || !x.iter().zip(&y).all(|(p, q)| same_line(p, q)) {
                 return None;
             }
-            pieces.push((lo..hi, x.iter().zip(&y).map(|(p, q)| pick(p, q)).collect(), None));
+            let v: Vec<String> = x.iter().zip(&y).map(|(p, q)| pick(p, q)).collect();
+            saved(&mut once, [&x, &y], &v);
+            pieces.push((lo..hi, v, None));
         } else {
             return None;
         }
@@ -706,6 +719,7 @@ fn rules_traced(b: &[String], sides: [(&[String], &Al); 2], ours_first: bool) ->
                         for (y, q) in i.iter().enumerate() {
                             pieces[rep].1[off + y] = pick(&r[off + y], q);
                         }
+                        saved(&mut once, [&i, &r], &pieces[rep].1);
                         pieces[rep].2 = None;
                         pieces.remove(ins);
                         continue;
@@ -761,7 +775,20 @@ fn rules_traced(b: &[String], sides: [(&[String], &Al); 2], ours_first: bool) ->
         .iter()
         .filter_map(|(k, &c)| replaced[1].get(k).map(|&d| (k.clone(), c.min(d))))
         .collect();
-    Some((out.concat(), Extra { whole, edits }))
+    Some((out.concat(), Extra { whole, edits, once }))
+}
+
+/// Add to `once` the copies of each line the two `put` had beyond what the
+/// piece made of them (`got`) has: the ones taken once.
+fn saved(once: &mut Counts, put: [&[String]; 2], got: &[String]) {
+    let (a, b, g) = (count(put[0]), count(put[1]), count(got));
+    for (k, &x) in &a {
+        let y = b.get(k).copied().unwrap_or(0);
+        let c = (x + y).saturating_sub(g.get(k).copied().unwrap_or(0));
+        if c > 0 {
+            *once.entry(k.clone()).or_default() += c;
+        }
+    }
 }
 
 // ---------- the judge ----------
@@ -902,7 +929,8 @@ fn in_every_rising(v: &[usize]) -> HashSet<usize> {
 /// - no line is less often in `m` than all of the true merge (where it is
 ///   clean), either side and the count each side's own change gives (ours,
 ///   plus what theirs added or less what it removed: where both removed a
-///   copy, they may be two copies);
+///   copy, they may be two copies; less the copies both put in that the
+///   reading's rules took once, `once` in [`Extra`]);
 /// - no line is more often in `m` than both the true merge (where it is
 ///   clean) and either side have it, but for the copies the rules put in by
 ///   the reading `m` came from, where they put them (`extra`), beyond those
@@ -920,6 +948,9 @@ fn bounded(m: &str, truth: Option<(&str, &Extra)>, [b, o, t]: [&str; 3], extra: 
     let lw = truth.map(|(w, _)| lines(w)).unwrap_or_default();
     let get = |n: &Counts, k: &str| n.get(k).copied().unwrap_or(0);
     let (nm, nb, no, nt, nw) = (count(&lm), count(&lb), count(&lo), count(&lt), count(&lw));
+    // Copies of each line both sides put in that the reading's rules took
+    // once.
+    let once = |k: &str| get(&extra.once, k);
     // What the reading's rules put in beyond what they put in the true merge,
     // which its count already holds.
     let extra = |k: &str| {
@@ -931,7 +962,7 @@ fn bounded(m: &str, truth: Option<(&str, &Extra)>, [b, o, t]: [&str; 3], extra: 
     let mut over: Vec<&String> = Vec::new();
     for k in keys {
         let (cm, cb, co, ct, cw) = (get(&nm, k), get(&nb, k), get(&no, k), get(&nt, k), get(&nw, k));
-        let mut low = co.max(ct).min((co + ct).saturating_sub(cb));
+        let mut low = co.max(ct).min((co + ct).saturating_sub(cb + once(k)));
         if truth.is_some() {
             low = low.min(cw);
         }
