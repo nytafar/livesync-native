@@ -396,8 +396,12 @@ async fn empty_files_alone_are_a_weak_match() {
     assert!(rep.weak_match.is_none() && rep.refusal(false).is_none(), "{rep:#?}");
 }
 
+/// A local NFD name beside a remote NFC document of the same text: where
+/// the filesystem keeps the two apart (Linux), they are two files and two
+/// documents, as push and pull treat them; where it folds them (APFS), the
+/// local file is the document's and is compared with it.
 #[tokio::test]
-async fn a_name_in_another_unicode_normalisation_is_refused() {
+async fn a_name_in_another_unicode_normalisation_is_its_own_file_where_names_do_not_fold() {
     let env = Env::new().await;
     env.both("a.md", b"a");
     env.both("b.md", b"b");
@@ -413,19 +417,17 @@ async fn a_name_in_another_unicode_normalisation_is_refused() {
         return;
     }
     let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
+    assert!(rep.name_case.is_empty(), "{rep:#?}");
     // APFS keeps the NFD name but also finds it by the NFC one: one file,
     // the remote document's, so it is compared, not refused
     // (`tests/macos.rs` runs both cases on any filesystem).
     if env.engine().fs_rules().normalization_insensitive {
-        assert!(rep.name_case.is_empty(), "{rep:#?}");
         assert_eq!(rep.identical, 3, "{rep:#?}");
         return;
     }
-    assert_eq!(paths(&rep.name_case), ["caf\u{e9}.md"], "{rep:#?}");
-    assert_eq!(rep.name_case[0].local_path.as_deref(), Some("cafe\u{301}.md"));
-    assert!(rep.only_local.is_empty() && rep.only_remote.is_empty(), "{rep:#?}");
-    assert!(rep.refusal(false).unwrap().contains("Unicode normalisation"));
-    assert!(!env.engine().adopt(AdoptOptions::apply()).await.unwrap().applied);
+    assert_eq!(paths(&rep.only_local), ["cafe\u{301}.md"], "{rep:#?}");
+    assert_eq!(paths(&rep.only_remote), ["caf\u{e9}.md"], "{rep:#?}");
+    assert_eq!(rep.identical, 2, "{rep:#?}");
 }
 
 #[tokio::test]

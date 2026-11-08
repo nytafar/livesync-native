@@ -328,13 +328,49 @@ async fn adopt_matches_an_nfd_name_with_its_nfc_document_where_names_fold() {
     assert!(rep.name_case.is_empty(), "{rep:#?}");
     assert_eq!(rep.identical, 3, "{rep:#?}");
     assert!(rep.only_local.is_empty() && rep.only_remote.is_empty(), "{rep:#?}");
-    // Where names do not fold, the same folder is refused (two files).
+    // Where names do not fold, they are two files, as push and pull see them.
     let rep = env
         .engine_on(&FsRules::permissive())
         .adopt(AdoptOptions::dry_run())
         .await
         .unwrap();
-    assert_eq!(rep.name_case.len(), 1, "{rep:#?}");
+    assert!(rep.name_case.is_empty(), "{rep:#?}");
+    assert_eq!(rep.only_local.len() + rep.only_remote.len(), 2, "{rep:#?}");
+}
+
+/// Review of #21: adopt refuses a name as another document's by what the
+/// filesystem folds, as push and pull do. With case-sensitive IDs, a local
+/// `Note.md` beside a remote `note.md` is that document's file on APFS, and
+/// its own file on case-sensitive APFS, which folds only normalisation.
+#[tokio::test]
+async fn adopt_tells_case_apart_where_only_normalisation_folds() {
+    let env = Env::new().await;
+    env.mock
+        .update_milestone(|m| m["tweak_values"]["PREFERRED"]["handleFilenameCaseSensitive"] = json!(true));
+    let put = |path: &str, body: &str| {
+        let ch = env.mock.put_chunks(&[body]);
+        env.mock
+            .put(json!({"_id": path, "path": path, "type": "plain", "children": ch,
+            "mtime": 1, "ctime": 1, "size": body.len(), "eden": {}}))
+    };
+    for p in ["a.md", "b.md", "note.md"] {
+        put(p, p);
+        env.write(p, p.as_bytes());
+    }
+    std::fs::rename(env.vault().join("note.md"), env.vault().join("tmp.md")).unwrap();
+    std::fs::rename(env.vault().join("tmp.md"), env.vault().join("Note.md")).unwrap();
+    let rep = env
+        .engine_on(&apfs_case_sensitive())
+        .adopt(AdoptOptions::dry_run())
+        .await
+        .unwrap();
+    assert!(rep.name_case.is_empty(), "{rep:#?}");
+    assert_eq!(rep.only_local.len(), 1, "{rep:#?}");
+    assert_eq!(rep.only_local[0].path, "Note.md", "{rep:#?}");
+    assert_eq!(rep.only_remote.len(), 1, "{rep:#?}");
+    let rep = env.engine_on(&apfs()).adopt(AdoptOptions::dry_run()).await.unwrap();
+    assert!(rep.name_case.is_empty() && rep.only_local.is_empty(), "{rep:#?}");
+    assert_eq!(rep.identical, 3, "{rep:#?}");
 }
 
 /// A vault folder this process may not read (macOS answers EPERM without a

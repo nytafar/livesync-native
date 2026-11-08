@@ -136,7 +136,8 @@ pub struct AdoptReport {
     /// list the file is in).
     pub conflicted_remotely: Vec<String>,
     /// The local name differs from the remote's only in case (same document,
-    /// on a filesystem that tells them apart) or in Unicode normalisation.
+    /// on a filesystem that tells them apart), or it is another document's
+    /// name on this filesystem (which folds case or Unicode normalisation).
     pub name_case: Vec<AdoptEntry>,
     /// The remote's content could not be read to compare, or a chunk of an
     /// identical file is missing on the remote: not adopted; the first sync
@@ -519,18 +520,24 @@ impl Engine {
             }
         }
 
-        // A local name that differs from an unmatched remote one only in case
-        // or Unicode normalisation (another ID, e.g. NFD here and NFC on the
-        // remote) would become a second file beside it: refused, as above.
+        // A local name this filesystem takes for an unmatched remote one's
+        // (another ID: its own was deleted, say) is that remote file's place:
+        // the first pull would write into it. Refused, as above. Names it
+        // keeps apart are two files, as push and pull treat them.
         let mut unmatched: HashMap<String, &FileDoc> = HashMap::new();
-        for (id, d) in &live {
-            if !seen_remote.contains(id) {
-                unmatched.entry(crate::index::fold_key(&d.path)).or_insert(d);
+        if fs.folds() {
+            for (id, d) in &live {
+                if !seen_remote.contains(id) {
+                    unmatched.entry(fs.fold_key(&d.path)).or_insert(d);
+                }
             }
         }
         let mut rest = Vec::with_capacity(only_local.len());
         for (id, found) in only_local {
-            match unmatched.get(&crate::index::fold_key(&found.rel)) {
+            match unmatched
+                .get(&fs.fold_key(&found.rel))
+                .filter(|doc| fs.same_name(&doc.path, &found.rel))
+            {
                 Some(doc) => {
                     seen_remote.insert(doc.id.clone());
                     rep.name_case.push(AdoptEntry {
