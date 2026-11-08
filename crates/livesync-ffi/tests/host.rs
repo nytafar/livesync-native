@@ -778,6 +778,40 @@ fn two_profiles_on_one_database_with_disjoint_scopes_run_at_once_as_separate_nod
     env.host.stop_all();
 }
 
+/// Review of #21: a vault folder the app may not read (all-files access
+/// revoked; EACCES here) is a failed state with the engine's "no access"
+/// message, retried by the supervisor, never a crash; once readable again,
+/// Sync now starts it and nothing was deleted.
+#[cfg(unix)]
+#[test]
+fn a_vault_the_app_cannot_read_is_a_status_not_a_crash() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let p = env.profile("app", "locked-vault");
+    std::fs::create_dir_all(&p.vault_path).unwrap();
+    std::fs::write(Path::new(&p.vault_path).join("a.md"), "a").unwrap();
+    let mode = |m| std::fs::set_permissions(&p.vault_path, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o000);
+    if std::fs::read_dir(&p.vault_path).is_ok() {
+        mode(0o755);
+        eprintln!("SKIPPED: root reads anything");
+        return;
+    }
+    env.host.start(p.clone()).unwrap();
+    wait_until("the refusal", Duration::from_secs(20), || {
+        env.status(&p).run_state == RunState::Failed
+    });
+    let msg = env.status(&p).run_message.unwrap_or_default();
+    mode(0o755);
+    assert!(msg.starts_with("no access to the vault folder"), "{msg}");
+    assert!(msg.contains("no file in it counts as deleted"), "{msg}");
+    env.host.sync_now(p.id.clone()).unwrap();
+    wait_until("the profile running", Duration::from_secs(10), || {
+        env.status(&p).run_state == RunState::Running
+    });
+    env.host.stop_all();
+}
+
 #[test]
 fn a_vault_held_by_another_engine_fails_only_that_profile_and_names_the_holder() {
     let env = Env::new();

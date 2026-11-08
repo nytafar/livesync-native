@@ -62,6 +62,14 @@ object StatusSummary {
     fun heldElsewhere(runMessage: String?): Boolean =
         runMessage?.contains("another LiveSync engine is using") == true
 
+    /**
+     * Whether an engine was refused because the vault folder cannot be read
+     * (all-files access revoked, or the folder's permissions): nothing syncs
+     * and nothing counts as deleted until it can.
+     */
+    fun noAccess(runMessage: String?): Boolean =
+        runMessage?.startsWith("no access to the vault folder") == true
+
     fun gateFailure(lastGate: String?): String? {
         val g = lastGate ?: return null
         val rest = g.substringAfter(' ', "")
@@ -76,6 +84,8 @@ object StatusSummary {
             "Starting" -> "starting…" to false
             "Failed" -> if (heldElsewhere(p.runMessage)) {
                 "not started: ${p.runMessage} (retrying)" to true
+            } else if (noAccess(p.runMessage)) {
+                "not started: no access to the vault folder; check all-files access (nothing is deleted; retrying)" to true
             } else {
                 "error: ${p.runMessage ?: "unknown"} (retrying)" to true
             }

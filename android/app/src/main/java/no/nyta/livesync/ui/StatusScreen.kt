@@ -137,6 +137,14 @@ fun StatusScreen(
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
+            if (st?.runState == RunState.FAILED && StatusSummary.noAccess(st.runMessage)) {
+                Text(
+                    "This app cannot read the vault folder (${st.runMessage}). Grant all-files access in the " +
+                        "system settings, or check the folder's permissions, then press Sync now; otherwise this " +
+                        "vault tries again by itself. No file counts as deleted meanwhile.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
             st?.safetyStop?.let {
                 Banner("Safety stop: ${it.substringAfter(' ')}", Tone.ERROR)
                 Text(

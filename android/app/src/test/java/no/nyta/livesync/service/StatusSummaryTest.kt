@@ -101,6 +101,18 @@ class StatusSummaryTest {
     }
 
     @Test
+    fun aVaultTheAppCannotReadSaysSoNotAsAnError() {
+        val msg = "no access to the vault folder /storage/emulated/0/Documents/Obsidian/test: nothing is synced " +
+            "until this process can read it, and no file in it counts as deleted (Permission denied (os error 13))"
+        assertTrue(StatusSummary.noAccess(msg))
+        assertFalse(StatusSummary.noAccess("index: disk I/O error"))
+        assertFalse(StatusSummary.noAccess(null))
+        val (text, alert) = StatusSummary.phrase(line("Test", state = "Failed").copy(runMessage = msg))
+        assertEquals("not started: no access to the vault folder; check all-files access (nothing is deleted; retrying)", text)
+        assertTrue(alert)
+    }
+
+    @Test
     fun onlyRealNetworkTransitionsArePassedOn() {
         val wifi = 1L shl 1
         val cell = 1L shl 0
