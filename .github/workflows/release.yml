@@ -1,5 +1,7 @@
-# Release on a pushed tag v*: the signed sideload APK, lsync for five targets,
-# SHA256SUMS and short notes, as a GitHub Release. AGENTS.md "Releasing".
+# Release on a pushed tag v*: the signed sideload APK, lsync for five targets
+# plus a universal macOS binary, install.sh, SHA256SUMS and short notes, as a
+# GitHub Release. AGENTS.md "Releasing". The AUR package, the Homebrew formula
+# and the Docker image are published by hand from pkg/ (pkg/README.md).
 #
 # workflow_dispatch builds the same assets into a draft release (no tag is
 # created until the draft is published), for testing the pipeline; it may
@@ -139,16 +141,32 @@ jobs:
             x86_64-unknown-linux-musl|aarch64-apple-darwin) "$bin" --version ;;
             x86_64-apple-darwin) arch -x86_64 "$bin" --version || echo "no Rosetta here; not run" ;;
           esac
-          name=lsync-${LSYNC_RELEASE_VERSION}-${TARGET}
-          mkdir -p "pkg/$name" dist
-          cp "$bin" "pkg/$name/lsync"
-          cp README.md "pkg/$name/"
-          tar -C pkg -czf "dist/$name.tar.gz" "$name"
+          scripts/ci/pack-cli.sh "$bin" "$TARGET" "$LSYNC_RELEASE_VERSION" dist
           ls -l dist
       - uses: actions/upload-artifact@v7
         with:
           name: dist-cli-${{ matrix.target }}
           path: dist/*
+          if-no-files-found: error
+
+  universal:
+    name: lsync universal-apple-darwin
+    needs: [version, cli]
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-cli-*-apple-darwin
+          path: dist
+          merge-multiple: true
+      - name: lipo
+        run: scripts/ci/macos-universal.sh "${{ needs.version.outputs.version }}" dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-cli-universal-apple-darwin
+          path: dist/lsync-*-universal-apple-darwin.tar.gz
           if-no-files-found: error
 
   apk:
@@ -229,7 +247,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [version, cli, apk]
+    needs: [version, cli, universal, apk]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -255,6 +273,7 @@ jobs:
       - name: Checksums and notes
         run: |
           set -euo pipefail
+          cp install.sh assets/
           (cd assets && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
           apk=$(cd assets && ls *.apk)
           if [[ "$SIGNED" == true ]]; then
@@ -264,10 +283,11 @@ jobs:
           fi
           prev=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_SHA^" 2>/dev/null || true)
           {
-            echo "## LiveSync for Android $VERSION"
+            echo "## lsync and LiveSync for Android $VERSION"
             echo
+            echo "- **lsync:** \`lsync-$VERSION-<target>.tar.gz\` for Linux x86_64 and aarch64 (static, musl), macOS (universal, and arm64 and x86_64 alone), and Android aarch64 (Termux)."
+            echo "- **Install:** \`sh install.sh --version $VERSION\` downloads the archive for this machine, checks it against SHA256SUMS and installs into ~/.local/bin (see the README for the AUR, Homebrew and Docker)."
             echo "- **App:** \`$apk\` (versionName $VERSION, versionCode $CODE). $apk_line"
-            echo "- **lsync CLI:** \`lsync-$VERSION-<target>.tar.gz\` for Linux x86_64 and aarch64 (static, musl), macOS arm64 and x86_64, and Android aarch64 (Termux)."
             echo "- **Checksums:** \`sha256sum -c SHA256SUMS\`"
             echo
             if [[ -n "$prev" ]]; then
@@ -288,7 +308,7 @@ jobs:
             echo "::error::a release $TAG exists already; delete it (gh release delete $TAG) to rebuild it"
             exit 1
           fi
-          args=(--title "LiveSync for Android $VERSION" --notes-file notes.md)
+          args=(--title "lsync and LiveSync for Android $VERSION" --notes-file notes.md)
           if [[ "$DRAFT" == true ]]; then
             args+=(--draft --target "$GITHUB_SHA")
           else

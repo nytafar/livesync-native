@@ -1,0 +1,26 @@
+# The AUR package lsync-bin. In the repo this is a template: pkg/fill.sh
+# fills in the version and the checksums from a release's SHA256SUMS
+# (pkg/README.md), and `makepkg --printsrcinfo > .SRCINFO` goes with it.
+
+pkgname=lsync-bin
+_version=@VERSION@
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc='Native Self-hosted LiveSync client: keeps Obsidian vault folders in sync with CouchDB, as a service'
+arch=('x86_64' 'aarch64')
+url='https://github.com/nytafar/livesync-native'
+license=('MIT OR Apache-2.0')
+provides=('lsync')
+conflicts=('lsync')
+options=('!strip' '!debug')
+source_x86_64=("${url}/releases/download/v${_version}/lsync-${_version}-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("${url}/releases/download/v${_version}/lsync-${_version}-aarch64-unknown-linux-musl.tar.gz")
+sha256sums_x86_64=('@SHA256_x86_64-unknown-linux-musl@')
+sha256sums_aarch64=('@SHA256_aarch64-unknown-linux-musl@')
+
+package() {
+  cd "lsync-${_version}-${CARCH}-unknown-linux-musl"
+  install -Dm755 lsync "${pkgdir}/usr/bin/lsync"
+  install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 -t "${pkgdir}/usr/share/licenses/${pkgname}" LICENSE-MIT LICENSE-APACHE NOTICE
+}

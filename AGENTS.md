@@ -51,7 +51,7 @@ The binary links only `libc`, `libm` and `libdl`. TLS is rustls with bundled web
 
 ## CI and releasing
 
-`.github/workflows/ci.yml` runs the gate on Linux and macOS and the Android gate (`scripts/build-apk.sh --unsigned`) on every push and PR.
+`.github/workflows/ci.yml` runs the gate on Linux and macOS, the Android gate (`scripts/build-apk.sh --unsigned`) and the universal macOS binary (both architectures, `scripts/ci/macos-universal.sh`, then `install.sh` from the built archives) on every push and PR.
 
 `.github/workflows/upstream-interop.yml` runs `scripts/interop.sh` weekly (and by hand: `gh workflow run upstream-interop.yml [-f tag=1.0.46]`) against the official CLI built from the latest upstream release (`scripts/ci/upstream-cli.sh`), on a throwaway CouchDB service container published on 127.0.0.1:8411 and set up by `scripts/ci/couchdb-init.sh`. It publishes nothing. When it fails, or a new upstream release is tested, update `COMPATIBILITY.md` and `TESTED_PLUGIN_VERSION` (`crates/livesync-model/src/gate.rs`) together. To try a release locally: `scripts/ci/upstream-cli.sh ~/scratch/upstream-cli [TAG]`, then `LSYNC_CLI_JS=<the cli_js it prints> scripts/interop.sh`.
 
@@ -63,7 +63,8 @@ gh run watch "$(gh run list -w Release -L1 --json databaseId -q '.[0].databaseId
 ```
 
 - Tags are `v<major>.<minor>.<patch>[-<pre>]`; a `-<pre>` tag makes a pre-release. The APK's versionName is the tag without `v`; its versionCode is `VERSION_CODE_BASE` (in the workflow) plus the workflow's run number, so it rises with every run. Only ever raise the base; renaming the workflow file resets the run number.
-- Assets: `livesync-android-<version>.apk` (signed with the sideload key), `lsync-<version>-<target>.tar.gz` for `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin` and `aarch64-linux-android` (Termux), `SHA256SUMS`, notes with the commits since the previous tag.
+- Assets: `livesync-android-<version>.apk` (signed with the sideload key), `lsync-<version>-<target>.tar.gz` for `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `universal-apple-darwin` (lipo of the two) and `aarch64-linux-android` (Termux), `install.sh`, `SHA256SUMS`, notes with the commits since the previous tag. Each archive holds `lsync-<version>-<target>/` with `lsync`, `README.md`, the licences and `NOTICE` (`scripts/ci/pack-cli.sh`); `install.sh`, `pkg/` and the Docker build rely on that layout.
+- After a release, the AUR package, the Homebrew formula and the Docker image are published by hand from `pkg/` (`pkg/README.md`): `pkg/fill.sh` fills the templates' version and checksums from the release's `SHA256SUMS`. `crates/lsync/tests/packaging.rs` runs `install.sh` and `fill.sh` on a fake release in the gate.
 - Signing comes from repository secrets `SIDELOAD_KEYSTORE_BASE64`, `SIDELOAD_STORE_PASSWORD`, `SIDELOAD_KEY_PASSWORD` (and optional `SIDELOAD_KEY_ALIAS`, default `livesync`); the optional repository variable `SIDELOAD_CERT_SHA256` pins the signer. A tag push without them fails; it is never released unsigned.
 - `gh workflow run release.yml -f version=0.0.0-ci-test` builds the same assets into a draft release (unsigned when the secrets are missing) without creating a tag. Delete it afterwards: `gh release delete v0.0.0-ci-test --yes`.
 - A hand build with `scripts/build-apk.sh` uses the commit count as versionCode, which is below every CI release: set `LIVESYNC_VERSION_CODE` above the installed one to install it over a release.

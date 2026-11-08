@@ -1,5 +1,6 @@
-# The repo's gate (AGENTS.md "Gate") on Linux and macOS, and the Android gate
-# (scripts/build-apk.sh: JVM unit tests, lint, assembleRelease), unsigned.
+# The repo's gate (AGENTS.md "Gate") on Linux and macOS, the Android gate
+# (scripts/build-apk.sh: JVM unit tests, lint, assembleRelease), unsigned, and
+# the universal macOS binary the release builds (scripts/ci/macos-universal.sh).
 name: CI
 
 on:
@@ -41,6 +42,51 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: cargo test
         run: cargo test --no-fail-fast
+
+  macos-universal:
+    name: macos universal binary
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ci-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin,x86_64-apple-darwin
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: universal
+      - name: Build both architectures
+        env:
+          LSYNC_RELEASE_VERSION: ${{ env.VERSION }}
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked -p lsync --target "$target"
+            scripts/ci/pack-cli.sh "target/$target/release/lsync" "$target" "$VERSION" dist
+          done
+      - name: lipo
+        run: |
+          set -euo pipefail
+          scripts/ci/macos-universal.sh "$VERSION" dist
+          tar -xzOf "dist/lsync-$VERSION-universal-apple-darwin.tar.gz" "lsync-$VERSION-universal-apple-darwin/lsync" > lsync-universal
+          chmod +x lsync-universal
+          [[ "$(./lsync-universal --version)" == "lsync $VERSION" ]]
+      - name: install.sh from the built archives
+        run: |
+          set -euo pipefail
+          (cd dist && shasum -a 256 -- *.tar.gz > SHA256SUMS)
+          sh install.sh --version "$VERSION" --base-url "file://$PWD/dist" --prefix "$RUNNER_TEMP/prefix"
+          [[ "$("$RUNNER_TEMP/prefix/bin/lsync" --version)" == "lsync $VERSION" ]]
+          lipo -archs "$RUNNER_TEMP/prefix/bin/lsync"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lsync-universal-apple-darwin
+          path: dist/lsync-*-universal-apple-darwin.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
   android:
     name: android app
