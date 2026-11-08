@@ -149,10 +149,12 @@ Run the other commands in the running container (`docker exec lsync lsync vault 
 
 - `lsync service install` writes the LaunchAgent `~/Library/LaunchAgents/no.nyta.lsync.plist` and loads it into your login session: started at login, restarted after an unsuccessful exit, logging to `~/Library/Logs/lsync/lsync.log` (`lsync service logs`). It is not a `Background` process, which would throttle its I/O and timers.
 - **Homebrew:** `brew services start lsync` runs the same service under Homebrew's label, logging to `$(brew --prefix)/var/log/lsync.log`. Use it or `lsync service install`, not both: the second service is refused.
-- **Privacy permissions:** a vault under `~/Documents`, `~/Desktop`, `~/Downloads` or iCloud Drive needs Full Disk Access for the `lsync` binary (System Settings, Privacy & Security). A service cannot ask for it. `lsync doctor` says when it is missing.
+- **Privacy permissions:** a vault under `~/Documents`, `~/Desktop`, `~/Downloads` or iCloud Drive needs Full Disk Access for the `lsync` binary (System Settings, Privacy & Security). A service cannot ask for it. Without it the vault is not started at all, never read as empty, so nothing counts as deleted; the service retries and picks it up once access is granted. `lsync doctor` says when it is missing.
+- **Names:** lsync probes each vault's volume for how it folds case and Unicode normalisation (APFS keeps `é` in either form as one file) and matches local names to the server's by exactly that. A file evicted to iCloud Drive (only `.NAME.icloud` left) counts as not checked, never as deleted.
+- **Renames:** FSEvents reports the two halves of a rename separately; lsync pairs them when both are the same file (device and inode), so a rename is sent as a rename. A file lsync had not seen since it started can't be paired that way, so its old name is held like any delete for 10 s, and the new name goes up as a new note.
 - **Passwords** can go in the Keychain: `lsync account add home … --secret keyring:home`.
 - **Menu bar:** `lsync status --follow --format=swiftbar` is a streamable [SwiftBar](https://github.com/swiftbar/SwiftBar) plugin.
-- The macOS build passes the whole test suite in CI, but has not yet been field-checked on a Mac with a real vault. Case-insensitive volumes behave as Android's shared storage does: a remote rename that changes only case keeps the old spelling on disk.
+- The macOS build passes the whole test suite in CI, but has not yet been field-checked on a Mac with a real vault. Case-insensitive volumes behave as Android's shared storage does: a remote rename that changes only case keeps the old spelling on disk. On a case-sensitive APFS volume, a case-only rename is sent as a rename of the same note.
 
 ## Android app
 
