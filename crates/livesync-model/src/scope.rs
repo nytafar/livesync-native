@@ -1,11 +1,35 @@
 //! Folder scope: which vault paths a profile syncs (spec "Folder scope").
 //!
 //! Prefixes are vault-relative folders, matched case-insensitively (the same
-//! lower-casing as document IDs). The scope is applied after the built-in
-//! skips (dot-paths, flag files, `syncIgnoreRegEx`).
+//! lower-casing as document IDs) and in Unicode NFC, so a folder the
+//! filesystem lists in NFD (macOS: `Cafe\u{301}`) matches a prefix typed in
+//! NFC (`Caf\u{e9}`) and the other way round. The scope is applied after the
+//! built-in skips (dot-paths, flag files, `syncIgnoreRegEx`).
 
 use crate::path::js_to_lower_case;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use unicode_normalization::{is_nfc, UnicodeNormalization};
+
+/// The form a path or prefix is matched in: lower-cased, then NFC.
+fn key(path: &str) -> String {
+    let lower = js_to_lower_case(path);
+    if is_nfc(&lower) {
+        lower
+    } else {
+        lower.nfc().collect()
+    }
+}
+
+/// A stored prefix in NFC (one saved before prefixes were normalised may
+/// not be).
+fn nfc(p: &str) -> Cow<'_, str> {
+    if is_nfc(p) {
+        Cow::Borrowed(p)
+    } else {
+        Cow::Owned(p.nfc().collect())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -21,7 +45,8 @@ pub enum ScopeMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub mode: ScopeMode,
-    /// Normalised, lower-cased folder prefixes without leading or trailing `/`.
+    /// Normalised (lower-cased, NFC) folder prefixes without leading or
+    /// trailing `/`.
     pub prefixes: Vec<String>,
 }
 
@@ -67,7 +92,7 @@ fn normalise_prefix(p: &str) -> Result<String, String> {
             return Err(format!("folder prefix {p:?} is a dot-path; dot-paths never sync"));
         }
     }
-    Ok(js_to_lower_case(&segs.join("/")))
+    Ok(key(&segs.join("/")))
 }
 
 fn under(key: &str, prefix: &str) -> bool {
@@ -105,26 +130,26 @@ impl Scope {
     }
 
     fn covered(&self, key: &str) -> bool {
-        self.prefixes.iter().any(|p| under(key, p))
+        self.prefixes.iter().any(|p| under(key, &nfc(p)))
     }
 
     /// Whether a vault path is inside the scope.
     pub fn contains(&self, path: &str) -> bool {
         match self.mode {
             ScopeMode::All => true,
-            ScopeMode::Include => self.covered(&js_to_lower_case(path)),
-            ScopeMode::Exclude => !self.covered(&js_to_lower_case(path)),
+            ScopeMode::Include => self.covered(&key(path)),
+            ScopeMode::Exclude => !self.covered(&key(path)),
         }
     }
 
     /// Whether a folder may hold files inside the scope (so a scan must
     /// descend into it).
     pub fn may_contain_under(&self, dir: &str) -> bool {
-        let key = js_to_lower_case(dir.trim_matches('/'));
+        let key = key(dir.trim_matches('/'));
         match self.mode {
             ScopeMode::All => true,
             ScopeMode::Exclude => !self.covered(&key),
-            ScopeMode::Include => self.covered(&key) || self.prefixes.iter().any(|p| under(p, &key)),
+            ScopeMode::Include => self.covered(&key) || self.prefixes.iter().any(|p| under(&nfc(p), &key)),
         }
     }
 
@@ -157,7 +182,7 @@ impl Scope {
                         v.push(q.clone());
                     }
                     for e in &old.prefixes {
-                        if under(e, q) {
+                        if under(&nfc(e), q) {
                             v.push(e.clone());
                         }
                     }
@@ -173,8 +198,11 @@ impl Scope {
     /// How much of the folder `dir` (vault-relative) syncs, for showing a
     /// scope against a folder list.
     pub fn coverage(&self, dir: &str) -> Coverage {
-        let key = js_to_lower_case(dir.trim_matches('/'));
-        let nested = self.prefixes.iter().any(|p| p != &key && under(p, &key));
+        let key = key(dir.trim_matches('/'));
+        let nested = self.prefixes.iter().any(|p| {
+            let p = nfc(p);
+            *p != *key && under(&p, &key)
+        });
         match self.mode {
             ScopeMode::All => Coverage::Whole,
             ScopeMode::Include if self.covered(&key) => Coverage::Whole,
@@ -223,6 +251,29 @@ mod tests {
         assert!(!inc.may_contain_under("projects/beta"));
         assert!(!exc.may_contain_under("Private/sub"));
         assert!(exc.may_contain_under("public"));
+    }
+
+    /// Review of #21: APFS lists a folder in the spelling it was created
+    /// with, NFD from the Finder: it matches a prefix typed in NFC, and an
+    /// NFD prefix matches an NFC folder.
+    #[test]
+    fn matching_folds_unicode_normalisation() {
+        let (nfc_name, nfd_name) = ("Caf\u{e9}", "Cafe\u{301}");
+        let exc = s(ScopeMode::Exclude, &[nfc_name]);
+        assert!(!exc.contains(&format!("{nfd_name}/menu.md")));
+        assert!(!exc.may_contain_under(nfd_name));
+        assert_eq!(exc.coverage(nfd_name), Coverage::None);
+        let inc = s(ScopeMode::Include, &[nfd_name]);
+        assert_eq!(inc.prefixes, vec!["caf\u{e9}"]);
+        assert!(inc.contains(&format!("{nfc_name}/menu.md")));
+        assert!(inc.contains(&format!("{nfd_name}/menu.md")));
+        assert!(inc.may_contain_under(nfc_name));
+        assert_eq!(inc.coverage(nfd_name), Coverage::Whole);
+        // A prefix saved before prefixes were normalised still matches.
+        let old: Scope = serde_json::from_str(r#"{"mode":"include","prefixes":["cafe\u0301/sub"]}"#).unwrap();
+        assert!(old.contains(&format!("{nfc_name}/sub/x.md")));
+        assert!(old.may_contain_under(nfc_name));
+        assert_eq!(old.coverage(nfc_name), Coverage::Part);
     }
 
     #[test]
