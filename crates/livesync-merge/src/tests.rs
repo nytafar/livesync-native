@@ -1193,6 +1193,46 @@ fn a_line_both_inserted_a_blank_line_apart_stays_open_whatever_the_counts() {
     assert_eq!(written(&m), "- [x] gym\n\n- [x] gym\n");
 }
 
+/// A line both sides added, one copy on each side of an anchor that may
+/// have moved: the stretch around that anchor reads it as moved and places
+/// the other side's copy past it, in a gap no text has the line in, and the
+/// other copy is in another stretch (the 200k props' seed after review 8;
+/// bc33fa0 merged it with `remote 4` twice). Open.
+#[test]
+fn a_line_both_added_is_never_carried_past_an_anchor_into_a_second_copy() {
+    let b = "line 1\n\n\n\nline 2\n- x\nline 3\n";
+    let o = "\nline 2\nline 1 e\n\n\nline 3\nremote 4\n";
+    let t = "line 1\n\n\n\nremote 4\nline 2\nline 3\n";
+    for m in both_ways(b, o, t) {
+        if let Outcome::Write(w) = &m.outcome {
+            let w = String::from_utf8_lossy(w);
+            assert!(w.matches("remote 4").count() < 2, "{w:?}");
+        }
+    }
+}
+
+/// Review 8's two merges that take a line both sides put in at one point
+/// once, where one side also removed another copy (so it may have moved the
+/// lines around it instead): each is that side's file, which a writer that
+/// never saw the other side's line would have written too. Open (review 9).
+#[test]
+fn a_line_both_put_in_once_beside_a_move_stays_open() {
+    let cases = [
+        ("A\nB\nC\n---\n", "A\n---\nB\nC\n", "A\n---\nB\nC\n---\n"),
+        (
+            "- x\nline 1\n\n- x\n---\n---\n",
+            "- x\nline 1\n---\n\n- x\n--- o",
+            "- x\nline 1\n---\n\n- x\n---\n---\n",
+        ),
+        ("---\r\nline 1\r\n", "line 1\r\n---\r\n", "line 1\r\n---\r\nline 1\r\n"),
+    ];
+    for (b, o, t) in cases {
+        for m in both_ways(b, o, t) {
+            assert!(m.outcome.is_open(), "{b:?} {o:?} {t:?}: {m:?}");
+        }
+    }
+}
+
 #[test]
 fn insertions_either_side_of_a_kept_blank_line_are_never_taken_twice() {
     // R2 added a blank line, which the diff puts before the base's blank

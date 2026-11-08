@@ -52,7 +52,13 @@
 //!    the end, a line appended there), the placement rules decide as for any
 //!    change. And whatever moved: a line neither side has more often than the
 //!    base is not in the merge more often than in both sides, and one neither
-//!    side has less often is not in it less often than in either.
+//!    side has less often is not in it less often than in either. A line the
+//!    merge has more often than either side (both added it) is in each gap
+//!    no more often than the base or a side has it there, or (where both
+//!    sides have it there) than both together: a reading that moved an
+//!    anchor may carry one side's copy past it, into a gap no text has it in,
+//!    while the other copy is in another stretch, where no rule of one
+//!    stretch sees the two.
 //! 4. **Stretches both sides changed.** Each side's change is read in every
 //!    way the texts allow: every longest common subsequence of the side's
 //!    stretch with the base's ([`readings`]). Every pair of readings is merged
@@ -77,7 +83,14 @@
 //!      price of a symmetric merge: a deletion right beside the other side's
 //!      change stays open;
 //!    - under some reading a side removed a line and put the same line
-//!      elsewhere in the stretch (a move), where the other side removed it.
+//!      elsewhere in the stretch (a move), where the other side removed it;
+//!    - under some reading a side removed a line and put the same line
+//!      elsewhere (a move), and the merge has it less often than that side
+//!      and the other side's insertions of it give (less the base copies the
+//!      other side removed): the other side put it in at the same point,
+//!      taken once, where read as a move it is a line of its own. A merge
+//!      that is the moving side's file would lose it without a word, were
+//!      that side a writer that never saw it.
 //!
 //!    Where the readings are too many to try ([`MAX_READINGS`], [`MAX_PAIRS`]),
 //!    the stretch too large to line up ([`MAX_CELLS`]), or judging it would
@@ -409,7 +422,11 @@ fn anchors(t: [&[&str]; 3], budget: &mut Budget) -> Result<Vec<[usize; 3]>, OutO
 /// - a line neither side has more often than the base, which the merge has
 ///   more often than both sides; or one neither side has less often, which
 ///   the merge has less often than either side. No right merge does that,
-///   however the lines moved.
+///   however the lines moved;
+/// - a line the merge has more often than either side, in a gap where it has
+///   it more often than the base and each side there (but for copies both
+///   sides have in the gap): a copy carried past an anchor that a stretch's
+///   reading moved, beside the other side's copy elsewhere.
 fn in_doubt(t: [&[&str]; 4], gaps: &[[Range<usize>; 4]], budget: &mut Budget) -> Result<Vec<bool>, OutOfBudget> {
     budget.spend(8 * t.iter().map(|x| x.len()).sum::<usize>())?;
     // (line, gap) -> how often each text has it, and the totals.
@@ -576,6 +593,13 @@ fn in_doubt(t: [&[&str]; 4], gaps: &[[Range<usize>; 4]], budget: &mut Budget) ->
         let more = o <= b && th <= b && m > o.max(th);
         let fewer = o >= b && th >= b && m < o.max(th);
         if (more || fewer) && c[1..].iter().any(|&x| x != c[0]) {
+            open[g] = true;
+        }
+        // More often than either side, with a copy in a gap where no text
+        // has it as often: carried past an anchor a reading moved (where both
+        // sides have it in the gap, two runs at one point may hold it each).
+        let stray = c[3] > c[0].max(c[1]).max(c[2]) && !(c[1] > 0 && c[2] > 0 && c[3] <= c[1] + c[2]);
+        if m > o.max(th) && stray {
             open[g] = true;
         }
     }
@@ -843,7 +867,11 @@ fn contested(
                 return Ok(false);
             }
             match plain(b, [(o, &ao.al), (t, &at.al)], ours_first) {
-                Some(x) if x == m => {}
+                Some(x) if x == m => {
+                    if short_of_move(b, (o, ao), (t, at), &x) || short_of_move(b, (t, at), (o, ao), &x) {
+                        return Ok(false);
+                    }
+                }
                 _ => return Ok(false),
             }
         }
@@ -920,6 +948,37 @@ impl Reading {
             moved,
         }
     }
+}
+
+/// Whether the merge `x` of a stretch has a line (not blank) that side `a`
+/// may have moved (removed a copy and put one in elsewhere) less often than
+/// a move gives: all of `a`'s copies, and those `c` put in, less the base
+/// copies `c` removed. Where `c` put the line in at the point `a` did, the
+/// placement rules take it once, by `a`'s reading as an insertion; read as a
+/// move, `c`'s copy is a line of its own, and a merge that is `a`'s file
+/// would lose it without a word (a writer that never saw `c`'s line).
+fn short_of_move(b: &[&str], (sa, ra): (&[&str], &Reading), (sc, rc): (&[&str], &Reading), x: &[&str]) -> bool {
+    let count = |v: &mut dyn Iterator<Item = &&str>, l: &str| v.filter(|y| !blank(y) && content(y) == l).count();
+    let mut kept = vec![false; sc.len()];
+    for &j in rc.al.iter().flatten() {
+        kept[j] = true;
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    (0..b.len()).filter(|&i| ra.moved[i]).any(|i| {
+        let l = content(b[i]);
+        if !seen.insert(l) {
+            return false;
+        }
+        let put = sc
+            .iter()
+            .zip(&kept)
+            .filter(|(y, k)| !**k && !blank(y) && content(y) == l)
+            .count();
+        let gone = (0..b.len())
+            .filter(|&k| content(b[k]) == l && rc.al[k].is_none())
+            .count();
+        count(&mut x.iter(), l) + gone < count(&mut sa.iter(), l) + put
+    })
 }
 
 /// The base lines around a base line up to the nearest ones that are not
