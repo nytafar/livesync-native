@@ -1,28 +1,164 @@
-# livesync-android
+# lsync: Self-hosted LiveSync without Obsidian
 
-**Self-hosted LiveSync for Android that keeps syncing when Obsidian is closed.**
+**A native client for [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync) that keeps vault folders in sync with your CouchDB on desktops, servers and Android, whether or not Obsidian is open.**
 
-[Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync) keeps Obsidian vaults in sync through your own CouchDB. On the desktop it works well. On Android it struggles:
+Self-hosted LiveSync syncs Obsidian vaults through your own CouchDB, but only while Obsidian runs: the plugin lives inside the app. It also keeps a full replica of the database (for our vault 1.8 GB and over 300,000 documents) and does its chunking and hashing on the thread you type on.
 
-- **It only syncs while Obsidian is open.** The plugin runs inside the app, and Android suspends it in the background. Notes edited elsewhere arrive only after you open Obsidian, and then you wait while it catches up.
-- **It keeps the whole database on the phone.** The plugin stores a full replica in Obsidian's IndexedDB: every document and every chunk, including old revisions. For our vault that is 1.8 GB and over 300,000 documents.
-- **It does the heavy work on Obsidian's UI thread.** Chunking, hashing and replication share the thread you type on.
+lsync is a small sync engine in Rust that talks to the same database, wire-compatible with the plugin. It runs on its own as a service and keeps plain folders in sync: a laptop's vault, a server's notes folder that agents and scripts write to, or a phone's vault. Obsidian opens such a folder as an ordinary vault, with the LiveSync plugin turned off on that device. The desktop plugin and the official CLI keep working against the same database.
 
-So we rebuilt the client: a small native sync engine in Rust that talks to the same CouchDB database, wire-compatible with the official plugin. It runs on its own, always on, and keeps a plain folder in sync. Obsidian opens that folder as an ordinary vault, with the LiveSync plugin turned off on that device. The desktop plugin and the official CLI keep working against the same database.
+- **One binary, three roles:** the service (`lsync serve`, every vault in one process), the CLI for people and scripts, and a stand-in for the official LiveSync CLI.
+- **Linux, macOS and Termux;** the [Android app](#android-app) shares the engine.
+- **Small and fast:** a first sync of 2,200 files in 21 s with 96 MB of memory, and a 2.2 MB index instead of a replica (see [How it compares](#how-it-compares)).
+- **Fails closed:** an unknown database format, setting or plugin release stops that vault with a message, instead of being guessed at ([`COMPATIBILITY.md`](COMPATIBILITY.md)).
 
-## Two ways to run it
+This is an independent client, not affiliated with the Self-hosted LiveSync project.
 
-### Android app
+## Install
 
-A foreground service keeps one or more vault folders in sync, whether or not Obsidian is open.
+Every release has static binaries for Linux (x86_64 and aarch64, musl), a universal macOS binary and a Termux build, with `SHA256SUMS`, on the [releases page](https://github.com/nytafar/livesync-native/releases).
 
-- Edits from other devices land in the phone's vault in under a second, and phone edits are pushed about 2 s after Obsidian saves them.
-- It keeps only a small index on the phone and fetches content on demand: the first sync of 2,458 files took 62 s.
-- It comes back by itself after a reboot or an app update.
-- Each vault can be pull-only (read-only, the safe way to start) or two-way, and can sync all folders, only some, or all but some.
-- The password is encrypted with a key in the Android Keystore.
+**Script** (Linux and macOS, into `~/.local/bin`, no sudo): it downloads the archive for this machine, checks it against the release's `SHA256SUMS` and stops on a mismatch.
 
-Requires Android 11 or later. Build the APK with `scripts/build-apk.sh` (see [AGENTS.md](AGENTS.md)), install it, then:
+```sh
+curl -fsSLO https://github.com/nytafar/livesync-native/releases/latest/download/install.sh
+sh install.sh                         # --version 0.4.0, --prefix DIR or --bin-dir DIR; --help
+```
+
+**Arch and Omarchy** (AUR): `yay -S lsync-bin` (or `paru -S lsync-bin`).
+
+**Homebrew** (macOS and Linux): `brew install nytafar/tap/lsync`. `brew services start lsync` then runs the service ([below](#macos)).
+
+**Docker:** `ghcr.io/nytafar/lsync` for amd64 and arm64, [below](#docker).
+
+**By hand:** download `lsync-<version>-<target>.tar.gz` and `SHA256SUMS`, check with `sha256sum -c --ignore-missing SHA256SUMS` (macOS: `shasum -a 256 -c`), and put `lsync` on your `PATH`. On macOS a binary downloaded with a browser is quarantined: `xattr -d com.apple.quarantine lsync` once.
+
+**From source** (Rust stable): `cargo install --locked --git https://github.com/nytafar/livesync-native lsync`, or `cargo build --release -p lsync` in a checkout. Build and test instructions are in [AGENTS.md](AGENTS.md).
+
+## Quick start
+
+```sh
+lsync account add home --url https://couch.example.net --user me   # asks for the password
+lsync vault add notes --db vault --folder ~/Notes                    # --include/--exclude for some folders
+lsync connect                     # check that the database is one lsync can sync
+lsync sync                        # optional: the first sync now, in the foreground
+lsync service install             # run `lsync serve` at login (systemd user service, or a LaunchAgent)
+lsync status --all                # every vault of the service
+```
+
+On a server, `lsync service install --linger` starts the user service at boot without a login; for a system service, see [Running on a server](#running-on-a-server).
+
+**Taking over a vault the LiveSync plugin keeps in sync.** Import its settings, turn the plugin off on this machine, check, then take the folder over:
+
+```sh
+lsync import ~/Notes/.obsidian/plugins/obsidian-livesync/data.json   # account and vault "notes", added disabled
+# In Obsidian on this machine: turn Self-hosted LiveSync off (lsync refuses a vault where it is on).
+lsync --vault notes adopt --dry-run   # identical, differing, only here, only on the server
+lsync --vault notes adopt             # adopt the identical files without a transfer, then the first sync
+lsync vault enable notes              # let the service run it
+lsync service install
+```
+
+Files that differ from the server's version become conflicts with no common ancestor, so the dry run lists them first. `import` also reads the official CLI's `settings.json`; settings lsync cannot honour (end-to-end encryption, path obfuscation, another kind of remote) stop it with the reason. Details under [What syncs](#reference).
+
+A database that a plugin or CLI from 1.0.46 on set up new is refused for now (NFC path identity); databases set up before keep working. [`COMPATIBILITY.md`](COMPATIBILITY.md) has the tested versions and what to do.
+
+## The service
+
+`lsync serve` runs every enabled vault in `lsync.toml` in one process, with one HTTP connection pool per server. A failing vault is retried, from 15 s to 15 minutes, without stopping the others. `lsync service install` runs it under systemd or launchd; `kill -HUP` or `lsync reload` rereads the config, and `lsync account …` and `lsync vault …` tell it to.
+
+**The control socket.** The service listens on a Unix socket, never on the network: `$XDG_RUNTIME_DIR/lsync/control.sock` on Linux, `~/Library/Application Support/lsync/control.sock` on macOS, `/run/lsync/control.sock` for the system service (`$LSYNC_RUNTIME_DIR` overrides). Only the service's own user may connect (checked per connection with `SO_PEERCRED` or `getpeereid`), and for the system service the members of its `--group`. The protocol is newline-delimited JSON, stable within a major version and documented under [Reference](#reference), so a status bar, a script or an agent can use it: `printf '%s\n' '{"v":1,"id":1,"method":"status"}' | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/lsync/control.sock"`.
+
+**One CLI, two paths.** Every command for a vault asks the socket first. When the service runs that vault, the command runs inside the service, which holds the vault's locks; otherwise the CLI opens the engine itself, one-shot. The output and the exit code are the same either way.
+
+## Commands
+
+| Command | What |
+|---|---|
+| `lsync sync` | One two-way sync: pull, register this device, push local changes. |
+| `lsync pull` | One pull into the folder; never writes to the server. |
+| `lsync fetch` | Start over from the server (upstream's "Fetch"), then sync. |
+| `lsync flush [PATH…]` | Push now and return once stored on the server, with the revisions. |
+| `lsync wait --applied PATH[@REV]`, `--idle` | Block until that revision is in the local file, or nothing is pending. |
+| `lsync status [--all] [--json]` | A vault's index, last gate result and files needing attention; `--all`: every vault of the service. |
+| `lsync status --follow --waybar` | One [Waybar](https://github.com/Alexays/Waybar) JSON line per change; `--format=swiftbar\|text\|json`. |
+| `lsync check-ignore PATH…` | Which ignore file and rule (or other filter) keeps each path out of sync. |
+| `lsync allow-deletes` | Confirm a vault's mass-delete stop: the files it listed, and only those, are deleted. |
+| `lsync doctor` | Check the config, the secret stores, the vault folders, the watch limit and the service. |
+| `lsync import FILE` | The plugin's `data.json` or the official CLI's `settings.json` to an account and a vault. |
+| `lsync adopt [--dry-run]` | Take over a folder that is already in sync, before its first sync here. |
+| `lsync serve`, `lsync service install\|uninstall\|status\|logs` | The service, and installing it. |
+| `lsync account add\|ls\|passwd\|rm`, `lsync vault add\|ls\|edit\|enable\|disable\|rm` | Edit `lsync.toml`, keeping its comments. |
+| `lsync pause`, `resume`, `sync-now`, `reload`, `events` | Talk to the running service. |
+| `lsync connect`, `folders`, `daemon` | Check the database; list the server's folders; one vault in the foreground. |
+
+With more than one vault, name one: `lsync --vault notes sync`. `flush` and `wait` let an agent on a server write a note and flush it while a script on a laptop waits for exactly that revision. Every option, the environment variables and the exit codes are under [Reference](#reference).
+
+## What syncs
+
+- **Ignore files** (`ignore_files = [".gitignore"]` for a vault) work as in the plugin and the official CLI, so every client agrees on what is in the vault. They are **not git's rules**: `*.log` matches only beside its ignore file, so write `**/*.log` for git's behaviour. Edits apply while running, an unreadable ignore file stops its folder instead of syncing it, and ignored folders such as `node_modules/` are never watched. `lsync check-ignore` explains any path.
+- **The trash.** A file deleted on another device is moved to `<vault>/.trash/` with its folders kept (or to the system trash, or deleted: `trash = "system"`, `"none"`). Only a file that still matches its synced version is moved; an edited one is kept.
+- **Dot-paths** (`.obsidian/`, other dot-folders and dot-files) stay out, except the ones listed in `sync_dot_paths`; `.obsidian/` never syncs.
+- **Folder scope:** all folders, only some (`--include`) or all but some (`--exclude`).
+
+## Safety
+
+- **It never overwrites or deletes a local edit it has not synced.** If the server changed too, your edit becomes a conflict for the desktop plugin to resolve.
+- **The upstream guard.** Before every write session (at start, after every reconnect, and every 5 minutes) it reads the database's version document, `used_features` and the milestone's tweaks. A newer generation, an unknown feature or setting, or a setting that changed stops that vault, and only that vault, with a message naming what changed and the newest plugin version known to work. It resumes by itself once the remote is compatible again. A weekly CI job runs the interop scenarios against the latest upstream release ([`COMPATIBILITY.md`](COMPATIBILITY.md)).
+- **The plugin guard.** Two-way sync refuses an Obsidian vault whose config folder (`.obsidian/`, or another one a device uses) has Self-hosted LiveSync enabled: two clients would write the same folder and database. `--allow-plugin` (or `allow_plugin = true`) is for a deliberate handover.
+- **The mass-delete stop.** A pass that would delete more than 20 files with no known destination, when they are also more than half of what it tracks, stops and asks; so does one that finds the synced folders empty and would delete 3 or more. The service judges a burst of deletes as one, so a slow wipe still meets the stop. `lsync status` shows the stop and `lsync allow-deletes` confirms exactly the files it lists. Moves into `.trash/` and renames never count.
+- **Deletes are LiveSync's soft deletes,** and only for files that were in sync.
+- **One engine per vault folder and per state folder,** whichever process it comes from; a second one is refused and told who holds it.
+
+## Running on a server
+
+- **A lingering user service** (`lsync service install --linger`) is the simple way: it starts at boot and runs as you.
+- **A system service** keeps the config away from the service:
+
+  ```sh
+  sudo useradd --system --user-group --create-home --home-dir /var/lib/lsync-home lsync
+  sudo lsync --system account add home --url https://couch.example.net --user me --secret credential:lsync-home
+  sudo lsync --system vault add notes --account home --db vault --folder /srv/notes
+  sudo lsync service install --system --run-as lsync [--group agents]
+  lsync --system status --all       # as lsync, or a member of --group
+  ```
+
+  - **`--run-as` is required,** and root only when named. The binary must be one only root can change (`/usr/local/bin`, or the AUR package's `/usr/bin`).
+  - **The config stays root's:** `/etc/lsync` is 0750 and its files 0640, owned by root with the service's group, so the service reads them and cannot change them. Every edit is `sudo lsync --system …`. That group must be the service user's alone; install refuses a shared one.
+  - **Passwords:** `credential:lsync-NAME` keeps a password encrypted with `systemd-creds`, for the service alone; `file:` keeps it in `secrets.toml`, readable by the service's group, and install warns about each one.
+  - **The socket group:** with `--group GROUP`, members of that group (agents running as other users) may use the control socket: status, pause, resume, sync-now, events, reload and `lsync --system --vault NAME status|sync|fetch|pull`. They cannot read the config.
+  - **Hardening:** `ProtectSystem=strict` with the vault folders as the only `ReadWritePaths=`, `PrivateTmp`, `NoNewPrivileges`, `UMask=0007`; `Type=notify` with a watchdog.
+
+  Full details under [Reference](#reference).
+
+### Docker
+
+The image is `FROM scratch`: the static binary (it bundles its CA roots) and nothing else. It runs `lsync serve` as a system service as uid 10001, with the config in `/config`, the indexes and the control socket in `/state`, and the vault folders mounted where the config says, by convention under `/vaults`. With bind mounts, run it as the folders' owner:
+
+```sh
+mkdir -p config state vaults/notes
+run="docker run --user $(id -u):$(id -g) -v ./config:/config -v ./state:/state -v ./vaults:/vaults"
+$run --rm -it ghcr.io/nytafar/lsync account add home --url https://couch.example.net --user me
+$run --rm ghcr.io/nytafar/lsync vault add notes --db vault --folder /vaults/notes
+$run -d --name lsync --restart unless-stopped ghcr.io/nytafar/lsync     # lsync serve
+docker exec lsync lsync status --all
+```
+
+Run the other commands in the running container (`docker exec lsync lsync vault add …`) so the service reloads at once. Without `--user`, the folders must be writable by uid 10001. `pkg/` has the Dockerfile and how the image is built.
+
+## macOS
+
+- `lsync service install` writes the LaunchAgent `~/Library/LaunchAgents/no.nyta.lsync.plist` and loads it into your login session: started at login, restarted after an unsuccessful exit, logging to `~/Library/Logs/lsync/lsync.log` (`lsync service logs`). It is not a `Background` process, which would throttle its I/O and timers.
+- **Homebrew:** `brew services start lsync` runs the same service under Homebrew's label, logging to `$(brew --prefix)/var/log/lsync.log`. Use it or `lsync service install`, not both: the second service is refused.
+- **Privacy permissions:** a vault under `~/Documents`, `~/Desktop`, `~/Downloads` or iCloud Drive needs Full Disk Access for the `lsync` binary (System Settings, Privacy & Security). A service cannot ask for it. `lsync doctor` says when it is missing.
+- **Passwords** can go in the Keychain: `lsync account add home … --secret keyring:home`.
+- **Menu bar:** `lsync status --follow --format=swiftbar` is a streamable [SwiftBar](https://github.com/swiftbar/SwiftBar) plugin.
+- The macOS build passes the whole test suite in CI, but has not yet been field-checked on a Mac with a real vault. Case-insensitive volumes behave as Android's shared storage does: a remote rename that changes only case keeps the old spelling on disk.
+
+## Android app
+
+A foreground service keeps one or more vault folders on the phone in sync, whether or not Obsidian is open. Edits from other devices land in under a second, phone edits are pushed about 2 s after Obsidian saves them, and it comes back by itself after a reboot or an app update. It keeps only a small index and fetches content on demand: the first sync of 2,458 files took 62 s. The password is encrypted with a key in the Android Keystore.
+
+Requires Android 11 or later. Each release has a signed APK, `livesync-android-<version>.apk`; to build it yourself, see `scripts/build-apk.sh` in [AGENTS.md](AGENTS.md). Install it, then:
 
 1. Grant all-files access, notifications and the battery exemption on the setup screen.
 2. Pick a **new** folder under `Documents/Obsidian/`.
@@ -30,24 +166,9 @@ Requires Android 11 or later. Build the APK with `scripts/build-apk.sh` (see [AG
 4. Choose the folders to sync: a passing test lists the server's top-level folders with their file counts and sizes (on mobile data only when you tap "List the folders on the server", since it reads about 1 KB per file); tick them, or type a path.
 5. Save. Once the first sync finishes, open the folder in Obsidian ("Open folder as vault") and leave the LiveSync plugin off there.
 
-The home screen lists every vault with one line of status; "Add vault" sets up another one the same way. Vault folders may not be the same or inside each other, but two vaults may sync different folders of the same database: each is its own device to the other LiveSync clients. One notification summarises all of them, and removing a vault stops only that one.
+The home screen lists every vault with one line of status; "Add vault" sets up another one the same way. Each vault can be pull-only (the safe way to start) or two-way. Vault folders may not be the same or inside each other, but two vaults may sync different folders of the same database: each is its own device to the other LiveSync clients. One notification summarises all of them, and removing a vault stops only that one.
 
-### `lsync`, the command-line client
-
-The same engine as a single binary for Linux (and Termux on Android): one-shot pulls and syncs, or a long-running daemon for a server or a desktop without Obsidian.
-
-```sh
-lsync account add home --url https://couch.example.net --user me   # asks for the password
-lsync vault add notes --db vault --folder ~/Notes
-lsync connect            # check that the database is compatible
-lsync serve              # every vault, two-way, continuously, in one process
-lsync daemon             # one vault, two-way, continuously
-lsync daemon --pull-only # follow the server, never write to it
-```
-
-With more than one vault, name the one to act on: `lsync --vault notes sync`. While `lsync serve` runs, the other commands go through it (below), so `lsync sync`, `lsync status` and the rest work the same with or without the service.
-
-Full usage is under [Reference](#reference).
+**Termux:** the `aarch64-linux-android` archive is the CLI for Termux.
 
 ## How it compares
 
@@ -68,28 +189,16 @@ Both clients wrote the same 2,202 files byte for byte (lsync also writes the two
 
 To rerun: `scripts/bench/snapshot.sh` once, then `scripts/bench/run.sh --contenders lsync,official` and `python3 scripts/bench/summarise.py "$BENCH_WORK"`. See `AGENTS.md` for the prerequisites.
 
-## Safety
-
-- **It never overwrites or deletes a local edit it has not synced.** If the server changed too, your edit becomes a conflict for the desktop plugin to resolve.
-- **It fails closed.** Anything it doesn't recognise stops the sync instead of being guessed at, for example an unknown database version, encryption, or settings that changed since setup.
-- **It notices when the plugin moves on (the upstream guard).** Before every write session (at start, after every reconnect, and every 5 minutes while running) it reads the database's version document, `used_features` and the milestone's tweaks. A newer generation, a feature or a setting it doesn't know, or a setting that changed, stops that vault, and only that vault, with a message naming what changed and the newest plugin version known to work; it resumes by itself once the remote is compatible again. [`COMPATIBILITY.md`](COMPATIBILITY.md) lists the tested plugin and CLI versions, what each gate checks and what to do when one trips. A weekly CI job runs the interop scenarios against the latest upstream release.
-- **It doesn't share a vault with the plugin (the plugin guard).** Two-way sync refuses an Obsidian vault whose config folder enables Self-hosted LiveSync: `.obsidian/`, or any other top-level dot-folder a device uses as its config folder (Obsidian's "Override config folder", e.g. `.obsidian-mobile/`), that holds `plugins/obsidian-livesync/` and lists the plugin in its `community-plugins.json`. Two clients would write the same folder and database. A config folder that cannot be read counts as enabled. `--allow-plugin` (or `allow_plugin = true` for the vault) is for a deliberate handover. Plain folders, and read-only runs (`lsync pull`, a pull-only vault, also its fetch), are not affected; `lsync adopt` refuses such a folder in either mode.
-- **Deletes are LiveSync's soft deletes,** and only for files that were in sync. A pass that would delete more than 20 files with no known destination, when they are also more than half of what it tracks, stops and asks; so does one that finds the synced folders empty and would delete 3 or more. A move into `.trash/` or a rename never counts (as long as the file is still there under its new name), and smaller deletions go through without asking.
-- **A file deleted on another device goes to the trash,** `<vault>/.trash/` by default, with its folders kept, so a wrong delete can be undone. Only files that still match their synced version are moved.
-- **It stays out of `.obsidian/` and every other dot-folder,** unless you allowlist one (never `.obsidian/`).
-
 ## Status and limits
 
-Working: pull-only and two-way sync, the Android app and the CLI, tested against the official CLI and on a Samsung S22+ (Android 16) syncing a real 10,000-file vault.
+Working: pull-only and two-way sync, the service with its control socket and installers, and the Android app, tested against the official CLI on every scenario and on a Samsung S22+ (Android 16) syncing a real 10,000-file vault. The macOS build passes the test suite in CI.
 
 Not yet:
-- end-to-end encryption and path obfuscation; such databases are refused;
-- setup import (QR or setup URI);
-- merging conflicts on the device: they are left for the desktop plugin;
+- end-to-end encryption, path obfuscation and NFC path identity; such databases are refused;
+- setup URIs and QR codes (`lsync import` reads the settings files);
+- merging conflicts: they are left for the desktop plugin;
 - Hidden File Sync and Customisation Sync (`.obsidian/`);
-- release builds and an app-store listing.
-
-This is an independent client, not affiliated with the Self-hosted LiveSync project.
+- code signing and notarisation on macOS, and an app-store listing for Android.
 
 ## Reference
 
@@ -519,6 +628,7 @@ Exit codes:
 | `android/` | The Android app (Kotlin, Compose): foreground service, onboarding, vault list, status screens |
 | `tools/golden` | Node program pinned to `@vrtmrz/livesync-commonlib` 0.2.1; it emits the fixtures in `fixtures/golden` |
 | `scripts/` | APK and Termux builds, dev-database environment, a vault comparison script, and `interop.sh` (the M2 scenarios against the official CLI) |
+| `install.sh`, `pkg/` | The install script, and the AUR package, Homebrew formula and Docker image, published at each release ([`pkg/README.md`](pkg/README.md)) |
 
 Build and test instructions are in [AGENTS.md](AGENTS.md).
 
