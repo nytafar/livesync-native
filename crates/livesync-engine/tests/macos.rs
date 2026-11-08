@@ -60,6 +60,17 @@ impl Env {
     fn engine(&self) -> Engine {
         Engine::open(self.couch(), self.config()).unwrap()
     }
+    /// The two-way daemon as on a filesystem with `rules`, with short
+    /// settle and hold times and no periodic rescan.
+    fn daemon_on(&self, rules: &FsRules) -> Engine {
+        let mut cfg = self.config();
+        let r = rules.clone();
+        cfg.fs_probe = Some(FsProbe::new(move |_| Ok(r.clone())));
+        cfg.settle = Duration::from_millis(150);
+        cfg.rescan_interval = Duration::from_secs(3600);
+        cfg.delete_hold = Duration::from_millis(500);
+        Engine::open(self.couch(), cfg).unwrap()
+    }
     fn write(&self, rel: &str, bytes: &[u8]) {
         let p = self.vault().join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -89,6 +100,16 @@ impl Env {
     fn deleted(&self, path: &str) -> bool {
         self.doc(path).is_some_and(|d| d.get("deleted") == Some(&json!(true)))
     }
+    /// Whether any revision of the document at `path` (by the
+    /// case-insensitive ID) was a deletion.
+    fn ever_deleted(&self, path: &str) -> bool {
+        let st = self.mock.state.lock().unwrap();
+        st.trees.get(&path_to_id(path, true)).is_some_and(|t| {
+            t.revs
+                .values()
+                .any(|n| n.deleted || n.body.as_ref().is_some_and(|b| b.get("deleted") == Some(&json!(true))))
+        })
+    }
     /// Writes other than the milestone's.
     fn doc_writes(&self) -> Vec<(String, String)> {
         self.mock
@@ -114,6 +135,16 @@ fn apfs_case_sensitive() -> FsRules {
         normalization_insensitive: true,
         ..FsRules::permissive()
     }
+}
+
+async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {what}");
 }
 
 const NAMES: [(&str, &str); 3] = [
@@ -221,6 +252,49 @@ async fn a_filesystem_that_folds_only_normalisation_keeps_case_apart() {
     let rep = env.engine_on(&fs).sync_once().await.unwrap();
     assert_eq!(rep.push.pushed + rep.push.deleted, 0, "{rep:?}");
     assert!(env.mock.live_paths().contains(&nfc.to_string()));
+
+    // With LiveSync's default, case-insensitive document IDs
+    // (`handleFilenameCaseSensitive` false), `Draft.md` and `draft.md` are
+    // one document: a case-only rename renames it, in a full pass ...
+    let env = Env::new().await;
+    env.write("Draft.md", b"draft");
+    env.engine_on(&fs).sync_once().await.unwrap();
+    env.mv("Draft.md", "draft.md");
+    let rep = env.engine_on(&fs).sync_once().await.unwrap();
+    assert_eq!((rep.push.pushed, rep.push.deleted), (1, 0), "{rep:?}");
+    assert_eq!(env.mock.live_paths(), ["draft.md"]);
+    assert!(!env.ever_deleted("draft.md"));
+    // ... and in the daemon, where the watcher reports it as a rename and a
+    // partial pass sees both names: the old name's document is the new
+    // name's, so it is renamed, never deleted.
+    let env = Env::new().await;
+    env.write("Draft.md", b"draft");
+    env.engine_on(&fs).sync_once().await.unwrap();
+    let engine = env.daemon_on(&fs);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn({
+        let e = engine.clone();
+        async move { e.run(rx).await }
+    });
+    env.write("probe.md", b"probe");
+    wait_until("the watcher", || env.remote("probe.md").is_some()).await;
+    env.mock.clear_requests();
+    env.mv("Draft.md", "draft.md");
+    wait_until("the case-only rename", || {
+        env.mock.live_paths().contains(&"draft.md".to_string())
+    })
+    .await;
+    // Past the settle time and the delete hold.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(env.mock.live_paths(), ["draft.md", "probe.md"]);
+    // One write: the rename. No deletion, not even one the server refused.
+    assert_eq!(env.doc_writes().len(), 1, "{:?}", env.doc_writes());
+    assert!(!env.ever_deleted("draft.md"), "{:?}", env.doc("draft.md"));
+    tx.send(true).unwrap();
+    task.await.unwrap().unwrap();
+    drop(engine);
+    let rep = env.engine_on(&fs).sync_once().await.unwrap();
+    assert_eq!(rep.push.pushed + rep.push.created + rep.push.deleted, 0, "{rep:?}");
 }
 
 /// Two remote documents whose paths differ only in normalisation (made on

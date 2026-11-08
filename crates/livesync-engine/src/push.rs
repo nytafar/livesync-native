@@ -1024,9 +1024,10 @@ impl Engine {
             && r.disk_mtime == Some(f.mtime_ms)
             && r.base_rev.is_some()
             && r.state != State::OutOfScope
-            // A case-only rename on a case-sensitive filesystem keeps the
-            // document but changes its path.
-            && (self.inner.fs.folds() || r.path == f.rel)
+            // A rename this filesystem tells apart (a case-only rename where
+            // only Unicode normalisation folds, as on case-sensitive APFS)
+            // keeps the document but changes its path.
+            && self.inner.fs.same_name(&r.path, &f.rel)
     }
 
     /// One document failed. Record it and go on, unless the error means the
@@ -2205,7 +2206,26 @@ impl Engine {
         // past their wait): their wait is remembered until that resolves.
         let mut waiting: HashSet<String> = HashSet::new();
         for r in gone {
+            // A rename that keeps the document (a case-only rename where IDs
+            // fold case and the filesystem does not): never a deletion while
+            // the new name is there. It is pushed as that document's file, by
+            // this pass if it saw the new name, else by the pass that does.
+            let moved_on = self
+                .with_index(|ix| ix.by_doc(&r.doc_id))?
+                .is_some_and(|now| now.path != r.path);
             let dest = hints.dest(&r.path);
+            let same_doc = |d: &String| {
+                self.doc_id_for(d) == r.doc_id
+                    && std::fs::symlink_metadata(self.inner.cfg.vault.join(d)).is_ok_and(|m| m.is_file())
+            };
+            if moved_on || dest.as_ref().is_some_and(same_doc) {
+                debug!(
+                    "{}: renamed to {}, which is the same document; not a deletion",
+                    r.path,
+                    dest.as_deref().unwrap_or("another spelling")
+                );
+                continue;
+            }
             let failed_dest = dest.as_ref().is_some_and(|d| ctx.failed_paths.contains(d))
                 || r.disk_hash.as_ref().is_some_and(|h| ctx.failed_hashes.contains(h));
             if failed_dest {
