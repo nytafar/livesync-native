@@ -90,6 +90,7 @@
 use crate::dmp::{Budget, OutOfBudget};
 use crate::lines::{blank, content, Hunk, Seg, Walk};
 use crate::LineOverlap;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -474,6 +475,9 @@ fn in_doubt(t: [&[&str]; 4], gaps: &[[Range<usize>; 4]], budget: &mut Budget) ->
     //   point), the placement rules decide as for any change.
     budget.spend(4 * t.iter().map(|x| x.len()).sum::<usize>())?;
     let mut open = vec![false; gaps.len()];
+    // (first gap, last gap, side) -> the window's cells some longest common
+    // subsequence pairs, built once however many moved lines ask.
+    let mut tables: HashMap<(usize, usize, usize), OnLcs> = HashMap::new();
     for (&(l, side), (ins, rem)) in &way {
         if !ins.iter().any(|g| rem.iter().any(|h| g != h)) {
             continue;
@@ -504,7 +508,14 @@ fn in_doubt(t: [&[&str]; 4], gaps: &[[Range<usize>; 4]], budget: &mut Budget) ->
                             .map(move |j| (i - rb.start, j - rs.start))
                     })
                     .collect();
-                rival = pairable(wb, ws, &pairs, budget)?;
+                if pairs.is_empty() {
+                    continue;
+                }
+                let on = match tables.entry((lo, hi, side)) {
+                    Entry::Occupied(e) => e.into_mut(),
+                    Entry::Vacant(e) => e.insert(OnLcs::new(wb, ws, budget)?),
+                };
+                rival = on.pairs(&pairs);
             }
         }
         let meets = |g: usize, arrived: bool| -> bool {
@@ -571,44 +582,70 @@ fn in_doubt(t: [&[&str]; 4], gaps: &[[Range<usize>; 4]], budget: &mut Budget) ->
     Ok(open)
 }
 
-/// Whether some longest common subsequence of `b` and `s` pairs one of
-/// `pairs` (a base line and a side line). Past [`MAX_CELLS`], taken as so.
-fn pairable(b: &[&str], s: &[&str], pairs: &[(usize, usize)], budget: &mut Budget) -> Result<bool, OutOfBudget> {
-    let (n, m) = (b.len(), s.len());
-    if pairs.is_empty() {
-        return Ok(false);
+/// The cells of `b` (base lines) and `s` (a side's lines) that some longest
+/// common subsequence of them pairs. Past [`MAX_CELLS`], every cell is taken
+/// as so.
+struct OnLcs {
+    /// One bit per cell, row `i` of `b` times `w` plus `j` of `s`; `None`
+    /// past [`MAX_CELLS`].
+    bits: Option<Vec<u64>>,
+    w: usize,
+}
+
+impl OnLcs {
+    fn new(b: &[&str], s: &[&str], budget: &mut Budget) -> Result<OnLcs, OutOfBudget> {
+        let (n, m) = (b.len(), s.len());
+        if n * m > MAX_CELLS {
+            return Ok(OnLcs { bits: None, w: m });
+        }
+        budget.spend(2 * (n + 1) * (m + 1))?;
+        let w = m + 1;
+        // Longest common subsequences of the ends from each cell on, and of
+        // the starts up to it.
+        let mut after = vec![0u32; (n + 1) * w];
+        for i in (0..n).rev() {
+            for j in (0..m).rev() {
+                after[i * w + j] = if same_line(b[i], s[j]) {
+                    after[(i + 1) * w + j + 1] + 1
+                } else {
+                    after[(i + 1) * w + j].max(after[i * w + j + 1])
+                };
+            }
+        }
+        let mut before = vec![0u32; (n + 1) * w];
+        for i in 1..=n {
+            for j in 1..=m {
+                before[i * w + j] = if same_line(b[i - 1], s[j - 1]) {
+                    before[(i - 1) * w + j - 1] + 1
+                } else {
+                    before[(i - 1) * w + j].max(before[i * w + j - 1])
+                };
+            }
+        }
+        let longest = after[0];
+        let mut bits = vec![0u64; (n * m).div_ceil(64)];
+        for i in 0..n {
+            for j in 0..m {
+                if same_line(b[i], s[j]) && before[i * w + j] + 1 + after[(i + 1) * w + j + 1] == longest {
+                    let k = i * m + j;
+                    bits[k / 64] |= 1 << (k % 64);
+                }
+            }
+        }
+        Ok(OnLcs { bits: Some(bits), w: m })
     }
-    if n * m > MAX_CELLS {
-        return Ok(true);
-    }
-    budget.spend(2 * (n + 1) * (m + 1))?;
-    let w = m + 1;
-    // Longest common subsequences of the ends from each cell on, and of the
-    // starts up to it.
-    let mut after = vec![0u32; (n + 1) * w];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            after[i * w + j] = if same_line(b[i], s[j]) {
-                after[(i + 1) * w + j + 1] + 1
-            } else {
-                after[(i + 1) * w + j].max(after[i * w + j + 1])
-            };
+
+    /// Whether some longest common subsequence pairs one of `pairs` (a base
+    /// line and a side line).
+    fn pairs(&self, pairs: &[(usize, usize)]) -> bool {
+        match &self.bits {
+            None => !pairs.is_empty(),
+            Some(bits) => pairs.iter().any(|&(i, j)| {
+                let k = i * self.w + j;
+                bits[k / 64] & (1 << (k % 64)) != 0
+            }),
         }
     }
-    let mut before = vec![0u32; (n + 1) * w];
-    for i in 1..=n {
-        for j in 1..=m {
-            before[i * w + j] = if same_line(b[i - 1], s[j - 1]) {
-                before[(i - 1) * w + j - 1] + 1
-            } else {
-                before[(i - 1) * w + j].max(before[i * w + j - 1])
-            };
-        }
-    }
-    let longest = after[0];
-    Ok(pairs
-        .iter()
-        .any(|&(i, j)| same_line(b[i], s[j]) && before[i * w + j] + 1 + after[(i + 1) * w + j + 1] == longest))
 }
 
 /// A side's gap `s` lined up with the base's `b` by one longest common

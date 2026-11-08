@@ -232,3 +232,53 @@ fn sparse_unique_lines_merge() {
         );
     }
 }
+
+/// Review 8, finding 1: a block of tasks that recur elsewhere in the note
+/// (so none is an anchor) carried from one long section to the next, while
+/// the other side adds a line further down. Every carried line asks whether
+/// a longest common subsequence of the same window pairs it; the window's
+/// table is built once, not once per line, so the merge stays far inside the
+/// budget (it ran out of budget, `too_large`, at 300-line sections).
+#[test]
+fn recurring_block_carried_between_long_sections() {
+    for (s, k) in [(100, 20), (300, 20), (600, 20), (300, 60)] {
+        let s = n(s);
+        let tasks: Vec<String> = (0..k).map(|i| format!("- [ ] task {i}")).collect();
+        let fill = |tag: &str, n: usize| -> Vec<String> {
+            (0..n)
+                .map(|i| if i % 3 == 0 { String::new() } else { format!("- {tag}") })
+                .collect()
+        };
+        let mut b = vec!["# Top".to_string()];
+        b.extend(tasks.clone());
+        b.push("## A".into());
+        b.extend(tasks.clone());
+        b.extend(fill("a", s));
+        b.push("## B".into());
+        b.extend(fill("b", s));
+        b.push("## C".into());
+        b.extend(fill("c", 20));
+        // Ours carries the block from the top of A to the top of B.
+        let mut o = b.clone();
+        let a = o.iter().position(|l| l == "## A").unwrap();
+        let block: Vec<String> = o.drain(a + 1..a + 1 + k).collect();
+        let at = o.iter().position(|l| l == "## B").unwrap() + 1;
+        o.splice(at..at, block);
+        // Theirs adds a note in C.
+        let mut t = b.clone();
+        let c = t.iter().position(|l| l == "## C").unwrap();
+        t.insert(c + 2, "theirs note".into());
+        let mut want = o.clone();
+        let c = want.iter().position(|l| l == "## C").unwrap();
+        want.insert(c + 2, "theirs note".into());
+
+        let what = format!("block of {k} recurring tasks carried, sections of {s}");
+        let start = Instant::now();
+        let m = timed(&what, &join(&b), &join(&o), &join(&t));
+        let took = start.elapsed();
+        assert_eq!(m, Some(join(&want)), "{what}");
+        if !cfg!(debug_assertions) {
+            assert!(took < Duration::from_millis(100), "{what}: {took:?}");
+        }
+    }
+}
