@@ -1292,6 +1292,14 @@ proptest! {
     fn a_stale_writer_is_never_taken_for_one_that_saw_the_change(seed in any::<u64>()) {
         right_by_history(&truth::guard_stream(seed, Some(false)).0, seed)?;
     }
+
+    /// Review 9's class: a line both sides have and the base has not, on
+    /// either side of a unique line one side moved (see
+    /// `truth::anchor_stream`): every clean merge is right.
+    #[test]
+    fn a_line_both_have_beside_a_moved_anchor_merges_right(seed in any::<u64>()) {
+        right_by_history(&truth::anchor_stream(seed).0, seed)?;
+    }
 }
 
 /// Review 5's ordinary notes (`ordinary4`): sections with headings,
@@ -1893,10 +1901,9 @@ proptest! {
 
 // ---------- ground truth: the judge is no rubber stamp ----------
 
-/// Review 7's garbles, each a merge the judge once let through under a
+/// Review 7's three garbles, each a merge the judge once let through under a
 /// history-ambiguous class. Each history's true merge passes; the garble
-/// does not. (Its third, a stale writer's file, is right by an as short
-/// history: see `the_judge_accepts_a_line_both_put_in_once`.)
+/// does not.
 #[test]
 fn the_judge_rejects_review_7s_garbles() {
     use truth::{edited, file, History};
@@ -1976,6 +1983,18 @@ fn the_judge_rejects_review_7s_garbles() {
                 ),
             },
             "line 1\nline 1\nline 1\nt 3\nline 1\n",
+        ),
+        // A stale writer's file, by a reading that moved `line 1` up where
+        // the writer moved `---` down: R2's second `line 1`, which the true
+        // merge keeps, lost (review 9: no side's file by such a reading where
+        // a reading keeps a line it lacks).
+        (
+            History {
+                base: file(&[(0, "---"), (1, "line 1")], true, true),
+                ours: edited(file(&[(1, "line 1"), (0, "---")], true, true), &[0]),
+                theirs: edited(file(&[(1001, "line 1"), (0, "---"), (1, "line 1")], true, true), &[]),
+            },
+            "line 1\r\n---\r\n",
         ),
     ];
     for (h, garble) in cases {
@@ -2068,12 +2087,20 @@ fn the_judge_accepts_what_two_histories_allow() {
 }
 
 /// Review 8, finding 2: a line both sides put in at one point, taken once,
-/// where one side also removed a copy of it. That side's reading as putting
+/// where one side also removed another copy. That side's reading as putting
 /// the line in and removing another copy, where it really moved the lines
 /// around it, gives a merge with fewer copies than ours plus theirs less the
-/// base: the true merge of a history shorter than the real one, or as short.
+/// base: right by that reading where the merge is no side's file.
+///
+/// Review 9: where that merge is a side's file (the side that moved), it is
+/// wrong. No text tells a writer that moved lines from a stale one that never
+/// saw the other side's line, and taking the stale writer's file loses that
+/// line without a word: the judge takes a side's file by a reading that
+/// moved lines the other way or read one side as the other (Smaller, Twin,
+/// Same) only where no reading's merge keeps a line of the other side's that
+/// the file lacks and that side may have moved.
 #[test]
-fn the_judge_accepts_a_line_both_put_in_once() {
+fn a_line_both_put_in_once_but_never_by_a_side_file_that_lacks_it() {
     use truth::{edited, file, History};
     // Ours moved `B` and `C` down past `---` (or `---` up), theirs put a
     // `---` in after `A`.
@@ -2087,7 +2114,33 @@ fn the_judge_accepts_a_line_both_put_in_once() {
     };
     assert_eq!(h.texts()[1], "A\n---\nB\nC\n");
     assert_eq!(h.texts()[2], "A\n---\nB\nC\n---\n");
-    let m = "A\n---\nB\nC\n";
+    for ours_first in [true, false] {
+        let m = "A\n---\nB\nC\n";
+        assert!(
+            truth::judge(&h, m, ours_first).is_err(),
+            "{:?}\n{}",
+            truth::judge(&h, m, ours_first),
+            truth::explain(&h, m, ours_first)
+        );
+    }
+    // The same, where theirs also edited `D`: the merge is no side's file,
+    // and the shorter reading's.
+    let h = History {
+        base: file(&[(0, "A"), (1, "B"), (2, "C"), (3, "---"), (4, "D")], false, true),
+        ours: edited(
+            file(&[(0, "A"), (3, "---"), (1, "B"), (2, "C"), (4, "D")], false, true),
+            &[1, 2],
+        ),
+        theirs: edited(
+            file(
+                &[(0, "A"), (10, "---"), (1, "B"), (2, "C"), (3, "---"), (11, "D2")],
+                false,
+                true,
+            ),
+            &[],
+        ),
+    };
+    let m = "A\n---\nB\nC\nD2\n";
     for ours_first in [true, false] {
         assert!(
             truth::judge(&h, m, ours_first).is_ok(),
@@ -2098,7 +2151,7 @@ fn the_judge_accepts_a_line_both_put_in_once() {
     // Ours moved a blank line and `- x` down past a `---` and turned the
     // last `---` into `--- o` (without a final newline); theirs put a `---`
     // in after `line 1`. The true merge has two `---`; ours read as putting
-    // one in after `line 1` (once, with theirs) has one.
+    // one in after `line 1` (once, with theirs) is ours' file, with one.
     let base = [(0, "- x"), (1, "line 1"), (2, ""), (3, "- x"), (4, "---"), (5, "---")];
     let h = History {
         base: file(&base, false, true),
@@ -2139,30 +2192,7 @@ fn the_judge_accepts_a_line_both_put_in_once() {
     assert_eq!(o, "- x\nline 1\n---\n\n- x\n--- o");
     assert_eq!(t, "- x\nline 1\n---\n\n- x\n---\n---\n");
     for ours_first in [true, false] {
-        assert!(
-            truth::judge(&h, &o, ours_first).is_ok(),
-            "{}",
-            truth::explain(&h, &o, ours_first)
-        );
-    }
-    // The first case with one line where it moved two (review 7's third
-    // garble): ours moved `---` down past `line 1`, which reads as well as
-    // `line 1` moved up, as short a history. Theirs put a `line 1` in at the
-    // top: by that reading, both put it in there, once, and ours removed the
-    // other one.
-    let h = History {
-        base: file(&[(0, "---"), (1, "line 1")], true, true),
-        ours: edited(file(&[(1, "line 1"), (0, "---")], true, true), &[0]),
-        theirs: edited(file(&[(1001, "line 1"), (0, "---"), (1, "line 1")], true, true), &[]),
-    };
-    let m = "line 1\r\n---\r\n";
-    for ours_first in [true, false] {
-        assert_eq!(
-            truth::judge(&h, m, ours_first),
-            Ok(truth::Class::Twin),
-            "{}",
-            truth::explain(&h, m, ours_first)
-        );
+        assert!(truth::judge(&h, &o, ours_first).is_err());
     }
 }
 
@@ -2422,7 +2452,8 @@ fn judged(h: &truth::History, kind: Kind) -> Result<Vec<Option<truth::Class>>, S
 }
 
 /// Tallies of the ground-truth judge over the streams: `N` seeds (default
-/// 100k) from `SEED`, printed. Not part of the gate:
+/// 100k) from `SEED`, printed, after how review 5's ordinary notes merge
+/// (`N` cases, each kind). Not part of the gate:
 /// `cargo test --release -p livesync-merge --test props tallies -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -2430,14 +2461,37 @@ fn tallies() {
     let n: u64 = std::env::var("N").ok().and_then(|x| x.parse().ok()).unwrap_or(100_000);
     let seed: u64 = std::env::var("SEED").ok().and_then(|x| x.parse().ok()).unwrap_or(0);
     let show: usize = std::env::var("SHOW").ok().and_then(|x| x.parse().ok()).unwrap_or(3);
-    let streams: [(&str, &dyn Fn(u64) -> truth::History); 6] = [
+    let streams: [(&str, &dyn Fn(u64) -> truth::History); 7] = [
         ("truth", &truth::truth_stream),
         ("notes", &truth::notes_stream),
         ("dup", &|s| truth::dup_stream(s).0),
         ("guard-fresh", &|s| truth::guard_stream(s, Some(true)).0),
         ("guard-stale", &|s| truth::guard_stream(s, Some(false)).0),
         ("journal", &|s| truth::journal_stream(s).0),
+        ("anchor", &|s| truth::anchor_stream(s).0),
     ];
+    // Review 5's ordinary notes (changes in different sections): how many
+    // merges to the expected text, open, or other.
+    {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+        let mut runner = TestRunner::deterministic();
+        let strat = ordinary_case();
+        let mut tally: std::collections::BTreeMap<&str, usize> = Default::default();
+        for _ in 0..n {
+            let (c, want, ours_newer) = strat.new_tree(&mut runner).unwrap().current();
+            let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
+            for kind in [Kind::Text, Kind::Markdown] {
+                let key = match run(kind, &c, mo, mt).outcome {
+                    Outcome::Write(m) if m == want.as_bytes() => "merged",
+                    Outcome::Write(_) => "WRONG",
+                    _ => "open",
+                };
+                *tally.entry(key).or_default() += 1;
+            }
+        }
+        println!("== ordinary: {tally:?}");
+    }
     for (name, gen) in streams {
         let mut tally: std::collections::BTreeMap<String, usize> = Default::default();
         let mut wrong: Vec<String> = Vec::new();

@@ -58,7 +58,8 @@
 //!   blocks of the same size swapped), so a history as short moved the other
 //!   ones. Check: the merge is the true merge of the history with one side
 //!   read as the shortest history that keeps the fewest of the real one's
-//!   pairs ([`farthest`]), or of it with copies swapped.
+//!   pairs ([`farthest`]; of those, also the one that keeps the lines the side
+//!   moved in place, [`farthest_keeping`]), or of it with copies swapped.
 //! - [`Class::Same`]: both sides' texts are the same over some lines (the
 //!   same change, as D9 takes once), reached by histories that differ (one
 //!   moved a heading down, the other a blank line up). Check: the merge is
@@ -85,12 +86,18 @@
 //!   every file has once parts are two lines (the crate's rule for a line
 //!   both added at two places holds within one stretch between such lines).
 //!
+//! A side's file is right by Smaller, Twin or Same only where no reading's merge
+//! (the true merge's, or the shortest histories' within the count bounds)
+//! keeps more often a line (not blank) the other side typed and the file's
+//! side never had, where a shortest reading of the file's side removed a
+//! base copy of it and put one in: no text tells a writer that
+//! moved lines from a
+//! stale one that never saw the other side's line, and the stale writer's
+//! file would lose it without a word (review 9).
+//!
 //! So finding 1 of review 6 (a line both added, at two places with only
-//! blank or deleted lines between), and review 7's first two garbles, are in
-//! no class. (Its third is a [`Class::Twin`]: one side moved a line down,
-//! read as the line it passed moved up, and the other side put that line in
-//! at the same point; review 8.) Everything else that is clean and not the
-//! true merge is wrong.
+//! blank or deleted lines between), and review 7's three garbles, are in no
+//! class. Everything else that is clean and not the true merge is wrong.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -469,10 +476,21 @@ pub fn nearest(b: &[String], s: &[String], al: &Al) -> Al {
 /// pairs in it (where a side moved a block past one as long, the other block
 /// moved).
 pub fn farthest(b: &[String], s: &[String], al: &Al) -> Al {
+    farthest_keeping(b, s, al, &HashSet::new())
+}
+
+/// [`farthest`], and of those, the one that keeps the most of the base lines
+/// `moved` (those the side really moved) in place: where the side moved a
+/// block past one as long, the reading that moved the other block instead
+/// (repeated lines may give other readings as far that move neither).
+pub fn farthest_keeping(b: &[String], s: &[String], al: &Al, moved: &HashSet<usize>) -> Al {
     let (n, m) = (b.len(), s.len());
     let real: HashSet<(usize, usize)> = al.iter().enumerate().filter_map(|(i, j)| j.map(|j| (i, j))).collect();
-    let big = n + m + 1;
-    let score = |i: usize, j: usize| big + usize::from(!real.contains(&(i, j)));
+    // Lines matched first, pairs not the real history's second, moved lines
+    // kept third.
+    let far = n + 1;
+    let big = far * (n + 1) + 1;
+    let score = |i: usize, j: usize| big + far * usize::from(!real.contains(&(i, j))) + usize::from(moved.contains(&i));
     let mut l = vec![vec![0usize; m + 1]; n + 1];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
@@ -1046,6 +1064,83 @@ fn judge_class(h: &History, m: &str, ours_first: bool) -> Result<Class, String> 
         })
     };
     let (ao, at) = (by_identity(&h.base, &h.ours), by_identity(&h.base, &h.theirs));
+    // A merge that is one side's file, where the true merge or that of
+    // another reading of the texts keeps a line (not blank) more often that
+    // the other side typed and the file's side never had, where a shortest
+    // reading of the file's side removed a base copy of it and put one in
+    // (read as a move of that copy, the file loses the other's line): no
+    // text tells a writer that never saw the other side's change from one
+    // that did, and taking a stale writer's file loses that line without a
+    // word (the lost-update guard). Right only as the true merge, or with
+    // equal copies read as the other ones (Copies, which no text tells
+    // apart either way): not by a reading that moved lines the other way
+    // (Smaller, Twin) or read one side as the other's (Same).
+    let mut loses: Option<String> = None;
+    if os != ts && (m == os || m == ts) {
+        let nm = count(&m.split_inclusive('\n').collect::<Vec<_>>());
+        let nb = count(&b);
+        // The lines the other side typed (not the base's, moved or kept)
+        // that the file's side never had (it never saw them).
+        let (mine, other) = if m == os {
+            (&h.ours, &h.theirs)
+        } else {
+            (&h.theirs, &h.ours)
+        };
+        let ids: HashSet<usize> = h.base.lines.iter().chain(&mine.file.lines).map(|l| l.id).collect();
+        let typed: HashSet<&str> = other
+            .file
+            .lines
+            .iter()
+            .filter(|l| !ids.contains(&l.id))
+            .map(|l| l.text.as_str())
+            .collect();
+        let (so, st) = h.shared();
+        let (co, ct) = (canon_but(&b, &o, ao.clone(), &so), canon_but(&b, &t, at.clone(), &st));
+        // The lines the file's side may have moved: under one of its
+        // shortest readings, it removed a base copy and put one in.
+        let (ms, mc) = if m == os { (&o, &co) } else { (&t, &ct) };
+        let mut moved: HashSet<&str> = HashSet::new();
+        let shortest = [nearest(&b, ms, mc), farthest(&b, ms, mc)];
+        for al in shortest.iter().chain(minimal(&b, ms, mc).then_some(mc)) {
+            let kept: HashSet<usize> = al.iter().flatten().copied().collect();
+            let put: HashSet<&str> = (0..ms.len())
+                .filter(|j| !kept.contains(j))
+                .map(|j| content(&ms[j]))
+                .collect();
+            for i in (0..b.len()).filter(|&i| al[i].is_none()) {
+                if put.contains(content(&b[i])) {
+                    moved.insert(content(&b[i]));
+                }
+            }
+        }
+        let keeps = |w: &str| {
+            count(&w.split_inclusive('\n').collect::<Vec<_>>())
+                .iter()
+                .any(|(k, &c)| {
+                    c > nm.get(k).copied().unwrap_or(0)
+                        && nb.contains_key(k)
+                        && typed.contains(k.as_str())
+                        && moved.contains(k.as_str())
+                })
+        };
+        // The real history and the shortest ones nearest it; a reading's
+        // merge that is out of the count bounds itself is no merge to lose
+        // against.
+        let readings = [
+            (ao.clone(), at.clone()),
+            (co.clone(), ct.clone()),
+            (nearest(&b, &o, &co), nearest(&b, &t, &ct)),
+        ];
+        for (x, y) in &readings {
+            if let Some((w, extra)) = rules_traced(&b, [(&o, x), (&t, y)], ours_first) {
+                if keeps(&w) && bounded(&w, truth, texts, &extra) && loses.is_none() {
+                    loses = Some(format!(
+                        "a side's file, where a reading's merge {w:?} keeps a line it lacks"
+                    ));
+                }
+            }
+        }
+    }
     if fits(&ao, &at) {
         return Ok(Class::Copies);
     }
@@ -1054,24 +1149,33 @@ fn judge_class(h: &History, m: &str, ours_first: bool) -> Result<Class, String> 
     let (lo, lt) = (minimal(&b, &o, &co), minimal(&b, &t, &ct));
     if !lo || !lt {
         let (no, nt) = (nearest(&b, &o, &co), nearest(&b, &t, &ct));
-        if fits(&no, &nt) {
+        if loses.is_none() && fits(&no, &nt) {
             return Ok(Class::Smaller);
         }
     }
     // A side that moved lines: the lines they passed may as well have moved
     // the other way, as few of them.
     let (mo, mt) = (!h.ours.moved.is_empty(), !h.theirs.moved.is_empty());
-    if mo || mt {
-        let read = |s: &[String], c: &Al, minimal: bool, moved: bool| -> Vec<Al> {
+    if (mo || mt) && loses.is_none() {
+        let at_base = |e: &Edited| -> HashSet<usize> {
+            (0..h.base.lines.len())
+                .filter(|&i| e.moved.contains(&h.base.lines[i].id))
+                .collect()
+        };
+        let read = |s: &[String], c: &Al, minimal: bool, moved: Option<HashSet<usize>>| -> Vec<Al> {
             let mut v = vec![if minimal { c.clone() } else { nearest(&b, s, c) }];
-            if moved {
+            if let Some(moved) = moved {
                 v.push(farthest(&b, s, c));
+                v.push(farthest_keeping(&b, s, c, &moved));
             }
             v
         };
         // One side at a time: two such readings at once may meet at one
         // point and order lines against every file.
-        let (vo, vt) = (read(&o, &co, lo, mo), read(&t, &ct, lt, mt));
+        let (vo, vt) = (
+            read(&o, &co, lo, mo.then(|| at_base(&h.ours))),
+            read(&t, &ct, lt, mt.then(|| at_base(&h.theirs))),
+        );
         let one = |i: usize, j: usize| i == 0 || j == 0;
         if (0..vo.len()).any(|i| (0..vt.len()).any(|j| one(i, j) && fits(&vo[i], &vt[j]))) {
             return Ok(Class::Twin);
@@ -1079,8 +1183,11 @@ fn judge_class(h: &History, m: &str, ours_first: bool) -> Result<Class, String> 
     }
     // Where the texts agree, one side read as having made the other's
     // change.
-    if fits(&co, &carried(&b, &o, &t, &co)) || fits(&carried(&b, &t, &o, &ct), &ct) {
+    if loses.is_none() && (fits(&co, &carried(&b, &o, &t, &co)) || fits(&carried(&b, &t, &o, &ct), &ct)) {
         return Ok(Class::Same);
+    }
+    if let Some(e) = loses {
+        return Err(e);
     }
     Err(match truth {
         Some((w, _)) => format!("the true merge is {w:?}"),
@@ -1922,4 +2029,134 @@ pub fn dup_stream(seed: u64) -> (History, bool) {
         },
         l_newer,
     )
+}
+
+/// Review 9's class: a line both sides have that the base has not, on either
+/// side of an anchor that may have moved (the 200k props' seed after review
+/// 8). The base is a few unique lines with blank lines, `- x` and `---`
+/// between. Theirs puts a line in (`remote 1`) and maybe deletes or adds a
+/// filler line. Ours starts from theirs (it saw the line, and moves it
+/// elsewhere, or keeps it) or from the base (it types the same line
+/// somewhere of its own); then it moves a unique line up or down past a few
+/// lines (or a block of two to four lines anywhere), and maybe edits a unique
+/// line or deletes or adds a filler line. The bool:
+/// whether ours started from theirs.
+pub fn anchor_stream(seed: u64) -> (History, bool) {
+    let mut r = Rng(seed);
+    const FILL: &[&str] = &["", "", "", "- x", "---"];
+    let mut next = 1000;
+    let mut lines = Vec::new();
+    let uniques = 2 + r.below(4);
+    let mut id = 0;
+    for u in 0..uniques {
+        for _ in 0..r.below(4) {
+            lines.push(Line {
+                id,
+                text: FILL[r.below(FILL.len())].to_string(),
+                crlf: false,
+            });
+            id += 1;
+        }
+        lines.push(Line {
+            id,
+            text: format!("line {}", u + 1),
+            crlf: false,
+        });
+        id += 1;
+    }
+    for _ in 0..r.below(3) {
+        lines.push(Line {
+            id,
+            text: FILL[r.below(FILL.len())].to_string(),
+            crlf: false,
+        });
+        id += 1;
+    }
+    let base = File {
+        lines,
+        fin: !r.chance(0.05),
+    };
+    let start = Edited {
+        file: base.clone(),
+        moved: HashSet::new(),
+    };
+    let mut fresh = |next: &mut usize, text: &str| -> Line {
+        *next += 1;
+        Line {
+            id: *next,
+            text: text.to_string(),
+            crlf: false,
+        }
+    };
+    let filler = |r: &mut Rng, s: &mut Edited, next: &mut usize, fresh: &mut dyn FnMut(&mut usize, &str) -> Line| {
+        let v = &mut s.file.lines;
+        if r.chance(0.5) {
+            let at: Vec<usize> = (0..v.len()).filter(|&i| FILL.contains(&v[i].text.as_str())).collect();
+            if !at.is_empty() {
+                v.remove(at[r.below(at.len())]);
+            }
+        } else {
+            let l = fresh(next, FILL[r.below(FILL.len())]);
+            let at = r.below(v.len() + 1);
+            v.insert(at, l);
+        }
+    };
+    // Theirs.
+    let mut theirs = start.clone();
+    let x = fresh(&mut next, "remote 1");
+    let at = r.below(theirs.file.lines.len() + 1);
+    theirs.file.lines.insert(at, x.clone());
+    if r.chance(0.4) {
+        filler(&mut r, &mut theirs, &mut next, &mut fresh);
+    }
+    settle(&start, &mut theirs);
+    // Ours.
+    let saw = r.chance(0.5);
+    let from = if saw { theirs.clone() } else { start.clone() };
+    let mut ours = from.clone();
+    {
+        let v = &mut ours.file.lines;
+        if saw {
+            if r.chance(0.7) {
+                let i = v.iter().position(|l| l.id == x.id).expect("theirs' line");
+                let l = v.remove(i);
+                ours.moved.insert(l.id);
+                let at = r.below(v.len() + 1);
+                v.insert(at, l);
+            }
+        } else {
+            let l = fresh(&mut next, "remote 1");
+            let at = r.below(v.len() + 1);
+            v.insert(at, l);
+        }
+    }
+    // A unique line moved a few lines up or down, or a block of lines.
+    if r.chance(0.4) {
+        move_block(&mut r, &mut ours);
+    } else {
+        let v = &mut ours.file.lines;
+        let us: Vec<usize> = (0..v.len()).filter(|&i| v[i].text.starts_with("line ")).collect();
+        let i = us[r.below(us.len())];
+        let l = v.remove(i);
+        let span = 1 + r.below(4);
+        let to = if r.chance(0.5) {
+            i.saturating_sub(span)
+        } else {
+            (i + span).min(v.len())
+        };
+        ours.moved.insert(l.id);
+        v.insert(to, l);
+    }
+    if r.chance(0.4) {
+        let v = &mut ours.file.lines;
+        let us: Vec<usize> = (0..v.len()).filter(|&i| v[i].text.starts_with("line ")).collect();
+        let i = us[r.below(us.len())];
+        let text = format!("{} e", v[i].text);
+        v[i] = fresh(&mut next, &text);
+    }
+    if r.chance(0.4) {
+        filler(&mut r, &mut ours, &mut next, &mut fresh);
+    }
+    settle(&from, &mut ours);
+    (History { base, ours, theirs }, saw)
 }
