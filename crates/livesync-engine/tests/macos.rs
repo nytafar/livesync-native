@@ -405,7 +405,8 @@ async fn a_vault_without_access_is_refused_never_taken_for_empty() {
 }
 
 /// A file evicted to iCloud Drive (only `.NAME.icloud` is left beside it)
-/// is not a deleted file.
+/// is not a deleted file, on macOS. Elsewhere such a stub is a stale copy
+/// (a vault folder copied off a Mac, say) and holds no deletion back.
 #[tokio::test]
 async fn a_file_evicted_to_icloud_is_not_deleted() {
     let env = Env::new().await;
@@ -415,6 +416,11 @@ async fn a_file_evicted_to_icloud_is_not_deleted() {
     std::fs::remove_file(env.vault().join("a.md")).unwrap();
     env.write(".a.md.icloud", b"placeholder");
     let rep = env.engine().sync_once().await.unwrap();
+    if !livesync_engine::platform::ICLOUD_PLACEHOLDERS {
+        assert_eq!(rep.push.deleted, 1, "{rep:?}");
+        assert!(env.deleted("a.md"));
+        return;
+    }
     assert_eq!(rep.push.deleted, 0, "{rep:?}");
     assert!(!env.deleted("a.md"));
     let st = env.engine().status().unwrap();

@@ -70,7 +70,8 @@ pub(crate) fn check_vault_root(vault: &Path) -> Result<(), String> {
 
 /// Whether only iCloud Drive's placeholder for `path` is there
 /// (`.NAME.icloud` beside it): the file was evicted to iCloud ("Optimise Mac
-/// Storage"), not deleted. Plain names, so it is checked everywhere.
+/// Storage"), not deleted. Only consulted on macOS
+/// (`platform::ICLOUD_PLACEHOLDERS`).
 pub fn icloud_placeholder(path: &Path) -> bool {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return false;

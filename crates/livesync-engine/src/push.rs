@@ -2125,11 +2125,17 @@ impl Engine {
             }
             let at = self.inner.cfg.vault.join(&r.path);
             let looked = match std::fs::symlink_metadata(&at) {
-                // Only iCloud Drive's placeholder is here: the file is in
-                // iCloud, not deleted.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && crate::access::icloud_placeholder(&at) => Err(
-                    std::io::Error::other("evicted to iCloud Drive; only its .icloud placeholder is here"),
-                ),
+                // Only iCloud Drive's placeholder is here (macOS): the file
+                // is in iCloud, not deleted.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && crate::platform::ICLOUD_PLACEHOLDERS
+                        && crate::access::icloud_placeholder(&at) =>
+                {
+                    Err(std::io::Error::other(
+                        "evicted to iCloud Drive; only its .icloud placeholder is here",
+                    ))
+                }
                 x => x,
             };
             match looked {

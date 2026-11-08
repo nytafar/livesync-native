@@ -22,6 +22,10 @@ use std::io;
 /// permission problem (`EACCES`).
 pub const PRIVACY_EPERM: bool = cfg!(target_os = "macos");
 
+/// Whether a `.NAME.icloud` beside a missing file means iCloud Drive evicted
+/// it (macOS). Elsewhere such a stub is a stale copy and holds nothing back.
+pub const ICLOUD_PLACEHOLDERS: bool = cfg!(target_os = "macos");
+
 /// The platform's default local-change watcher.
 pub fn default_watcher(tx: WatchSender) -> io::Result<Box<dyn Watcher>> {
     Ok(Box::new(notify_watcher::NotifyWatcher::new(tx)?))
