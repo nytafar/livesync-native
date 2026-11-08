@@ -165,6 +165,12 @@ async fn an_nfd_name_is_the_nfc_documents_file_where_names_fold() {
 async fn an_nfd_name_is_a_rename_where_names_do_not_fold() {
     let (nfc, nfd) = NAMES[0];
     let env = Env::new().await;
+    std::fs::create_dir_all(env.vault()).unwrap();
+    if FsRules::probe(&env.vault()).unwrap().normalization_insensitive {
+        // The disk itself finds the NFD name by the NFC one (APFS).
+        eprintln!("SKIPPED: this filesystem folds Unicode normalisation");
+        return;
+    }
     env.mock.put_text(nfc, &["remote text"]);
     env.engine_on(&FsRules::permissive()).sync_once().await.unwrap();
     env.mv(nfc, nfd);

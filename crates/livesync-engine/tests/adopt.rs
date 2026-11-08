@@ -413,6 +413,14 @@ async fn a_name_in_another_unicode_normalisation_is_refused() {
         return;
     }
     let rep = env.engine().adopt(AdoptOptions::dry_run()).await.unwrap();
+    // APFS keeps the NFD name but also finds it by the NFC one: one file,
+    // the remote document's, so it is compared, not refused
+    // (`tests/macos.rs` runs both cases on any filesystem).
+    if env.engine().fs_rules().normalization_insensitive {
+        assert!(rep.name_case.is_empty(), "{rep:#?}");
+        assert_eq!(rep.identical, 3, "{rep:#?}");
+        return;
+    }
     assert_eq!(paths(&rep.name_case), ["caf\u{e9}.md"], "{rep:#?}");
     assert_eq!(rep.name_case[0].local_path.as_deref(), Some("cafe\u{301}.md"));
     assert!(rep.only_local.is_empty() && rep.only_remote.is_empty(), "{rep:#?}");
