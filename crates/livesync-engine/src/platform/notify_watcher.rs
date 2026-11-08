@@ -9,11 +9,14 @@
 //! (`RenameMode::Any`), with nothing that ties them together, where inotify
 //! pairs them by cookie (`RenameMode::Both`). [`RenamePairer`] pairs them: a
 //! half whose path is gone, followed within the coalescing window by a half
-//! whose path exists, is one rename, unless the file's identity (device and
-//! inode), where it was seen at the old name, says otherwise. Each half is
-//! still reported as a change at once; the pair only adds the rename, so the
-//! push side matches the old document with the new name instead of holding
-//! its deletion as part of a burst.
+//! whose path exists, is one rename only when the file's identity (device and
+//! inode) was seen at the old name and is the one at the new name. Without a
+//! known identity the halves are not paired: adjacency alone would let a
+//! real deletion pass for a rename to whatever arrived next (a dot-file, an
+//! ignored name), recorded as moved out of the synced folders. Each half is
+//! still reported as a change at once; a verified pair adds the rename, so
+//! the push side matches the old document with the new name instead of
+//! holding its deletion as part of a burst. The same holds for folders.
 
 use crate::watcher::{WatchEvent, WatchSender, Watcher};
 use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
@@ -38,9 +41,9 @@ type FileId = (u64, u64);
 /// Pairs the separate halves of FSEvents renames (see the module docs).
 #[derive(Debug, Default)]
 pub(crate) struct RenamePairer {
-    /// Old names (gone when reported), newest last, with when they came and
-    /// the identity last seen there.
-    gone: VecDeque<(PathBuf, Instant, Option<FileId>)>,
+    /// Old names (gone when reported) whose identity was seen, newest last,
+    /// with when they came and that identity.
+    gone: VecDeque<(PathBuf, Instant, FileId)>,
     /// The identity last seen at a path, for paths that had events.
     ids: HashMap<PathBuf, FileId>,
     order: VecDeque<PathBuf>,
@@ -48,23 +51,22 @@ pub(crate) struct RenamePairer {
 
 impl RenamePairer {
     /// One half of a rename at `path`, seen at `now`; `id` is what is at
-    /// `path` now (`None`: nothing). Returns the rename it completes.
+    /// `path` now (`None`: nothing). Returns the rename it completes, which
+    /// is always one whose identity was known at both names and the same.
     pub(crate) fn half(&mut self, path: PathBuf, now: Instant, id: Option<FileId>) -> Option<(PathBuf, PathBuf)> {
         self.gone
             .retain(|(_, at, _)| now.saturating_duration_since(*at) <= RENAME_WINDOW);
         let Some(id) = id else {
-            let was = self.ids.get(&path).copied();
             self.gone.retain(|(p, _, _)| *p != path);
-            self.gone.push_back((path, now, was));
+            // An old name never seen cannot be told from a deletion.
+            if let Some(was) = self.ids.get(&path).copied() {
+                self.gone.push_back((path, now, was));
+            }
             return None;
         };
         self.seen(&path, id);
-        // The newest old name that may be this file: the same identity, or
-        // one never seen (unknown).
-        let i = self
-            .gone
-            .iter()
-            .rposition(|(p, _, was)| *p != path && was.is_none_or(|w| w == id))?;
+        // The newest old name that was this very file.
+        let i = self.gone.iter().rposition(|(p, _, was)| *p != path && *was == id)?;
         let (from, _, _) = self.gone.remove(i)?;
         self.ids.remove(&from);
         Some((from, path))
@@ -234,6 +236,7 @@ mod tests {
     fn the_halves_of_a_rename_are_paired() {
         let t = Instant::now();
         let mut p = RenamePairer::default();
+        p.seen(Path::new("/v/old.md"), (1, 7));
         assert_eq!(p.half("/v/old.md".into(), t, None), None);
         assert_eq!(
             p.half("/v/new.md".into(), t + Duration::from_millis(5), Some((1, 7))),
@@ -241,8 +244,30 @@ mod tests {
         );
         // Each old name pairs once.
         assert_eq!(
-            p.half("/v/other.md".into(), t + Duration::from_millis(6), Some((1, 8))),
+            p.half("/v/other.md".into(), t + Duration::from_millis(6), Some((1, 7))),
             None
+        );
+    }
+
+    /// Review of #21: an old name whose identity was never seen is not
+    /// paired with whatever arrives next. A tracked note deleted just before
+    /// an editor wrote `.hidden.json` is a deletion, not a move out of scope.
+    #[test]
+    fn an_old_name_never_seen_is_not_paired() {
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+        let mut p = RenamePairer::default();
+        assert_eq!(p.half("/v/note.md".into(), t, None), None);
+        assert_eq!(p.half("/v/.hidden.json".into(), t + ms(1), Some((1, 9))), None);
+        // A folder likewise.
+        assert_eq!(p.half("/v/dir".into(), t + ms(2), None), None);
+        assert_eq!(p.half("/v/.dir".into(), t + ms(3), Some((1, 10))), None);
+        // Seen, it pairs.
+        p.seen(Path::new("/v/notes"), (1, 11));
+        assert_eq!(p.half("/v/notes".into(), t + ms(4), None), None);
+        assert_eq!(
+            p.half("/v/Notes 2".into(), t + ms(5), Some((1, 11))),
+            Some(("/v/notes".into(), "/v/Notes 2".into()))
         );
     }
 
@@ -250,6 +275,7 @@ mod tests {
     fn halves_too_far_apart_are_not_a_rename() {
         let t = Instant::now();
         let mut p = RenamePairer::default();
+        p.seen(Path::new("/v/old.md"), (1, 7));
         p.half("/v/old.md".into(), t, None);
         assert_eq!(p.half("/v/new.md".into(), t + RENAME_WINDOW * 3, Some((1, 7))), None);
     }
@@ -313,6 +339,20 @@ mod tests {
                 WatchEvent::Renamed { from: old, to: new },
             ]
         );
+        // A file and a folder with no event before their rename (here since
+        // before the watcher began): changes only, no rename.
+        for (from, to) in [("plain.md", ".plain.md"), ("folder", ".folder")] {
+            let (from, to) = (d.path().join(from), d.path().join(to));
+            if from.ends_with("folder") {
+                std::fs::create_dir(&from).unwrap();
+            } else {
+                std::fs::write(&from, b"y").unwrap();
+            }
+            std::fs::rename(&from, &to).unwrap();
+            map_event(rename_half(&from), &tx, &aliases, &pairer, true);
+            map_event(rename_half(&to), &tx, &aliases, &pairer, true);
+            assert_eq!(drain(&mut rx), [WatchEvent::Changed(from), WatchEvent::Changed(to)]);
+        }
         // inotify's paired renames are passed on as they are.
         let both = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
             .add_path("/v/a".into())
