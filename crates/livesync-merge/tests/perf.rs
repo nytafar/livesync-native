@@ -184,3 +184,51 @@ fn long_logs() {
         );
     }
 }
+
+/// Review 7, finding 3: a long note with sparse unique lines (a heading every
+/// few hundred lines, repeated lines between) merges where each side changed
+/// lines far apart or one per section: the check lines up only what the
+/// sides changed around each anchor, so no window is too large to read and
+/// the file is no stretch of its own (895839e opened these, or ran out of
+/// budget).
+#[test]
+fn sparse_unique_lines_merge() {
+    let rep = ["", "- [ ] gym", "", "---", "- x"];
+    for (size, k) in [(1500, 300), (3000, 50), (3000, 200), (3000, 1000), (10000, 200)] {
+        let size = n(size);
+        let k = k.min(size / 3).max(5);
+        let base: Vec<String> = (0..size)
+            .map(|i| {
+                if i % k == 0 {
+                    format!("## Day {i}")
+                } else {
+                    rep[i % rep.len()].to_string()
+                }
+            })
+            .collect();
+        // One insertion each, far apart.
+        let (mut o, mut t) = (base.clone(), base.clone());
+        o.insert(3, "o note".into());
+        t.insert(size - 3, "t note".into());
+        let what = format!("{size} lines, a heading every {k}, far apart");
+        assert!(
+            timed(&what, &join(&base), &join(&o), &join(&t)).is_some(),
+            "{what}: open"
+        );
+        // One insertion per section each.
+        let (mut o, mut t) = (base.clone(), base.clone());
+        for s in (0..size).step_by(k).rev() {
+            if s + k / 2 < size {
+                t.insert(s + k / 2, format!("t note {s}"));
+            }
+            if s + 3 < size {
+                o.insert(s + 2, format!("o note {s}"));
+            }
+        }
+        let what = format!("{size} lines, a heading every {k}, one each per section");
+        assert!(
+            timed(&what, &join(&base), &join(&o), &join(&t)).is_some(),
+            "{what}: open"
+        );
+    }
+}

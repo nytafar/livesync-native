@@ -8,7 +8,7 @@
 //! final-newline changes. So what each side did to each base line is known,
 //! not read from the texts: a base line the side still has (not moved) is the
 //! line it kept, everything else is its change. The true merge is the
-//! placement rules applied to those changes ([`rules`]): never to an
+//! placement rules applied to those changes ([`rules_traced`]): never to an
 //! alignment of the texts, and never to anything of the merge's.
 //!
 //! The rules, as the crate documents them:
@@ -44,36 +44,49 @@
 //!   `- x` may as well have inserted it before; one that deleted one of two
 //!   blank lines in a row, either. The texts are the same either way. Check:
 //!   the merge is the true merge of the history with such lines swapped
-//!   ([`slides`]), and has no line both sides added more often than the true
-//!   merge has it (where that is a conflict: than either side has it). So
-//!   the class covers both sides making the same change at places only
-//!   copies part (taken once, as D9 asks), and a writer that changed one of
-//!   R2's copies, never a line twice.
+//!   ([`slides`]). So the class covers both sides making the same change at
+//!   places only copies part (taken once, as D9 asks), and a writer that
+//!   changed one of R2's copies.
 //! - [`Class::Smaller`]: the history is longer than the texts show. A side
 //!   removed a line and typed the same text elsewhere, moved a line, or
 //!   copied one and changed the original, so that the texts read as fewer
 //!   changes: the lines it kept are not a longest common subsequence with
 //!   the base ([`minimal`]). Check: the merge is the true merge of the
 //!   shortest history the texts show that keeps the most of the real one's
-//!   pairs ([`nearest`]), or of it with copies swapped. Where the real
-//!   history's true merge is a conflict, also: no line both sides added is
-//!   there more often than either side has it, unless a line every file has
-//!   once parts each two copies (the crate's rule for a line both added at
-//!   two places holds within one stretch between such lines). So finding 1
-//!   of review 6 (a line both added, at two places with only blank or
-//!   deleted lines between) is never in this class.
-//!
+//!   pairs ([`nearest`]), or of it with copies swapped.
+//! - [`Class::Twin`]: a side moved lines past as many other lines (two
+//!   blocks of the same size swapped), so a history as short moved the other
+//!   ones. Check: the merge is the true merge of the history with one side
+//!   read as the shortest history that keeps the fewest of the real one's
+//!   pairs ([`farthest`]), or of it with copies swapped.
 //! - [`Class::Same`]: both sides' texts are the same over some lines (the
 //!   same change, as D9 takes once), reached by histories that differ (one
 //!   moved a heading down, the other a blank line up). Check: the merge is
 //!   the true merge of the history with one side read as the other wherever
-//!   their texts agree ([`carried`]), or of it with copies swapped, under the
-//!   count bound of [`Class::Copies`]. This is review 6's settled class (a),
-//!   identical stretches on both sides.
+//!   their texts agree ([`carried`]), or of it with copies swapped. This is
+//!   review 6's settled class (a), identical stretches on both sides.
 //!
-//! Under all three, lines of two runs inserted at one point that go in whole may
-//! be there more often than either side has them: that is the rule.
-//! Everything else that is clean and not the true merge is wrong.
+//! Every class is held to the same count bounds ([`bounded`]), so none
+//! takes a line twice or drops one beyond what two histories allow (order
+//! needs none of its own: the readings are each side's own, and two sides'
+//! moves compose):
+//!
+//! - no line less often than all of the true merge, either side, and the
+//!   count each side's own change gives (where both removed a copy, they may
+//!   be two copies; where both added one at two places, one);
+//! - no line more often than the true merge and either side (where the true
+//!   merge is a conflict: than either side), but for copies the rules put in
+//!   by position: the same text from edits of different lines on both sides
+//!   (each ticked another copy of a task), and, where the true merge is a
+//!   conflict, two runs at one point that go in whole;
+//! - a line over that only as often, in each segment between lines no side
+//!   moved, as the true merge or either side has it there: copies a line
+//!   every file has once parts are two lines (the crate's rule for a line
+//!   both added at two places holds within one stretch between such lines).
+//!
+//! So finding 1 of review 6 (a line both added, at two places with only
+//! blank or deleted lines between), and review 7's three garbles, are in no
+//! class. Everything else that is clean and not the true merge is wrong.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
@@ -447,6 +460,41 @@ pub fn nearest(b: &[String], s: &[String], al: &Al) -> Al {
     canon(b, s, out)
 }
 
+/// The shortest history the texts show that is farthest from the real one:
+/// a longest common subsequence of `b` and `s` with the fewest of `al`'s kept
+/// pairs in it (where a side moved a block past one as long, the other block
+/// moved).
+pub fn farthest(b: &[String], s: &[String], al: &Al) -> Al {
+    let (n, m) = (b.len(), s.len());
+    let real: HashSet<(usize, usize)> = al.iter().enumerate().filter_map(|(i, j)| j.map(|j| (i, j))).collect();
+    let big = n + m + 1;
+    let score = |i: usize, j: usize| big + usize::from(!real.contains(&(i, j)));
+    let mut l = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            let mut best = l[i + 1][j].max(l[i][j + 1]);
+            if same_line(&b[i], &s[j]) {
+                best = best.max(l[i + 1][j + 1] + score(i, j));
+            }
+            l[i][j] = best;
+        }
+    }
+    let mut out: Al = vec![None; n];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if same_line(&b[i], &s[j]) && l[i][j] == l[i + 1][j + 1] + score(i, j) {
+            out[i] = Some(j);
+            i += 1;
+            j += 1;
+        } else if l[i][j] == l[i + 1][j] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    canon(b, s, out)
+}
+
 /// A side `s` read as the other side `x` (with its alignment `ax`) changed
 /// the base, wherever their texts agree: `x`'s kept pairs carried to `s` by a
 /// longest common subsequence of the two, and the shortest history of `s`
@@ -547,19 +595,27 @@ fn two_runs(first: &[String], second: &[String]) -> Option<Vec<String>> {
     Some(first.iter().chain(second).cloned().collect())
 }
 
-/// The true merge: the placement rules (see the module docs) applied to each
-/// side's changes by its alignment `al` with the base `b`. `None` where the
-/// rules say conflict.
-pub fn rules(b: &[String], sides: [(&[String], &Al); 2], ours_first: bool) -> Option<String> {
-    rules_traced(b, sides, ours_first).map(|x| x.0)
+/// Copies of a line the placement rules put in more often than either side
+/// has it, by rule, where they put them.
+#[derive(Default)]
+struct Extra {
+    /// Two runs inserted at one point that went in whole: how many more
+    /// copies of each line than either run has.
+    whole: Counts,
+    /// Changes of different base lines by the two sides that give the same
+    /// line (each side ticked another copy of a task): how many copies of
+    /// each line both sides' edits (changes that put in no more lines than
+    /// they took out) put in.
+    edits: Counts,
 }
 
-/// [`rules`], with the lines (not blank) of two runs inserted at one point
-/// that went in whole: those may be there more often than either side has
-/// them, by the rule.
-fn rules_traced(b: &[String], sides: [(&[String], &Al); 2], ours_first: bool) -> Option<(String, HashSet<String>)> {
+/// The true merge: the placement rules (see the module docs) applied to each
+/// side's changes by its alignment `al` with the base `b` (`None` where the
+/// rules say conflict), with the copies the rules put in more often than
+/// either side has them ([`Extra`]).
+fn rules_traced(b: &[String], sides: [(&[String], &Al); 2], ours_first: bool) -> Option<(String, Extra)> {
     let n = b.len();
-    let mut whole: HashSet<String> = HashSet::new();
+    let mut whole: Counts = HashMap::new();
     let all: Vec<Change> = (0..2)
         .flat_map(|x| changes(n, sides[x].0.len(), sides[x].1, x))
         .collect();
@@ -601,7 +657,13 @@ fn rules_traced(b: &[String], sides: [(&[String], &Al); 2], ours_first: bool) ->
             let (f, s) = if ours_first { (run(0), run(1)) } else { (run(1), run(0)) };
             let v = two_runs(&f, &s)?;
             if v.len() == f.len() + s.len() {
-                whole.extend(v.iter().filter(|l| !blank(l)).map(|l| content(l).to_string()));
+                let (cf, cs) = (count(&f), count(&s));
+                for (k, &x) in &cf {
+                    let both = x.min(cs.get(k).copied().unwrap_or(0));
+                    if both > 0 {
+                        *whole.entry(k.clone()).or_default() += both;
+                    }
+                }
             }
             pieces.push((lo..lo, v, None));
         } else if cs.iter().all(|c| c.side.is_empty()) {
@@ -674,11 +736,19 @@ fn rules_traced(b: &[String], sides: [(&[String], &Al); 2], ours_first: bool) ->
     };
     let mut out: Vec<String> = Vec::new();
     let mut p = 0;
-    for (r, l, _) in &pieces {
+    let mut replaced: [Counts; 2] = Default::default();
+    for (r, l, who) in &pieces {
         for i in p..r.start {
             out.push(kept(i)?);
         }
         out.extend(l.iter().cloned());
+        // Edits only: a change that put in more lines than it took out holds
+        // an insertion.
+        if let (Some(w), false) = (who, r.is_empty() || l.len() > r.len()) {
+            for (k, c) in count(l) {
+                *replaced[*w].entry(k).or_default() += c;
+            }
+        }
         p = r.end;
     }
     for i in p..n {
@@ -687,7 +757,11 @@ fn rules_traced(b: &[String], sides: [(&[String], &Al); 2], ours_first: bool) ->
     if out.iter().rev().skip(1).any(|l| !l.ends_with('\n')) {
         return None;
     }
-    Some((out.concat(), whole))
+    let edits = replaced[0]
+        .iter()
+        .filter_map(|(k, &c)| replaced[1].get(k).map(|&d| (k.clone(), c.min(d))))
+        .collect();
+    Some((out.concat(), Extra { whole, edits }))
 }
 
 // ---------- the judge ----------
@@ -701,6 +775,9 @@ pub enum Class {
     Copies,
     /// The true merge of the shortest history the texts show.
     Smaller,
+    /// The true merge of a history as short, that moved the lines a side's
+    /// moved lines passed instead.
+    Twin,
     /// The same change by text on both sides, read as one.
     Same,
 }
@@ -742,36 +819,144 @@ impl History {
 
     /// The true merge (`None`: a conflict).
     pub fn truth(&self, ours_first: bool) -> Option<String> {
+        self.truth_traced(ours_first).map(|x| x.0)
+    }
+
+    /// [`History::truth`], with the copies the rules put in it ([`Extra`]).
+    fn truth_traced(&self, ours_first: bool) -> Option<(String, Extra)> {
         let (b, o, t) = (self.base.texts(), self.ours.file.texts(), self.theirs.file.texts());
         let (so, st) = self.shared();
         let ao = canon_but(&b, &o, by_identity(&self.base, &self.ours), &so);
         let at = canon_but(&b, &t, by_identity(&self.base, &self.theirs), &st);
-        rules(&b, [(&o, &ao), (&t, &at)], ours_first)
+        rules_traced(&b, [(&o, &ao), (&t, &at)], ours_first)
     }
 }
 
-/// Whether `m` has no line (not blank) that both sides added more often
-/// than the true merge has it (where that is a conflict: than either side
-/// has it, counted in each segment between lines every file has once: the
-/// crate keeps a line both added at two places apart only within one stretch
-/// between such lines). Lines of two runs inserted at one point that go in
-/// whole (`whole`) are there as often as the rule puts them. Swapping equal
-/// lines never takes a line both added twice.
-fn no_more(m: &str, truth: Option<&str>, [b, o, t]: [&str; 3], whole: &HashSet<String>) -> bool {
+/// How often each line (not blank) is somewhere, by content.
+type Counts = HashMap<String, usize>;
+
+/// The lines (not blank) every file of `files` has once, that no side moved:
+/// in every longest run of them that keeps the first file's order in each
+/// other file (where a line moved, the lines it passed stay; where two swapped,
+/// neither is fixed). They part each file into the same segments.
+fn fixed(files: &[&[String]]) -> HashSet<String> {
+    let counts: Vec<Counts> = files.iter().map(|f| count(f)).collect();
+    let at: Vec<HashMap<&str, usize>> = files
+        .iter()
+        .map(|f| {
+            f.iter()
+                .enumerate()
+                .filter(|(_, l)| !blank(l))
+                .map(|(i, l)| (content(l), i))
+                .collect()
+        })
+        .collect();
+    // Lines each file has once, in the first file's order.
+    let mut once: Vec<&str> = counts[0]
+        .iter()
+        .filter(|(k, &c)| c == 1 && counts.iter().all(|n| n.get(*k) == Some(&1)))
+        .map(|(k, _)| k.as_str())
+        .collect();
+    once.sort_by_key(|k| at[0][k]);
+    let mut keep: HashSet<&str> = once.iter().copied().collect();
+    for p in &at[1..] {
+        let keys: Vec<usize> = once.iter().map(|k| p[k]).collect();
+        let every = in_every_rising(&keys);
+        keep.retain(|k| every.contains(&p[k]));
+    }
+    keep.into_iter().map(str::to_string).collect()
+}
+
+/// The values of `v` in every longest rising subsequence of it: those in
+/// some longest one, alone at their place in it.
+fn in_every_rising(v: &[usize]) -> HashSet<usize> {
+    let n = v.len();
+    // The longest rising run ending at each element, and starting at it.
+    let mut end = vec![1usize; n];
+    for x in 0..n {
+        for y in 0..x {
+            if v[y] < v[x] {
+                end[x] = end[x].max(end[y] + 1);
+            }
+        }
+    }
+    let mut start = vec![1usize; n];
+    for x in (0..n).rev() {
+        for y in x + 1..n {
+            if v[x] < v[y] {
+                start[x] = start[x].max(start[y] + 1);
+            }
+        }
+    }
+    let longest = end.iter().copied().max().unwrap_or(0);
+    let some: Vec<usize> = (0..n).filter(|&x| end[x] + start[x] - 1 == longest).collect();
+    some.iter()
+        .filter(|&&x| some.iter().filter(|&&y| end[y] == end[x]).count() == 1)
+        .map(|&x| v[x])
+        .collect()
+}
+
+/// Whether the count of each line (not blank) in `m` is bound by the true
+/// merge (see the module docs):
+///
+/// - no line is less often in `m` than all of the true merge (where it is
+///   clean), either side and the count each side's own change gives (ours,
+///   plus what theirs added or less what it removed: where both removed a
+///   copy, they may be two copies);
+/// - no line is more often in `m` than both the true merge (where it is
+///   clean) and either side have it, but for the copies the rules put in by
+///   the reading `m` came from, where they put them (`extra`), beyond those
+///   they put in the true merge: the same line from both sides' edits of
+///   different base lines (each ticked another copy), and two runs at one
+///   point that went in whole;
+/// - except that a line over that may be there as often in each segment
+///   between lines no side moved ([`fixed`]) as the true merge or either
+///   side has it there: the crate keeps a line both added at two places
+///   apart only within one stretch between such lines, so copies a segment
+///   apart are two lines.
+fn bounded(m: &str, truth: Option<(&str, &Extra)>, [b, o, t]: [&str; 3], extra: &Extra) -> bool {
     let lines = |s: &str| s.split_inclusive('\n').map(str::to_string).collect::<Vec<_>>();
     let (lm, lb, lo, lt) = (lines(m), lines(b), lines(o), lines(t));
-    let (nm, nb, no, nt) = (count(&lm), count(&lb), count(&lo), count(&lt));
-    let nw = truth.map(|w| count(&lines(w)));
-    let get = |n: &HashMap<String, usize>, k: &str| n.get(k).copied().unwrap_or(0);
-    let once = |k: &str| [&nm, &nb, &no, &nt].iter().all(|n| get(n, k) == 1);
-    // Counts per segment between lines every file has once: the line before
-    // each, and the line's content.
+    let lw = truth.map(|(w, _)| lines(w)).unwrap_or_default();
+    let get = |n: &Counts, k: &str| n.get(k).copied().unwrap_or(0);
+    let (nm, nb, no, nt, nw) = (count(&lm), count(&lb), count(&lo), count(&lt), count(&lw));
+    // What the reading's rules put in beyond what they put in the true merge,
+    // which its count already holds.
+    let extra = |k: &str| {
+        let mine = get(&extra.edits, k) + get(&extra.whole, k);
+        let theirs = truth.map_or(0, |(_, x)| get(&x.edits, k) + get(&x.whole, k));
+        mine.saturating_sub(theirs)
+    };
+    let keys: HashSet<&String> = nm.keys().chain(nw.keys()).chain(no.keys()).chain(nt.keys()).collect();
+    let mut over: Vec<&String> = Vec::new();
+    for k in keys {
+        let (cm, cb, co, ct, cw) = (get(&nm, k), get(&nb, k), get(&no, k), get(&nt, k), get(&nw, k));
+        let mut low = co.max(ct).min((co + ct).saturating_sub(cb));
+        if truth.is_some() {
+            low = low.min(cw);
+        }
+        if cm < low {
+            return false;
+        }
+        if cm > cw.max(co).max(ct) + extra(k) {
+            over.push(k);
+        }
+    }
+    if over.is_empty() {
+        return true;
+    }
+    let mut files: Vec<&[String]> = vec![&lb, &lm, &lo, &lt];
+    if truth.is_some() {
+        files.push(&lw);
+    }
+    let parts = fixed(&files);
+    // Counts per segment: the line that starts it, and the line's content.
     let segments = |ls: &[String]| -> HashMap<(Option<String>, String), usize> {
         let mut n: HashMap<(Option<String>, String), usize> = HashMap::new();
         let mut at: Option<String> = None;
         for l in ls.iter().filter(|l| !blank(l)) {
             let c = content(l).to_string();
-            if once(&c) {
+            if parts.contains(&c) {
                 at = Some(c);
             } else {
                 *n.entry((at.clone(), c)).or_default() += 1;
@@ -779,60 +964,146 @@ fn no_more(m: &str, truth: Option<&str>, [b, o, t]: [&str; 3], whole: &HashSet<S
         }
         n
     };
-    let (sm, so, st) = (segments(&lm), segments(&lo), segments(&lt));
+    let (sm, so, st, sw) = (segments(&lm), segments(&lo), segments(&lt), segments(&lw));
     let get2 =
         |n: &HashMap<(Option<String>, String), usize>, k: &(Option<String>, String)| n.get(k).copied().unwrap_or(0);
-    let both = |k: &str| get(&no, k) > get(&nb, k) && get(&nt, k) > get(&nb, k) && !whole.contains(k);
-    match &nw {
-        Some(w) => nm.iter().all(|(k, &c)| !both(k) || c <= get(w, k)),
-        None => sm
-            .iter()
-            .all(|(key, &c)| !both(&key.1) || c <= get2(&so, key).max(get2(&st, key))),
-    }
+    sm.iter()
+        .filter(|(key, _)| over.contains(&&key.1))
+        .all(|(key, &c)| c <= get2(&sw, key).max(get2(&so, key)).max(get2(&st, key)) + extra(&key.1))
 }
 
 /// Judge a clean merge `m` of a history (see the module docs): the class it
 /// falls in, or what is wrong.
 pub fn judge(h: &History, m: &str, ours_first: bool) -> Result<Class, String> {
-    let truth = h.truth(ours_first);
-    if truth.as_deref() == Some(m) {
+    judge_why(h, m, ours_first).map(|x| x.0)
+}
+
+/// [`judge`], and whether the merge has a line more often than the count
+/// bounds allow but for the copies the placement rules put in (two runs at
+/// one point that went in whole, edits of different lines to the same text):
+/// right by those rules only.
+pub fn judge_why(h: &History, m: &str, ours_first: bool) -> Result<(Class, bool), String> {
+    let class = judge_class(h, m, ours_first)?;
+    if class == Class::Exact {
+        return Ok((class, false));
+    }
+    let traced = h.truth_traced(ours_first);
+    let [bs, os, ts] = h.texts();
+    let truth = traced.as_ref().map(|(w, x)| (w.as_str(), x));
+    let by_rule = !bounded(m, truth, [&bs, &os, &ts], &Extra::default());
+    Ok((class, by_rule))
+}
+
+fn judge_class(h: &History, m: &str, ours_first: bool) -> Result<Class, String> {
+    let traced = h.truth_traced(ours_first);
+    if traced.as_ref().is_some_and(|(w, _)| w == m) {
         return Ok(Class::Exact);
     }
     let (b, o, t) = (h.base.texts(), h.ours.file.texts(), h.theirs.file.texts());
     let [bs, os, ts] = h.texts();
     let texts = [bs.as_str(), os.as_str(), ts.as_str()];
+    let truth = traced.as_ref().map(|(w, x)| (w.as_str(), x));
     // Whether some pair of the alignments' copies swapped merges to `m`,
-    // within the count bound.
-    let fits = |ao: &Al, at: &Al, bound: &dyn Fn(&HashSet<String>) -> bool| -> bool {
+    // within the count bounds.
+    let fits = |ao: &Al, at: &Al| -> bool {
         let (vo, vt) = (slides(&b, &o, ao, 32), slides(&b, &t, at, 32));
         vo.iter().any(|x| {
             vt.iter().any(|y| {
-                rules_traced(&b, [(&o, x), (&t, y)], ours_first).is_some_and(|(r, whole)| r == m && bound(&whole))
+                rules_traced(&b, [(&o, x), (&t, y)], ours_first)
+                    .is_some_and(|(r, extra)| r == m && bounded(m, truth, texts, &extra))
             })
         })
     };
     let (ao, at) = (by_identity(&h.base, &h.ours), by_identity(&h.base, &h.theirs));
-    if fits(&ao, &at, &|w| no_more(m, truth.as_deref(), texts, w)) {
+    if fits(&ao, &at) {
         return Ok(Class::Copies);
     }
     let (so, st) = h.shared();
     let (co, ct) = (canon_but(&b, &o, ao.clone(), &so), canon_but(&b, &t, at.clone(), &st));
-    if !minimal(&b, &o, &co) || !minimal(&b, &t, &ct) {
+    let (lo, lt) = (minimal(&b, &o, &co), minimal(&b, &t, &ct));
+    if !lo || !lt {
         let (no, nt) = (nearest(&b, &o, &co), nearest(&b, &t, &ct));
-        if fits(&no, &nt, &|w| truth.is_some() || no_more(m, None, texts, w)) {
+        if fits(&no, &nt) {
             return Ok(Class::Smaller);
+        }
+    }
+    // A side that moved lines: the lines they passed may as well have moved
+    // the other way, as few of them.
+    let (mo, mt) = (!h.ours.moved.is_empty(), !h.theirs.moved.is_empty());
+    if mo || mt {
+        let read = |s: &[String], c: &Al, minimal: bool, moved: bool| -> Vec<Al> {
+            let mut v = vec![if minimal { c.clone() } else { nearest(&b, s, c) }];
+            if moved {
+                v.push(farthest(&b, s, c));
+            }
+            v
+        };
+        // One side at a time: two such readings at once may meet at one
+        // point and order lines against every file.
+        let (vo, vt) = (read(&o, &co, lo, mo), read(&t, &ct, lt, mt));
+        let one = |i: usize, j: usize| i == 0 || j == 0;
+        if (0..vo.len()).any(|i| (0..vt.len()).any(|j| one(i, j) && fits(&vo[i], &vt[j]))) {
+            return Ok(Class::Twin);
         }
     }
     // Where the texts agree, one side read as having made the other's
     // change.
-    let bound = |w: &HashSet<String>| no_more(m, truth.as_deref(), texts, w);
-    if fits(&co, &carried(&b, &o, &t, &co), &bound) || fits(&carried(&b, &t, &o, &ct), &ct, &bound) {
+    if fits(&co, &carried(&b, &o, &t, &co)) || fits(&carried(&b, &t, &o, &ct), &ct) {
         return Ok(Class::Same);
     }
     Err(match truth {
-        Some(w) => format!("the true merge is {w:?}"),
+        Some((w, _)) => format!("the true merge is {w:?}"),
         None => "the true merge is a conflict".to_string(),
     })
+}
+
+/// What the judge tried for a clean merge `m` of a history, for reading a
+/// failure: each class's readings, the merge each gives and whether it is
+/// within the count bounds.
+pub fn explain(h: &History, m: &str, ours_first: bool) -> String {
+    let traced = h.truth_traced(ours_first);
+    let truth = traced.as_ref().map(|(w, _)| w.clone());
+    let (b, o, t) = (h.base.texts(), h.ours.file.texts(), h.theirs.file.texts());
+    let [bs, os, ts] = h.texts();
+    let texts = [bs.as_str(), os.as_str(), ts.as_str()];
+    let mut out = format!("truth {truth:?}\n");
+    let mut show = |name: &str, ao: &Al, at: &Al| {
+        let r = rules_traced(&b, [(&o, ao), (&t, at)], ours_first);
+        let line = match r {
+            None => "conflict".to_string(),
+            Some((r, extra)) => format!(
+                "{:?} same={} bounded={}",
+                r,
+                r == m,
+                bounded(m, traced.as_ref().map(|(w, x)| (w.as_str(), x)), texts, &extra)
+            ),
+        };
+        out += &format!("  {name}: ours {ao:?} theirs {at:?}\n    {line}\n");
+    };
+    let (ao, at) = (by_identity(&h.base, &h.ours), by_identity(&h.base, &h.theirs));
+    show("identity", &ao, &at);
+    for x in slides(&b, &o, &ao, 32) {
+        for y in slides(&b, &t, &at, 32) {
+            if rules_traced(&b, [(&o, &x), (&t, &y)], ours_first).is_some_and(|(r, _)| r == m) {
+                show("slide", &x, &y);
+            }
+        }
+    }
+    let (so, st) = h.shared();
+    let (co, ct) = (canon_but(&b, &o, ao.clone(), &so), canon_but(&b, &t, at.clone(), &st));
+    show("canon", &co, &ct);
+    let (no, nt) = (nearest(&b, &o, &co), nearest(&b, &t, &ct));
+    show("nearest", &no, &nt);
+    let (fo, ft) = (farthest(&b, &o, &co), farthest(&b, &t, &ct));
+    show("farthest", &fo, &ft);
+    show("nearest/farthest", &no, &ft);
+    show("farthest/nearest", &fo, &nt);
+    out += &format!(
+        "  minimal ours {} theirs {}\n",
+        minimal(&b, &o, &co),
+        minimal(&b, &t, &ct)
+    );
+    out
 }
 
 // ---------- the streams ----------
@@ -950,9 +1221,42 @@ impl Script<'_> {
                 let l = self.fresh(t, false);
                 s.file.lines.insert(r.below(n + 1), l);
             }
+            // A block of lines moved.
+            21 if n > 2 => move_block(r, s),
             _ => {}
         }
     }
+}
+
+/// Move a block of two to four lines (fewer where the file is short) to
+/// another place.
+fn move_block(r: &mut Rng, s: &mut Edited) {
+    let n = s.file.lines.len();
+    let k = (2 + r.below(3)).min(n - 1);
+    let a = r.below(n - k + 1);
+    let block: Vec<Line> = s.file.lines.drain(a..a + k).collect();
+    for l in &block {
+        s.moved.insert(l.id);
+    }
+    let to = r.below(s.file.lines.len() + 1);
+    for (y, l) in block.into_iter().enumerate() {
+        s.file.lines.insert(to + y, l);
+    }
+}
+
+/// A frontmatter block for the top of a base, with identities from `id`.
+fn frontmatter(id: &mut usize, crlf: bool) -> Vec<Line> {
+    ["---", "title: Note", "tags: [a, b]", "---"]
+        .iter()
+        .map(|t| {
+            *id += 1;
+            Line {
+                id: *id,
+                text: t.to_string(),
+                crlf,
+            }
+        })
+        .collect()
 }
 
 /// Keep only the moves a script made from `from` to `to` that changed a
@@ -1000,8 +1304,13 @@ pub fn truth_stream(seed: u64) -> History {
         uq: 0,
         crlf_p,
     };
-    let nb = r.below(10);
+    // Mostly short files; some longer, some with frontmatter.
+    let nb = if r.chance(0.15) { 10 + r.below(30) } else { r.below(10) };
     let mut lines = Vec::new();
+    let mut fm = 500;
+    if r.chance(0.1) {
+        lines.extend(frontmatter(&mut fm, r.chance(crlf_p)));
+    }
     for i in 0..nb {
         let text = pool(&mut r, "line", &mut sc.uq);
         lines.push(Line {
@@ -1053,7 +1362,12 @@ pub fn notes_stream(seed: u64) -> History {
         });
     };
     let mut pc = 0;
-    for b in 0..2 + r.below(4) {
+    if r.chance(0.15) {
+        let mut fm = 5000;
+        base.extend(frontmatter(&mut fm, false));
+    }
+    let blocks = if r.chance(0.15) { 6 + r.below(8) } else { 2 + r.below(4) };
+    for b in 0..blocks {
         if b > 0 {
             push(&mut base, String::new());
         }
@@ -1106,7 +1420,7 @@ pub fn notes_stream(seed: u64) -> History {
             }
         };
         let at = r.below(n.max(1));
-        match r.below(11) {
+        match r.below(12) {
             0 | 1 if n > 0 && !v[at].text.is_empty() => {
                 let t = if v[at].text.starts_with("- [ ]") {
                     v[at].text.replacen("- [ ]", "- [x]", 1)
@@ -1144,6 +1458,19 @@ pub fn notes_stream(seed: u64) -> History {
                 s.moved.insert(l.id);
                 let to = r.below(n);
                 s.file.lines.insert(to, l);
+            }
+            // A paragraph or a run of tasks moved: the lines from `at` to the
+            // next blank line.
+            11 if n > 2 && !v[at].text.is_empty() => {
+                let end = (at..n).find(|&i| v[i].text.is_empty()).unwrap_or(n);
+                let block: Vec<Line> = v.drain(at..end).collect();
+                for l in &block {
+                    s.moved.insert(l.id);
+                }
+                let to = r.below(v.len() + 1);
+                for (y, l) in block.into_iter().enumerate() {
+                    s.file.lines.insert(to + y, l);
+                }
             }
             _ => {}
         }
@@ -1185,23 +1512,33 @@ pub fn guard_stream(seed: u64, fresh: Option<bool>) -> (History, bool) {
             w.to_string()
         }
     };
+    // Some files with `\r\n` line ends, some without a final newline, some
+    // longer, some with frontmatter.
+    let crlf_p = if r.chance(0.15) { 0.3 } else { 0.0 };
     let mut sc = Script {
         next: 1000,
         pool: &pool,
         uq: 0,
-        crlf_p: 0.0,
+        crlf_p,
     };
-    let nb = r.below(8);
+    let nb = if r.chance(0.15) { 8 + r.below(25) } else { r.below(8) };
     let mut lines = Vec::new();
+    let mut fm = 500;
+    if r.chance(0.1) {
+        lines.extend(frontmatter(&mut fm, r.chance(crlf_p)));
+    }
     for i in 0..nb {
         let text = pool(&mut r, "line", &mut sc.uq);
         lines.push(Line {
             id: i,
             text,
-            crlf: false,
+            crlf: r.chance(crlf_p),
         });
     }
-    let r1 = File { lines, fin: true };
+    let r1 = File {
+        lines,
+        fin: !r.chance(0.1),
+    };
     let start = Edited {
         file: r1.clone(),
         moved: HashSet::new(),
@@ -1211,7 +1548,6 @@ pub fn guard_stream(seed: u64, fresh: Option<bool>) -> (History, bool) {
         for _ in 0..1 + r.below(3) {
             sc.step(r, &mut s, who);
         }
-        s.file.fin = true;
         settle(from, &mut s);
         s
     };
@@ -1230,6 +1566,187 @@ pub fn guard_stream(seed: u64, fresh: Option<bool>) -> (History, bool) {
         },
         fresh,
     )
+}
+
+/// A file written out by hand: each line's identity and text, all with the
+/// same line end (`crlf`), and whether the last one ends with it.
+pub fn file(lines: &[(usize, &str)], crlf: bool, fin: bool) -> File {
+    File {
+        lines: lines
+            .iter()
+            .map(|&(id, text)| Line {
+                id,
+                text: text.to_string(),
+                crlf,
+            })
+            .collect(),
+        fin,
+    }
+}
+
+/// A side written out by hand: its file and the identities it moved.
+pub fn edited(file: File, moved: &[usize]) -> Edited {
+    Edited {
+        file,
+        moved: moved.iter().copied().collect(),
+    }
+}
+
+/// Review 7's journal notes (`rev7-probe` `journal`), ported with
+/// identities: unique day headings, sections of tasks, notes, blank lines and
+/// `---`. Ours carries an open task forward, from its section to near the top
+/// of a later one (or to the end), and maybe edits more; theirs makes one to
+/// three ordinary edits: a tick or an edit, a task or a line added, a line
+/// deleted, a log line appended. The bool: whether all of theirs' edits are
+/// in sections other than the two the carry touches (and, where the task went
+/// to the last section, theirs appended nothing).
+pub fn journal_stream(seed: u64) -> (History, bool) {
+    let mut r = Rng(seed);
+    const POOL: &[&str] = &[
+        "",
+        "- [ ] gym",
+        "- [ ] water plants",
+        "",
+        "---",
+        "- x",
+        "- [ ] call mom",
+    ];
+    let mut id = 0;
+    let mut fresh = |text: String| {
+        id += 1;
+        Line { id, text, crlf: false }
+    };
+    let mut lines = Vec::new();
+    // Each line's section.
+    let mut section = Vec::new();
+    let mut note = 0;
+    let sections = 3 + r.below(6);
+    for k in 0..sections {
+        lines.push(fresh(format!("## Day {k}")));
+        section.push(k);
+        for _ in 0..2 + r.below(6) {
+            let t = if r.chance(0.4) {
+                note += 1;
+                format!("note {note}")
+            } else {
+                POOL[r.below(POOL.len())].to_string()
+            };
+            lines.push(fresh(t));
+            section.push(k);
+        }
+    }
+    let base = File { lines, fin: true };
+    let sec_of = |f: &File, i: usize| -> usize {
+        // The section of a line: the last heading at or before it.
+        f.lines[..=i.min(f.lines.len().saturating_sub(1))]
+            .iter()
+            .rev()
+            .find_map(|l| l.text.strip_prefix("## Day ").and_then(|x| x.parse().ok()))
+            .unwrap_or(0)
+    };
+    let mut ours = Edited {
+        file: base.clone(),
+        moved: HashSet::new(),
+    };
+    // The carry: an open task, to near the top of a later section or the end.
+    let tasks: Vec<usize> = (0..base.lines.len())
+        .filter(|&i| base.lines[i].text.starts_with("- [ ]"))
+        .collect();
+    let mut touched: HashSet<usize> = HashSet::new();
+    let mut to_last = false;
+    if !tasks.is_empty() {
+        let i = tasks[r.below(tasks.len())];
+        let from = section[i];
+        let l = ours.file.lines.remove(i);
+        ours.moved.insert(l.id);
+        let heads: Vec<usize> = (i..ours.file.lines.len())
+            .filter(|&j| ours.file.lines[j].text.starts_with("## "))
+            .collect();
+        let n = ours.file.lines.len();
+        let to = if heads.is_empty() || r.chance(0.2) {
+            n
+        } else {
+            (heads[r.below(heads.len())] + 1 + r.below(3)).min(n)
+        };
+        let into = if to == 0 { 0 } else { sec_of(&ours.file, to - 1) };
+        ours.file.lines.insert(to, l);
+        touched.insert(from);
+        touched.insert(into);
+        to_last = into + 1 == sections;
+    }
+    let mut next = 10_000;
+    let mut more = |r: &mut Rng, s: &mut Edited, who: &str, log: &mut bool| -> Option<usize> {
+        let v = &mut s.file.lines;
+        let n = v.len();
+        let at = r.below(n);
+        next += 1;
+        let line = |t: String| Line {
+            id: next,
+            text: t,
+            crlf: false,
+        };
+        match r.below(5) {
+            0 => {
+                v.insert(at, line(format!("{who} added {next}")));
+                Some(at)
+            }
+            1 if !v[at].text.is_empty() && !v[at].text.starts_with("## ") => {
+                let t = if v[at].text.starts_with("- [ ]") {
+                    v[at].text.replacen("- [ ]", "- [x]", 1)
+                } else {
+                    format!("{} {who}", v[at].text)
+                };
+                v[at] = line(t);
+                Some(at)
+            }
+            2 => {
+                v.insert(at, line(format!("- [ ] {who} task {next}")));
+                Some(at)
+            }
+            3 if !v[at].text.starts_with("## ") && at > 0 => {
+                v.remove(at);
+                Some(at - 1)
+            }
+            4 => {
+                v.push(line(format!("- {who} log {next}")));
+                *log = true;
+                Some(v.len() - 1)
+            }
+            _ => None,
+        }
+    };
+    let mut log = false;
+    if r.chance(0.3) {
+        let mut ignore = false;
+        if let Some(at) = more(&mut r, &mut ours, "o", &mut ignore) {
+            touched.insert(sec_of(&ours.file, at));
+        }
+    }
+    let mut theirs = Edited {
+        file: base.clone(),
+        moved: HashSet::new(),
+    };
+    let mut apart = true;
+    for _ in 0..1 + r.below(3) {
+        if let Some(at) = more(&mut r, &mut theirs, "t", &mut log) {
+            // An edit at a section's first line after its heading touches the
+            // section before too (the line it went in after).
+            let k = sec_of(&theirs.file, at);
+            let before = sec_of(&theirs.file, at.saturating_sub(1));
+            if touched.contains(&k) || touched.contains(&before) {
+                apart = false;
+            }
+        }
+    }
+    if to_last && log {
+        apart = false;
+    }
+    let from = Edited {
+        file: base.clone(),
+        moved: HashSet::new(),
+    };
+    settle(&from, &mut ours);
+    (History { base, ours, theirs }, apart)
 }
 
 impl History {
@@ -1265,6 +1782,9 @@ pub fn dup_stream(seed: u64) -> (History, bool) {
     const POOL: &[&str] = &["", "", "---", "- x", "u", "u", "u", "u"];
     let mut next = 1000;
     let mut uq = 0;
+    // Some files with `\r\n` line ends (on some lines), some without a final
+    // newline, some longer.
+    let crlf_p = if r.chance(0.15) { 0.4 } else { 0.0 };
     let mut word = |r: &mut Rng, who: &str, next: &mut usize| {
         let w = POOL[r.below(POOL.len())];
         let text = if w == "u" {
@@ -1277,17 +1797,20 @@ pub fn dup_stream(seed: u64) -> (History, bool) {
         Line {
             id: *next,
             text,
-            crlf: false,
+            crlf: r.chance(crlf_p),
         }
     };
-    let len = r.below(8);
+    let len = if r.chance(0.15) { 8 + r.below(25) } else { r.below(8) };
     let mut lines = Vec::new();
     for i in 0..len {
         let mut l = word(&mut r, "line", &mut next);
         l.id = i;
         lines.push(l);
     }
-    let r1 = File { lines, fin: true };
+    let r1 = File {
+        lines,
+        fin: !r.chance(0.1),
+    };
     let mut side = |r: &mut Rng, from: &Edited, who: &str, ops: usize, next: &mut usize| {
         let mut s = from.clone();
         for _ in 0..1 + r.below(3) {
@@ -1332,6 +1855,17 @@ pub fn dup_stream(seed: u64) -> (History, bool) {
                     let at = r.below(v.len() + 1);
                     v.insert(at, l);
                 }
+                5 if v.len() > 2 => move_block(r, &mut s),
+                6 if !v.is_empty() && crlf_p > 0.0 => {
+                    let at = r.below(v.len());
+                    *next += 1;
+                    v[at] = Line {
+                        id: *next,
+                        text: v[at].text.clone(),
+                        crlf: !v[at].crlf,
+                    };
+                }
+                7 => s.file.fin = !s.file.fin,
                 _ => {}
             }
         }
@@ -1342,9 +1876,9 @@ pub fn dup_stream(seed: u64) -> (History, bool) {
         file: r1.clone(),
         moved: HashSet::new(),
     };
-    let r2 = side(&mut r, &start, "remote", 5, &mut next);
+    let r2 = side(&mut r, &start, "remote", 8, &mut next);
     let l = if r.below(2) == 0 {
-        side(&mut r, &start, "writer", 5, &mut next)
+        side(&mut r, &start, "writer", 8, &mut next)
     } else {
         side(&mut r, &r2, "writer", 3, &mut next)
     };

@@ -1220,7 +1220,7 @@ proptest! {
 
 /// Every clean line merge of a history (`truth::judge`), in each side and
 /// mtime order, and the secondary oracles (`passes_oracle`) on each.
-fn right_by_history(h: &truth::History) -> Result<(), TestCaseError> {
+fn right_by_history(h: &truth::History, seed: u64) -> Result<(), TestCaseError> {
     if h.artifact() {
         return Ok(());
     }
@@ -1228,7 +1228,14 @@ fn right_by_history(h: &truth::History) -> Result<(), TestCaseError> {
     if o == t || o == b || t == b {
         return Ok(());
     }
-    if let Err(e) = judged(h, Kind::Text) {
+    // As a note (a line merge unless the frontmatter rule applies) for a
+    // third of the seeds.
+    let kind = if seed.is_multiple_of(3) {
+        Kind::Markdown
+    } else {
+        Kind::Text
+    };
+    if let Err(e) = judged(h, kind) {
         prop_assert!(false, "{}", e);
     }
     let c = Case {
@@ -1251,21 +1258,21 @@ proptest! {
     /// history, or falls in a named history-ambiguous class.
     #[test]
     fn clean_merges_are_the_true_merge_of_the_history(seed in any::<u64>()) {
-        right_by_history(&truth::truth_stream(seed))?;
+        right_by_history(&truth::truth_stream(seed), seed)?;
     }
 
     /// Review 5's realistic notes (paragraphs, tasks, headings, `---`, blank
     /// lines; edits, ticks, paragraph breaks, appends, moves): the same.
     #[test]
     fn notes_merge_to_the_true_merge_of_the_history(seed in any::<u64>()) {
-        right_by_history(&truth::notes_stream(seed))?;
+        right_by_history(&truth::notes_stream(seed), seed)?;
     }
 
     /// Review 6's dup fuzz: no line both sides added is taken twice where
     /// the history has it once, and every clean merge is right.
     #[test]
     fn the_dup_fuzz_merges_to_the_true_merge(seed in any::<u64>()) {
-        right_by_history(&truth::dup_stream(seed).0)?;
+        right_by_history(&truth::dup_stream(seed).0, seed)?;
     }
 
     /// The lost-update guard, a writer that saw R2 (L is R2 with the
@@ -1273,7 +1280,7 @@ proptest! {
     /// the writer reverted or moved R2's own lines (no text shows that).
     #[test]
     fn a_writer_that_saw_the_change_gets_the_true_merge(seed in any::<u64>()) {
-        right_by_history(&truth::guard_stream(seed, Some(true)).0)?;
+        right_by_history(&truth::guard_stream(seed, Some(true)).0, seed)?;
     }
 
     /// The guard's silent path, a stale writer (L is R1 with the writer's
@@ -1283,7 +1290,7 @@ proptest! {
     /// difference (a named class).
     #[test]
     fn a_stale_writer_is_never_taken_for_one_that_saw_the_change(seed in any::<u64>()) {
-        right_by_history(&truth::guard_stream(seed, Some(false)).0)?;
+        right_by_history(&truth::guard_stream(seed, Some(false)).0, seed)?;
     }
 }
 
@@ -1839,6 +1846,452 @@ fn generators_reach_merges() {
     );
 }
 
+/// Review 7's journal notes with a task carried forward (`truth::journal_stream`):
+/// every clean merge is the true merge or a named ambiguity, and where the
+/// other side's edits are all in sections the carry does not touch, the
+/// merge is clean in every side and mtime order (finding 1: a carry used to
+/// open on any change of the other side in the gaps it touched).
+fn a_carry_forward_merges(h: &truth::History, apart: bool, seed: u64) -> Result<(), TestCaseError> {
+    right_by_history(h, seed)?;
+    let [b, o, t] = h.texts();
+    if !apart || o == b || t == b || o == t {
+        return Ok(());
+    }
+    let c = Case {
+        base: b,
+        ours: o,
+        theirs: t,
+    };
+    for (mo, mt) in [(2000, 3000), (3000, 2000)] {
+        for x in [c.clone(), swapped(&c)] {
+            let m = run(Kind::Text, &x, mo, mt);
+            prop_assert!(
+                matches!(m.outcome, Outcome::Write(_)),
+                "open: {:?}\nbase {:?}\nours {:?}\ntheirs {:?}\n{}",
+                m.outcome,
+                x.base,
+                x.ours,
+                x.theirs,
+                h.describe()
+            );
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// A task carried forward in a journal merges where the other side's
+    /// edits are elsewhere, and is never merged wrong.
+    #[test]
+    fn a_task_carried_forward_merges_with_edits_elsewhere(seed in any::<u64>()) {
+        let (h, apart) = truth::journal_stream(seed);
+        a_carry_forward_merges(&h, apart, seed)?;
+    }
+}
+
+// ---------- ground truth: the judge is no rubber stamp ----------
+
+/// Review 7's three garbles, each a merge the judge once let through under a
+/// history-ambiguous class. Each history's true merge passes; the garble
+/// does not.
+#[test]
+fn the_judge_rejects_review_7s_garbles() {
+    use truth::{edited, file, History};
+    let cases = [
+        // Smaller had no count bound where the true merge is clean: `- buy
+        // milk`, which both added, twice.
+        (
+            History {
+                base: file(
+                    &[
+                        (0, "line 1"),
+                        (1, "## Notes"),
+                        (2, "line 2"),
+                        (3, ""),
+                        (4, "line 3"),
+                        (5, "line 4"),
+                        (6, "line 5"),
+                    ],
+                    false,
+                    true,
+                ),
+                ours: edited(
+                    file(
+                        &[
+                            (1001, "line 1"),
+                            (0, "line 1"),
+                            (1, "## Notes"),
+                            (2, "line 2"),
+                            (1002, "- buy milk"),
+                            (3, ""),
+                            (4, "line 3"),
+                            (5, "line 4"),
+                            (6, "line 5"),
+                        ],
+                        false,
+                        true,
+                    ),
+                    &[],
+                ),
+                theirs: edited(
+                    file(
+                        &[
+                            (1003, "line 4"),
+                            (0, "line 1"),
+                            (1, "## Notes"),
+                            (3, ""),
+                            (4, "line 3"),
+                            (2, "line 2"),
+                            (1004, "- buy milk"),
+                            (5, "line 4"),
+                            (6, "line 5"),
+                        ],
+                        false,
+                        true,
+                    ),
+                    &[3, 4],
+                ),
+            },
+            "line 1\nline 4\nline 1\n## Notes\n- buy milk\n\nline 3\nline 2\n- buy milk\nline 4\nline 5\n",
+        ),
+        // Copies exempted a line by its text wherever two runs at one point
+        // went in whole: `line 1` four times, the true merge has it three.
+        (
+            History {
+                base: file(&[(0, "line 1"), (1, "line 1")], false, false),
+                ours: edited(
+                    file(&[(0, "line 1"), (1, "line 1"), (1001, "line 1")], false, false),
+                    &[],
+                ),
+                theirs: edited(
+                    file(
+                        &[(0, "line 1"), (1, "line 1"), (1002, "t 3"), (1003, "line 1")],
+                        false,
+                        true,
+                    ),
+                    &[],
+                ),
+            },
+            "line 1\nline 1\nline 1\nt 3\nline 1\n",
+        ),
+        // Same took a stale writer's file for the merge: R2's second `line
+        // 1`, which the true merge keeps, lost.
+        (
+            History {
+                base: file(&[(0, "---"), (1, "line 1")], true, true),
+                ours: edited(file(&[(1, "line 1"), (0, "---")], true, true), &[0]),
+                theirs: edited(file(&[(1001, "line 1"), (0, "---"), (1, "line 1")], true, true), &[]),
+            },
+            "line 1\r\n---\r\n",
+        ),
+    ];
+    for (h, garble) in cases {
+        let truth = h.truth(true).expect("a clean true merge");
+        assert_eq!(truth::judge(&h, &truth, true), Ok(truth::Class::Exact));
+        assert!(
+            truth::judge(&h, garble, true).is_err(),
+            "{garble:?} passes the judge\n{}",
+            h.describe()
+        );
+    }
+}
+
+/// Review 7, finding 4: merges the judge took for wrong where two histories
+/// allow them. Each is the true merge of a history as short as the real one.
+#[test]
+fn the_judge_accepts_what_two_histories_allow() {
+    use truth::{edited, file, History};
+    let lines =
+        |ids: std::ops::Range<usize>| -> Vec<(usize, String)> { ids.map(|i| (i, format!("line {}", i + 1))).collect() };
+    fn refs(v: &[(usize, String)]) -> Vec<(usize, &str)> {
+        v.iter().map(|(i, t)| (*i, t.as_str())).collect()
+    }
+    // Two blocks of four swapped (or the other four moved), and ours put a
+    // copy of `line 10` in: the history that moved the other block takes it
+    // clean.
+    let base = lines(0..16);
+    let mut ours = refs(&base);
+    ours.insert(3, (1001, "line 10"));
+    let mut theirs = refs(&base);
+    let block: Vec<(usize, &str)> = theirs.drain(2..6).collect();
+    for (y, l) in block.into_iter().enumerate() {
+        theirs.insert(6 + y, l);
+    }
+    let swap = History {
+        base: file(&refs(&base), false, true),
+        ours: edited(file(&ours, false, true), &[]),
+        theirs: edited(file(&theirs, false, true), &[2, 3, 4, 5]),
+    };
+    let m = "line 1\nline 2\nline 7\nline 8\nline 9\nline 10\nline 3\nline 10\nline 4\nline 5\nline 6\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\n";
+    assert!(
+        truth::judge(&swap, m, true).is_ok(),
+        "{}",
+        truth::explain(&swap, m, true)
+    );
+    // Theirs moved `line 14` up (or four lines down), ours turned `line 11`
+    // into a second `---`: `line 14`, which every file has once, moved, so it
+    // parts no segments, and the `---` both added are not counted apart from
+    // the ones they sit with.
+    let base: Vec<(usize, &str)> = vec![
+        (0, "line 1"),
+        (1, "---"),
+        (2, "line 2"),
+        (3, ""),
+        (4, "line 3"),
+        (5, "line 4"),
+        (6, "line 5"),
+        (7, "line 6"),
+        (8, "line 7"),
+        (9, "line 8"),
+        (10, "line 9"),
+        (11, "line 10"),
+        (12, "line 11"),
+        (13, "---"),
+        (14, "line 12"),
+        (15, "line 13"),
+        (16, "  "),
+        (17, "  "),
+        (18, "line 14"),
+    ];
+    let mut ours = base.clone();
+    ours.remove(12);
+    ours.insert(13, (1002, "---"));
+    let mut theirs = base.clone();
+    theirs.insert(3, (1001, "---"));
+    let tail: Vec<(usize, &str)> = theirs.drain(13..17).collect();
+    theirs.extend(tail);
+    let moved = History {
+        base: file(&base, false, true),
+        ours: edited(file(&ours, false, true), &[]),
+        theirs: edited(file(&theirs, false, true), &[12, 13, 14, 15]),
+    };
+    let m = "line 1\n---\nline 2\n---\n\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n  \n  \nline 14\n---\n---\nline 12\nline 13\n";
+    assert_eq!(moved.texts()[2], "line 1\n---\nline 2\n---\n\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\n  \n  \nline 14\nline 11\n---\nline 12\nline 13\n");
+    assert!(
+        truth::judge(&moved, m, true).is_ok(),
+        "{}",
+        truth::explain(&moved, m, true)
+    );
+}
+
+/// Lines once in every file of `files` (not blank), by content.
+fn once_in_all(files: &[&str]) -> std::collections::HashSet<String> {
+    let counts: Vec<HashMap<String, usize>> = files
+        .iter()
+        .map(|f| {
+            let mut n: HashMap<String, usize> = HashMap::new();
+            for l in f.split_inclusive('\n').filter(|l| !l.trim().is_empty()) {
+                *n.entry(l.trim_end_matches(['\n', '\r']).to_string()).or_default() += 1;
+            }
+            n
+        })
+        .collect();
+    counts[0]
+        .iter()
+        .filter(|(k, _)| counts.iter().all(|n| n.get(*k) == Some(&1)))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// Lines (not blank) every file of `files` has once that no side moved: for
+/// each other file, in every longest run of them in the first file's order
+/// that the file keeps.
+fn unmoved(files: &[&str]) -> std::collections::HashSet<String> {
+    let key = |l: &str| l.trim_end_matches(['\n', '\r']).to_string();
+    let at: Vec<HashMap<String, usize>> = files
+        .iter()
+        .map(|f| f.split_inclusive('\n').enumerate().map(|(i, l)| (key(l), i)).collect())
+        .collect();
+    let mut v: Vec<String> = once_in_all(files).into_iter().collect();
+    v.sort_by_key(|k| at[0][k]);
+    let n = v.len();
+    let mut keep: std::collections::HashSet<String> = v.iter().cloned().collect();
+    for p in &at[1..] {
+        let rises = |x: usize, y: usize| p[&v[x]] < p[&v[y]];
+        let mut end = vec![1usize; n];
+        for y in 0..n {
+            for x in 0..y {
+                if rises(x, y) {
+                    end[y] = end[y].max(end[x] + 1);
+                }
+            }
+        }
+        let mut start = vec![1usize; n];
+        for x in (0..n).rev() {
+            for y in x + 1..n {
+                if rises(x, y) {
+                    start[x] = start[x].max(start[y] + 1);
+                }
+            }
+        }
+        let longest = end.iter().copied().max().unwrap_or(0);
+        let some: Vec<usize> = (0..n).filter(|&x| end[x] + start[x] - 1 == longest).collect();
+        let every: std::collections::HashSet<&String> = some
+            .iter()
+            .filter(|&&x| some.iter().filter(|&&y| end[y] == end[x]).count() == 1)
+            .map(|&x| &v[x])
+            .collect();
+        keep.retain(|k| every.contains(k));
+    }
+    keep
+}
+
+/// How often the line `k` is in each segment of `s` between lines of `parts`
+/// (keyed by the line that starts the segment).
+fn segment_counts(s: &str, parts: &std::collections::HashSet<String>, k: &str) -> HashMap<Option<String>, usize> {
+    let mut n: HashMap<Option<String>, usize> = HashMap::new();
+    let mut at = None;
+    for l in s.split_inclusive('\n').map(|l| l.trim_end_matches(['\n', '\r'])) {
+        if parts.contains(l) {
+            at = Some(l.to_string());
+        } else if l == k {
+            *n.entry(at.clone()).or_default() += 1;
+        }
+    }
+    n
+}
+
+/// The true merge of a history, mutated: a line put in once more, a line
+/// dropped, two lines next to each other swapped. The judge rejects every
+/// mutant that changes a count or an order beyond what the named
+/// ambiguities allow:
+///
+/// - a line (not blank) put in next to a copy of it, more often than both the
+///   true merge and either side have it, in all and in its segment between
+///   lines no side moved;
+/// - a line less often than all of the true merge, either side, and ours
+///   plus theirs less the base have it (where both removed a copy, they may
+///   be two copies);
+/// - two lines (not blank) every file has once swapped, where base and both
+///   sides have them in the same order and no side moved either, nor any
+///   lines past them (both are in every longest run of such lines each file
+///   keeps in the base's order: two sides' moves compose).
+///
+/// A line put in again that the judge takes only by the placement rules'
+/// own copies (two runs at one point that go in whole, each with the line;
+/// both sides' edits of other lines to it) is within the named ambiguity.
+/// Each case tries a few mutants, from every stream.
+fn mutants_are_rejected(h: &truth::History, seed: u64) -> Result<(), TestCaseError> {
+    if h.artifact() {
+        return Ok(());
+    }
+    let [b, o, t] = h.texts();
+    if o == t || o == b || t == b {
+        return Ok(());
+    }
+    let ours_first = seed.is_multiple_of(2);
+    let Some(w) = h.truth(ours_first) else {
+        return Ok(());
+    };
+    let key = |l: &str| l.trim_end_matches(['\n', '\r']).to_string();
+    let n = |s: &str, k: &str| s.split_inclusive('\n').filter(|l| key(l) == k).count();
+    let wl: Vec<String> = w.split_inclusive('\n').map(str::to_string).collect();
+    if wl.is_empty() {
+        return Ok(());
+    }
+    let ids = |f: &truth::File| f.lines.iter().map(|l| l.id).collect::<Vec<_>>();
+    let moved = |text: &str| {
+        [&h.ours, &h.theirs].iter().any(|s| {
+            s.moved.iter().any(|id| {
+                s.file.lines.iter().any(|l| l.id == *id && l.text == text)
+                    || h.base.lines.iter().any(|l| l.id == *id && l.text == text)
+            })
+        })
+    };
+    let _ = ids;
+    let once = once_in_all(&[&b, &o, &t, &w]);
+    let pos = |s: &str, k: &str| s.split_inclusive('\n').position(|l| key(l) == k);
+    let mut r = truth::Rng(seed ^ 0x5eed);
+    for _ in 0..6 {
+        let i = r.below(wl.len());
+        let line = &wl[i];
+        let k = key(line);
+        let mut v = wl.clone();
+        let (what, must) = match r.below(3) {
+            0 if !line.trim().is_empty() => {
+                let mut x = line.clone();
+                if !x.ends_with('\n') {
+                    x.push('\n');
+                }
+                // Next to the line it copies, more often in its segment
+                // between lines no side moved than the true merge and either
+                // side have it there (copies a segment apart are two lines).
+                v.insert(i + r.below(2), x);
+                let m = v.concat();
+                let parts = unmoved(&[&m, &b, &o, &t, &w]);
+                let at = |s: &str| segment_counts(s, &parts, &k);
+                let (sm, sw, so, st) = (at(&m), at(&w), at(&o), at(&t));
+                let get = |x: &HashMap<Option<String>, usize>, g: &Option<String>| x.get(g).copied().unwrap_or(0);
+                let over = n(&m, &k) > n(&w, &k).max(n(&o, &k)).max(n(&t, &k))
+                    && sm
+                        .iter()
+                        .any(|(g, &c)| c > get(&sw, g).max(get(&so, g)).max(get(&st, g)));
+                ("a line put in again", over)
+            }
+            1 if !line.trim().is_empty() => {
+                v.remove(i);
+                let m = v.concat();
+                let (cm, cw, cb, co, ct) = (n(&m, &k), n(&w, &k), n(&b, &k), n(&o, &k), n(&t, &k));
+                let low = cw.min(co.max(ct)).min((co + ct).saturating_sub(cb));
+                ("a line dropped", cm < low)
+            }
+            _ if i + 1 < wl.len() => {
+                let q = key(&wl[i + 1]);
+                v.swap(i, i + 1);
+                let still = unmoved(&[&b, &o, &t, &w]);
+                let fixed = once.contains(&k)
+                    && still.contains(&k)
+                    && still.contains(&q)
+                    && k != q
+                    && !moved(&k)
+                    && !moved(&q)
+                    && wl[i].ends_with('\n')
+                    && wl[i + 1].ends_with('\n')
+                    && [&b, &o, &t].iter().all(|f| pos(f, &k) < pos(f, &q));
+                ("two lines swapped", fixed)
+            }
+            _ => continue,
+        };
+        if !must {
+            continue;
+        }
+        let m = v.concat();
+        match truth::judge_why(h, &m, ours_first) {
+            Err(_) => {}
+            // A line put in again where a reading's two runs at one point
+            // go in whole with it in each (or both sides edited other lines
+            // to it): the rule, named.
+            Ok((_, true)) if what == "a line put in again" => {}
+            Ok((c, _)) => prop_assert!(
+                false,
+                "{what} passes as {c:?}\nbase {b:?}\nours {o:?}\ntheirs {t:?}\ntrue {w:?}\nmutant {m:?} (ours_first {ours_first})\n{}",
+                h.describe()
+            ),
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// The ground-truth judge rejects mutants of true merges from every
+    /// stream (see `mutants_are_rejected`).
+    #[test]
+    fn the_judge_rejects_mutated_true_merges(seed in any::<u64>()) {
+        let h = match seed % 5 {
+            0 => truth::truth_stream(seed),
+            1 => truth::notes_stream(seed),
+            2 => truth::dup_stream(seed).0,
+            3 => truth::guard_stream(seed, Some(true)).0,
+            _ => truth::guard_stream(seed, Some(false)).0,
+        };
+        mutants_are_rejected(&h, seed)?;
+    }
+}
+
 // ---------- ground truth: tallies ----------
 
 /// Every clean line merge of a history in each side and mtime order, judged
@@ -1872,6 +2325,11 @@ fn judged(h: &truth::History, kind: Kind) -> Result<Vec<Option<truth::Class>>, S
         for ours_newer in [false, true] {
             let (mo, mt) = if ours_newer { (3000, 2000) } else { (2000, 3000) };
             let m = run(kind, &c, mo, mt);
+            // The frontmatter rule merges by key, which the line rules do
+            // not model; its own properties judge it.
+            if m.rule != Rule::Lines {
+                continue;
+            }
             let got = match m.outcome {
                 Outcome::Write(w) => Some(String::from_utf8(w).unwrap()),
                 Outcome::Identical => Some(c.ours.clone()),
@@ -1883,12 +2341,13 @@ fn judged(h: &truth::History, kind: Kind) -> Result<Vec<Option<truth::Class>>, S
                     Ok(k) => out.push(Some(k)),
                     Err(e) => {
                         return Err(format!(
-                            "{e}\nbase {:?}\nours {:?}\ntheirs {:?}\nmerged {m:?} (ours_first {})\n{}",
+                            "{e}\nbase {:?}\nours {:?}\ntheirs {:?}\nmerged {m:?} (ours_first {})\n{}\n{}",
                             c.base,
                             c.ours,
                             c.theirs,
                             !ours_newer,
-                            hs.describe()
+                            hs.describe(),
+                            truth::explain(&hs, &m, !ours_newer)
                         ))
                     }
                 },
@@ -1907,18 +2366,20 @@ fn tallies() {
     let n: u64 = std::env::var("N").ok().and_then(|x| x.parse().ok()).unwrap_or(100_000);
     let seed: u64 = std::env::var("SEED").ok().and_then(|x| x.parse().ok()).unwrap_or(0);
     let show: usize = std::env::var("SHOW").ok().and_then(|x| x.parse().ok()).unwrap_or(3);
-    let streams: [(&str, &dyn Fn(u64) -> truth::History); 5] = [
+    let streams: [(&str, &dyn Fn(u64) -> truth::History); 6] = [
         ("truth", &truth::truth_stream),
         ("notes", &truth::notes_stream),
         ("dup", &|s| truth::dup_stream(s).0),
         ("guard-fresh", &|s| truth::guard_stream(s, Some(true)).0),
         ("guard-stale", &|s| truth::guard_stream(s, Some(false)).0),
+        ("journal", &|s| truth::journal_stream(s).0),
     ];
     for (name, gen) in streams {
         let mut tally: std::collections::BTreeMap<String, usize> = Default::default();
         let mut wrong: Vec<String> = Vec::new();
         for k in 0..n {
-            let h = gen(seed.wrapping_mul(1_000_003).wrapping_add(k));
+            let hs = seed.wrapping_mul(1_000_003).wrapping_add(k);
+            let h = gen(hs);
             if h.artifact() {
                 continue;
             }
@@ -1933,7 +2394,12 @@ fn tallies() {
                     }
                 }
             }
-            match judged(&h, Kind::Text) {
+            let kind = if k.is_multiple_of(3) {
+                Kind::Markdown
+            } else {
+                Kind::Text
+            };
+            match judged(&h, kind) {
                 Ok(v) => {
                     let truth_clean = h.truth(true).is_some();
                     for x in v {
@@ -1948,7 +2414,7 @@ fn tallies() {
                 Err(e) => {
                     *tally.entry("WRONG".into()).or_default() += 1;
                     if wrong.len() < show {
-                        wrong.push(e);
+                        wrong.push(format!("stream seed {hs} ({kind:?})\n{e}"));
                     }
                 }
             }

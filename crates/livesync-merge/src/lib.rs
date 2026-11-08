@@ -104,12 +104,15 @@
 //!   conflict hunk of its own. It is also open where a side may be the other
 //!   side's file with lines of its own on top, or with a line the other
 //!   deleted typed back right beside its own change (both readings are
-//!   plausible, and they disagree); where a line one side moved (or the
-//!   lines it passed, a line each file has once among them) meets a change
-//!   of the other side in the stretch it left or reached; where a line both
-//!   sides added would be there more often than either side has it, from the
-//!   two sides at two places in one stretch (one insertion read at two
-//!   points: a paragraph break or a deleted line between); where a line
+//!   plausible, and they disagree); where a line one side moved meets a
+//!   change of the other side: of the line itself, right around where it
+//!   left, or right around where it arrived where the lines it passed may
+//!   have moved instead (a line moved to where the other side inserted, with
+//!   no such rival reading, is two insertions at one point); where a line
+//!   both sides added would be there more often than either side has it, or
+//!   with only blank lines between the copies, from the two sides at two
+//!   places in one stretch (one insertion read at two points: a paragraph
+//!   break or a deleted line between); where a line
 //!   would be there more often (or less often) than any side's change
 //!   explains; where the merge would mix `\r\n` and `\n` line ends that no
 //!   file mixes. A lost-update guard reads

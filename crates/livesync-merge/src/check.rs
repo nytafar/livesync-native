@@ -24,9 +24,13 @@
 //!      spaces): the anchor may have moved across a blank line, or the blank
 //!      line across it;
 //!    - a longest common subsequence of a side's lines around the anchor
-//!      (its two gaps, and two anchors each way) with the base's need not
-//!      match the anchor (lines matched across it instead are as many): the
-//!      anchor may be the line that moved, and the lines it passed stayed.
+//!      (its two gaps, and two anchors each way, or its own two gaps where
+//!      those are too many to line up) with the base's need not match the
+//!      anchor (lines matched across it instead are as many): the anchor may
+//!      be the line that moved, and the lines it passed stayed. Only the lines
+//!      between the two texts' common start and end are lined up: an anchor
+//!      in the common start or end is in every longest common subsequence,
+//!      and so is one where all of one side's lines there are in the other's.
 //! 2. **Stretches only one side changed.** Where one side's stretch is the
 //!    base's, that side changed nothing there, and the merge's stretch must be
 //!    the other side's, byte for byte (blank lines and `---` included); where
@@ -35,24 +39,33 @@
 //! 3. **Moves.** A line (not blank) that a side inserted in one gap and
 //!    removed from another (by a longest common subsequence of each gap it
 //!    changed with the base's) may have moved between them, or the lines
-//!    between may have moved past it. Where the other side changed either
-//!    gap at all, the readings place that change differently around the
-//!    moved line: those gaps stay open. And whatever moved: a line neither
-//!    side has more often than the base is not in the merge more often than
-//!    in both sides, and one neither side has less often is not in it less
-//!    often than in either.
+//!    between may have moved past it. The two readings place the other
+//!    side's change alike but at the ends of what moved, so those gaps stay
+//!    open only where the other side's change can meet the move: where it
+//!    changed how often the line is in one of them; where it changed (or
+//!    inserted between) the lines right around the line where it left (a
+//!    deletion right beside the other side's change); or where it did so
+//!    where the line arrived and the lines it passed may have moved instead
+//!    (a longest common subsequence of the gaps between pairs the line's old
+//!    copy with its new one). Elsewhere, and where the line arrived at the
+//!    other side's insertion with no such rival reading (a task carried to
+//!    the end, a line appended there), the placement rules decide as for any
+//!    change. And whatever moved: a line neither side has more often than the
+//!    base is not in the merge more often than in both sides, and one neither
+//!    side has less often is not in it less often than in either.
 //! 4. **Stretches both sides changed.** Each side's change is read in every
 //!    way the texts allow: every longest common subsequence of the side's
 //!    stretch with the base's ([`readings`]). Every pair of readings is merged
 //!    by the placement rules ([`plain`]), which share nothing with the merge's
 //!    own code. The stretch is clean only where every pair merges, all to the
 //!    same text, blank lines and `---` included, and the merge's stretch is
-//!    that text. A reading's merge is a conflict where it would have a line
-//!    (not blank) more often than either side's stretch, placed by pieces of
-//!    the two sides at two places, one of them an insertion ([`twice`]): both
-//!    sides added it, and another reading has them at one point, one
-//!    insertion taken once. (Within one stretch only: copies apart across an
-//!    anchor are two lines.) Further, it is open where:
+//!    that text. A reading's merge is a conflict where it has a line (not
+//!    blank) placed by pieces of the two sides at two places, one of them an
+//!    insertion, more often than either side's stretch or with only blank
+//!    lines between the two copies ([`twice`]): both sides added it, and
+//!    another reading has them at one point, one insertion taken once.
+//!    (Within one stretch only: copies apart across an anchor are two lines.)
+//!    Further, it is open where:
 //!    - one side's stretch is the other's with lines added (a writer that saw
 //!      the other change and wrote on top of it), and the merge is not that,
 //!      where the other side's change added lines (not only deleted some);
@@ -156,17 +169,26 @@ pub(crate) fn check(
     // shows too.
     let mut weak = vec![false; an.len()];
     for (k, w) in weak.iter_mut().enumerate() {
-        let (lo, hi) = (k.saturating_sub(WINDOW), (k + 1 + WINDOW).min(an.len()));
         for x in [1, 2] {
-            let same = |g: usize| texts[x][gaps[g][x].clone()] == texts[0][gaps[g][0].clone()];
-            if (lo..=hi).all(same) {
-                continue;
-            }
-            let rb = gaps[lo][0].start..gaps[hi][0].end;
-            let rs = gaps[lo][x].start..gaps[hi][x].end;
-            let at = (an[k][0] - rb.start, an[k][x] - rs.start);
-            if skippable(&texts[0][rb], &texts[x][rs], at, budget)? {
-                *w = true;
+            // The window: two anchors each way, or (where that is too large to
+            // line up) the anchor's own two gaps.
+            for width in [WINDOW, 0] {
+                let (lo, hi) = (k.saturating_sub(width), (k + 1 + width).min(an.len()));
+                let same = |g: usize| texts[x][gaps[g][x].clone()] == texts[0][gaps[g][0].clone()];
+                if (lo..=hi).all(same) {
+                    break;
+                }
+                let rb = gaps[lo][0].start..gaps[hi][0].end;
+                let rs = gaps[lo][x].start..gaps[hi][x].end;
+                let at = (an[k][0] - rb.start, an[k][x] - rs.start);
+                match skippable(&texts[0][rb], &texts[x][rs], at, budget)? {
+                    Some(skip) => {
+                        *w |= skip;
+                        break;
+                    }
+                    None if width == 0 => *w = true,
+                    None => {}
+                }
             }
         }
     }
@@ -227,12 +249,40 @@ pub(crate) fn check(
 }
 
 /// Whether a longest common subsequence of `b` and `s` need not match the
-/// pair `at` (an anchor): one that leaves it out is as long. Past
-/// [`MAX_CELLS`], taken as so.
-fn skippable(b: &[&str], s: &[&str], at: (usize, usize), budget: &mut Budget) -> Result<bool, OutOfBudget> {
+/// pair `at` (an anchor, a line each has once): one that leaves it out is as
+/// long. `None` where the lines it would take to tell are past
+/// [`MAX_CELLS`].
+///
+/// Only the lines between their common start and end need lining up: one
+/// longest common subsequence matches the common start and end line by line,
+/// so an anchor there is in every one (leaving it out loses it, and gains
+/// nothing). Nor need they where one side's middle lines are all in the
+/// other's in order: a longest common subsequence is all of the shorter, and
+/// one without the anchor is shorter.
+fn skippable(b: &[&str], s: &[&str], at: (usize, usize), budget: &mut Budget) -> Result<Option<bool>, OutOfBudget> {
+    budget.spend(b.len() + s.len())?;
+    let pre = b.iter().zip(s).take_while(|(x, y)| same_line(x, y)).count();
+    let suf = b[pre..]
+        .iter()
+        .rev()
+        .zip(s[pre..].iter().rev())
+        .take_while(|(x, y)| same_line(x, y))
+        .count();
+    let (b, s) = (&b[pre..b.len() - suf], &s[pre..s.len() - suf]);
+    if at.0 < pre || at.1 < pre || at.0 >= pre + b.len() || at.1 >= pre + s.len() {
+        return Ok(Some(false));
+    }
+    let at = (at.0 - pre, at.1 - pre);
+    let within = |short: &[&str], long: &[&str]| {
+        let mut it = long.iter();
+        short.iter().all(|x| it.any(|y| same_line(x, y)))
+    };
+    if within(b, s) || within(s, b) {
+        return Ok(Some(false));
+    }
     let (n, m) = (b.len(), s.len());
     if n * m > MAX_CELLS {
-        return Ok(true);
+        return Ok(None);
     }
     budget.spend(2 * (n + 1) * (m + 1))?;
     let lcs = |skip: Option<(usize, usize)>| -> u32 {
@@ -249,7 +299,7 @@ fn skippable(b: &[&str], s: &[&str], at: (usize, usize), budget: &mut Budget) ->
         }
         l[0]
     };
-    Ok(lcs(Some(at)) == lcs(None))
+    Ok(Some(lcs(Some(at)) == lcs(None)))
 }
 
 /// Whether some lines end in `\r\n` and others in a bare `\n`.
@@ -385,37 +435,127 @@ fn in_doubt(t: [&[&str]; 4], gaps: &[[Range<usize>; 4]], budget: &mut Budget) ->
     // (line, side) -> the gaps it inserted it in, and removed it from.
     type Gaps = (Vec<usize>, Vec<usize>);
     let mut way: HashMap<(&str, usize), Gaps> = HashMap::new();
+    // (gap, side) -> the side's gap lined up with the base's.
+    let mut aligned: HashMap<(usize, usize), Vec<Option<usize>>> = HashMap::new();
     for (g, r) in gaps.iter().enumerate() {
         for side in [1, 2] {
             if !changed[g][side - 1] {
                 continue;
             }
-            let (ins, rem) = gap_diff(&t[0][r[0].clone()], &t[side][r[side].clone()], budget)?;
-            for l in ins {
-                way.entry((l, side)).or_default().0.push(g);
+            let (b, s) = (&t[0][r[0].clone()], &t[side][r[side].clone()]);
+            let al = gap_align(b, s, budget)?;
+            let mut kept = vec![false; b.len()];
+            for &i in al.iter().flatten() {
+                kept[i] = true;
             }
-            for l in rem {
-                way.entry((l, side)).or_default().1.push(g);
+            for (l, _) in s.iter().zip(&al).filter(|(l, a)| a.is_none() && !blank(l)) {
+                way.entry((content(l), side)).or_default().0.push(g);
             }
+            for (l, _) in b.iter().zip(&kept).filter(|(l, k)| !**k && !blank(l)) {
+                way.entry((content(l), side)).or_default().1.push(g);
+            }
+            aligned.insert((g, side), al);
         }
     }
-    // The gaps a move touches, per line and side, and whether the other side
-    // changed one of them: which line moved (this one, or the lines it
-    // passed) is open to reading, and the readings place the other side's
-    // change differently around it.
-    let mut moved: Vec<(Vec<usize>, bool)> = Vec::new();
-    for (&(_, side), (ins, rem)) in &way {
-        let across = ins.iter().any(|g| rem.iter().any(|h| g != h));
-        if across {
-            let gs: Vec<usize> = ins.iter().chain(rem).copied().collect();
-            let clash = gs.iter().any(|&g| changed[g][2 - side]);
-            moved.push((gs, clash));
-        }
-    }
+    // A move meets the other side's change where the readings of the move
+    // place that change differently, or where it is a deletion right beside
+    // the other side's change (as a deletion is, see [`typed_back`]):
+    // - the other side changed how often the line is in a gap the move
+    //   touches;
+    // - the other side changed (or inserted between) the lines right around
+    //   a copy of it where it left (blank lines and lines the side removed
+    //   between do not part them);
+    // - the same where it arrived, but only where the lines it passed may
+    //   have moved the other way instead: no more of them than the side
+    //   moved (the anchors between count at least), else that reading is
+    //   longer and the one the texts show is this line moved. Two readings
+    //   differ only at the ends of what moved; elsewhere in those gaps, and
+    //   where the line arrived at the other side's insertion (two runs at one
+    //   point), the placement rules decide as for any change.
+    budget.spend(4 * t.iter().map(|x| x.len()).sum::<usize>())?;
     let mut open = vec![false; gaps.len()];
-    for (gs, clash) in &moved {
-        if *clash {
-            for &g in gs {
+    for (&(l, side), (ins, rem)) in &way {
+        if !ins.iter().any(|g| rem.iter().any(|h| g != h)) {
+            continue;
+        }
+        let other = 3 - side;
+        // How many lines the side inserted in a gap, and removed from one.
+        let size = |g: usize| -> (usize, usize) {
+            let al = &aligned[&(g, side)];
+            let kept = al.iter().flatten().count();
+            (al.len() - kept, gaps[g][0].len() - kept)
+        };
+        let mut rival = false;
+        for &g in ins {
+            for &h in rem {
+                if rival || g == h || g.abs_diff(h) > size(g).0.min(size(h).1) {
+                    continue;
+                }
+                let (lo, hi) = (g.min(h), g.max(h));
+                let rb = gaps[lo][0].start..gaps[hi][0].end;
+                let rs = gaps[lo][side].start..gaps[hi][side].end;
+                let (from, to) = (gaps[h][0].clone(), gaps[g][side].clone());
+                let (wb, ws) = (&t[0][rb.clone()], &t[side][rs.clone()]);
+                let pairs: Vec<(usize, usize)> = from
+                    .filter(|&i| content(t[0][i]) == l)
+                    .flat_map(|i| {
+                        to.clone()
+                            .filter(|&j| content(t[side][j]) == l)
+                            .map(move |j| (i - rb.start, j - rs.start))
+                    })
+                    .collect();
+                rival = pairable(wb, ws, &pairs, budget)?;
+            }
+        }
+        let meets = |g: usize, arrived: bool| -> bool {
+            if !changed[g][other - 1] {
+                return false;
+            }
+            let c = n.get(&(l, g)).copied().unwrap_or([0; 4]);
+            if c[other] != c[0] {
+                return true;
+            }
+            if arrived && !rival {
+                return false;
+            }
+            let r = &gaps[g];
+            let b = &t[0][r[0].clone()];
+            let al = &aligned[&(g, side)];
+            let reach = changed_reach(b, &t[other][r[other].clone()]);
+            // The lines around each copy, as the base lines before and after
+            // (`None`: the gap's end, an anchor), kept by the side and not
+            // blank.
+            let mut around: Vec<(Option<usize>, Option<usize>)> = Vec::new();
+            if arrived {
+                let s = &t[side][r[side].clone()];
+                let fixed = |j: usize| al[j].filter(|_| !blank(s[j]));
+                for j in (0..s.len()).filter(|&j| content(s[j]) == l) {
+                    around.push(((0..j).rev().find_map(fixed), (j + 1..s.len()).find_map(fixed)));
+                }
+            } else {
+                let mut kept = vec![false; b.len()];
+                for &i in al.iter().flatten() {
+                    kept[i] = true;
+                }
+                let fixed = |i: &usize| kept[*i] && !blank(b[*i]);
+                for i in (0..b.len()).filter(|&i| content(b[i]) == l) {
+                    around.push(((0..i).rev().find(fixed), (i + 1..b.len()).find(fixed)));
+                }
+            }
+            around.iter().any(|&(lo, hi)| {
+                // The neighbours' lines (and those between), and the points
+                // between them.
+                let lines = lo.unwrap_or(0)..hi.map_or(b.len(), |x| x + 1);
+                let points = lo.map_or(0, |x| x + 1)..=hi.unwrap_or(b.len());
+                if reach.is_empty() {
+                    points.contains(&reach.start)
+                } else {
+                    reach.start < lines.end && lines.start < reach.end
+                }
+            })
+        };
+        if ins.iter().any(|&g| meets(g, true)) || rem.iter().any(|&g| meets(g, false)) {
+            for &g in ins.iter().chain(rem) {
                 open[g] = true;
             }
         }
@@ -431,14 +571,50 @@ fn in_doubt(t: [&[&str]; 4], gaps: &[[Range<usize>; 4]], budget: &mut Budget) ->
     Ok(open)
 }
 
-/// The lines (not blank) a side's gap `s` inserted and removed against the
-/// base's `b`, by one longest common subsequence; past [`MAX_CELLS`], by the
-/// lines between their common start and end.
-fn gap_diff<'a>(
-    b: &[&'a str],
-    s: &[&'a str],
-    budget: &mut Budget,
-) -> Result<(Vec<&'a str>, Vec<&'a str>), OutOfBudget> {
+/// Whether some longest common subsequence of `b` and `s` pairs one of
+/// `pairs` (a base line and a side line). Past [`MAX_CELLS`], taken as so.
+fn pairable(b: &[&str], s: &[&str], pairs: &[(usize, usize)], budget: &mut Budget) -> Result<bool, OutOfBudget> {
+    let (n, m) = (b.len(), s.len());
+    if pairs.is_empty() {
+        return Ok(false);
+    }
+    if n * m > MAX_CELLS {
+        return Ok(true);
+    }
+    budget.spend(2 * (n + 1) * (m + 1))?;
+    let w = m + 1;
+    // Longest common subsequences of the ends from each cell on, and of the
+    // starts up to it.
+    let mut after = vec![0u32; (n + 1) * w];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            after[i * w + j] = if same_line(b[i], s[j]) {
+                after[(i + 1) * w + j + 1] + 1
+            } else {
+                after[(i + 1) * w + j].max(after[i * w + j + 1])
+            };
+        }
+    }
+    let mut before = vec![0u32; (n + 1) * w];
+    for i in 1..=n {
+        for j in 1..=m {
+            before[i * w + j] = if same_line(b[i - 1], s[j - 1]) {
+                before[(i - 1) * w + j - 1] + 1
+            } else {
+                before[(i - 1) * w + j].max(before[i * w + j - 1])
+            };
+        }
+    }
+    let longest = after[0];
+    Ok(pairs
+        .iter()
+        .any(|&(i, j)| same_line(b[i], s[j]) && before[i * w + j] + 1 + after[(i + 1) * w + j + 1] == longest))
+}
+
+/// A side's gap `s` lined up with the base's `b` by one longest common
+/// subsequence: the base line of each of the side's lines it kept. Past
+/// [`MAX_CELLS`], only their common start and end.
+fn gap_align(b: &[&str], s: &[&str], budget: &mut Budget) -> Result<Vec<Option<usize>>, OutOfBudget> {
     let pre = b.iter().zip(s).take_while(|(x, y)| x == y).count();
     let suf = b[pre..]
         .iter()
@@ -446,37 +622,35 @@ fn gap_diff<'a>(
         .zip(s[pre..].iter().rev())
         .take_while(|(x, y)| x == y)
         .count();
-    let (b, s) = (&b[pre..b.len() - suf], &s[pre..s.len() - suf]);
-    let keep = |x: &[&'a str], kept: &[bool]| -> Vec<&'a str> {
-        x.iter()
-            .zip(kept)
-            .filter(|(l, k)| !**k && !blank(l))
-            .map(|(l, _)| content(l))
-            .collect()
-    };
-    let (n, m) = (b.len(), s.len());
+    let mut out: Vec<Option<usize>> = vec![None; s.len()];
+    for (k, x) in out.iter_mut().enumerate().take(pre) {
+        *x = Some(k);
+    }
+    for (k, x) in out.iter_mut().rev().enumerate().take(suf) {
+        *x = Some(b.len() - 1 - k);
+    }
+    let (bm, sm) = (&b[pre..b.len() - suf], &s[pre..s.len() - suf]);
+    let (n, m) = (bm.len(), sm.len());
     if n * m > MAX_CELLS {
         budget.spend(n + m)?;
-        return Ok((keep(s, &vec![false; m]), keep(b, &vec![false; n])));
+        return Ok(out);
     }
     budget.spend((n + 1) * (m + 1))?;
     let w = m + 1;
     let mut l = vec![0u32; (n + 1) * w];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            l[i * w + j] = if b[i] == s[j] {
+            l[i * w + j] = if bm[i] == sm[j] {
                 l[(i + 1) * w + j + 1] + 1
             } else {
                 l[(i + 1) * w + j].max(l[i * w + j + 1])
             };
         }
     }
-    let (mut kb, mut ks) = (vec![false; n], vec![false; m]);
     let (mut i, mut j) = (0, 0);
     while i < n && j < m {
-        if b[i] == s[j] {
-            kb[i] = true;
-            ks[j] = true;
+        if bm[i] == sm[j] {
+            out[pre + j] = Some(pre + i);
             i += 1;
             j += 1;
         } else if l[(i + 1) * w + j] >= l[i * w + j + 1] {
@@ -485,7 +659,36 @@ fn gap_diff<'a>(
             j += 1;
         }
     }
-    Ok((keep(s, &ks), keep(b, &kb)))
+    Ok(out)
+}
+
+/// The base lines a side's gap `s` changed against the base's `b`: between
+/// their common start and end, and further back as far as what it changed
+/// could slide along equal lines (a line inserted after a copy of it may as
+/// well be before it). Empty: an insertion at that point.
+fn changed_reach(b: &[&str], s: &[&str]) -> Range<usize> {
+    let pre = b.iter().zip(s).take_while(|(x, y)| x == y).count();
+    let suf = b[pre..]
+        .iter()
+        .rev()
+        .zip(s[pre..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let hi = b.len() - suf;
+    // The change as base lines lo..bl that became the side's lo..sl (the
+    // common start is the same lines in both). It may as well have been one
+    // line earlier where the line before it is the last line of both parts.
+    let (mut lo, mut bl, mut sl) = (pre, hi, s.len() - suf);
+    while lo > 0 && (bl > lo || sl > lo) {
+        let p = b[lo - 1];
+        if (bl > lo && b[bl - 1] != p) || (sl > lo && s[sl - 1] != p) {
+            break;
+        }
+        lo -= 1;
+        bl -= 1;
+        sl -= 1;
+    }
+    lo..hi
 }
 
 /// The elements of `v` that are in every longest subsequence of `v` whose
@@ -1170,13 +1373,16 @@ fn plain<'a>(b: &[&'a str], sides: [(&[&'a str], &[Option<usize>]); 2], ours_fir
 }
 
 /// Whether the plain merge `out` of a stretch (with `from`, the piece of each
-/// of its lines) has a line (not blank) more often than either side's stretch,
-/// placed by pieces of the two sides at two places, one of them an insertion.
+/// of its lines) has a line (not blank) placed by pieces of the two sides at
+/// two places, one of them an insertion (or a change that put in more lines
+/// than it took out), where it is more often than in either side's stretch,
+/// or where only blank lines are between the two copies (a side that removed
+/// another copy elsewhere in the stretch hides the count, not the place).
 /// Both sides added that line; one reading puts the two at different points
-/// (with blank lines, lines a side deleted or a kept line between), another
-/// at one point, where they are one insertion taken once: which is whose no
-/// text shows. Two runs at one point share a place and stay whole; two
-/// different lines both edited to the same text are no insertion.
+/// (with blank lines, lines a side deleted or a kept line between), another at
+/// one point, where they are one insertion taken once: which is whose no text
+/// shows. Two runs at one point share a place and stay whole; two different
+/// lines both edited to the same text (one line for one) are no insertion.
 fn twice(pieces: &[Piece], [o, t]: [&[&str]; 2], out: &[&str], from: &[Option<usize>]) -> bool {
     fn count<'a>(x: &[&'a str]) -> HashMap<&'a str, usize> {
         let mut n: HashMap<&str, usize> = HashMap::new();
@@ -1201,11 +1407,31 @@ fn twice(pieces: &[Piece], [o, t]: [&[&str]; 2], out: &[&str], from: &[Option<us
         }
     }
     let one_side = |p: &Piece, q: &Piece| p.alone.is_some() && p.alone == q.alone;
+    // A piece that puts in more lines than it takes out holds an insertion.
+    let adds = |p: &Piece| p.lines.len() > p.at.len();
+    let apart = |x: usize, y: usize| {
+        let (u, v) = (&pieces[x], &pieces[y]);
+        x != y && !one_side(u, v) && (adds(u) || adds(v))
+    };
+    // Each line from a piece against the nearest line before it that is not
+    // blank.
+    let mut last: Option<(&str, Option<usize>)> = None;
+    for (l, f) in out.iter().zip(from) {
+        if blank(l) {
+            continue;
+        }
+        if let (Some((p, Some(x))), Some(y)) = (last, *f) {
+            if p == content(l) && apart(x, y) {
+                return true;
+            }
+        }
+        last = Some((content(l), *f));
+    }
     at.values().any(|ps| {
         ps.iter().enumerate().any(|(k, &x)| {
             ps[k + 1..].iter().any(|&y| {
                 let (u, v) = (&pieces[x], &pieces[y]);
-                !one_side(u, v) && (u.at.is_empty() || v.at.is_empty())
+                !one_side(u, v) && (adds(u) || adds(v))
             })
         })
     })

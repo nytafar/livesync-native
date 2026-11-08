@@ -1037,6 +1037,162 @@ fn shapes_two_histories_read_differently_stay_open() {
     }
 }
 
+/// Review 7, finding 1: a task carried forward (removed from one day,
+/// added to a later one) merges where the other side's change cannot meet it,
+/// in every side and mtime order: anchors fix which line moved. It stays open
+/// where the other side changed the task's old neighbours (a deletion right
+/// beside the other side's change) or how often the task is in a gap it
+/// touches.
+#[test]
+fn a_task_carried_forward_merges_where_the_other_change_is_elsewhere() {
+    let week = "# Week\n\n## Mon\n- [ ] gym\n- [ ] read\n- [x] call mom\n\n## Tue\n- [ ] read\n- [ ] water plants\n\n## Notes\nSome text.\n";
+    let to_end = "# Week\n\n## Mon\n- [ ] read\n- [x] call mom\n\n## Tue\n- [ ] read\n- [ ] water plants\n- [ ] gym\n\n## Notes\nSome text.\n";
+    let to_top = "# Week\n\n## Mon\n- [ ] read\n- [x] call mom\n\n## Tue\n- [ ] gym\n- [ ] read\n- [ ] water plants\n\n## Notes\nSome text.\n";
+    let merges = [
+        // The reviewer's example: carried to the top of Tue, Tue's last task
+        // ticked.
+        (
+            to_top,
+            week.replace("- [ ] water plants", "- [x] water plants"),
+            "# Week\n\n## Mon\n- [ ] read\n- [x] call mom\n\n## Tue\n- [ ] gym\n- [ ] read\n- [x] water plants\n\n## Notes\nSome text.\n",
+        ),
+        (
+            to_end,
+            week.replace("## Tue\n- [ ] read", "## Tue\n- [x] read"),
+            "# Week\n\n## Mon\n- [ ] read\n- [x] call mom\n\n## Tue\n- [x] read\n- [ ] water plants\n- [ ] gym\n\n## Notes\nSome text.\n",
+        ),
+        (
+            to_end,
+            week.replace("## Tue\n", "## Tue\n- [ ] dentist\n"),
+            "# Week\n\n## Mon\n- [ ] read\n- [x] call mom\n\n## Tue\n- [ ] dentist\n- [ ] read\n- [ ] water plants\n- [ ] gym\n\n## Notes\nSome text.\n",
+        ),
+        (
+            to_end,
+            week.replace("Some text.", "Some text, edited."),
+            "# Week\n\n## Mon\n- [ ] read\n- [x] call mom\n\n## Tue\n- [ ] read\n- [ ] water plants\n- [ ] gym\n\n## Notes\nSome text, edited.\n",
+        ),
+        // A unique line moved to another section, the other side edited a
+        // line there.
+        (
+            "## A\nalpha two\n\n## B\nbeta one\nbeta two\nbeta three\nalpha one\n",
+            "## A\nalpha one\nalpha two\n\n## B\nbeta one!\nbeta two\nbeta three\n".to_string(),
+            "## A\nalpha two\n\n## B\nbeta one!\nbeta two\nbeta three\nalpha one\n",
+        ),
+    ];
+    for (o, t, want) in &merges {
+        let b = if o.starts_with("## A") {
+            "## A\nalpha one\nalpha two\n\n## B\nbeta one\nbeta two\nbeta three\n"
+        } else {
+            week
+        };
+        let t = if o.starts_with("## A") {
+            b.replace("beta one", "beta one!")
+        } else {
+            t.clone()
+        };
+        for m in both_ways(b, o, &t) {
+            assert_eq!(written(&m), *want, "{o:?} {t:?}");
+        }
+    }
+    // Carried to the top of Tue, a new task, a task deleted and a task
+    // copied, each against Tue's last task ticked (review 7's `carry2`).
+    let ticked = week.replace("- [ ] water plants", "- [x] water plants");
+    for o in [
+        week.replace("## Tue\n", "## Tue\n- [ ] swim\n"),
+        week.replace("## Mon\n- [ ] gym\n", "## Mon\n")
+            .replace("## Tue\n", "## Tue\n- [ ] swim\n"),
+        week.replace("## Mon\n- [ ] gym\n", "## Mon\n")
+            .replace("## Tue\n", "## Tue\n- [ ] gym\n"),
+        week.replace("## Tue\n", "## Tue\n- [ ] gym\n"),
+    ] {
+        for m in both_ways(week, &o, &ticked) {
+            assert!(matches!(m.outcome, Outcome::Write(_)), "{o:?}: {m:?}");
+        }
+    }
+    // Open: the other side ticked the task right after the carried one's old
+    // place.
+    let t = week.replace("## Mon\n- [ ] gym\n- [ ] read", "## Mon\n- [ ] gym\n- [x] read");
+    for m in both_ways(week, to_end, &t) {
+        assert!(m.outcome.is_open(), "{m:?}");
+    }
+    // Open: the other side ticked the carried task itself.
+    let t = week.replace("- [ ] gym", "- [x] gym");
+    for m in both_ways(week, to_end, &t) {
+        assert!(m.outcome.is_open(), "{m:?}");
+    }
+}
+
+/// A line moved where the other side inserted at the point it arrived:
+/// where no reading as short moves the lines it passed instead, they are two
+/// insertions at one point, both whole, the older first (a task carried to
+/// the end of the file and a line appended on the other device). Where the
+/// lines it passed are as few (the anchor between may be the line that
+/// moved), the readings differ: open.
+#[test]
+fn a_moved_line_and_an_insertion_where_it_arrives() {
+    let b = "## Mon\n- [ ] gym\n- [ ] read\nnote 1\n## Tue\nnote 2\n";
+    let o = "## Mon\n- [ ] read\nnote 1\n## Tue\nnote 2\n- [ ] gym\n";
+    let t = "## Mon\n- [ ] gym\n- [ ] read\nnote 1\n## Tue\nnote 2\n- log\n";
+    let older_first = |ours_newer: bool| {
+        if ours_newer {
+            "## Mon\n- [ ] read\nnote 1\n## Tue\nnote 2\n- log\n- [ ] gym\n"
+        } else {
+            "## Mon\n- [ ] read\nnote 1\n## Tue\nnote 2\n- [ ] gym\n- log\n"
+        }
+    };
+    for ours_newer in [false, true] {
+        assert_eq!(
+            written(&run(Kind::Text, Some(b), o, t, ours_newer)),
+            older_first(ours_newer)
+        );
+    }
+    // Moved past one unique line, which may as well be the line that moved:
+    // open.
+    let b = "A\nX\nH\nB\n";
+    let o = "A\nH\nX\nB\n";
+    let t = "A\nX\nH\nY\nB\n";
+    for m in both_ways(b, o, t) {
+        assert!(m.outcome.is_open(), "{m:?}");
+    }
+}
+
+/// A line both sides inserted with only a blank line between them in the
+/// merge is one insertion read at two places, even where a side removed
+/// another copy in the same stretch, so that the merge has it no more often
+/// than that side (review 7's dup fuzz; 895839e merged it with `## Notes`
+/// four times).
+#[test]
+fn a_line_both_inserted_a_blank_line_apart_stays_open_whatever_the_counts() {
+    let b = "line 1\n- [ ] gym\n\n## Notes\nline 2\n## Notes\n";
+    let o = "line 1\n## Notes\n- [ ] gym\n## Notes\n\n## Notes\nline 2";
+    let t = "line 1\n- [ ] gym\n\n## Notes\n## Notes\nline 2\n## Notes\n";
+    for kind in [Kind::Text, Kind::Markdown] {
+        for ours_newer in [false, true] {
+            assert!(run(kind, Some(b), o, t, ours_newer).outcome.is_open());
+            assert!(run(kind, Some(b), t, o, ours_newer).outcome.is_open());
+        }
+    }
+    // Two changes that each put in more lines than they took out, both with
+    // `--- e`: the line both added, twice in one stretch (895839e merged
+    // it).
+    let b = "- x\n- x\n---\n- x\n---\n\n";
+    let o = "- x\n- x\n---\n- x\n- x\n--- e\n\nwriter 1\n";
+    let t = "- x\n- x\n--- e\n- x\n---\n\n";
+    for m in both_ways(b, o, t) {
+        assert!(m.outcome.is_open(), "{m:?}");
+    }
+    // Ticks of two different copies are two edits, no insertion: they merge.
+    let b = "- [ ] gym\n\n- [ ] gym\n";
+    let m = run(
+        Kind::Text,
+        Some(b),
+        "- [x] gym\n\n- [ ] gym\n",
+        "- [ ] gym\n\n- [x] gym\n",
+        true,
+    );
+    assert_eq!(written(&m), "- [x] gym\n\n- [x] gym\n");
+}
+
 #[test]
 fn insertions_either_side_of_a_kept_blank_line_are_never_taken_twice() {
     // R2 added a blank line, which the diff puts before the base's blank

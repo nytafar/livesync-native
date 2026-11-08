@@ -1045,7 +1045,8 @@ fn plain_merge<'a>(
     }
     // Within one stretch between anchors: a line (not blank) the merge would
     // have more often than either side, from pieces of the two sides at two
-    // places, one an insertion: one insertion read at two places.
+    // places, one an insertion (or a change that put in more lines than it
+    // took out): one insertion read at two places.
     if one_stretch {
         let lines_of = |x: &[&str]| count(x);
         let (no, nt) = (lines_of(sides[0].0), lines_of(sides[1].0));
@@ -1063,8 +1064,11 @@ fn plain_merge<'a>(
         let get = |n: &HashMap<String, usize>, l: &str| n.get(l).copied().unwrap_or(0);
         for (x, u) in pieces.iter().enumerate() {
             for v in &pieces[x + 1..] {
+                // An insertion, or a change that put in more lines than it
+                // took out.
                 let one_side = u.2.is_some() && u.2 == v.2;
-                if one_side || !(u.0.is_empty() || v.0.is_empty()) {
+                let grows = |p: &(Range<usize>, Vec<&str>, Option<usize>)| p.1.len() > p.0.len();
+                if one_side || !(grows(u) || grows(v)) {
                     continue;
                 }
                 let twice = u.1.iter().filter(|p| !blank(p)).any(|p| {
@@ -1095,19 +1099,49 @@ fn plain_merge<'a>(
         }
     };
     let mut out: Vec<&str> = Vec::new();
+    // The piece each line came from, its side (`None`: both), and whether it
+    // put in more lines than it took out (`None`: a kept line).
+    let mut whose: Vec<Option<(usize, Option<usize>, bool)>> = Vec::new();
     let mut p = 0;
-    for (r, l, _) in &pieces {
+    for (x, (r, l, side)) in pieces.iter().enumerate() {
         for i in p..r.start {
             out.push(kept(i)?);
+            whose.push(None);
         }
         out.extend(l.iter().copied());
+        whose.extend(l.iter().map(|_| Some((x, *side, l.len() > r.len()))));
         p = r.end;
     }
     for i in p..n {
         out.push(kept(i)?);
+        whose.push(None);
     }
     if out.iter().rev().skip(1).any(|l| !l.ends_with('\n')) {
         return None;
+    }
+    // Within one stretch: the same line (not blank) from pieces of the two
+    // sides, one an insertion (or a change that put in more lines than it
+    // took out), with only blank lines between them in the merge: one
+    // insertion read at two places, whatever the counts.
+    if one_stretch {
+        let seen: Vec<(usize, &str)> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| !blank(l))
+            .map(|(i, l)| (i, content(l)))
+            .collect();
+        for w in seen.windows(2) {
+            let ((i, a), (j, c)) = (w[0], w[1]);
+            if a != c {
+                continue;
+            }
+            if let (Some((x, sx, ix)), Some((y, sy, iy))) = (whose[i], whose[j]) {
+                let one_side = sx.is_some() && sx == sy;
+                if x != y && !one_side && (ix || iy) {
+                    return None;
+                }
+            }
+        }
     }
     Some(out.concat())
 }
