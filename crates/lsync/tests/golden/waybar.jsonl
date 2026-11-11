@@ -8,6 +8,10 @@
 {"alt":"stopped","class":"stopped","text":"stopped","tooltip":"notes: safety stop: 30 files went missing &lt;all of Notes/&gt; &amp; more\nwork: error: index error"}
 # offline
 {"alt":"offline","class":"offline","text":"offline","tooltip":"notes: offline: changes feed failed: connection refused"}
+# offline while reconnecting
+{"alt":"offline","class":"offline","text":"offline","tooltip":"notes: offline: transport error during GET /: timed out"}
+# retrying a refusal
+{"alt":"error","class":"error","text":"error","tooltip":"notes: error: HTTP 401 from GET /vault: unauthorized"}
 # paused and disabled
 {"alt":"paused","class":"paused","text":"paused","tooltip":"notes: paused"}
 # no service

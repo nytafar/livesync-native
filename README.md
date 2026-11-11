@@ -439,7 +439,7 @@ notes/plan.md is at 3-9f2c41e0b8a5d7c6e4f1a2b3c4d5e6f7 (after 0.4s)
 <details>
 <summary>Status bars and notifications</summary>
 
-`lsync status --follow --waybar` prints one [Waybar](https://github.com/Alexays/Waybar) JSON line whenever the state of the service's vaults changes (`--vault NAME` for one). `class` and `alt` are the most pressing state of any vault: `stopped` (a safety stop, the upstream stop or a remote lock: something to act on), `error` (a vault fails or cannot run), `conflict`, `offline` (the server cannot be reached), `syncing`, `paused`, `ok`, or `off` (no service; it keeps looking for one). The tooltip has a line per vault. A Waybar module:
+`lsync status --follow --waybar` prints one [Waybar](https://github.com/Alexays/Waybar) JSON line whenever the state of the service's vaults changes (`--vault NAME` for one). `class` and `alt` are the most pressing state of any vault: `stopped` (a safety stop, the upstream stop or a remote lock: something to act on), `error` (a vault fails or cannot run, or the server answers but refuses it, as with a wrong password), `conflict`, `offline` (the server cannot be reached), `syncing`, `paused`, `ok`, or `off` (no service; it keeps looking for one). The tooltip has a line per vault. A Waybar module:
 
 ```jsonc
 "custom/lsync": {

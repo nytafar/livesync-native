@@ -11,7 +11,8 @@
 //! Each vault is one of these, and the bar shows the most pressing:
 //! `stopped` (a safety stop, the upstream stop, a remote lock: a person
 //! must act), `error` (the engine fails, or the settings cannot be used),
-//! `conflict`, `offline` (the server cannot be reached), `syncing`,
+//! `conflict`, `offline` (the server cannot be reached; a refusal or an
+//! error a network does not fix, such as a wrong password, is `error`), `syncing`,
 //! `paused`, `ok`. `off` is no service.
 
 use livesync_host::control::Client;
@@ -128,11 +129,20 @@ pub fn vault_line(v: &VaultView) -> Option<VaultLine> {
     let Some(a) = &v.activity else {
         return line("ok", "synced".into());
     };
+    let last_error = st.and_then(|s| s.last_error.as_deref()).map(short);
+    if a.unreachable {
+        // Also while the next attempt connects.
+        return line(
+            "offline",
+            last_error.map_or("offline".into(), |w| format!("offline: {w}")),
+        );
+    }
     use livesync_engine::PullPhase::*;
     match a.pull {
         Retrying => {
-            let why = st.and_then(|s| s.last_error.as_deref()).map(short);
-            line("offline", why.map_or("offline".into(), |w| format!("offline: {w}")))
+            // The server answered, but no: a person must act.
+            let why = a.refused.as_deref().map(short).or(last_error);
+            line("error", why.map_or("error".into(), |w| format!("error: {w}")))
         }
         Starting | Stopped => line("syncing", "connecting".into()),
         // A newer service's phase.
@@ -431,8 +441,22 @@ mod tests {
             (
                 "offline",
                 status(
-                    json!([{"name": "notes", "state": "running", "activity": live(json!({"pull": "retrying"})),
+                    json!([{"name": "notes", "state": "running", "activity": live(json!({"pull": "retrying", "unreachable": true})),
                                "status": {"last_error": "1730000000000 changes feed failed: connection refused"}}]),
+                ),
+            ),
+            (
+                "offline while reconnecting",
+                status(
+                    json!([{"name": "notes", "state": "running", "activity": live(json!({"pull": "starting", "unreachable": true})),
+                               "status": {"last_error": "1730000000000 transport error during GET /: timed out"}}]),
+                ),
+            ),
+            (
+                "retrying a refusal",
+                status(
+                    json!([{"name": "notes", "state": "running", "activity": live(json!({"pull": "retrying"})),
+                               "status": {"last_error": "1730000000000 HTTP 401 from GET /vault: unauthorized"}}]),
                 ),
             ),
             (
@@ -469,7 +493,10 @@ mod tests {
     #[test]
     fn the_most_pressing_vault_wins() {
         let classes: Vec<&str> = cases().iter().map(|(_, st)| summarise(Ok(st)).class).collect();
-        assert_eq!(classes, ["ok", "syncing", "conflict", "stopped", "offline", "paused"]);
+        assert_eq!(
+            classes,
+            ["ok", "syncing", "conflict", "stopped", "offline", "offline", "error", "paused"]
+        );
         let b = summarise(Ok(&cases()[2].1));
         assert_eq!(b.text, "2 conflicts");
         assert_eq!(b.vaults[1].text, "pulling");
