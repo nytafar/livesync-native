@@ -68,6 +68,16 @@ class NetworkMonitor(
     }
 }
 
+/** Whether this phone has a network at all, for the status texts. */
+object Connectivity {
+    fun hasNetwork(context: Context): Boolean {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return true
+        val n = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(n) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+}
+
 /**
  * Passes on only real transitions of the default network. Capability updates
  * for the same network arrive all the time (signal strength, bandwidth, a

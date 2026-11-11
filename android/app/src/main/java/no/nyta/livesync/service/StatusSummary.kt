@@ -26,11 +26,24 @@ data class ProfileLine(
     val rebuildOrphans: String? = null,
     /** Rows kept although another device deleted them. */
     val deletedElsewhere: Long = 0,
+    /** The engine runs but cannot reach the server (a network error, a 5xx). */
+    val unreachable: Boolean = false,
+    /** This phone has no network at all. */
+    val noNetwork: Boolean = false,
+    /** Local edits waiting to be pushed (two-way only). */
+    val localChanges: Long = 0,
+    /** When the engine last had the server answering. */
+    val lastConnectedMs: Long? = null,
 )
 
 /** The single status notification for every profile (spec: one service, one notification). */
 object StatusSummary {
-    fun line(p: no.nyta.livesync.profile.Profile, st: no.nyta.livesync.core.ProfileStatus?, startProblem: String?) =
+    fun line(
+        p: no.nyta.livesync.profile.Profile,
+        st: no.nyta.livesync.core.ProfileStatus?,
+        startProblem: String?,
+        noNetwork: Boolean = false,
+    ) =
         ProfileLine(
             name = p.name,
             paused = p.paused,
@@ -46,7 +59,19 @@ object StatusSummary {
             rebuildWait = st?.rebuildWait,
             rebuildOrphans = st?.rebuildOrphans,
             deletedElsewhere = st?.deletedElsewhere ?: 0,
+            unreachable = st?.connection == no.nyta.livesync.core.Connection.UNREACHABLE,
+            noNetwork = noNetwork,
+            localChanges = if (p.pullOnly) 0 else st?.dirty ?: 0,
+            lastConnectedMs = listOfNotNull(st?.daemonHeartbeatMs, st?.lastGateOkMs).maxOrNull(),
         )
+
+    /**
+     * A running engine that cannot reach the server: the phone has no
+     * network, or the server does not answer. Not a fault: edits wait, and
+     * the engine tries again by itself (at once when the network changes).
+     */
+    fun offline(p: ProfileLine): Boolean =
+        !p.paused && p.startProblem == null && p.runState == "Running" && (p.noNetwork || p.unreachable)
 
     /**
      * The notification: [title], the one-line [summary] shown collapsed, and
@@ -90,12 +115,21 @@ object StatusSummary {
                 "error: ${p.runMessage ?: "unknown"} (retrying)" to true
             }
             else -> {
-                gateFailure(p.lastGate)?.let { return "not syncing: $it" to true }
+                val offline = offline(p)
+                // Offline, the last gate failed only because the server could
+                // not be reached: that is no fault to show.
+                if (!offline) gateFailure(p.lastGate)?.let { return "not syncing: $it" to true }
                 p.safetyStop?.let { return "safety stop: ${it.substringAfter(' ')}" to true }
                 p.rebuildWait?.let { return "waiting for a rebuild elsewhere to finish" to false }
-                val mode = if (p.pullOnly) "pull-only" else "syncing"
-                val parts = mutableListOf(mode)
-                p.lastActivityMs?.let { parts += "last change ${clock(it, now)}" }
+                val parts = mutableListOf<String>()
+                if (offline) {
+                    parts += if (p.noNetwork) "offline" else "server unreachable, retrying"
+                    p.lastConnectedMs?.let { parts += "last connected ${clock(it, now)}" }
+                    if (p.localChanges > 0) parts += "${p.localChanges} local change${if (p.localChanges == 1L) "" else "s"} waiting"
+                } else {
+                    parts += if (p.pullOnly) "pull-only" else "syncing"
+                    p.lastActivityMs?.let { parts += "last change ${clock(it, now)}" }
+                }
                 if (p.conflicted > 0) parts += "${p.conflicted} conflicted"
                 if (p.deletedElsewhere > 0) parts += "${p.deletedElsewhere} kept after a delete elsewhere"
                 if (p.rebuildOrphans != null) parts += "files pushed back after a rebuild"
@@ -127,10 +161,11 @@ object StatusSummary {
     private fun counts(lines: List<Pair<ProfileLine, Boolean>>): String {
         val attention = lines.filter { it.second }.map { it.first.name }
         val rest = lines.filter { !it.second }.map { it.first }
-        val buckets = linkedMapOf("syncing" to 0, "starting" to 0, "stopped" to 0, "paused" to 0)
+        val buckets = linkedMapOf("syncing" to 0, "offline" to 0, "starting" to 0, "stopped" to 0, "paused" to 0)
         for (l in rest) {
             val b = when {
                 l.paused -> "paused"
+                offline(l) -> "offline"
                 l.runState == "Running" -> "syncing"
                 l.runState == "Starting" -> "starting"
                 else -> "stopped"

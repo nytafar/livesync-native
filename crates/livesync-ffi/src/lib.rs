@@ -19,7 +19,7 @@ pub mod status;
 pub use folders::{Cancel, FolderInfo, FolderList};
 pub use host::{LiveSync, RunState, StatusListener, VaultAccess};
 pub use profile::{check_scope, paths_overlap, ProfileConfig, ScopeKind};
-pub use status::{AttentionItem, GateOutcome, GateResult, ProfileStatus, StateCount};
+pub use status::{AttentionItem, ConflictItem, Connection, GateOutcome, GateResult, ProfileStatus, StateCount};
 
 use livesync_engine::EngineError;
 use livesync_host::HostError;

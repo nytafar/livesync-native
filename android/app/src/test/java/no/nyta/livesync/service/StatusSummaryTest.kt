@@ -175,4 +175,35 @@ class StatusSummaryTest {
         assertEquals(b.text, posts[3])
         assertEquals(a.text, posts.last())
     }
+
+    @Test
+    fun offlineIsSaidPlainlyNotAsAnError() {
+        val now = 1_761_550_000_000L
+        // The gate failed because the server could not be reached.
+        val down = line(gate = "1700000000000 failed: transport error during GET /: connection refused")
+            .copy(pullOnly = false, localChanges = 3, lastConnectedMs = now - 3_600_000)
+        val noNet = StatusSummary.phrase(down.copy(noNetwork = true), now)
+        assertFalse(noNet.second)
+        assertTrue(noNet.first, noNet.first.startsWith("offline · last connected "))
+        assertTrue(noNet.first, noNet.first.endsWith(" · 3 local changes waiting"))
+        val unreachable = StatusSummary.phrase(down.copy(unreachable = true, localChanges = 1), now)
+        assertFalse(unreachable.second)
+        assertTrue(unreachable.first, unreachable.first.startsWith("server unreachable, retrying"))
+        assertTrue(unreachable.first, unreachable.first.endsWith("1 local change waiting"))
+        // Conflicts still need the user while offline.
+        assertTrue(StatusSummary.phrase(down.copy(noNetwork = true, conflicted = 2), now).second)
+        // With the server answering, a failed gate is still a fault.
+        assertTrue(StatusSummary.phrase(down, now).second)
+        // Paused, or not running, is not "offline".
+        assertEquals("paused", StatusSummary.phrase(down.copy(noNetwork = true, paused = true), now).first)
+        assertFalse(StatusSummary.offline(down.copy(noNetwork = true, runState = "Starting")))
+    }
+
+    @Test
+    fun offlineVaultsAreCountedNotFlagged() {
+        val lines = listOf(line("Notes"), line("Work").copy(noNetwork = true))
+        val t = StatusSummary.summarize(lines)
+        assertFalse(t.alert)
+        assertEquals("1 syncing · 1 offline", t.summary)
+    }
 }

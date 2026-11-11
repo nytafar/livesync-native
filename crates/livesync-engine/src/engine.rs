@@ -3074,7 +3074,7 @@ impl Engine {
                         EngineError::Remote(_) => backoff.next_delay(),
                         _ => return Err(e),
                     };
-                    self.set_pull_phase(PullPhase::Retrying);
+                    self.set_retrying(&e);
                     log_wait(
                         &mut refused,
                         &e,
@@ -3146,7 +3146,7 @@ impl Engine {
                     EngineError::Remote(_) | EngineError::Other(_) => backoff.next_delay(),
                     _ => return Err(e),
                 };
-                self.set_pull_phase(PullPhase::Retrying);
+                self.set_retrying(&e);
                 log_wait(
                     &mut refused,
                     &e,
@@ -3272,7 +3272,7 @@ impl Engine {
                                     EngineError::Remote(_) => backoff.next_delay(),
                                     _ => return Err(e),
                                 };
-                                self.set_pull_phase(PullPhase::Retrying);
+                                self.set_retrying(&e);
                                 log_wait(
                                     &mut refused,
                                     &e,
@@ -3301,7 +3301,7 @@ impl Engine {
                         }
                         let e = EngineError::from(e);
                         self.record_error(&e);
-                        self.set_pull_phase(PullPhase::Retrying);
+                        self.set_retrying(&e);
                         warn!("changes feed failed: {e}; reconnecting in {wait:.0?}");
                         if self.sleep_or_shutdown(wait, &mut shutdown).await {
                             return Ok(());

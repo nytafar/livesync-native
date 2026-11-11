@@ -159,6 +159,12 @@ pub struct Activity {
     /// The gate refused for a reason a person must deal with, and the pull
     /// side waits it out: why. Cleared once the gate passes.
     pub refused: Option<String>,
+    /// The pull side waits because the server could not be reached, or
+    /// failed in a way that passes (a network error, no data, a 5xx): the
+    /// device is offline or the server is down, not a fault to act on. It
+    /// stays set while the next attempt connects, and clears once the
+    /// server answers, or the next failure is another kind.
+    pub unreachable: bool,
 }
 
 /// Whether nothing is pending or settling ([`Engine::idle`]).
@@ -290,6 +296,7 @@ impl Engine {
             a.running = false;
             a.ended = true;
             a.pull = PullPhase::Stopped;
+            a.unreachable = false;
             a.settling = 0;
             a.pushing = false;
             a.push_due = false;
@@ -305,7 +312,22 @@ impl Engine {
     }
 
     pub(crate) fn set_pull_phase(&self, p: PullPhase) {
-        self.set_activity(|a| a.pull = p);
+        self.set_activity(|a| {
+            a.pull = p;
+            if p.connected() || p == PullPhase::Stopped {
+                a.unreachable = false;
+            }
+        });
+    }
+
+    /// The pull side waits to try again after `e`; [`Activity::unreachable`]
+    /// says whether it is the server that could not be reached.
+    pub(crate) fn set_retrying(&self, e: &EngineError) {
+        let unreachable = matches!(e, EngineError::Remote(r) if r.is_transient());
+        self.set_activity(|a| {
+            a.pull = PullPhase::Retrying;
+            a.unreachable = unreachable;
+        });
     }
 
     /// Whether nothing is pending or settling: the daemon runs and follows

@@ -97,6 +97,9 @@ pub struct MockState {
     /// Store the next `PUT`, then answer 500 as if the response was lost.
     pub lose_next_put_response: bool,
     pub db_missing: bool,
+    /// Answer every request with a 503, as a proxy does while the server
+    /// behind it is down.
+    pub down: bool,
     /// Hold every document write (PUT and `_bulk_docs`) this long before
     /// answering it: a slow server, with a push pass in flight meanwhile.
     pub write_delay: Option<Duration>,
@@ -555,6 +558,9 @@ async fn track_conn(
         .unwrap()
         .conns
         .push((req.method().to_string(), req.uri().path().to_string(), peer));
+    if st.lock().unwrap().down {
+        return (StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
+    }
     next.run(req).await
 }
 

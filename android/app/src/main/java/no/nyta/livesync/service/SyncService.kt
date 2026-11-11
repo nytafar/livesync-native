@@ -85,7 +85,9 @@ class SyncService : Service() {
         network = NetworkMonitor(this) { up, metered ->
             handler.post {
                 app.core.getOrNull()?.engine?.networkChanged(up, metered)
-                if (up) handler.post { updateNotification() }
+                // Down as well as up: "offline" shows at once, not at the
+                // next refresh.
+                handler.post { updateNotification() }
             }
         }.also { it.start() }
         handler.postDelayed(refresh, REFRESH_MS)
@@ -267,6 +269,7 @@ class SyncService : Service() {
 
     private fun updateNotification() {
         val core = app.core.getOrNull() ?: return
+        val noNetwork = !Connectivity.hasNetwork(this)
         val lines = try {
             app.profiles.all().map { p ->
                 val st = if (p.paused) null else try {
@@ -275,7 +278,7 @@ class SyncService : Service() {
                     null
                 }
                 st?.let { alertIfNew(p, it) }
-                StatusSummary.line(p, st, problems[p.id])
+                StatusSummary.line(p, st, problems[p.id], noNetwork)
             }
         } catch (e: Exception) {
             return

@@ -149,6 +149,8 @@ pub struct VaultStatus {
     /// be checked now (a folder or an ignore file that cannot be read).
     pub mass_delete_waits: bool,
     pub deletes_waiting: u64,
+    /// What the running engine is doing (`None` when no engine runs).
+    pub activity: Option<livesync_engine::Activity>,
 }
 
 /// The result of a connect test.
@@ -759,6 +761,7 @@ impl Host {
             mass_delete_allowed: engine.as_ref().is_some_and(|e| e.mass_delete_allowed()),
             mass_delete_waits: engine.as_ref().is_some_and(|e| e.mass_delete_waits()),
             deletes_waiting: engine.as_ref().map_or(0, |e| e.deletes_waiting()),
+            activity: engine.as_ref().map(|e| e.activity()),
         }
     }
 

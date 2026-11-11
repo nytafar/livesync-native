@@ -242,3 +242,38 @@ async fn a_network_change_during_a_wait_reconnects_on_fresh_connections() {
     );
     d.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_server_that_cannot_be_reached_reads_as_unreachable_until_it_answers() {
+    use livesync_engine::PullPhase;
+    let env = Env::new().await;
+    env.mock.put_text("a.md", &["a"]);
+    env.mock.state.lock().unwrap().down = true;
+    let engine = env.engine_with(|c| c.regate_interval = Duration::from_secs(3600));
+    let d = Daemon::two_way(&engine);
+    until("waiting on a server that is down", 30, || {
+        let a = engine.activity();
+        a.pull == PullPhase::Retrying && a.unreachable
+    })
+    .await;
+    assert!(env.read("a.md").is_none());
+    // Back up: the network comes back, and the flag goes once it answers.
+    env.mock.state.lock().unwrap().down = false;
+    engine.network_changed(true);
+    until("the first pull", 10, || env.read("a.md").is_some()).await;
+    until("connected again", 10, || {
+        let a = engine.activity();
+        a.pull.connected() && !a.unreachable
+    })
+    .await;
+    // A server that answers but refuses (no such database) is not
+    // "unreachable": that needs a person, not a network.
+    env.mock.state.lock().unwrap().db_missing = true;
+    engine.network_changed(true);
+    until("waiting after a refusal", 30, || {
+        let a = engine.activity();
+        a.pull == PullPhase::Retrying && !a.unreachable
+    })
+    .await;
+    d.stop().await.unwrap();
+}

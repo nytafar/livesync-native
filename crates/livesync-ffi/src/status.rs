@@ -106,6 +106,53 @@ pub struct AttentionItem {
 /// Cap on the attention list handed to the UI.
 pub const ATTENTION_CAP: usize = 200;
 
+/// One file in conflict: the server holds more than one current revision of
+/// it, and an official LiveSync client must pick (this client never merges).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ConflictItem {
+    pub path: String,
+    /// The engine's note: how many revisions conflict, or that another
+    /// device deleted it while this one's copy was kept.
+    pub note: String,
+    /// The local file's modification time when the index last saw it.
+    pub modified_ms: Option<i64>,
+    /// Another device deleted the document; this device's copy was kept.
+    pub deleted_elsewhere: bool,
+}
+
+/// Whether the engine can talk to the server now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Connection {
+    /// No engine runs (stopped, paused, failed and waiting to retry).
+    None,
+    /// Running the gate: connecting, or about to.
+    Connecting,
+    /// The server answers: catching up, applying or following live.
+    Connected,
+    /// The server could not be reached, or failed in a way that passes (a
+    /// network error, no data, a 5xx): offline or the server is down. The
+    /// engine tries again by itself, at once when the network comes back.
+    Unreachable,
+    /// Waiting to try again after another failure: a gate refusal, a wrong
+    /// password, a missing database (`last_error` says which).
+    Waiting,
+}
+
+impl Connection {
+    pub(crate) fn of(a: Option<&livesync_engine::Activity>) -> Self {
+        use livesync_engine::PullPhase::*;
+        let Some(a) = a.filter(|a| a.running) else {
+            return Connection::None;
+        };
+        match a.pull {
+            _ if a.unreachable => Connection::Unreachable,
+            Retrying => Connection::Waiting,
+            CatchingUp | Live | Applying => Connection::Connected,
+            Starting | Stopped | Unknown => Connection::Connecting,
+        }
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ProfileStatus {
     pub profile_id: String,
@@ -169,6 +216,12 @@ pub struct ProfileStatus {
     /// Rows kept because another device deleted the document while this
     /// device's copy was in conflict (or had changed).
     pub deleted_elsewhere: i64,
+    /// Whether the server can be reached now (running engines only).
+    pub connection: Connection,
+    /// The files in conflict, by path: the first 50 (`conflicted` counts
+    /// them all). Those that are not also deleted elsewhere are left out of
+    /// `attention`.
+    pub conflicts: Vec<ConflictItem>,
     /// This engine session's push totals (two-way only; zero otherwise).
     pub pushed: i64,
     pub push_conflicts: i64,
@@ -255,6 +308,8 @@ pub(crate) fn from_engine(
         rebuild_wait: None,
         rebuild_orphans: None,
         deleted_elsewhere: 0,
+        connection: Connection::None,
+        conflicts: vec![],
         pushed: 0,
         push_conflicts: 0,
         deleted_remote: 0,
@@ -305,6 +360,21 @@ pub(crate) fn from_engine(
     out.safety_stop = st.safety_stop.clone();
     out.rebuild_wait = st.rebuild_wait.clone();
     out.rebuild_orphans = st.rebuild_orphans.clone();
+    out.conflicts = st
+        .conflicted
+        .iter()
+        .map(|r| {
+            let note = r.note.clone().unwrap_or_default();
+            ConflictItem {
+                path: r.path.clone(),
+                deleted_elsewhere: note.contains(DELETED_ELSEWHERE),
+                note,
+                modified_ms: r.disk_mtime,
+            }
+        })
+        .collect();
+    // Conflicts have their own list; a conflict that is also a deletion
+    // elsewhere stays here too, with the other rows that need a decision.
     let rows = [
         ("conflicted", &st.conflicted),
         ("dirty", &st.dirty),
@@ -325,7 +395,7 @@ pub(crate) fn from_engine(
                     path: r.path.clone(),
                     note,
                 });
-            } else {
+            } else if kind != "conflicted" {
                 rest.push(AttentionItem {
                     kind: kind.into(),
                     path: r.path.clone(),

@@ -166,6 +166,7 @@ impl LiveSync {
         out.mass_delete_allowed = st.mass_delete_allowed;
         out.mass_delete_waits = st.mass_delete_waits;
         out.deletes_waiting = st.deletes_waiting;
+        out.connection = status::Connection::of(st.activity.as_ref());
         out
     }
 

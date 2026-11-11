@@ -40,11 +40,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import no.nyta.livesync.EngineLifecycle
 import no.nyta.livesync.LiveSyncApp
+import no.nyta.livesync.core.Connection
 import no.nyta.livesync.core.GateResult
 import no.nyta.livesync.core.LiveSyncException
 import no.nyta.livesync.core.ProfileStatus
 import no.nyta.livesync.core.RunState
 import no.nyta.livesync.profile.Profile
+import no.nyta.livesync.service.Connectivity
 import no.nyta.livesync.service.StatusSummary
 import no.nyta.livesync.service.SyncService
 
@@ -81,11 +83,13 @@ fun StatusScreen(
     var gateResult by remember { mutableStateOf<GateResult?>(null) }
     var busy by remember { mutableStateOf<String?>(null) }
     var showRaw by remember { mutableStateOf(false) }
+    var noNetwork by remember { mutableStateOf(false) }
 
     // Every 2 s while the activity is started, never with the screen off.
     PollWhileStarted(profileId, 2000) {
         val p = withContext(Dispatchers.IO) { app.profiles.get(profileId) }
         profile = p
+        noNetwork = !Connectivity.hasNetwork(ctx)
         if (p != null) {
             status = withContext(Dispatchers.IO) { runCatching { core.status(p) }.getOrNull() }
             logs = withContext(Dispatchers.IO) { runCatching { core.engine.recentLogLines(LOG_LINES) }.getOrDefault(logs) }
@@ -127,8 +131,37 @@ fun StatusScreen(
             if (stopNote != null && stopNote?.first != st?.safetyStop) stopNote = null
         }
         SectionCard("Status") {
-            val (phrase, alert) = StatusSummary.phrase(StatusSummary.line(p, st, app.startProblems[p.id]))
-            Banner(phrase, if (alert) Tone.ERROR else if (st?.runState == RunState.RUNNING) Tone.OK else Tone.INFO)
+            val line = StatusSummary.line(p, st, app.startProblems[p.id], noNetwork)
+            val offline = StatusSummary.offline(line)
+            val (phrase, alert) = StatusSummary.phrase(line)
+            Banner(
+                phrase,
+                when {
+                    alert -> Tone.ERROR
+                    offline -> if (line.noNetwork) Tone.INFO else Tone.WARN
+                    st?.runState == RunState.RUNNING -> Tone.OK
+                    else -> Tone.INFO
+                },
+            )
+            if (offline) {
+                val waiting = if (p.pullOnly) {
+                    "Changes from the server arrive once it can be reached again."
+                } else {
+                    "Edits on this phone are kept and pushed once it can be reached again; nothing is lost."
+                }
+                Text(
+                    if (line.noNetwork) {
+                        "This phone has no network connection. $waiting Syncing resumes by itself when the " +
+                            "network comes back."
+                    } else {
+                        "This phone has a network, but the server does not answer: it may be down, or reachable " +
+                            "only from your home network or a VPN. $waiting This vault tries again by itself, at " +
+                            "once when the network changes, otherwise less often over time (at most every " +
+                            "15 minutes)." + (st?.lastError?.let { "\n\nLast error: ${fmtStamped(it)}" } ?: "")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
             if (st?.runState == RunState.FAILED && StatusSummary.heldElsewhere(st.runMessage)) {
                 Text(
                     "Another sync engine (a Termux lsync, another app, or another copy of this one) is using this " +
@@ -190,7 +223,8 @@ fun StatusScreen(
                     Tone.WARN,
                 )
             }
-            st?.lastError?.let { Banner("Last error: ${fmtStamped(it)}", Tone.WARN) }
+            // Offline, the error is the outage itself, explained above.
+            if (!offline) st?.lastError?.let { Banner("Last error: ${fmtStamped(it)}", Tone.WARN) }
             st?.let {
                 Formats.fetchOwedBanner(
                     needsFullFetch = it.needsFullFetch,
@@ -240,6 +274,19 @@ fun StatusScreen(
 
         SectionCard("Sync") {
             KeyValue("Engine", st?.let { "${it.runState.name.lowercase()}${it.runMessage?.let { m -> " — $m" } ?: ""}" })
+            KeyValue(
+                "Server",
+                listOfNotNull(
+                    when (st?.connection) {
+                        Connection.CONNECTED -> "connected"
+                        Connection.CONNECTING -> "connecting"
+                        Connection.UNREACHABLE -> "cannot be reached; retrying"
+                        Connection.WAITING -> "waiting to retry (see Last gate)"
+                        Connection.NONE, null -> null
+                    },
+                    "this phone has no network".takeIf { noNetwork },
+                ).joinToString(" · ").ifEmpty { null },
+            )
             KeyValue("Last gate", fmtStamped(st?.lastGate))
             KeyValue("Gate passed", fmtTime(st?.lastGateOkMs))
             KeyValue("since", st?.since)
@@ -272,12 +319,43 @@ fun StatusScreen(
             }
         }
 
+        if ((st?.conflicted ?: 0) > 0) {
+            SectionCard("Conflicts (${st!!.conflicted})") {
+                Text(
+                    "These files have more than one current version on the server, from edits on two devices " +
+                        "before they synced. This app never merges them: resolve each in Obsidian with the " +
+                        "Self-hosted LiveSync plugin (on a computer), and the result syncs back here. Until then " +
+                        "the file on this phone stays as it is.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                st.conflicts.forEach { c ->
+                    Column(Modifier.padding(vertical = 4.dp)) {
+                        Text(c.path, style = MaterialTheme.typography.bodyMedium)
+                        val detail = listOfNotNull(
+                            c.note.takeIf { it.isNotEmpty() },
+                            c.modifiedMs?.let { "file here changed ${fmtTime(it)}" },
+                        ).joinToString(" · ")
+                        if (detail.isNotEmpty()) {
+                            Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+                if (st.conflicted > st.conflicts.size) {
+                    Text(
+                        "Showing the first ${st.conflicts.size} by path.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+
         if (!st?.attention.isNullOrEmpty()) {
             SectionCard("Needs attention (${st!!.attention.size})") {
                 Text(
-                    "Conflicts are resolved by an official LiveSync client (desktop); dirty files are local edits " +
-                        "not pushed (pull-only) or waiting to be pushed; deleted_elsewhere files were deleted on " +
-                        "another device while this copy was kept.",
+                    "Dirty files are local edits not pushed (pull-only) or waiting to be pushed; deleted_elsewhere " +
+                        "files were deleted on another device while this copy was kept (if it was also in conflict, " +
+                        "it is listed under Conflicts too).",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 LazyColumn(Modifier.heightIn(max = 300.dp)) {
