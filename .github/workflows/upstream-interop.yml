@@ -1,6 +1,8 @@
 # The interop scenarios (scripts/interop.sh) against the latest upstream
 # release of the official Self-hosted LiveSync CLI, weekly and by hand, so a
 # breaking release is known before any device updates (COMPATIBILITY.md).
+# A second job fails when npm has a newer @vrtmrz/livesync-commonlib than
+# the one the golden vectors pin (tools/golden/package.json).
 #
 # CouchDB runs as a throwaway service container published on port 8411
 # (interop.sh accepts only 127.0.0.1:8411); its credentials exist
@@ -36,6 +38,42 @@ env:
   CI_COUCHDB_PASSWORD: ci-throwaway-password
 
 jobs:
+  # The golden vectors (tools/golden) pin a commonlib release. A newer one
+  # on npm is a version upstream may already ship: fail, so the pin, the
+  # fixtures and the Rust ports are brought up to it (AGENTS.md, "Golden
+  # vectors").
+  commonlib-pin:
+    name: golden vectors pin the latest commonlib
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24.x"
+      - name: Compare the pin with npm's latest release
+        run: |
+          pinned=$(node -p 'require("./tools/golden/package.json").dependencies["@vrtmrz/livesync-commonlib"]')
+          latest=$(npm view @vrtmrz/livesync-commonlib dist-tags.latest)
+          echo "pinned $pinned, npm latest $latest"
+          echo "### commonlib: pinned $pinned, npm latest $latest" >> "$GITHUB_STEP_SUMMARY"
+          PINNED="$pinned" LATEST="$latest" node -e '
+            const v = (s) => s.split(/[-+]/)[0].split(".").map(Number);
+            const [p, l] = [v(process.env.PINNED), v(process.env.LATEST)];
+            if (p.length !== 3 || l.length !== 3 || [...p, ...l].some(Number.isNaN)) {
+              console.error(`cannot compare ${process.env.PINNED} with ${process.env.LATEST}`);
+              process.exit(1);
+            }
+            for (let i = 0; i < 3; i++) {
+              if (l[i] > p[i]) {
+                console.error(`::error::npm has @vrtmrz/livesync-commonlib ${process.env.LATEST}, newer than the pin ${process.env.PINNED} in tools/golden/package.json`);
+                process.exit(1);
+              }
+              if (l[i] < p[i]) break;
+            }'
+
   interop:
     name: interop against the latest official CLI
     runs-on: ubuntu-latest
