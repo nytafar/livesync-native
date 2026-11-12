@@ -1,0 +1,73 @@
+{
+ "meta": {
+  "generator": "tools/golden/crypto.mjs",
+  "package": "@vrtmrz/livesync-commonlib",
+  "version": "0.4.3"
+ },
+ "upstream": {
+  "commonlib": "0.4.3",
+  "octagonalWheels": "0.1.56"
+ },
+ "cases": [
+  {
+   "pbkdf2salt": "sPhusotAGL9oRxVhjeeB1l0ALmCmH0OWunkgChnRsuo=",
+   "upstreamCreatesSalt": false,
+   "decoded": "sPhusotAGL9oRxVhjeeB1l0ALmCmH0OWunkgChnRsuo=",
+   "decodedLength": 32
+  },
+  {
+   "pbkdf2salt": "0/sp+0CzW7tnCBRrDm1KmQ==",
+   "upstreamCreatesSalt": false,
+   "decoded": "0/sp+0CzW7tnCBRrDm1KmQ==",
+   "decodedLength": 16
+  },
+  {
+   "pbkdf2salt": "8g==",
+   "upstreamCreatesSalt": false,
+   "decoded": "8g==",
+   "decodedLength": 1
+  },
+  {
+   "pbkdf2salt": "sPhusotAGL9oRxVhjeeB1l0ALmCmH0OWunkgChnRsuo",
+   "upstreamCreatesSalt": false,
+   "decoded": "sPhusotAGL9oRxVhjeeB1l0ALmCmH0OWunkgChnRsuo=",
+   "decodedLength": 32
+  },
+  {
+   "pbkdf2salt": "sPhusotAGL9oRxVhjeeB\n1l0ALmCmH0OWunkgChnRsuo=",
+   "upstreamCreatesSalt": false,
+   "decoded": "sPhusotAGL9oRxVhjeeB1l0ALmCmH0OWunkgChnRsuo=",
+   "decodedLength": 32
+  },
+  {
+   "pbkdf2salt": " sPhusotAGL9oRxVhjeeB1l0ALmCmH0OWunkgChnRsuo=\t",
+   "upstreamCreatesSalt": false,
+   "decoded": "sPhusotAGL9oRxVhjeeB1l0ALmCmH0OWunkgChnRsuo=",
+   "decodedLength": 32
+  },
+  {
+   "pbkdf2salt": "",
+   "upstreamCreatesSalt": true,
+   "decoded": "",
+   "decodedLength": 0
+  },
+  {
+   "pbkdf2salt": "not*base64",
+   "upstreamCreatesSalt": false,
+   "decoded": "",
+   "decodedLength": 0
+  },
+  {
+   "pbkdf2salt": "abcde",
+   "upstreamCreatesSalt": false,
+   "decoded": "",
+   "decodedLength": 0
+  },
+  {
+   "pbkdf2salt": "Hd0oAj214gBV6H48pChsNFMAGdmuGY7K0k7OZhPnpj4=",
+   "upstreamCreatesSalt": false,
+   "decoded": "Hd0oAj214gBV6H48pChsNFMAGdmuGY7K0k7OZhPnpj4=",
+   "decodedLength": 32
+  }
+ ]
+}

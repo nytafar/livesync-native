@@ -13,3 +13,4 @@ thiserror = "2.0.21"
 regex-syntax = "0.8.11"
 unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8.19", features = ["xxh64"] }
+zeroize = "1"

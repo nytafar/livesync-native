@@ -3,6 +3,7 @@ affiliated with it. Parts of it are ported from, or reproduce the behaviour of,
 Self-hosted LiveSync (https://github.com/vrtmrz/obsidian-livesync) and
 livesync-commonlib (https://github.com/vrtmrz/livesync-commonlib), notably the
 v3-rabin-karp chunk splitter (crates/livesync-model/src/splitter.rs), the
+end-to-end encryption transforms (crates/livesync-crypto), the
 document and wire formats, and the golden fixtures generated from
 @vrtmrz/livesync-commonlib (tools/golden, fixtures/golden). Those projects are
 distributed under the following licence, which applies to the ported parts:

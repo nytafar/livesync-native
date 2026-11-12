@@ -621,6 +621,7 @@ Exit codes:
 | Path | What |
 |---|---|
 | `crates/livesync-model` | Pure model: doc types, path→ID, chunk IDs, the splitter, decompression codec, gate evaluation, milestone registration, folder scope |
+| `crates/livesync-crypto` | Pure end-to-end encryption core (E2EE V2/HKDF): the key context, `%=` envelopes, the document transforms with the unencrypted-content policy, the sync-parameters salt; not wired in yet |
 | `crates/livesync-remote` | CouchDB over HTTP (reqwest + rustls with bundled webpki roots): `_changes`, `_all_docs`, `_local` docs, backoff |
 | `crates/livesync-engine` | Pull and push loops, daemons, SQLite index, vault file operations; platform seams (`Watcher`, `FsRules`) |
 | `crates/livesync-host` | Hosting vaults for every front-end: one supervisor per vault (retries from 15 s to 15 min), accounts and vaults (`lsync.toml`), the secret stores, migration from profile files, the service (reload, pause, commands, events, flush and wait), the control socket with its protocol and client, and notifications |
