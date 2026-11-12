@@ -58,7 +58,14 @@ lsync vault enable notes              # let the service run it
 lsync service install
 ```
 
-Files that differ from the server's version become conflicts with no common ancestor, so the dry run lists them first. `import` also reads the official CLI's `settings.json`; settings lsync cannot honour (end-to-end encryption, path obfuscation, another kind of remote) stop it with the reason. Details under [What syncs](#reference).
+Files that differ from the server's version become conflicts with no common ancestor, so the dry run lists them first. `import` also reads the official CLI's `settings.json`; with end-to-end encryption on, the passphrase goes into the secret store with the password. Settings lsync cannot honour (path obfuscation, encryption other than V2, another kind of remote) stop it with the reason. Details under [What syncs](#reference).
+
+**An end-to-end encrypted database** (the plugin's "End-to-End Encryption", V2, without path obfuscation) needs its passphrase, kept in the secret store like a password:
+
+```sh
+lsync vault add notes --db vault --folder ~/Notes --e2ee   # asks for the passphrase (or --passphrase-stdin)
+lsync vault passphrase notes                                 # change it later; --remove for a plaintext database
+```
 
 A database that a plugin or CLI from 1.0.46 on set up new is refused for now (NFC path identity); databases set up before keep working. [`COMPATIBILITY.md`](COMPATIBILITY.md) has the tested versions and what to do.
 
@@ -124,7 +131,7 @@ With more than one vault, name one: `lsync --vault notes sync`. `flush` and `wai
 
   - **`--run-as` is required,** and root only when named. The binary must be one only root can change (`/usr/local/bin`, or the AUR package's `/usr/bin`).
   - **The config stays root's:** `/etc/lsync` is 0750 and its files 0640, owned by root with the service's group, so the service reads them and cannot change them. Every edit is `sudo lsync --system …`. That group must be the service user's alone; install refuses a shared one.
-  - **Passwords:** `credential:lsync-NAME` keeps a password encrypted with `systemd-creds`, for the service alone; `file:` keeps it in `secrets.toml`, readable by the service's group, and install warns about each one.
+  - **Passwords and passphrases:** `credential:lsync-NAME` keeps a password, or a vault's end-to-end encryption passphrase (`sudo lsync --system vault passphrase NAME --secret credential:lsync-NAME`), encrypted with `systemd-creds`, for the service alone; `file:` keeps it in `secrets.toml`, readable by the service's group, and install warns about each one.
   - **The socket group:** with `--group GROUP`, members of that group (agents running as other users) may use the control socket: status, pause, resume, sync-now, events, reload and `lsync --system --vault NAME status|sync|fetch|pull`. They cannot read the config.
   - **Hardening:** `ProtectSystem=strict` with the vault folders as the only `ReadWritePaths=`, `PrivateTmp`, `NoNewPrivileges`, `UMask=0007`; `Type=notify` with a watchdog.
 
@@ -195,8 +202,10 @@ To rerun: `scripts/bench/snapshot.sh` once, then `scripts/bench/run.sh --contend
 
 Working: pull-only and two-way sync, the service with its control socket and installers, and the Android app, tested against the official CLI on every scenario and on a Samsung S22+ (Android 16) syncing a real 10,000-file vault. The macOS build passes the test suite in CI.
 
+End-to-end encryption (V2, as the plugin and CLI write it by default) works in every command, desktop only: the Android app refuses an encrypted database and says the desktop CLI syncs it.
+
 Not yet:
-- end-to-end encryption, path obfuscation and NFC path identity; such databases are refused;
+- path obfuscation, V1 encryption, encrypted internal metadata and NFC path identity; such databases are refused;
 - setup URIs and QR codes (`lsync import` reads the settings files);
 - merging conflicts: they are left for the desktop plugin;
 - Hidden File Sync and Customisation Sync (`.obsidian/`);
@@ -238,9 +247,10 @@ Not yet:
   - a version document that is missing, above 13 or invalid, or that has unknown `used_features`;
   - a missing milestone, or one that is locked and doesn't list us. When the database was not rebuilt (its `created` is the one this device synced with), the message says so and names the device that holds the lock and when it last connected; `lsync status` shows it as `REMOTE LOCKED`. lsync never unlocks it by itself: unlock it from an official client if the rebuild was not meant, or run `lsync fetch` to start over from the remote;
   - incompatible chunk-version ranges;
-  - encryption, path obfuscation, a `hashAlg` other than xxhash64, or `pathNormalizationVersion=1`;
+  - path obfuscation, encryption other than V2 (or with encrypted internal metadata or dynamic iteration counts), a `hashAlg` other than xxhash64, or `pathNormalizationVersion=1`;
+  - an encrypted database without the vault's passphrase, a passphrase for a database that is not encrypted, or a passphrase that does not decrypt the database (see "End-to-end encryption" below);
   - PREFERRED tweaks that changed since setup, or that it doesn't know (a setting a newer plugin added), until adopted with `lsync connect --adopt-tweaks`;
-  - encrypted content;
+  - encrypted content in a database whose settings say it is not encrypted, and plaintext content in one that is (unless accepted);
   - an index that belongs to another remote or another vault folder;
   - for two-way sync, an Obsidian vault with the Self-hosted LiveSync plugin enabled (unless allowed).
 
@@ -299,6 +309,7 @@ lsync account rm home           # only when no vault uses it
 lsync vault add notes --account home --db vault --folder ~/Notes [--exclude Archive] [--mode pull-only]
 lsync vault ls [--json]
 lsync vault edit notes --include Notes,Projects --device-name desk   # --unset KEY clears a setting
+lsync vault passphrase notes    # an end-to-end encrypted database's passphrase (asked; --passphrase-stdin, --remove)
 lsync vault disable notes       # and enable
 lsync vault rm notes            # the folder and the index are kept
 
@@ -321,6 +332,10 @@ These commands edit the file in place and keep its comments and layout; a change
 An account without `--user` is a server without authentication: it has no password and is not asked for one. The server URL holds no user or password (`https://me:pw@...` is refused: give `--user`, and the password when asked). `account add` never takes over a `file:` key that another account uses or that already holds a password, unless given `--replace-secret`.
 
 `--password` and `LSYNC_PASSWORD` still override the store for one run.
+
+**End-to-end encryption.** A vault whose database is encrypted names its passphrase's store the same way, in `passphrase` (`passphrase = "file:e2ee.home.vault"`). `lsync vault add NAME ... --e2ee` asks for it (or reads it with `--passphrase-stdin`; `--passphrase-secret STORE:KEY` puts it elsewhere than the default `file:e2ee.ACCOUNT.DATABASE`, which the vaults of one account on one database share: a second vault there finds it already stored and is not asked). `lsync vault passphrase NAME` sets or changes it (`--passphrase-stdin`, `--secret STORE:KEY`), for every vault that shares it, and `--remove` takes it off the vault (and out of the store when no other vault uses it). It is never taken from the command line, never logged, and never in `status --json` or `vault ls --json` (which say only where it is and whether it is set); `lsync doctor` checks that it can be read. `LSYNC_PASSPHRASE` gives it to one run, for runs without a vault in `lsync.toml`.
+
+What lsync does with it, as the plugin 1.0.49 does: the database's `encrypt` (in the milestone's PREFERRED settings) and the vault's passphrase must agree, or the vault is refused with what to do; lsync never writes plaintext into an encrypted database or ciphertext into a plaintext one. The key is derived once per session from the passphrase and the database's salt (`_local/obsidian_livesync_sync_parameters`), and the passphrase is checked against the database (its `syncinfo`, else its first encrypted chunks) before anything is pulled or pushed: a wrong one stops the vault and writes nothing. A two-way sync creates a missing salt as the plugin does, in a database with no encrypted chunks yet; a read-only pull refuses instead. Chunks are encrypted (`%=`, AES-256-GCM with HKDF) under the passphrase-mixed `h:+` IDs the official clients make, so they deduplicate with theirs; file metadata (paths, sizes, times) stays readable on the server, as it does for the plugin without path obfuscation. A document with plaintext content (a device without encryption wrote it) stops the pull before it, as the plugin's replication does, and shows as `UPSTREAM STOP` in `lsync status` until it is gone, unless the vault sets `accept_unencrypted_content = true` (the plugin's "Accept unencrypted content"; `lsync vault edit NAME --accept-unencrypted-content true`). A single document or chunk that does not decrypt (changed ciphertext, the V1 format) is held: it stays pending in `status` with why, its local file is left alone, and nothing is pushed for it. `lsync folders` lists an encrypted database without the passphrase.
 
 A keyring that is still locked (a desktop service that starts before the login unlocks it) is not an error: the vault shows "waiting for the keyring" in `lsync status --all`, and the service tries again every 20 s, so the vault starts once the keyring is unlocked. lsync never shows an unlock prompt itself. Without a desktop session (a server, an SSH login) there is no Secret Service: use `file:` or, for the system service, `credential:`. `file:` stays the default; `--secret keyring:NAME` puts an account's password in the keyring.
 
@@ -560,7 +575,7 @@ notes/.gitignore:1:drafts/	notes/drafts/d.md
 
 Only a file that still matches its synced version is moved; an edited one is kept and reported as `dirty`. Folders the move leaves empty are removed, as upstream does, but never the vault folder itself nor a folder holding anything. Our own move is never reported back as a local delete, and it never counts toward the mass-delete stop.
 
-**From the LiveSync plugin or the official CLI.** `lsync import FILE` reads the plugin's `data.json` (`<vault>/.obsidian/plugins/obsidian-livesync/data.json`) or the official CLI's `settings.json` (`<vault>/.livesync/settings.json`) and adds an account and a vault for it: the server, user and database, `syncIgnoreRegEx`, `syncOnlyRegEx` and the ignore files. The password goes into the secret store. An account for the same server and user is reused (and an import that brings another password for it is refused). The folder is the one the file lies in, or `--folder`; the name is the folder's, or `--name`. The connection in these files is encrypted with the configuration passphrase: `*` unless the plugin keeps one on the device or asks for it, and then `--config-passphrase-stdin` gives it. Settings lsync cannot honour stop the import with the reason: another kind of remote, end-to-end encryption, path obfuscation, JWT or custom headers. So do the ones lsync leaves out on purpose (hidden-file sync, customisation sync, resolving conflicts by the newer file, writing conflicted documents, P2P), unless `--accept KEY` says to go on without them. `--dry-run` shows what would be added. The vault is added disabled.
+**From the LiveSync plugin or the official CLI.** `lsync import FILE` reads the plugin's `data.json` (`<vault>/.obsidian/plugins/obsidian-livesync/data.json`) or the official CLI's `settings.json` (`<vault>/.livesync/settings.json`) and adds an account and a vault for it: the server, user and database, `syncIgnoreRegEx`, `syncOnlyRegEx` and the ignore files. The password goes into the secret store. An account for the same server and user is reused (and an import that brings another password for it is refused). The folder is the one the file lies in, or `--folder`; the name is the folder's, or `--name`. The connection in these files is encrypted with the configuration passphrase: `*` unless the plugin keeps one on the device or asks for it, and then `--config-passphrase-stdin` gives it. With end-to-end encryption on, the passphrase (`encryptedPassphrase`, decrypted with the connection, or `passphrase` in older files) goes into the secret store as the vault's `passphrase`, and `acceptUnencryptedContent` becomes `accept_unencrypted_content`. Settings lsync cannot honour stop the import with the reason: another kind of remote, encryption other than V2, encrypted internal metadata, path obfuscation, JWT or custom headers. So do the ones lsync leaves out on purpose (hidden-file sync, customisation sync, resolving conflicts by the newer file, writing conflicted documents, P2P), unless `--accept KEY` says to go on without them. `--dry-run` shows what would be added. The vault is added disabled.
 
 `lsync adopt` then takes the folder over, before its first sync here. It compares every file with the server's version by its chunks, the way a push splits it, and by content where those differ (another client's splitter), and says what the first sync does with each file: identical files are adopted with no transfer and no write; differing ones are pushed as roots of their own beside the server's version, which makes conflicts with no common ancestor; files only here are pushed, files only on the server are written; files the server deleted are put back, removed or kept as conflicts, as the first sync's reconcile rules decide. `--dry-run` only reports, on a throwaway index; without it, the identical files are recorded and the first sync runs. Identical files are only adopted when every chunk of the server's version is on the server; the others are left to the first sync. It refuses a vault whose index already tracks files, a folder the server shares no file with, names that differ from the server's only in case or Unicode normalisation, folders it cannot read, and a folder whose LiveSync plugin is still enabled, as the plugin guard does (`--allow-plugin`, or `allow_plugin = true` for the vault, for a deliberate handover). A weak match, where fewer than half of the files on the smaller side (empty files not counted) are identical, needs `--accept-weak-match` once you checked it is the right folder and database. `--json` exits as `sync --json` does.
 
@@ -621,7 +636,7 @@ Exit codes:
 | Path | What |
 |---|---|
 | `crates/livesync-model` | Pure model: doc types, path→ID, chunk IDs, the splitter, decompression codec, gate evaluation, milestone registration, folder scope |
-| `crates/livesync-crypto` | Pure end-to-end encryption core (E2EE V2/HKDF): the key context, `%=` envelopes, the document transforms with the unencrypted-content policy, the sync-parameters salt; not wired in yet |
+| `crates/livesync-crypto` | Pure end-to-end encryption core (E2EE V2/HKDF): the key context, `%=` envelopes, the document transforms with the unencrypted-content policy, the sync-parameters salt; `livesync-remote` applies it at the database boundary |
 | `crates/livesync-remote` | CouchDB over HTTP (reqwest + rustls with bundled webpki roots): `_changes`, `_all_docs`, `_local` docs, backoff |
 | `crates/livesync-engine` | Pull and push loops, daemons, SQLite index, vault file operations; platform seams (`Watcher`, `FsRules`) |
 | `crates/livesync-host` | Hosting vaults for every front-end: one supervisor per vault (retries from 15 s to 15 min), accounts and vaults (`lsync.toml`), the secret stores, migration from profile files, the service (reload, pause, commands, events, flush and wait), the control socket with its protocol and client, and notifications |
