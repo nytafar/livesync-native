@@ -7,8 +7,9 @@ use std::sync::{Mutex, OnceLock};
 use livesync_crypto::{CryptoError, KeyContext, RandomSource};
 use serde_json::Value;
 
-pub const COMMONLIB: &str = "0.4.3";
-pub const WHEELS: &str = "0.1.56";
+/// The pinned versions (upstream.env).
+pub const COMMONLIB: &str = livesync_model::upstream::COMMONLIB;
+pub const WHEELS: &str = livesync_model::upstream::OCTAGONAL_WHEELS;
 
 /// A fixture file from `tools/golden/crypto.mjs`, checked for the upstream versions.
 pub fn fixture(name: &str) -> Value {

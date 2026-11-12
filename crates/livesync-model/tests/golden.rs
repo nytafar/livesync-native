@@ -10,7 +10,11 @@ fn fixture(name: &str) -> Vec<Value> {
         .join(name);
     let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
     let v: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["meta"]["version"], "0.4.3", "fixtures must come from commonlib 0.4.3");
+    assert_eq!(
+        v["meta"]["version"],
+        livesync_model::upstream::COMMONLIB,
+        "fixtures must come from the pinned commonlib (upstream.env)"
+    );
     v["cases"].as_array().unwrap().clone()
 }
 
