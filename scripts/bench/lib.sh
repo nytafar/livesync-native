@@ -12,7 +12,11 @@ case "$LSYNC_URL" in
 esac
 export DEV_CONTAINER=${DEV_CONTAINER:-lsync-dev-couchdb}
 export SNAP_DB=${SNAP_DB:-bench-snap}
-export CLI_JS=${LSYNC_CLI_JS:-$HOME/code/ref/obsidian-livesync/src/apps/cli/dist/index.cjs}
+# The official CLI of the pinned release (upstream.env), from the reference
+# layout (built on first use; LSYNC_CLI_JS or LSYNC_UPSTREAM_TAG run another
+# one, and it says so). Scripts that run the CLI call bench_cli first; the
+# plug-in contender runs from the same release folder (bench.py).
+bench_cli() { CLI_JS=$("$BENCH_REPO/scripts/upstream.sh" cli); export CLI_JS; }
 export BIN=${LSYNC_BIN:-$BENCH_REPO/target/release/lsync}
 # Work area on disk (not /tmp, which is tmpfs here: vault writes would land in RAM).
 export BENCH_WORK=${BENCH_WORK:-$HOME/scratch/lsync-bench}

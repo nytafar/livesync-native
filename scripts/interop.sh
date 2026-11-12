@@ -6,10 +6,9 @@
 #   KEEP=1 scripts/interop.sh     # keep the database and the work folder
 #   ONLY="S1 S4" scripts/interop.sh
 #
-# Needs: node, the official CLI (by default the build of the release that
-# COMPATIBILITY.md lists as tested, LSYNC_UPSTREAM_TAG; see CLI_JS below, or
-# $LSYNC_CLI_JS), python3, curl, and ~/.config/livesync-android/dev.env (see
-# scripts/dev-env.sh).
+# Needs: node, the official CLI (the pinned release in upstream.env, built on
+# first use; see CLI_JS below), python3, curl, and
+# ~/.config/livesync-android/dev.env (see scripts/dev-env.sh).
 #
 # Scenarios:
 #   S1  the CLI creates, edits, renames and deletes; lsync converges
@@ -58,34 +57,11 @@ case "$LSYNC_URL" in
   http://127.0.0.1:8411*|http://localhost:8411*) ;;
   *) echo "refusing: interop runs only against the dev container on 127.0.0.1:8411" >&2; exit 1 ;;
 esac
-# The official CLI: $LSYNC_CLI_JS as given (the weekly job sets it), or the
-# build of UPSTREAM_TAG, the release COMPATIBILITY.md lists as tested, from
-# the first place that has it:
-#   ~/code/ref/obsidian-livesync-<tag>     a checkout of that tag beside the reference
-#   $LSYNC_UPSTREAM_DIR/obsidian-livesync  what scripts/ci/upstream-cli.sh builds
-#                                          (default ~/scratch/upstream-cli)
-#   ~/code/ref/obsidian-livesync           the reference checkout
-# and failing that the reference checkout at whatever release it has, with a
-# warning that names it.
-UPSTREAM_TAG=${LSYNC_UPSTREAM_TAG:-1.0.49}
+# The official CLI of the pinned release (upstream.env), built into the
+# reference layout when missing; LSYNC_CLI_JS or LSYNC_UPSTREAM_TAG run
+# another one, and say so (scripts/upstream.sh).
+CLI_JS=$(scripts/upstream.sh cli)
 cli_version_of() { node -p 'require(process.argv[1]).version' "$(dirname "$1")/../package.json" 2>/dev/null || echo '?'; }
-if [[ -n "${LSYNC_CLI_JS:-}" ]]; then
-  CLI_JS=$LSYNC_CLI_JS
-else
-  REF_CLI=$HOME/code/ref/obsidian-livesync/src/apps/cli/dist/index.cjs
-  CLI_JS=
-  for c in "$HOME/code/ref/obsidian-livesync-$UPSTREAM_TAG/src/apps/cli/dist/index.cjs" \
-           "${LSYNC_UPSTREAM_DIR:-$HOME/scratch/upstream-cli}/obsidian-livesync/src/apps/cli/dist/index.cjs" \
-           "$REF_CLI"; do
-    if [[ -f "$c" && "$(cli_version_of "$c")" == "$UPSTREAM_TAG-cli" ]]; then CLI_JS=$c; break; fi
-  done
-  if [[ -z "$CLI_JS" && -f "$REF_CLI" ]]; then
-    CLI_JS=$REF_CLI
-    echo "warning: no official CLI $UPSTREAM_TAG found; using $(cli_version_of "$CLI_JS") at $CLI_JS" >&2
-    echo "         (build $UPSTREAM_TAG with: scripts/ci/upstream-cli.sh ~/scratch/upstream-cli $UPSTREAM_TAG)" >&2
-  fi
-  [[ -n "$CLI_JS" ]] || { echo "official CLI $UPSTREAM_TAG not found; build it with: scripts/ci/upstream-cli.sh ~/scratch/upstream-cli $UPSTREAM_TAG" >&2; exit 1; }
-fi
 [[ -f "$CLI_JS" ]] || { echo "official CLI not found at $CLI_JS" >&2; exit 1; }
 cargo build --release -q -p lsync
 BIN=$REPO/target/release/lsync
@@ -182,7 +158,9 @@ PY
 
 CLI_VERSION=$(cli_version_of "$CLI_JS")
 CLI_REF=$(git -C "$(dirname "$CLI_JS")" rev-parse --short HEAD 2>/dev/null || echo '?')
-log "== interop run $RUN: lsync $(git rev-parse --short HEAD) vs official CLI $CLI_VERSION (ref $CLI_REF), database $DB"
+PINNED=$(scripts/upstream.sh get PLUGIN_RELEASE)
+[[ "$CLI_VERSION" == "$PINNED-cli" ]] && CLI_PIN="the pinned release" || CLI_PIN="NOT the pinned $PINNED-cli"
+log "== interop run $RUN: lsync $(git rev-parse --short HEAD) vs official CLI $CLI_VERSION ($CLI_PIN, ref $CLI_REF), database $DB"
 couch -X PUT "$LSYNC_URL/$DB" >/dev/null
 
 # --- setup: the CLI initialises the database with our setup's tweaks -----------

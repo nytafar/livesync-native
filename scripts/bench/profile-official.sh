@@ -7,6 +7,7 @@
 #   python3 scripts/bench/cpuprofile_top.py $BENCH_WORK/profile-official/*.cpuprofile
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
+bench_cli
 SECS=${1:-360}
 W=$BENCH_WORK/profile-official
 rm -rf "${W:?}"

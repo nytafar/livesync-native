@@ -1,16 +1,17 @@
-# The interop scenarios (scripts/interop.sh) against the latest upstream
-# release of the official Self-hosted LiveSync CLI, weekly and by hand, so a
+# The interop scenarios (scripts/interop.sh) against the official
+# Self-hosted LiveSync CLI of the pinned release (upstream.env) and, when
+# upstream has a newer one, of that release too, weekly and by hand, so a
 # breaking release is known before any device updates (COMPATIBILITY.md).
-# A second job fails when npm has a newer @vrtmrz/livesync-commonlib than
-# the one the golden vectors pin (tools/golden/package.json).
+# The pin job fails when upstream has a newer plugin release or npm a newer
+# @vrtmrz/livesync-commonlib than the pin: time for scripts/bump-upstream.sh.
 #
 # CouchDB runs as a throwaway service container published on port 8411
 # (interop.sh accepts only 127.0.0.1:8411); its credentials exist
 # only for this job. The official CLI is built from the release tag with
-# scripts/ci/upstream-cli.sh, without install scripts and without the
-# job's token in reach (the checkout keeps no credentials, and only the
-# step that looks up the latest release gets the token). Nothing is
-# published: no release, no artefact, nothing pushed.
+# scripts/upstream.sh (scripts/ci/upstream-cli.sh), without install scripts
+# and without the job's token in reach (the checkout keeps no credentials,
+# and only the step that looks up the latest release gets the token).
+# Nothing is published: no release, no artefact, nothing pushed.
 name: Upstream interop
 
 on:
@@ -19,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Upstream release tag to test (empty: the latest release)"
+        description: "Upstream release tag to test (empty: the pinned release, and the latest if newer)"
         required: false
         default: ""
 
@@ -38,14 +39,18 @@ env:
   CI_COUCHDB_PASSWORD: ci-throwaway-password
 
 jobs:
-  # The golden vectors (tools/golden) pin a commonlib release. A newer one
-  # on npm is a version upstream may already ship: fail, so the pin, the
-  # fixtures and the Rust ports are brought up to it (AGENTS.md, "Golden
-  # vectors").
-  commonlib-pin:
-    name: golden vectors pin the latest commonlib
+  # The pin and what upstream has now. Never fails on a newer release (the
+  # pin job below does), so the interop job still tests both.
+  versions:
+    name: pinned and latest upstream
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      pinned: ${{ steps.v.outputs.pinned }}
+      latest: ${{ steps.v.outputs.latest }}
+      pinned_commonlib: ${{ steps.v.outputs.pinned_commonlib }}
+      latest_commonlib: ${{ steps.v.outputs.latest_commonlib }}
+      tags: ${{ steps.v.outputs.tags }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -53,31 +58,72 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "24.x"
-      - name: Compare the pin with npm's latest release
+      # The token only looks up the latest release (API rate limit); no
+      # upstream code runs in this job.
+      - name: Read the pin, look up upstream
+        id: v
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
         run: |
-          pinned=$(node -p 'require("./tools/golden/package.json").dependencies["@vrtmrz/livesync-commonlib"]')
-          latest=$(npm view @vrtmrz/livesync-commonlib dist-tags.latest)
-          echo "pinned $pinned, npm latest $latest"
-          echo "### commonlib: pinned $pinned, npm latest $latest" >> "$GITHUB_STEP_SUMMARY"
-          PINNED="$pinned" LATEST="$latest" node -e '
-            const v = (s) => s.split(/[-+]/)[0].split(".").map(Number);
-            const [p, l] = [v(process.env.PINNED), v(process.env.LATEST)];
-            if (p.length !== 3 || l.length !== 3 || [...p, ...l].some(Number.isNaN)) {
-              console.error(`cannot compare ${process.env.PINNED} with ${process.env.LATEST}`);
-              process.exit(1);
-            }
-            for (let i = 0; i < 3; i++) {
-              if (l[i] > p[i]) {
-                console.error(`::error::npm has @vrtmrz/livesync-commonlib ${process.env.LATEST}, newer than the pin ${process.env.PINNED} in tools/golden/package.json`);
-                process.exit(1);
-              }
-              if (l[i] < p[i]) break;
-            }'
+          pinned=$(scripts/upstream.sh get PLUGIN_RELEASE)
+          latest=$(scripts/ci/upstream-cli.sh --tag | sed -n 's/^tag=//p')
+          pinned_commonlib=$(scripts/upstream.sh get COMMONLIB)
+          latest_commonlib=$(npm view @vrtmrz/livesync-commonlib dist-tags.latest)
+          if [[ -n "$TAG" ]]; then
+            tags=$(jq -cn --arg t "$TAG" '[$t]')
+          else
+            tags=$(jq -cn --arg p "$pinned" --arg l "$latest" '[$p, $l] | unique')
+          fi
+          {
+            echo "pinned=$pinned"; echo "latest=$latest"
+            echo "pinned_commonlib=$pinned_commonlib"; echo "latest_commonlib=$latest_commonlib"
+            echo "tags=$tags"
+          } | tee -a "$GITHUB_OUTPUT"
+          {
+            echo "### Upstream: pinned $pinned (commonlib $pinned_commonlib)"
+            echo "latest release $latest, npm latest commonlib $latest_commonlib; interop runs $tags"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # A newer plugin release or commonlib than the pin is a version devices
+  # may already run: fail, so the pin, the fixtures and the Rust ports are
+  # brought up to it (AGENTS.md, "Bumping upstream").
+  pin:
+    name: the pin is the latest upstream
+    needs: versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Compare the pin with upstream
+        env:
+          PINNED: ${{ needs.versions.outputs.pinned }}
+          LATEST: ${{ needs.versions.outputs.latest }}
+          PINNED_LIB: ${{ needs.versions.outputs.pinned_commonlib }}
+          LATEST_LIB: ${{ needs.versions.outputs.latest_commonlib }}
+        run: |
+          # newer A B: A is a higher version than B (by sort -V).
+          newer() { [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]; }
+          rc=0
+          if newer "$LATEST" "$PINNED"; then
+            echo "::error::upstream has Self-hosted LiveSync $LATEST, newer than the pin $PINNED in upstream.env (scripts/bump-upstream.sh)"
+            rc=1
+          fi
+          if newer "$LATEST_LIB" "$PINNED_LIB"; then
+            echo "::error::npm has @vrtmrz/livesync-commonlib $LATEST_LIB, newer than the pin $PINNED_LIB in upstream.env (scripts/bump-upstream.sh)"
+            rc=1
+          fi
+          [[ $rc == 1 ]] || echo "the pin ($PINNED, commonlib $PINNED_LIB) is upstream's latest"
+          exit $rc
 
   interop:
-    name: interop against the latest official CLI
+    name: interop against the official CLI ${{ matrix.tag }}
+    needs: versions
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.versions.outputs.tags) }}
     services:
       couchdb:
         image: couchdb:3.5
@@ -100,19 +146,15 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "24.x"
-      # The token only looks up the latest release (API rate limit). The
-      # build, which runs upstream code, gets the tag and no token.
-      - name: Pick the upstream release
-        id: tag
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
-        run: scripts/ci/upstream-cli.sh --tag "$TAG" | tee -a "$GITHUB_OUTPUT"
-      - name: Build the official CLI from the upstream release
+      # The build runs upstream code: it gets the tag and no token. A tag other
+      # than the pin is announced by scripts/upstream.sh (and interop.sh).
+      - name: Build the official CLI of the release
         id: cli
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
-        run: scripts/ci/upstream-cli.sh "$RUNNER_TEMP/upstream" "$TAG" | tee -a "$GITHUB_OUTPUT"
+          LSYNC_UPSTREAM_TAG: ${{ matrix.tag }}
+        run: |
+          cli_js=$(LSYNC_REF_DIR="$RUNNER_TEMP/ref" scripts/upstream.sh cli)
+          echo "cli_js=$cli_js" | tee -a "$GITHUB_OUTPUT"
       - name: Configure CouchDB
         env:
           COUCHDB_URL: http://127.0.0.1:8411
@@ -131,14 +173,14 @@ jobs:
             echo "LSYNC_DEV_USER=$CI_COUCHDB_USER"
             echo "LSYNC_DEV_PASSWORD=$CI_COUCHDB_PASSWORD"
           } > "$LSYNC_DEV_ENV"
-          echo "### Upstream interop: official CLI ${{ steps.cli.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Upstream interop: official CLI ${{ matrix.tag }} (pinned ${{ needs.versions.outputs.pinned }})" >> "$GITHUB_STEP_SUMMARY"
           set -o pipefail
           KEEP=1 scripts/interop.sh 2>&1 | tee "$RUNNER_TEMP/interop.txt"
       - name: Summary
         if: always()
         run: |
           if [[ -f "$RUNNER_TEMP/interop.txt" ]]; then
-            { echo '```'; grep -E '^(==|S[0-9]|  (PASS|FAIL)|passed )' "$RUNNER_TEMP/interop.txt" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            { echo '```'; grep -E '^(==|[SE][0-9]|  (PASS|FAIL)|passed )' "$RUNNER_TEMP/interop.txt" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Logs of a failed run
         if: failure()

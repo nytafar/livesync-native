@@ -2,7 +2,7 @@
 // for the benchmark. Run from the official repo (so its runner and node_modules
 // resolve), with tsx:
 //
-//   cd ~/code/ref/obsidian-livesync && npx tsx <this file>
+//   cd ~/code/ref/obsidian-livesync-<tag> && npx tsx <this file>   (bench.py does)
 //
 // Isolation comes from upstream's own E2E runner (@vrtmrz/obsidian-test-session):
 // a temporary vault, temporary HOME/XDG directories and its own Electron
