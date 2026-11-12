@@ -36,6 +36,19 @@
 #   S11 the upstream guard on the CLI's own defaults: a database the CLI sets
 #       up untouched is synced, or (when it turns features on) refused with a
 #       message naming each feature and the newest plugin version known to work
+#   E1  end-to-end encryption (V2, no path obfuscation), CLI -> lsync: a
+#       database the CLI encrypts (generation 12, no syncinfo) is read, with
+#       edits, renames and deletes
+#   E2  lsync -> CLI: what lsync writes is ciphertext under h:+ chunk IDs the
+#       CLI makes too, and the CLI reads it byte for byte (edits, a move, a delete)
+#   E3  concurrent edits in the encrypted database: a branch both list as a
+#       conflict, resolved with the CLI
+#   E4  a wrong passphrase on either side: lsync refuses and writes nothing;
+#       the CLI cannot read lsync's notes
+#   E5  lsync as the first writer: it creates the missing encryption salt, and
+#       a new CLI device reads what it wrote
+#   E6  plaintext content injected into the encrypted database stops lsync's
+#       pull (status shows it); once it is gone, syncing resumes
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -98,6 +111,8 @@ cleanup() {
   if [[ "${KEEP:-0}" != 1 ]]; then
     couch -X DELETE "$LSYNC_URL/$DB" >/dev/null || true
     couch -X DELETE "$LSYNC_URL/$DB-defaults" >/dev/null || true
+    couch -X DELETE "$LSYNC_URL/$DB-e2ee" >/dev/null || true
+    couch -X DELETE "$LSYNC_URL/$DB-e2ee-first" >/dev/null || true
     [[ "$W" == /tmp/lsync-it.* ]] && rm -rf -- "$W"
   fi
   exit $rc
@@ -645,6 +660,197 @@ else
   check "lsync syncs it (exit $rc)" test "$rc" -eq 0 -o "$rc" -eq 3
   check "  ... and has the CLI's note" file_is "$W/vault-d9/s9/init.md" "defaults"
 fi
+fi
+
+# --- E1-E6: end-to-end encryption ------------------------------------------------
+if want E1 || want E2 || want E3 || want E4 || want E5 || want E6; then
+DBE="$DB-e2ee"
+# A throwaway, never logged.
+E2EE_PASS="interop-throwaway-$RUN"
+E2EE_TWEAKS='"customChunkSize": 60, "usePluginSync": false, "pathNormalizationVersion": 0, "encrypt": true, "E2EEAlgorithm": "v2", "usePathObfuscation": false, "encryptInternalMetadata": false, "idDerivationVersion": 0, "hashAlg": "xxhash64"'
+couch -X PUT "$LSYNC_URL/$DBE" >/dev/null
+cli_settings "$W/cli-defaults.json" "$W/cli-e.json" "$DBE" "{$E2EE_TWEAKS, \"passphrase\": \"$E2EE_PASS\"}"
+mkdir -p "$W/clidb-e" "$W/vault-e"
+clie() { node "$CLI_JS" "$W/clidb-e" --settings "$W/cli-e.json" "$@" 2>>"$W/cli.log"; }
+clie_cat() { clie cat "$1" | sed '/^\[CLIWatchAdapter\]/d'; }
+clie_ls_line() { clie ls "$1" | awk -F'\t' -v p="$1" '$1 == p { print; exit }'; }
+lse() { local rc=0; LSYNC_DB=$DBE LSYNC_VAULT=$W/vault-e LSYNC_STATE_DIR=$W/state-e LSYNC_CONFIG=$W/e.toml \
+        LSYNC_DEVICE_NAME=interop-e LSYNC_PASSPHRASE=$E2EE_PASS "$BIN" "$@" 2>>"$W/lsync-e.log" || rc=$?; [[ $rc == 0 || $rc == 3 ]] || return $rc; }
+edoc() { couch "$LSYNC_URL/$DBE/$(python3 -c 'import sys,urllib.parse; p=sys.argv[1].lower(); p="/"+p if p.startswith("_") else p; print(urllib.parse.quote(p,safe=""))' "$1")${2:-}"; }
+# Every chunk in $1 is V2 ciphertext (e_, "%=") under an h:+ ID; prints the count.
+all_sealed() {
+  couch "$LSYNC_URL/$1/_all_docs?include_docs=true&start_key=%22h%3A%22&end_key=%22h%3B%22" | python3 -c '
+import json, sys
+rows = [r for r in json.load(sys.stdin)["rows"] if r.get("doc")]
+bad = [r["id"] for r in rows if not (r["id"].startswith("h:+") and r["doc"].get("e_") is True and r["doc"].get("data", "").startswith("%="))]
+print(len(rows)); sys.exit(1 if bad or not rows else 0)' >/dev/null
+}
+printf 'encrypted init\n' | clie put e/init.md >/dev/null
+clie sync >/dev/null
+check "the CLI encrypted the database (encrypt in the tweaks, a salt, h:+ chunks)" bash -c \
+  "curl -sS -u '$LSYNC_USER:$LSYNC_PASSWORD' '$LSYNC_URL/$DBE/_local/obsydian_livesync_milestone' | grep -q '\"encrypt\":true' && curl -sS -u '$LSYNC_USER:$LSYNC_PASSWORD' '$LSYNC_URL/$DBE/_local/obsidian_livesync_sync_parameters' | grep -q pbkdf2salt"
+log "    version document: $(couch "$LSYNC_URL/$DBE/obsydian_livesync_version" | jfield '.get("version")'), syncinfo: $(couch -o /dev/null -w '%{http_code}' "$LSYNC_URL/$DBE/syncinfo")"
+check "every chunk the CLI wrote is sealed" all_sealed "$DBE"
+lse sync >/dev/null
+check "lsync reads the encrypted database" file_is "$W/vault-e/e/init.md" "encrypted init"
+fi
+
+if want E1; then
+log "E1 the CLI writes an encrypted database; lsync converges"
+gen "$W/src/e1.png" bin 700000 31
+printf 'E1 æøå 😀\n' | clie put e1/a.md >/dev/null
+printf 'rename me\n' | clie put e1/rename-me.md >/dev/null
+printf 'delete me\n' | clie put e1/del.md >/dev/null
+clie push "$W/src/e1.png" e1/pic.png >/dev/null
+clie sync >/dev/null
+lse sync >/dev/null
+check "created text arrives decrypted" file_is "$W/vault-e/e1/a.md" "E1 æøå 😀"
+check "created binary arrives byte-identical" same_file "$W/src/e1.png" "$W/vault-e/e1/pic.png"
+printf 'E1 edited\n' | clie put e1/a.md >/dev/null
+clie rm e1/rename-me.md >/dev/null
+printf 'rename me\n' | clie put e1/renamed.md >/dev/null
+clie rm e1/del.md >/dev/null
+clie sync >/dev/null
+lse sync >/dev/null
+check "edit arrives" file_is "$W/vault-e/e1/a.md" "E1 edited"
+check "rename: old name removed" gone "$W/vault-e/e1/rename-me.md"
+check "rename: new name present" file_is "$W/vault-e/e1/renamed.md" "rename me"
+check "delete arrives" gone "$W/vault-e/e1/del.md"
+fi
+
+if want E2; then
+log "E2 lsync writes into the encrypted database; the CLI reads it"
+mkdir -p "$W/vault-e/e2"
+printf 'mine æøå 😀\n' > "$W/vault-e/e2/x.md"
+gen "$W/vault-e/e2/big.md" text 1500000 33
+gen "$W/vault-e/e2/photo.jpg" bin 3000000 34
+printf 'gone soon\n' > "$W/vault-e/e2/gone.md"
+printf 'move me\n' > "$W/vault-e/e2/move.md"
+lse sync >/dev/null
+check "everything on the server is still sealed (no plain chunk, no plain h: ID)" all_sealed "$DBE"
+check "metadata stays readable without path obfuscation" test "$(edoc e2/x.md | jfield '["path"]')" == '"e2/x.md"'
+clie sync >/dev/null
+check "the CLI decrypts lsync's text" test "$(clie_cat e2/x.md)" == "mine æøå 😀"
+clie pull e2/photo.jpg "$W/out-e-photo.jpg" >/dev/null
+check "3 MB binary arrives byte-identical at the CLI" same_file "$W/vault-e/e2/photo.jpg" "$W/out-e-photo.jpg"
+clie pull e2/big.md "$W/out-e-big.md" >/dev/null
+check "1.5 MB text arrives byte-identical at the CLI" same_file "$W/vault-e/e2/big.md" "$W/out-e-big.md"
+for f in big.md photo.jpg; do
+  clie push "$W/vault-e/e2/$f" "e2-cli/$f" >/dev/null
+done
+clie sync >/dev/null
+for f in big.md photo.jpg; do
+  a=$(edoc "e2/$f" | jfield '["children"]')
+  b=$(edoc "e2-cli/$f" | jfield '["children"]')
+  check "$f: the same passphrase-mixed h:+ chunk IDs as the CLI's" test "$a" == "$b"
+done
+printf 'mine, edited\n' > "$W/vault-e/e2/x.md"
+mkdir -p "$W/vault-e/e2/moved"
+mv "$W/vault-e/e2/move.md" "$W/vault-e/e2/moved/move.md"
+rm "$W/vault-e/e2/gone.md"
+lse sync >/dev/null
+clie sync >/dev/null
+check "edit arrives at the CLI" test "$(clie_cat e2/x.md)" == "mine, edited"
+check "move arrives at the CLI" test "$(clie_cat e2/moved/move.md)" == "move me"
+check "delete arrives at the CLI" bash -c "! node '$CLI_JS' '$W/clidb-e' --settings '$W/cli-e.json' cat e2/gone.md >/dev/null 2>&1"
+check "still everything sealed" all_sealed "$DBE"
+fi
+
+if want E3; then
+log "E3 concurrent edits in the encrypted database"
+mkdir -p "$W/vault-e/e3"
+printf 'base\n' > "$W/vault-e/e3/c.md"
+lse sync >/dev/null
+clie sync >/dev/null
+printf 'cli edit\n' | clie put e3/c.md >/dev/null
+clie sync >/dev/null
+printf 'lsync edit\n' > "$W/vault-e/e3/c.md"
+lse sync >/dev/null
+check "lsync kept its local edit" file_is "$W/vault-e/e3/c.md" "lsync edit"
+check "lsync reports the conflict" bash -c \
+  "LSYNC_DB=$DBE LSYNC_VAULT=$W/vault-e LSYNC_STATE_DIR=$W/state-e LSYNC_CONFIG=$W/e.toml '$BIN' status --json 2>/dev/null | grep -q 'e3/c.md'"
+clie sync >/dev/null
+line=$(clie_ls_line e3/c.md)
+check "the CLI lists e3/c.md as conflicted" test "${line: -1}" == "*"
+check "the branch lsync wrote is sealed too" all_sealed "$DBE"
+rev=$(clie info e3/c.md | sed -n '/^{/,$p' | jfield '["revision"]' | tr -d '"')
+clie resolve e3/c.md "$rev" >/dev/null
+clie sync >/dev/null
+lse sync >/dev/null
+check "the CLI's resolution comes down decrypted" file_is "$W/vault-e/e3/c.md" "$(clie_cat e3/c.md)"
+fi
+
+if want E4; then
+log "E4 a wrong passphrase on either side"
+seq_before=$(couch "$LSYNC_URL/$DBE" | jfield '["update_seq"]')
+rc=0
+LSYNC_DB=$DBE LSYNC_VAULT=$W/vault-e4 LSYNC_STATE_DIR=$W/state-e4 LSYNC_CONFIG=$W/e4.toml LSYNC_DEVICE_NAME=interop-e4 \
+  LSYNC_PASSPHRASE="wrong-$RUN" "$BIN" sync >/dev/null 2>"$W/lsync-e4.log" || rc=$?
+check "lsync refuses a wrong passphrase (exit $rc)" test "$rc" -eq 2
+check "  ... saying so" grep -q "does not decrypt" "$W/lsync-e4.log"
+check "  ... without writing a file (lsync's own lock files aside)" bash -c "[[ -z \"\$(find '$W/vault-e4' -type f ! -name '.lsync.lock' ! -name '.lsync.holder' 2>/dev/null)\" ]]"
+check "  ... or anything to the database" test "$(couch "$LSYNC_URL/$DBE" | jfield '["update_seq"]')" == "$seq_before"
+check "  ... and never prints the passphrase" bash -c "! grep -q -- 'wrong-$RUN' '$W/lsync-e4.log'"
+# The CLI with another passphrase cannot read what lsync wrote.
+cli_settings "$W/cli-defaults.json" "$W/cli-e4.json" "$DBE" "{$E2EE_TWEAKS, \"passphrase\": \"wrong-$RUN\"}"
+mkdir -p "$W/clidb-e4"
+node "$CLI_JS" "$W/clidb-e4" --settings "$W/cli-e4.json" sync >/dev/null 2>>"$W/cli-e4.log" || true
+got=$(node "$CLI_JS" "$W/clidb-e4" --settings "$W/cli-e4.json" cat e/init.md 2>>"$W/cli-e4.log" | sed '/^\[CLIWatchAdapter\]/d' || true)
+check "the CLI with a wrong passphrase does not get the content" test "$got" != "encrypted init"
+fi
+
+if want E5; then
+log "E5 lsync is the first writer into an encrypted database without a salt"
+DBF="$DB-e2ee-first"
+couch -X PUT "$LSYNC_URL/$DBF" >/dev/null
+cli_settings "$W/cli-defaults.json" "$W/cli-f.json" "$DBF" "{$E2EE_TWEAKS, \"passphrase\": \"$E2EE_PASS\"}"
+mkdir -p "$W/clidb-f" "$W/clidb-f2" "$W/vault-f"
+node "$CLI_JS" "$W/clidb-f" --settings "$W/cli-f.json" sync >/dev/null 2>>"$W/cli.log"
+# The CLI set the database up; take its salt away, as if no device had made one.
+prev=$(couch "$LSYNC_URL/$DBF/_local/obsidian_livesync_sync_parameters" | jfield '.get("_rev")' | tr -d '"')
+[[ "$prev" != null ]] && couch -X DELETE "$LSYNC_URL/$DBF/_local/obsidian_livesync_sync_parameters?rev=$prev" >/dev/null
+docs=$(couch "$LSYNC_URL/$DBF/_all_docs" | python3 -c 'import json,sys; print(sum(1 for r in json.load(sys.stdin)["rows"] if r["id"].startswith("h:")))')
+log "    chunks before lsync: $docs; salt: $(couch -o /dev/null -w '%{http_code}' "$LSYNC_URL/$DBF/_local/obsidian_livesync_sync_parameters")"
+lsf() { local rc=0; LSYNC_DB=$DBF LSYNC_VAULT=$W/vault-f LSYNC_STATE_DIR=$W/state-f LSYNC_CONFIG=$W/f.toml \
+        LSYNC_DEVICE_NAME=interop-f LSYNC_PASSPHRASE=$E2EE_PASS "$BIN" "$@" 2>>"$W/lsync-f.log" || rc=$?; [[ $rc == 0 || $rc == 3 ]] || return $rc; }
+rc=0
+lsf pull >/dev/null 2>&1 || rc=$?
+check "a read-only pull refuses to create the salt (exit $rc)" test "$rc" -eq 2
+mkdir -p "$W/vault-f/e5"
+printf 'first writer æøå\n' > "$W/vault-f/e5/first.md"
+gen "$W/vault-f/e5/first.bin" bin 300000 35
+lsf sync >/dev/null
+check "lsync created the salt (32 bytes)" bash -c \
+  "curl -sS -u '$LSYNC_USER:$LSYNC_PASSWORD' '$LSYNC_URL/$DBF/_local/obsidian_livesync_sync_parameters' | python3 -c 'import json,sys,base64; d=json.load(sys.stdin); sys.exit(0 if d[\"type\"]==\"sync-parameters\" and len(base64.b64decode(d[\"pbkdf2salt\"]))==32 else 1)'"
+check "what lsync wrote is sealed" all_sealed "$DBF"
+node "$CLI_JS" "$W/clidb-f2" --settings "$W/cli-f.json" sync >/dev/null 2>>"$W/cli.log"
+got=$(node "$CLI_JS" "$W/clidb-f2" --settings "$W/cli-f.json" cat e5/first.md 2>>"$W/cli.log" | sed '/^\[CLIWatchAdapter\]/d')
+check "a new CLI device reads lsync's note" test "$got" == "first writer æøå"
+node "$CLI_JS" "$W/clidb-f2" --settings "$W/cli-f.json" pull e5/first.bin "$W/out-f.bin" >/dev/null 2>>"$W/cli.log"
+check "  ... and its binary, byte-identical" same_file "$W/vault-f/e5/first.bin" "$W/out-f.bin"
+fi
+
+if want E6; then
+log "E6 plaintext content in the encrypted database"
+# What a device without encryption would write: a plain chunk and a note on it.
+couch -X PUT "$LSYNC_URL/$DBE/h:e6plainchunk" -H 'Content-Type: application/json' -d '{"type":"leaf","data":"in the clear"}' >/dev/null
+couch -X PUT "$LSYNC_URL/$DBE/e6%2Fleak.md" -H 'Content-Type: application/json' \
+  -d '{"path":"e6/leak.md","type":"plain","children":["h:e6plainchunk"],"ctime":1,"mtime":1,"size":12,"eden":{}}' >/dev/null
+rc=0
+LSYNC_DB=$DBE LSYNC_VAULT=$W/vault-e LSYNC_STATE_DIR=$W/state-e LSYNC_CONFIG=$W/e.toml LSYNC_DEVICE_NAME=interop-e \
+  LSYNC_PASSPHRASE=$E2EE_PASS "$BIN" sync >/dev/null 2>"$W/lsync-e6.log" || rc=$?
+check "lsync stops at it (exit $rc)" test "$rc" -eq 2
+check "  ... naming the policy" grep -q "unencrypted chunk content" "$W/lsync-e6.log"
+check "  ... and does not write it" gone "$W/vault-e/e6/leak.md"
+st=$(LSYNC_DB=$DBE LSYNC_VAULT=$W/vault-e LSYNC_STATE_DIR=$W/state-e LSYNC_CONFIG=$W/e.toml "$BIN" status --json 2>/dev/null || true)
+check "  ... status shows the stop" test "$(echo "$st" | jfield '.get("upstream_stop") is not None')" == true
+clie sync >/dev/null 2>&1 || true
+log "    the official CLI's view of it: $(clie_cat e6/leak.md 2>/dev/null | head -c 60 || true)"
+rev=$(edoc e6/leak.md | jfield '["_rev"]' | tr -d '"')
+couch -X DELETE "$LSYNC_URL/$DBE/e6%2Fleak.md?rev=$rev" >/dev/null
+lse sync >/dev/null
+st=$(LSYNC_DB=$DBE LSYNC_VAULT=$W/vault-e LSYNC_STATE_DIR=$W/state-e LSYNC_CONFIG=$W/e.toml "$BIN" status --json 2>/dev/null || true)
+check "once it is gone, the pull gets past it and the stop lifts" test "$(echo "$st" | jfield '.get("upstream_stop") is None')" == true
 fi
 
 [[ $FAIL -eq 0 ]]
