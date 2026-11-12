@@ -1306,6 +1306,7 @@ dependencies = [
  "axum",
  "futures",
  "libc",
+ "livesync-crypto",
  "livesync-model",
  "livesync-remote",
  "log",
@@ -1331,6 +1332,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures",
+ "livesync-crypto",
  "livesync-engine",
  "livesync-host",
  "livesync-model",
@@ -1352,6 +1354,7 @@ dependencies = [
  "axum",
  "futures",
  "libc",
+ "livesync-crypto",
  "livesync-engine",
  "livesync-model",
  "livesync-remote",
@@ -1396,6 +1399,7 @@ dependencies = [
 name = "livesync-remote"
 version = "0.1.0"
 dependencies = [
+ "livesync-crypto",
  "livesync-model",
  "rand 0.8.8",
  "reqwest",
@@ -1437,6 +1441,7 @@ dependencies = [
  "clap",
  "futures",
  "libc",
+ "livesync-crypto",
  "livesync-engine",
  "livesync-host",
  "livesync-model",

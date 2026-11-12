@@ -47,7 +47,7 @@ use crate::vaultfs::{self, DiskState};
 use livesync_model::doc::{classify_doc, Classified};
 use livesync_model::gate::Refusal;
 use livesync_model::path::is_internal_id;
-use livesync_model::splitter::chunk_file;
+use livesync_model::splitter::chunk_file_with;
 use livesync_model::FileDoc;
 use serde::Serialize;
 use serde_json::json;
@@ -276,6 +276,23 @@ impl Engine {
                         continue;
                     }
                     last = Some(id.clone());
+                    if let Some(u) = r.undecryptable {
+                        crate::engine::held_or_stop(&u)?;
+                        // The first sync holds it too; the local file stays.
+                        if let Some(path) = u.path.filter(|p| scope.contains(p)) {
+                            *rep.skipped_remote.entry("undecryptable".into()).or_default() += 1;
+                            rep.undecided.push(AdoptEntry {
+                                path,
+                                remote_rev: u.rev,
+                                note: Some(format!(
+                                    "the remote document cannot be decrypted ({}); the first sync holds it",
+                                    u.error
+                                )),
+                                ..Default::default()
+                            });
+                        }
+                        continue;
+                    }
                     let Some(doc) = r.doc.filter(|d| !d.is_null()) else {
                         continue;
                     };
@@ -290,7 +307,7 @@ impl Engine {
                         }
                         _ => continue,
                     };
-                    if let Some(c) = f.children.iter().find(|c| c.starts_with("h:+")) {
+                    if let Some(c) = self.unreadable_child(&f) {
                         return Err(Refusal::EncryptedContent(format!("chunk {c} of {}", f.path)).into());
                     }
                     if is_internal_id(&f.id) {
@@ -683,6 +700,7 @@ impl Engine {
         let abs = self.inner.cfg.vault.join(&found.rel);
         let doc_path = doc_path.to_string();
         let split = *split;
+        let ids = self.inner.runtime.lock().unwrap().chunk_ids.clone();
         tokio::task::spawn_blocking(move || -> std::result::Result<Read, String> {
             let mtime = |md: &std::fs::Metadata| {
                 md.modified()
@@ -697,7 +715,7 @@ impl Engine {
             if before.len() != after.len() || mtime(&before) != mtime(&after) || bytes.len() as u64 != after.len() {
                 return Err("changed while it was read; run adopt again once it is quiet".into());
             }
-            let chunked = chunk_file(&doc_path, &bytes, &split);
+            let chunked = chunk_file_with(&doc_path, &bytes, &split, &ids);
             Ok(Read {
                 disk: DiskState {
                     hash: vaultfs::hash_bytes(&bytes),
@@ -758,7 +776,7 @@ impl Engine {
                 }
             }
             let fetched = self.fetch_chunks(wanted).await?;
-            on_remote.extend(fetched.keys().cloned());
+            on_remote.extend(fetched.data.keys().cloned());
             for c in unit {
                 let entry = AdoptEntry {
                     path: c.doc.path.clone(),

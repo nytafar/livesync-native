@@ -21,11 +21,13 @@ mod doc;
 mod error;
 pub mod ids;
 mod key;
+mod passphrase;
 mod policy;
 mod sync_params;
 
 pub use doc::DocumentCipher;
 pub use error::{ContentKind, CryptoError, Unsupported};
 pub use key::{KeyContext, OsRandom, RandomSource, HKDF_PREFIX, PBKDF2_ITERATIONS};
+pub use passphrase::Passphrase;
 pub use policy::{check_unencrypted_content, unencrypted_content_kinds};
 pub use sync_params::{parse_pbkdf2_salt, SyncParamsError};

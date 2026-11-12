@@ -1,7 +1,7 @@
 use std::fmt;
 
 /// What a failed encryption step means for the caller.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum CryptoError {
     /// AES-GCM authentication failed: the passphrase (or the PBKDF2 salt) is
     /// wrong, or the ciphertext was changed. The two cannot be told apart.

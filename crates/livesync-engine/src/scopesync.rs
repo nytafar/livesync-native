@@ -16,8 +16,6 @@ use crate::index::State;
 use crate::vaultfs::{self, RemoveOutcome};
 use livesync_model::path::{is_internal_id, path_to_id};
 use livesync_model::scope::{Scope, Widening};
-use livesync_remote::ChangeRow;
-use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::{debug, info, warn};
 
@@ -158,19 +156,7 @@ impl Engine {
             );
             for keys in ids.chunks(100) {
                 let rows = self.inner.couch.all_docs_by_keys(keys).await?;
-                let changes: Vec<ChangeRow> = rows
-                    .into_iter()
-                    .filter_map(|r| {
-                        let doc = r.doc.filter(|d| !d.is_null())?;
-                        Some(ChangeRow {
-                            seq: Value::Null,
-                            id: r.key.unwrap_or_default(),
-                            changes: vec![],
-                            deleted: false,
-                            doc: Some(doc),
-                        })
-                    })
-                    .collect();
+                let changes = crate::engine::rows_as_changes(rows);
                 self.apply_batch(changes).await?;
             }
         }
@@ -333,19 +319,7 @@ impl Engine {
         }
         for keys in ids.chunks(100) {
             let rows = self.inner.couch.all_docs_by_keys(keys).await?;
-            let changes: Vec<ChangeRow> = rows
-                .into_iter()
-                .filter_map(|r| {
-                    let doc = r.doc.filter(|d| !d.is_null())?;
-                    Some(ChangeRow {
-                        seq: Value::Null,
-                        id: r.key.unwrap_or_default(),
-                        changes: vec![],
-                        deleted: false,
-                        doc: Some(doc),
-                    })
-                })
-                .collect();
+            let changes = crate::engine::rows_as_changes(rows);
             self.apply_batch(changes).await?;
         }
         Ok(())

@@ -28,6 +28,7 @@ url = "2.5.8"
 libc = "0.2"
 
 [dev-dependencies]
+livesync-crypto = { version = "0.1.0", path = "../livesync-crypto" }
 axum = "0.8.9"
 futures = "0.3.34"
 tempfile = "3.27.0"

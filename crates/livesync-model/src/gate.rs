@@ -113,8 +113,29 @@ pub enum Refusal {
     TweakMismatch(String),
     #[error("the remote's PREFERRED settings (the milestone's tweaks) hold settings this client does not know: {0}; a newer Self-hosted LiveSync may have added them. {KNOWN_GOOD}; once you checked they do not change what is stored, adopt them with `lsync connect --adopt-tweaks`")]
     UnknownTweaks(String),
-    #[error("encrypted or obfuscated content found ({0}); end-to-end encryption is not supported yet. {KNOWN_GOOD}")]
+    #[error("encrypted or obfuscated content found ({0}) that this vault cannot read: lsync reads end-to-end encrypted databases (encrypt=true with a passphrase set for the vault, E2EE algorithm V2) but not path obfuscation, and never encrypted chunks in a database whose settings say encrypt=false. {KNOWN_GOOD}")]
     EncryptedContent(String),
+    /// The 1.0.49 unencrypted-content policy rejected a remote document:
+    /// plaintext content in an end-to-end encrypted database. Like upstream's
+    /// replication, the pull stops there (nothing of that batch is applied).
+    #[error("the remote document {document} holds unencrypted {kind} content, which an end-to-end encrypted database must not; it was rejected and the pull stops before it, as Self-hosted LiveSync 1.0.49 does. A device without end-to-end encryption may have written it: check that device's settings. If this content is meant, set `accept_unencrypted_content = true` for the vault (the plugin's \"acceptUnencryptedContent\")")]
+    UnencryptedContent { document: String, kind: String },
+    /// `encrypt=true` on the remote, and no passphrase for this vault.
+    /// `how`: how this front-end sets one.
+    #[error("the remote database is end-to-end encrypted (encrypt=true in its PREFERRED settings) and this vault has no passphrase; {how}")]
+    PassphraseMissing { how: String },
+    /// A passphrase for this vault, and a remote that is not encrypted.
+    #[error("this vault has an end-to-end encryption passphrase, but the remote database is not encrypted (encrypt is not true in its PREFERRED settings); lsync never writes encrypted content into a plaintext database. Remove the passphrase from the vault (`lsync vault passphrase NAME --remove`) or check that the vault points at the right database")]
+    PassphraseOnPlainDatabase,
+    /// The passphrase does not decrypt what the database holds.
+    #[error("the vault's passphrase does not decrypt the remote database ({0} failed authentication): it is not the passphrase this database was encrypted with. Nothing was written to the vault folder or the remote; set the right passphrase with `lsync vault passphrase NAME`")]
+    WrongPassphrase(String),
+    /// Nothing the passphrase could be checked against decrypts with V2.
+    #[error("the vault's passphrase cannot be checked: {0}. Nothing is synced until it can")]
+    UnverifiablePassphrase(String),
+    /// No PBKDF2 salt (`_local/obsidian_livesync_sync_parameters`).
+    #[error("the remote database has no encryption salt (`_local/obsidian_livesync_sync_parameters` {0}); {1}")]
+    NoSyncParameters(String, String),
     #[error("the local index belongs to a different remote ({0}); use another state directory or reset the index")]
     ForeignIndex(String),
     #[error("the local index belongs to the vault folder {index_vault}, not {vault}; use the profile or state directory that belongs to {vault}, or a new one")]
@@ -155,6 +176,7 @@ impl Refusal {
                 | Refusal::TweakMismatch(_)
                 | Refusal::UnknownTweaks(_)
                 | Refusal::EncryptedContent(_)
+                | Refusal::UnencryptedContent { .. }
         )
     }
 
@@ -595,7 +617,15 @@ pub fn unsupported_tweaks(p: &Map<String, Value>) -> Vec<Refusal> {
     let mut unsupported = |m: String| out.push(Refusal::UnsupportedSetting(m));
     let b = |k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
     if b("encrypt") {
-        unsupported("encrypt=true (end-to-end encryption arrives in M3)".into());
+        // V2 only: `""` is V1 and `forceV1` writes V1; absent is upstream's
+        // known default, V2.
+        match p.get("E2EEAlgorithm") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) if s == "v2" => {}
+            Some(v) => unsupported(format!(
+                "E2EEAlgorithm={v} with encrypt=true (lsync reads and writes only the V2 algorithm, \"v2\")"
+            )),
+        }
     }
     if b("usePathObfuscation") {
         unsupported("usePathObfuscation=true".into());
@@ -729,8 +759,20 @@ mod tests {
     fn tweaks() {
         let ok = json!({"encrypt":false,"usePathObfuscation":false,"hashAlg":"xxhash64","handleFilenameCaseSensitive":false});
         assert_eq!(assess_supported_tweaks(ok.as_object().unwrap()), Ok(()));
-        for bad in [
+        // End-to-end encryption with V2 (or upstream's default) passes here;
+        // whether the vault has the passphrase is the engine's to judge.
+        for good in [
             json!({"encrypt":true}),
+            json!({"encrypt":true,"E2EEAlgorithm":"v2"}),
+            json!({"encrypt":false,"E2EEAlgorithm":""}),
+        ] {
+            assert_eq!(assess_supported_tweaks(good.as_object().unwrap()), Ok(()), "{good}");
+        }
+        for bad in [
+            json!({"encrypt":true,"E2EEAlgorithm":""}),
+            json!({"encrypt":true,"E2EEAlgorithm":"forceV1"}),
+            json!({"encrypt":true,"encryptInternalMetadata":true}),
+            json!({"encrypt":true,"idDerivationVersion":1}),
             json!({"usePathObfuscation":true}),
             json!({"hashAlg":"sha1"}),
             json!({"hashAlg":""}),

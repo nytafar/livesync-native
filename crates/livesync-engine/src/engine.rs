@@ -7,7 +7,6 @@ use crate::index::{FileRow, Index, LocalIssue, Origin, PendingRow, RevisionRow, 
 use crate::platform::{self, Holder, VaultLock, VaultLockError};
 use crate::vaultfs::{self, DiskState, Expect, LockError, LockFile, RemoveOutcome, Trash, TrashMode, WriteError};
 use futures::stream::{self, StreamExt};
-use livesync_model::chunk::chunk_id_xxhash64;
 use livesync_model::codec::{self, CodecError};
 use livesync_model::doc::{classify_doc, Classified, MILESTONE_LOCAL_ID, SYNC_PARAMS_LOCAL_ID, VERSION_DOC_ID};
 use livesync_model::gate::{self, Milestone, Refusal};
@@ -297,7 +296,23 @@ pub struct EngineConfig {
     /// (default). `false` behaves as if flock failed with ENOSYS, as on
     /// Android's shared storage, so tests can run that path anywhere.
     pub vault_flock: bool,
+    /// The end-to-end encryption passphrase of the remote database, for a
+    /// vault whose remote has `encrypt=true` (and only then). Never logged.
+    pub passphrase: Option<livesync_crypto::Passphrase>,
+    /// Accept plaintext content in an encrypted database (upstream's
+    /// `acceptUnencryptedContent`, default off: such a document stops the pull).
+    pub accept_unencrypted_content: bool,
+    /// How this front-end sets a passphrase, for the refusal when an
+    /// encrypted database has none ([`PASSPHRASE_HOW_CLI`] by default).
+    pub passphrase_how: String,
 }
+
+/// Ends the reason of a remote document held because it cannot be
+/// decrypted; the push side leaves such a document's file alone.
+pub const HELD_NOTE: &str = "held: the local file is left alone and nothing is pushed for it";
+
+/// How the CLI sets a vault's passphrase (the refusal's advice).
+pub const PASSPHRASE_HOW_CLI: &str = "set the passphrase the database was encrypted with: `lsync vault passphrase NAME` (it asks for it, or reads it with --passphrase-stdin), or import the plugin's settings with `lsync import`";
 
 /// A front-end check that the vault is fully visible to this process (for
 /// example that Android's all-files access is still granted). `Err` carries
@@ -451,6 +466,9 @@ impl EngineConfig {
             delete_hold_max: Duration::from_secs(120),
             access_check: None,
             vault_flock: true,
+            passphrase: None,
+            accept_unencrypted_content: false,
+            passphrase_how: PASSPHRASE_HOW_CLI.to_string(),
         }
     }
 }
@@ -648,7 +666,26 @@ pub(crate) struct Runtime {
     pub(crate) split: SplitParams,
     /// The PREFERRED tweaks, advertised as ours when registering.
     pub(crate) preferred: Map<String, Value>,
+    /// How chunk IDs are made: plain, or mixed with the passphrase.
+    pub(crate) chunk_ids: livesync_model::chunk::ChunkIdScheme,
 }
+
+/// The end-to-end encryption set up for one PBKDF2 salt: the key is derived
+/// once and reused until the salt changes.
+pub(crate) struct CryptoSession {
+    salt: Vec<u8>,
+    /// Checked against the database before it was kept.
+    cipher: Arc<livesync_crypto::DocumentCipher>,
+}
+
+/// The `_all_docs` key range of encrypted chunks (`h:+…`).
+const ENCRYPTED_CHUNKS: (&str, &str) = ("h:+", "h:,");
+
+/// How many V2 ciphertexts the passphrase check tries (any one that
+/// decrypts proves it; one damaged chunk does not make it wrong).
+const PASSPHRASE_PROBES: usize = 3;
+/// How many encrypted chunks it looks at to find them.
+const PASSPHRASE_PROBE_PAGE: usize = 50;
 
 pub(crate) struct Inner {
     pub(crate) couch: Couch,
@@ -711,6 +748,11 @@ pub(crate) struct Inner {
     fold_lock: Mutex<()>,
     /// The milestone the gate read last (for log lines).
     last_milestone: Mutex<Option<Value>>,
+    /// The key for an encrypted remote, once derived.
+    pub(crate) crypto: tokio::sync::Mutex<Option<CryptoSession>>,
+    /// This session may write to the remote (the two-way commands): only
+    /// then may the gate create missing sync parameters.
+    pub(crate) may_write: AtomicBool,
     // Fields drop in declaration order: the vault lock goes before the state
     // lock, and the state lock last of all, so whoever waits for the state
     // lock (the FFI host restarting a profile) finds the vault free too.
@@ -778,6 +820,51 @@ pub(crate) fn conflict_note(doc: &FileDoc) -> String {
         "{} conflicting revision(s); resolve with an official client",
         doc.conflicts.len()
     )
+}
+
+/// Chunks a fetch got: their (decompressed) data, and the ones the
+/// encryption transform could not read, with why.
+#[derive(Default)]
+pub(crate) struct Chunks {
+    pub(crate) data: HashMap<String, String>,
+    pub(crate) failed: HashMap<String, String>,
+}
+
+/// A document the encryption transform refused: plaintext content stops the
+/// pull (as upstream's replication stops), anything else is held.
+pub(crate) fn held_or_stop(u: &livesync_remote::Undecryptable) -> Result<()> {
+    match &u.error {
+        livesync_crypto::CryptoError::Rejected {
+            document_id,
+            content_kind,
+        } => Err(Refusal::UnencryptedContent {
+            document: document_id.clone(),
+            kind: content_kind.to_string(),
+        }
+        .into()),
+        _ => Ok(()),
+    }
+}
+
+/// `_all_docs` rows as changes to apply: the bodies, and the documents the
+/// encryption transform refused (held by `apply_batch`, never dropped).
+pub(crate) fn rows_as_changes(rows: Vec<livesync_remote::AllDocsRow>) -> Vec<ChangeRow> {
+    rows.into_iter()
+        .filter_map(|r| {
+            let doc = r.doc.filter(|d| !d.is_null());
+            if doc.is_none() && r.undecryptable.is_none() {
+                return None;
+            }
+            Some(ChangeRow {
+                seq: Value::Null,
+                id: r.key.unwrap_or_default(),
+                changes: vec![],
+                deleted: false,
+                doc,
+                undecryptable: r.undecryptable,
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn seq_to_string(v: &Value) -> String {
@@ -906,6 +993,7 @@ impl Engine {
                     case_sensitive_ids: false,
                     split: SplitParams::default(),
                     preferred: Map::new(),
+                    chunk_ids: Default::default(),
                 }),
                 filters: Mutex::new(Arc::new(filters)),
                 trash,
@@ -931,6 +1019,8 @@ impl Engine {
                 stored_taps,
                 fold_lock: Mutex::new(()),
                 last_milestone: Mutex::new(None),
+                crypto: tokio::sync::Mutex::new(None),
+                may_write: AtomicBool::new(false),
                 _vault_lock: vault_lock,
                 _state_lock: state_lock,
             }),
@@ -1075,11 +1165,14 @@ impl Engine {
         let milestone = self.inner.last_milestone.lock().unwrap().clone();
         let seen = milestone.and_then(|m| gate::newest_remote_plugin(&m, &node));
         let message = match seen {
-            Some(s) => format!("{r} (the newest plugin the remote's milestone lists: {s})"),
-            None => r.to_string(),
+            // Plaintext in an encrypted database is no newer plugin's doing.
+            Some(s) if !matches!(r, Refusal::UnencryptedContent { .. }) => {
+                format!("{r} (the newest plugin the remote's milestone lists: {s})")
+            }
+            _ => r.to_string(),
         };
         let reason = match r {
-            Refusal::EncryptedContent(_) => format!("{CONTENT_STOP}{message}"),
+            Refusal::EncryptedContent(_) | Refusal::UnencryptedContent { .. } => format!("{CONTENT_STOP}{message}"),
             _ => message.clone(),
         };
         GuardStop {
@@ -1261,6 +1354,9 @@ impl Engine {
         let preferred = milestone.preferred().ok_or(Refusal::MissingPreferredTweaks)?.clone();
         gate::assess_supported_tweaks(&preferred)?;
         let params = couch.get_doc(&format!("_local/{SYNC_PARAMS_LOCAL_ID}"), false).await?;
+        // Before anything else is decided or recorded: a wrong or missing
+        // passphrase stops here.
+        let params = self.setup_encryption(&preferred, params).await?;
         let salt = params
             .as_ref()
             .and_then(|p| p.get("pbkdf2salt"))
@@ -1383,6 +1479,205 @@ impl Engine {
             fetch_to_resolve,
             needs_full_fetch,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // End-to-end encryption
+    // ------------------------------------------------------------------
+
+    /// Match the vault's passphrase with the remote's `encrypt`, and with
+    /// encryption on: the PBKDF2 salt (created by a session that may write,
+    /// when there is none), the key (derived once per salt, off the async
+    /// threads), the passphrase checked against the database, then the
+    /// transform and the chunk IDs. Returns the sync parameters as they are now.
+    async fn setup_encryption(&self, preferred: &Map<String, Value>, params: Option<Value>) -> Result<Option<Value>> {
+        use livesync_crypto::{parse_pbkdf2_salt, SyncParamsError};
+        let couch = &self.inner.couch;
+        let encrypt = preferred.get("encrypt").and_then(Value::as_bool).unwrap_or(false);
+        let passphrase = self.inner.cfg.passphrase.clone().filter(|p| !p.is_empty());
+        let mut session = self.inner.crypto.lock().await;
+        let pass = match (encrypt, passphrase) {
+            (false, None) => {
+                *session = None;
+                couch.set_cipher(None);
+                self.inner.runtime.lock().unwrap().chunk_ids = livesync_model::chunk::ChunkIdScheme::Plain;
+                return Ok(params);
+            }
+            (false, Some(_)) => return Err(Refusal::PassphraseOnPlainDatabase.into()),
+            (true, None) => {
+                return Err(Refusal::PassphraseMissing {
+                    how: self.inner.cfg.passphrase_how.clone(),
+                }
+                .into())
+            }
+            (true, Some(p)) => p,
+        };
+        let id = format!("_local/{SYNC_PARAMS_LOCAL_ID}");
+        let parsed = params.as_ref().map(parse_pbkdf2_salt);
+        let (params, salt) = match parsed {
+            Some(Ok(salt)) => (params, salt),
+            Some(Err(SyncParamsError::InvalidSalt | SyncParamsError::NotAnObject)) => {
+                return Err(Refusal::NoSyncParameters(
+                    "holds a salt that is not base64".into(),
+                    "lsync does not guess a salt; repair the document with an official client".into(),
+                )
+                .into())
+            }
+            None | Some(Err(SyncParamsError::NoSalt)) => {
+                let what = if params.is_some() { "has no salt" } else { "is missing" };
+                if !self.inner.may_write.load(Ordering::SeqCst) {
+                    return Err(Refusal::NoSyncParameters(
+                        what.into(),
+                        "a read-only pull never writes to the remote, so it cannot create one: run a two-way `lsync sync` once, or sync with an official client".into(),
+                    )
+                    .into());
+                }
+                let any = couch
+                    .all_docs_page_raw(Some(ENCRYPTED_CHUNKS.0), Some(ENCRYPTED_CHUNKS.1), 1, false)
+                    .await?;
+                if !any.is_empty() {
+                    return Err(Refusal::NoSyncParameters(
+                        what.into(),
+                        "but the database holds encrypted chunks already, which a new salt would not decrypt; lsync does not create one. Check the database with an official client".into(),
+                    )
+                    .into());
+                }
+                let params = self.create_sync_params(params).await?;
+                match params.as_ref().map(parse_pbkdf2_salt) {
+                    Some(Ok(salt)) => (params, salt),
+                    _ => {
+                        return Err(Refusal::NoSyncParameters(
+                            what.into(),
+                            "and it could not be created; try again".into(),
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+        if let Some(sess) = session.as_ref().filter(|s| s.salt == salt) {
+            couch.set_cipher(Some(sess.cipher.clone()));
+            return Ok(params);
+        }
+        if session.is_some() {
+            warn!("the remote's encryption salt ({id}) changed; deriving the key again");
+        }
+        let (key_pass, key_salt) = (pass.clone(), salt.clone());
+        let key =
+            tokio::task::spawn_blocking(move || livesync_crypto::KeyContext::derive(key_pass.expose(), &key_salt))
+                .await
+                .map_err(EngineError::other)?;
+        let cipher = Arc::new(livesync_crypto::DocumentCipher::new(
+            key,
+            self.inner.cfg.accept_unencrypted_content,
+        ));
+        self.verify_passphrase(&cipher).await?;
+        let ids = livesync_model::chunk::ChunkIdScheme::Encrypted(
+            livesync_model::chunk::PassphraseHash::from_passphrase(pass.expose()),
+        );
+        self.inner.runtime.lock().unwrap().chunk_ids = ids;
+        couch.set_cipher(Some(cipher.clone()));
+        *session = Some(CryptoSession { salt, cipher });
+        info!("end-to-end encryption: the passphrase opens the remote database");
+        Ok(params)
+    }
+
+    /// The passphrase against what the database holds: the `syncinfo`
+    /// document when there is one, else the first V2 chunks. An empty
+    /// database has nothing to check.
+    async fn verify_passphrase(&self, cipher: &livesync_crypto::DocumentCipher) -> Result<()> {
+        use livesync_crypto::CryptoError;
+        let couch = &self.inner.couch;
+        if let DocFetch::Found(info) = couch.fetch_doc_raw(livesync_crypto::ids::SYNCINFO_ID).await? {
+            let sealed = info
+                .get("data")
+                .and_then(Value::as_str)
+                .is_some_and(|d| d.starts_with(livesync_crypto::HKDF_PREFIX));
+            if sealed {
+                match cipher.outgoing(info) {
+                    Ok(_) => return Ok(()),
+                    Err(CryptoError::Authentication) => {
+                        return Err(Refusal::WrongPassphrase("the `syncinfo` document".into()).into())
+                    }
+                    Err(e) => debug!("syncinfo does not tell the passphrase ({e}); trying chunks"),
+                }
+            }
+        }
+        let rows = couch
+            .all_docs_page_raw(
+                Some(ENCRYPTED_CHUNKS.0),
+                Some(ENCRYPTED_CHUNKS.1),
+                PASSPHRASE_PROBE_PAGE,
+                true,
+            )
+            .await?;
+        let mut tried = Vec::new();
+        let mut seen = 0usize;
+        for doc in rows.into_iter().filter_map(|r| r.doc).filter(|d| !d.is_null()) {
+            let v2 = doc.get("type").and_then(Value::as_str) == Some("leaf")
+                && doc.get("e_") == Some(&Value::Bool(true))
+                && doc
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .is_some_and(|d| d.starts_with(livesync_crypto::HKDF_PREFIX));
+            seen += 1;
+            if !v2 {
+                continue;
+            }
+            let id = doc.get("_id").and_then(Value::as_str).unwrap_or_default().to_string();
+            match cipher.outgoing(doc) {
+                Ok(_) => return Ok(()),
+                Err(CryptoError::Authentication) => tried.push(id),
+                Err(e) => debug!("chunk {id} does not tell the passphrase ({e})"),
+            }
+            if tried.len() >= PASSPHRASE_PROBES {
+                break;
+            }
+        }
+        match (seen, tried.is_empty()) {
+            (0, _) => Ok(()),
+            (_, false) => Err(Refusal::WrongPassphrase(format!("encrypted chunk {}", tried.join(", "))).into()),
+            (n, true) => Err(Refusal::UnverifiablePassphrase(format!(
+                "none of the first {n} encrypted chunks is V2 ciphertext (\"%=\"), the only kind lsync reads"
+            ))
+            .into()),
+        }
+    }
+
+    /// Write the sync parameters with a new PBKDF2 salt (upstream's
+    /// `SyncParamsHandler`), keeping another device's when it wrote first.
+    async fn create_sync_params(&self, existing: Option<Value>) -> Result<Option<Value>> {
+        use rand::RngCore;
+        let couch = &self.inner.couch;
+        let id = format!("_local/{SYNC_PARAMS_LOCAL_ID}");
+        let mut current = existing;
+        for _ in 0..3 {
+            if current
+                .as_ref()
+                .is_some_and(|p| livesync_crypto::parse_pbkdf2_salt(p).is_ok())
+            {
+                return Ok(current);
+            }
+            let mut raw = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut raw);
+            let salt = codec::base64_encode(&raw);
+            let doc = match current.take() {
+                Some(mut d) => {
+                    d["pbkdf2salt"] = Value::from(salt);
+                    d
+                }
+                None => serde_json::json!({
+                    "_id": id, "type": "sync-parameters", "protocolVersion": 2, "pbkdf2salt": salt
+                }),
+            };
+            match couch.put_doc(&doc).await? {
+                PutOutcome::Saved { .. } => info!("created the remote's encryption salt ({id})"),
+                // Another device wrote it meanwhile: theirs is the one.
+                PutOutcome::Conflict => debug!("{id} was written meanwhile; reading it again"),
+            }
+            current = couch.get_doc(&id, false).await?;
+        }
+        Ok(current)
     }
 
     /// Register this node in the milestone (`node_info`, `tweak_values`,
@@ -1522,7 +1817,15 @@ impl Engine {
                 })
                 .await?;
             let n = resp.results.len();
-            self.apply_batch(resp.results).await?;
+            if let Err(e) = self.apply_batch(resp.results).await {
+                // A content stop (plaintext in an encrypted database, or
+                // content this vault cannot read) shows in `status` from
+                // here, for one-shot commands as for the daemon.
+                if let EngineError::Refused(Refusal::EncryptedContent(_) | Refusal::UnencryptedContent { .. }) = &e {
+                    self.record_error(&e);
+                }
+                return Err(e);
+            }
             self.with_index(|ix| ix.set_meta(meta::SINCE, &seq_to_string(&resp.last_seq)))?;
             if n > 0 {
                 self.log_progress(start, &before, resp.pending);
@@ -1594,7 +1897,18 @@ impl Engine {
         // Last occurrence of each document wins.
         let mut order: Vec<String> = Vec::new();
         let mut by_id: HashMap<String, Value> = HashMap::new();
+        // Documents the encryption transform refused, held (never applied).
+        let mut held: HashMap<String, Box<livesync_remote::Undecryptable>> = HashMap::new();
         for row in rows {
+            if let Some(u) = row.undecryptable {
+                // Plaintext in an encrypted database: the pull stops before
+                // anything of this batch is applied, as upstream's does.
+                held_or_stop(&u)?;
+                by_id.remove(&row.id);
+                held.insert(row.id, u);
+                continue;
+            }
+            held.remove(&row.id);
             let doc = match row.doc {
                 Some(d) => d,
                 None if row.deleted => {
@@ -1621,7 +1935,7 @@ impl Engine {
         let mut ignored = 0u64;
         // Pre-scan: refusals stop the batch before anything is applied.
         for id in &order {
-            let doc = &by_id[id];
+            let Some(doc) = by_id.get(id) else { continue };
             match classify_doc(doc) {
                 Classified::VersionDoc(v) => {
                     gate::assess_version_doc(Some(&v), true)?;
@@ -1663,7 +1977,7 @@ impl Engine {
                 }
                 Classified::Other { .. } => ignored += 1,
                 Classified::File(f) => {
-                    if let Some(c) = f.children.iter().find(|c| c.starts_with("h:+")) {
+                    if let Some(c) = self.unreadable_child(&f) {
                         return Err(Refusal::EncryptedContent(format!("chunk {c} of {}", f.path)).into());
                     }
                     if is_internal_id(&f.id) {
@@ -1706,6 +2020,9 @@ impl Engine {
         // Deletions and skips are quick, local-only work.
         let this = self.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
+            for u in held.into_values() {
+                this.hold_undecryptable(&u)?;
+            }
             for (id, rev, doc) in deletes {
                 this.apply_delete(&id, rev.as_deref(), doc.as_ref())?;
             }
@@ -1741,6 +2058,17 @@ impl Engine {
             r?;
         }
         Ok(())
+    }
+
+    /// An encrypted chunk in a document of a database this vault does not
+    /// decrypt (its settings say `encrypt=false`).
+    pub(crate) fn unreadable_child<'a>(&self, f: &'a FileDoc) -> Option<&'a String> {
+        if self.inner.couch.cipher().is_some() {
+            return None;
+        }
+        f.children
+            .iter()
+            .find(|c| livesync_crypto::ids::is_encrypted_chunk_id(c))
     }
 
     pub(crate) fn skip_reason(&self, f: &FileDoc) -> Option<Skip> {
@@ -2258,11 +2586,15 @@ impl Engine {
     }
 
     /// Fetch chunks with `POST _all_docs {keys}`: at most 100 keys and about
-    /// 16 MB of expected data per request. Missing chunks are left out.
-    pub(crate) async fn fetch_chunks(&self, wanted: Vec<(String, u64)>) -> Result<HashMap<String, String>> {
+    /// 16 MB of expected data per request. Missing chunks are left out;
+    /// chunks the encryption transform cannot read are listed with why (the
+    /// files that need them are held), and plaintext content in an encrypted
+    /// database stops the pull (the unencrypted-content policy).
+    pub(crate) async fn fetch_chunks(&self, wanted: Vec<(String, u64)>) -> Result<Chunks> {
         const MAX_KEYS: usize = 100;
         const MAX_BYTES: u64 = 16 * 1024 * 1024;
         let mut out = HashMap::with_capacity(wanted.len());
+        let mut failed = HashMap::new();
         let mut groups: Vec<Vec<String>> = Vec::new();
         let (mut cur, mut bytes) = (Vec::new(), 0u64);
         for (id, est) in wanted {
@@ -2281,6 +2613,12 @@ impl Engine {
             let mut fetched = 0u64;
             let mut nbytes = 0u64;
             for row in rows {
+                if let Some(u) = row.undecryptable {
+                    held_or_stop(&u)?;
+                    warn!("chunk {}: {}", u.id, u.error);
+                    failed.insert(u.id.clone(), u.error.to_string());
+                    continue;
+                }
                 let Some(doc) = row.doc else { continue };
                 let chunk: livesync_model::ChunkDoc = match serde_json::from_value(doc) {
                     Ok(c) => c,
@@ -2295,7 +2633,9 @@ impl Engine {
                     warn!("not a chunk: {:?} (type {:?})", row.key, chunk.kind);
                     continue;
                 }
-                if chunk.encrypted == Some(true) || chunk.id.starts_with("h:+") {
+                // Still encrypted after the transform: no passphrase for it
+                // (the transform decrypts every `h:+` chunk it reads).
+                if chunk.encrypted == Some(true) {
                     return Err(Refusal::EncryptedContent(format!("chunk {}", chunk.id)).into());
                 }
                 let data = match codec::decompress(&chunk.data) {
@@ -2313,7 +2653,7 @@ impl Engine {
             r.chunks_fetched += fetched;
             r.chunk_bytes += nbytes;
         }
-        Ok(out)
+        Ok(Chunks { data: out, failed })
     }
 
     async fn fetch_with_retry(&self, keys: &[String]) -> Result<Vec<livesync_remote::AllDocsRow>> {
@@ -2332,25 +2672,25 @@ impl Engine {
     }
 
     /// Concatenate a document's chunks. `Err` carries a reason to defer.
-    pub(crate) fn assemble(
-        &self,
-        doc: &FileDoc,
-        chunks: &HashMap<String, String>,
-    ) -> std::result::Result<Vec<u8>, String> {
+    pub(crate) fn assemble(&self, doc: &FileDoc, chunks: &Chunks) -> std::result::Result<Vec<u8>, String> {
+        let ids = self.inner.runtime.lock().unwrap().chunk_ids.clone();
         // `size` is the remote's word: reserve no more than 64 MiB on it.
         let mut out = Vec::with_capacity(doc.size.min(64 << 20) as usize);
         let mut missing = 0usize;
         let mut id_mismatch = 0u64;
         for c in &doc.children {
-            let piece: std::borrow::Cow<'_, str> = match (doc.eden.get(c), chunks.get(c)) {
+            let piece: std::borrow::Cow<'_, str> = match (doc.eden.get(c), chunks.data.get(c)) {
                 (Some(e), _) => codec::decompress(e).map_err(|e| format!("eden chunk {c}: {e}"))?,
                 (None, Some(d)) => std::borrow::Cow::Borrowed(d.as_str()),
                 (None, None) => {
+                    if let Some(why) = chunks.failed.get(c) {
+                        return Err(format!("chunk {c} cannot be read ({why}); {HELD_NOTE}"));
+                    }
                     missing += 1;
                     continue;
                 }
             };
-            if chunk_id_xxhash64(&piece) != *c {
+            if ids.chunk_id(&piece) != *c {
                 id_mismatch += 1;
             }
             match doc.kind {
@@ -2396,6 +2736,20 @@ impl Engine {
         warn!("{path}: deferred ({reason})");
         self.inner.report.lock().unwrap().pending += 1;
         self.with_index(|ix| ix.add_pending(id, rev, reason, vaultfs::now_ms()))
+    }
+
+    /// A remote document that cannot be decrypted (a wrong key for it, a
+    /// changed ciphertext, a V1 representation): pending, with why. Its
+    /// local file, if any, is left alone, and nothing is pushed for it.
+    fn hold_undecryptable(&self, u: &livesync_remote::Undecryptable) -> Result<()> {
+        let path = u.path.as_deref().unwrap_or(&u.id);
+        // Not a file this vault syncs: nothing to hold, but said.
+        if is_internal_id(&u.id) || u.id == livesync_crypto::ids::SYNCINFO_ID || !self.inner.cfg.scope.contains(path) {
+            warn!("{}: {}; not a file this vault syncs, passed over", u.id, u.error);
+            return Ok(());
+        }
+        let reason = format!("cannot be decrypted ({}); {HELD_NOTE}", u.error);
+        self.defer(&u.id, u.rev.as_deref(), path, &reason)
     }
 
     fn defer_doc(&self, doc: &FileDoc, reason: &str) -> Result<()> {
@@ -2690,7 +3044,22 @@ impl Engine {
         info!("retrying {} pending document(s)", due.len());
         let mut rows = Vec::new();
         for p in &due {
-            let doc = match self.inner.couch.fetch_doc(&p.doc_id, true).await? {
+            let doc = match self.inner.couch.fetch_doc(&p.doc_id, true).await {
+                // Still unreadable: held again by `apply_batch`.
+                Err(RemoteError::Crypto(u)) => {
+                    rows.push(ChangeRow {
+                        seq: Value::Null,
+                        id: p.doc_id.clone(),
+                        changes: vec![],
+                        deleted: false,
+                        doc: None,
+                        undecryptable: Some(u),
+                    });
+                    continue;
+                }
+                r => r?,
+            };
+            let doc = match doc {
                 DocFetch::Found(d) => d,
                 DocFetch::Deleted => serde_json::json!({"_id": p.doc_id, "_deleted": true}),
                 // Not a deletion: the database may have been recreated, or a
@@ -2715,6 +3084,7 @@ impl Engine {
                 changes: vec![],
                 deleted: false,
                 doc: Some(doc),
+                undecryptable: None,
             });
         }
         self.apply_batch(rows).await?;
@@ -2751,6 +3121,7 @@ impl Engine {
 
     async fn run_inner(&self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         self.check_plugin_guard()?;
+        self.inner.may_write.store(true, Ordering::SeqCst);
         // Each side stops when the caller says so, or when the other side
         // ended (a fatal error on one side stops both).
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -2786,6 +3157,7 @@ impl Engine {
     /// owed), register, then push everything that changed locally.
     pub async fn sync_once(&self) -> Result<SyncReport> {
         self.check_plugin_guard()?;
+        self.inner.may_write.store(true, Ordering::SeqCst);
         self.begin_one_shot();
         let start = Instant::now();
         self.reset_report();

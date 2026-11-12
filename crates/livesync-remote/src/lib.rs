@@ -3,6 +3,18 @@
 //! longpoll with heartbeat), chunk fetches through `POST _all_docs`, and the
 //! writes two-way sync needs: `PUT` with an explicit `_rev`, `_bulk_docs`
 //! (normal and `new_edits:false`) and `_local` document updates.
+//!
+//! End-to-end encryption is a transform at this boundary, as upstream's
+//! transform-pouch does it: with a cipher set ([`Couch::set_cipher`]), every
+//! document body read is passed through [`DocumentCipher::outgoing`] before
+//! the caller sees it, and every document written through
+//! [`DocumentCipher::incoming`], so the engine works on plaintext documents
+//! only. `_local/` documents and tombstones pass untouched. A document the
+//! transform refuses is never handed on as if it were valid: a row carries it
+//! as [`Undecryptable`] (with no body), a single read fails with
+//! [`RemoteError::Crypto`]. Writes are guarded both ways: nothing with
+//! plaintext content or a plain `h:` chunk ID goes into an encrypted database,
+//! and nothing encrypted into a plaintext one ([`RemoteError::Guard`]).
 
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -11,6 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use url::Url;
+
+pub use livesync_crypto::{CryptoError, DocumentCipher};
 
 pub mod backoff;
 pub use backoff::Backoff;
@@ -35,6 +49,35 @@ pub enum RemoteError {
     /// kept talking (the longpoll's heartbeats): the connection is taken for dead.
     #[error("no data during {what} for {after:?}; the connection is taken for dead")]
     Silent { what: String, after: Duration },
+    /// A document read through the end-to-end encryption transform could
+    /// not be decrypted, or was rejected by the unencrypted-content policy.
+    #[error("{0}")]
+    Crypto(Box<Undecryptable>),
+    /// A write refused before it was sent: it would have put plaintext into
+    /// an encrypted database, or encrypted content into a plaintext one.
+    #[error("refused to write {0}")]
+    Guard(String),
+}
+
+/// A remote document the end-to-end encryption transform refused, with what
+/// is known of it without decrypting (its metadata is not encrypted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Undecryptable {
+    pub id: String,
+    pub rev: Option<String>,
+    /// The file path, for a file document.
+    pub path: Option<String>,
+    pub error: CryptoError,
+}
+
+impl std::fmt::Display for Undecryptable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.error {
+            // Its own message names the document.
+            CryptoError::Rejected { .. } => write!(f, "{}", self.error),
+            e => write!(f, "remote document {}: {e}", self.id),
+        }
+    }
 }
 
 impl RemoteError {
@@ -44,7 +87,7 @@ impl RemoteError {
             RemoteError::Transport { .. } | RemoteError::Silent { .. } => true,
             RemoteError::Http { status, .. } => *status >= 500 || *status == 429 || *status == 408,
             RemoteError::Decode { .. } => true, // truncated bodies on flaky links
-            RemoteError::Url(_) => false,
+            RemoteError::Url(_) | RemoteError::Crypto(_) | RemoteError::Guard(_) => false,
         }
     }
 
@@ -113,6 +156,9 @@ pub struct ChangeRow {
     pub deleted: bool,
     #[serde(default)]
     pub doc: Option<Value>,
+    /// The document the encryption transform refused (`doc` is then `None`).
+    #[serde(skip)]
+    pub undecryptable: Option<Box<Undecryptable>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,6 +195,9 @@ pub struct AllDocsRow {
     pub error: Option<String>,
     #[serde(default)]
     pub value: Option<Value>,
+    /// The document the encryption transform refused (`doc` is then `None`).
+    #[serde(skip)]
+    pub undecryptable: Option<Box<Undecryptable>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +265,9 @@ pub struct Couch {
     label: String,
     /// Response body bytes read by this client and its clones.
     rx_bytes: Arc<AtomicU64>,
+    /// The end-to-end encryption transform, shared by this client's clones;
+    /// `None` for a plaintext database.
+    cipher: Arc<RwLock<Option<Arc<DocumentCipher>>>>,
 }
 
 impl std::fmt::Debug for Couch {
@@ -298,11 +350,54 @@ impl Couch {
             password,
             label,
             rx_bytes: Arc::new(AtomicU64::new(0)),
+            cipher: Arc::new(RwLock::new(None)),
         })
     }
 
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// Turn the end-to-end encryption transform on (a cipher) or off
+    /// (`None`: a plaintext database), for this client and its clones.
+    pub fn set_cipher(&self, cipher: Option<Arc<DocumentCipher>>) {
+        *self.cipher.write().unwrap_or_else(|e| e.into_inner()) = cipher;
+    }
+
+    /// The transform in use, if any.
+    pub fn cipher(&self) -> Option<Arc<DocumentCipher>> {
+        self.cipher.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// A document body as read from the remote, through the transform.
+    pub fn decrypt(&self, doc: Value) -> std::result::Result<Value, Box<Undecryptable>> {
+        match self.cipher() {
+            Some(c) => decrypt_with(&c, doc),
+            None => Ok(doc),
+        }
+    }
+
+    /// A document as it is to be written, through the transform and the
+    /// write guard.
+    pub fn encrypt(&self, doc: &Value) -> Result<Value> {
+        encrypt_with(self.cipher().as_deref(), doc)
+    }
+
+    fn decrypt_rows<T>(
+        &self,
+        rows: &mut [T],
+        parts: impl Fn(&mut T) -> (&mut Option<Value>, &mut Option<Box<Undecryptable>>),
+    ) {
+        let Some(c) = self.cipher() else { return };
+        for r in rows {
+            let (doc, failed) = parts(r);
+            if let Some(d) = doc.take() {
+                match decrypt_with(&c, d) {
+                    Ok(d) => *doc = Some(d),
+                    Err(u) => *failed = Some(u),
+                }
+            }
+        }
     }
 
     /// Response body bytes read so far by this client and its clones (the
@@ -465,7 +560,7 @@ impl Couch {
     pub async fn fetch_rev(&self, id: &str, rev: &str) -> Result<DocFetch> {
         let mut url = self.id_url(id);
         url.query_pairs_mut().append_pair("rev", rev);
-        self.fetch_url(id, url).await
+        self.fetch_decrypted(id, url).await
     }
 
     /// The ancestry of one revision (`GET /{db}/{id}?rev=…&revs=true`): the
@@ -516,7 +611,8 @@ impl Couch {
             .and_then(Value::as_str)
             .ok_or_else(|| RemoteError::Url("document without _id".into()))?;
         let what = format!("PUT {id}");
-        let r = self.send(&what, self.http().put(self.id_url(id)).json(doc)).await?;
+        let doc = self.encrypt(doc)?;
+        let r = self.send(&what, self.http().put(self.id_url(id)).json(&doc)).await?;
         if r.status() == StatusCode::CONFLICT {
             return Ok(PutOutcome::Conflict);
         }
@@ -536,6 +632,7 @@ impl Couch {
     /// tree as given (CouchDB then answers with an empty list on success).
     pub async fn bulk_docs(&self, docs: &[Value], new_edits: bool) -> Result<Vec<BulkResult>> {
         let url = self.doc_url(&["_bulk_docs"]);
+        let docs = docs.iter().map(|d| self.encrypt(d)).collect::<Result<Vec<Value>>>()?;
         let body = if new_edits {
             json!({ "docs": docs })
         } else {
@@ -559,6 +656,20 @@ impl Couch {
     /// One page of `GET /{db}/_all_docs` in key order, starting at
     /// `start_key` (inclusive) and stopping at `end_key` (inclusive).
     pub async fn all_docs_page(
+        &self,
+        start_key: Option<&str>,
+        end_key: Option<&str>,
+        limit: usize,
+        include_docs: bool,
+    ) -> Result<Vec<AllDocsRow>> {
+        let mut rows = self.all_docs_page_raw(start_key, end_key, limit, include_docs).await?;
+        self.decrypt_rows(&mut rows, |r| (&mut r.doc, &mut r.undecryptable));
+        Ok(rows)
+    }
+
+    /// [`Couch::all_docs_page`] without the encryption transform: the
+    /// bodies as stored (for checking a passphrase against them).
+    pub async fn all_docs_page_raw(
         &self,
         start_key: Option<&str>,
         end_key: Option<&str>,
@@ -592,7 +703,19 @@ impl Couch {
         if conflicts {
             url.query_pairs_mut().append_pair("conflicts", "true");
         }
-        self.fetch_url(id, url).await
+        self.fetch_decrypted(id, url).await
+    }
+
+    /// [`Couch::fetch_doc`] without the encryption transform.
+    pub async fn fetch_doc_raw(&self, id: &str) -> Result<DocFetch> {
+        self.fetch_url(id, self.id_url(id)).await
+    }
+
+    async fn fetch_decrypted(&self, id: &str, url: Url) -> Result<DocFetch> {
+        match self.fetch_url(id, url).await? {
+            DocFetch::Found(d) => self.decrypt(d).map(DocFetch::Found).map_err(RemoteError::Crypto),
+            other => Ok(other),
+        }
     }
 
     async fn fetch_url(&self, id: &str, url: Url) -> Result<DocFetch> {
@@ -638,7 +761,9 @@ impl Couch {
         }
         let rb = self.http().post(url).json(&changes_selector());
         let r = self.send_within("_changes", rb, q.idle_timeout).await?;
-        self.json_within("_changes", r, q.idle_timeout).await
+        let mut resp: ChangesResponse = self.json_within("_changes", r, q.idle_timeout).await?;
+        self.decrypt_rows(&mut resp.results, |r| (&mut r.doc, &mut r.undecryptable));
+        Ok(resp)
     }
 
     /// `POST /{db}/_all_docs?include_docs=true` with `keys`.
@@ -650,9 +775,96 @@ impl Couch {
         let r = self
             .send("_all_docs", self.http().post(url).json(&json!({ "keys": keys })))
             .await?;
-        let resp: AllDocsResponse = self.json("_all_docs", r).await?;
+        let mut resp: AllDocsResponse = self.json("_all_docs", r).await?;
+        self.decrypt_rows(&mut resp.rows, |r| (&mut r.doc, &mut r.undecryptable));
         Ok(resp.rows)
     }
+}
+
+/// Bodies that never go through the transform: `_local/` documents (the
+/// milestone, the sync parameters) and chunk tombstones without `data`
+/// (nothing to encrypt; upstream's `incoming` fails on them).
+fn passes_untouched(doc: &Value) -> bool {
+    let id = doc.get("_id").and_then(Value::as_str).unwrap_or_default();
+    let owns_data = id.starts_with(livesync_crypto::ids::CHUNK_PREFIX) || id == livesync_crypto::ids::SYNCINFO_ID;
+    id.starts_with("_local/")
+        || (owns_data && doc.get("_deleted").and_then(Value::as_bool) == Some(true) && doc.get("data").is_none())
+}
+
+fn decrypt_with(c: &DocumentCipher, doc: Value) -> std::result::Result<Value, Box<Undecryptable>> {
+    if passes_untouched(&doc) || doc.is_null() {
+        return Ok(doc);
+    }
+    let field = |k: &str| doc.get(k).and_then(Value::as_str).map(str::to_string);
+    let (id, rev, path) = (field("_id").unwrap_or_default(), field("_rev"), field("path"));
+    c.outgoing(doc)
+        .map_err(|error| Box::new(Undecryptable { id, rev, path, error }))
+}
+
+/// `incoming` (with a cipher) and the write guard, both ways.
+fn encrypt_with(c: Option<&DocumentCipher>, doc: &Value) -> Result<Value> {
+    let id = doc.get("_id").and_then(Value::as_str).unwrap_or_default();
+    if id.starts_with("_local/") {
+        return Ok(doc.clone());
+    }
+    let is_chunk_id = id.starts_with(livesync_crypto::ids::CHUNK_PREFIX);
+    let encrypted_id = livesync_crypto::ids::is_encrypted_chunk_id(id);
+    let children = doc
+        .get("children")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Some(c) = c else {
+        // A plaintext database: nothing encrypted may go in.
+        let sealed_eden = doc.get("eden").and_then(Value::as_object).is_some_and(|e| {
+            e.contains_key(livesync_crypto::ids::EDEN_ENCRYPTED_KEY)
+                || e.contains_key(livesync_crypto::ids::EDEN_ENCRYPTED_KEY_HKDF)
+        });
+        if encrypted_id
+            || doc.get("e_").is_some()
+            || sealed_eden
+            || children.iter().any(|c| livesync_crypto::ids::is_encrypted_chunk_id(c))
+        {
+            return Err(RemoteError::Guard(format!(
+                "{id}: encrypted content or an encrypted chunk ID into a database that is not encrypted"
+            )));
+        }
+        return Ok(doc.clone());
+    };
+    if is_chunk_id && !encrypted_id {
+        return Err(RemoteError::Guard(format!(
+            "{id}: a plain chunk ID into an end-to-end encrypted database"
+        )));
+    }
+    if let Some(p) = children
+        .iter()
+        .find(|c| !livesync_crypto::ids::is_encrypted_chunk_id(c))
+    {
+        return Err(RemoteError::Guard(format!(
+            "{id}: a reference to the plain chunk ID {p} into an end-to-end encrypted database"
+        )));
+    }
+    if passes_untouched(doc) {
+        return Ok(doc.clone());
+    }
+    let out = c
+        .incoming(doc.clone())
+        .map_err(|e| RemoteError::Guard(format!("{id}: it cannot be encrypted ({e})")))?;
+    // Nothing readable may be left: what upstream's reader would reject.
+    if let Err(e) = livesync_crypto::check_unencrypted_content(&out, false) {
+        return Err(RemoteError::Guard(format!(
+            "{id}: plaintext content into an end-to-end encrypted database ({e})"
+        )));
+    }
+    if encrypted_id
+        && !out
+            .get("data")
+            .and_then(Value::as_str)
+            .is_some_and(|d| d.starts_with(livesync_crypto::HKDF_PREFIX))
+    {
+        return Err(RemoteError::Guard(format!("{id}: a chunk that is not V2 ciphertext")));
+    }
+    Ok(out)
 }
 
 /// The user name and password written into a server URL
@@ -715,5 +927,70 @@ mod tests {
             password: None
         })
         .is_err());
+    }
+
+    fn cipher() -> DocumentCipher {
+        DocumentCipher::new(
+            livesync_crypto::KeyContext::derive("throwaway-test-passphrase", b"salt-for-tests"),
+            false,
+        )
+    }
+
+    #[test]
+    fn writes_are_encrypted_and_guarded() {
+        let c = cipher();
+        let chunk = json!({"_id": "h:+abc", "type": "leaf", "data": "secret text"});
+        let out = encrypt_with(Some(&c), &chunk).unwrap();
+        assert_eq!(out["e_"], json!(true));
+        assert!(out["data"].as_str().unwrap().starts_with("%="));
+        assert_eq!(decrypt_with(&c, out).unwrap()["data"], json!("secret text"));
+        // Plain chunk IDs, references to them and inline content never go in.
+        for bad in [
+            json!({"_id": "h:abc", "type": "leaf", "data": "x"}),
+            json!({"_id": "a.md", "path": "a.md", "type": "plain", "children": ["h:abc"], "eden": {}}),
+            json!({"_id": "a.md", "path": "a.md", "type": "notes", "data": "inline"}),
+        ] {
+            assert!(
+                matches!(encrypt_with(Some(&c), &bad), Err(RemoteError::Guard(_))),
+                "{bad}"
+            );
+        }
+        // Metadata and `_local/` documents pass; a chunk tombstone is not touched.
+        let meta = json!({"_id": "a.md", "path": "a.md", "type": "plain", "children": ["h:+1"], "eden": {}});
+        assert_eq!(encrypt_with(Some(&c), &meta).unwrap(), meta);
+        let tomb = json!({"_id": "h:+1", "_rev": "1-a", "_deleted": true});
+        assert_eq!(encrypt_with(Some(&c), &tomb).unwrap(), tomb);
+        let local = json!({"_id": "_local/x", "data": "anything"});
+        assert_eq!(encrypt_with(Some(&c), &local).unwrap(), local);
+        // The mirror: nothing encrypted into a plaintext database.
+        for bad in [
+            json!({"_id": "h:+abc", "type": "leaf", "data": "x"}),
+            json!({"_id": "h:abc", "type": "leaf", "data": "%=x", "e_": true}),
+            json!({"_id": "a.md", "path": "a.md", "type": "plain", "children": ["h:+abc"]}),
+            json!({"_id": "a.md", "type": "plain", "eden": {"h:++encrypted-hkdf": {"data": "%=x"}}}),
+        ] {
+            assert!(matches!(encrypt_with(None, &bad), Err(RemoteError::Guard(_))), "{bad}");
+        }
+        let plain = json!({"_id": "h:abc", "type": "leaf", "data": "x"});
+        assert_eq!(encrypt_with(None, &plain).unwrap(), plain);
+    }
+
+    #[test]
+    fn reads_that_fail_are_reported_with_what_is_known() {
+        let c = cipher();
+        let other = DocumentCipher::new(
+            livesync_crypto::KeyContext::derive("another-passphrase", b"salt-for-tests"),
+            false,
+        );
+        let sealed = encrypt_with(Some(&other), &json!({"_id": "h:+abc", "type": "leaf", "data": "x"})).unwrap();
+        let u = decrypt_with(&c, sealed).unwrap_err();
+        assert_eq!(u.id, "h:+abc");
+        assert_eq!(u.error, CryptoError::Authentication);
+        let plain = json!({"_id": "n.md", "_rev": "1-a", "path": "N.md", "type": "notes", "data": "x"});
+        let u = decrypt_with(&c, plain).unwrap_err();
+        assert!(matches!(u.error, CryptoError::Rejected { .. }), "{u:?}");
+        assert_eq!(u.path.as_deref(), Some("N.md"));
+        assert_eq!(u.rev.as_deref(), Some("1-a"));
+        assert!(!format!("{u}").is_empty());
     }
 }

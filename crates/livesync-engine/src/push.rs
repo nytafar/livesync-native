@@ -35,7 +35,7 @@ use crate::vaultfs::{self, DiskState, RemoveOutcome};
 use crate::watcher::{NoWatcher, WatchEvent, Watcher};
 use livesync_model::doc::{classify_doc, Classified};
 use livesync_model::path::path_to_id;
-use livesync_model::splitter::chunk_file;
+use livesync_model::splitter::chunk_file_with;
 use livesync_model::FileKind;
 use livesync_remote::{Backoff, DocFetch, PutOutcome, RemoteError};
 use serde::{Deserialize, Serialize};
@@ -1071,6 +1071,7 @@ impl Engine {
     /// fetch is owed or this node still has to be marked resolved.
     pub async fn push_all(&self, defer_recent: bool) -> Result<PushReport> {
         self.check_plugin_guard()?;
+        self.inner.may_write.store(true, Ordering::SeqCst);
         self.begin_one_shot();
         self.push_pass(defer_recent).await
     }
@@ -1542,10 +1543,27 @@ impl Engine {
             .filter(|r| self.inner.fs.same_name(&r.path, &doc_path))
             .map(|r| r.doc_id.clone())
             .unwrap_or_else(|| self.doc_id_for(&doc_path));
-        let split = self.inner.runtime.lock().unwrap().split;
+        // The remote version cannot be decrypted: nothing is pushed against
+        // what cannot be read (no edit, no conflict branch) while it is held.
+        if let Some(why) = self
+            .with_index(|ix| ix.pending_reason(&doc_id))?
+            .filter(|r| r.contains(crate::engine::HELD_NOTE))
+        {
+            ctx.attempt = None;
+            ctx.incomplete = true;
+            let note = format!("not pushed: the remote version {why}");
+            warn!("{rel}: {note}");
+            self.with_index(|ix| ix.set_issue(rel, "held", &note, vaultfs::now_ms()))?;
+            rep.issues += 1;
+            return Ok(Some(rel.to_string()));
+        }
+        let (split, ids) = {
+            let rt = self.inner.runtime.lock().unwrap();
+            (rt.split, rt.chunk_ids.clone())
+        };
         let chunked = {
             let p = doc_path.clone();
-            tokio::task::spawn_blocking(move || chunk_file(&p, &bytes, &split))
+            tokio::task::spawn_blocking(move || chunk_file_with(&p, &bytes, &split, &ids))
                 .await
                 .map_err(EngineError::other)?
         };

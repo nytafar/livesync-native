@@ -36,4 +36,6 @@ pub use engine::{
 pub use flush::{FlushOutcome, FlushReport, FlushedPath};
 pub use folders::{list_remote_folders, local_top_folders, FolderEntry, FolderListing};
 pub use index::{FileRow, Index, LocalIssue, Origin, RevisionRow, State};
+/// The end-to-end encryption passphrase type ([`EngineConfig::passphrase`]).
+pub use livesync_crypto::Passphrase;
 pub use push::{Confirmation, PushReport};

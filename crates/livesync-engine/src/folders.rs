@@ -83,8 +83,9 @@ struct Tally {
     spellings: BTreeMap<String, (u64, u64)>,
 }
 
-/// List the remote's top-level folders (see the module docs). Refuses a
-/// database whose paths are encrypted or obfuscated (E2EE, M4).
+/// List the remote's top-level folders (see the module docs). Works on an
+/// end-to-end encrypted database without its passphrase; refuses one whose
+/// paths are obfuscated.
 pub async fn list_remote_folders(couch: &Couch) -> Result<FolderListing> {
     let t0 = Instant::now();
     let rx0 = couch.bytes_received();
@@ -96,7 +97,10 @@ pub async fn list_remote_folders(couch: &Couch) -> Result<FolderListing> {
         // back first unless it was deleted meanwhile; only then is it skipped.
         let mut cursor: Option<String> = None;
         loop {
-            let rows = couch.all_docs_page(from.as_deref(), end, PAGE, true).await?;
+            // As stored: only paths and sizes are read, which end-to-end
+            // encryption (without path obfuscation) leaves in plaintext, so
+            // listing needs no passphrase.
+            let rows = couch.all_docs_page_raw(from.as_deref(), end, PAGE, true).await?;
             let n = rows.len();
             let mut last = None;
             for r in rows {

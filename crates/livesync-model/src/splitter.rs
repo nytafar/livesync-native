@@ -6,7 +6,7 @@
 //! `ContentSplitter/ContentSplitterBase.ts` (`getParamsFor`). The golden
 //! vectors in `fixtures/golden/splitter.json` pin the equivalence.
 
-use crate::chunk::chunk_id_xxhash64;
+use crate::chunk::ChunkIdScheme;
 use crate::codec::base64_encode;
 use crate::doc::FileKind;
 use crate::path::is_plain_text;
@@ -155,6 +155,11 @@ pub struct Chunked {
 /// are stored as `plain` with UTF-8 text pieces, everything else as `newnote`
 /// with base64 pieces. Empty pieces are dropped.
 pub fn chunk_file(path: &str, bytes: &[u8], params: &SplitParams) -> Chunked {
+    chunk_file_with(path, bytes, params, &ChunkIdScheme::Plain)
+}
+
+/// [`chunk_file`] with the database's chunk IDs (`h:+…` when it is encrypted).
+pub fn chunk_file_with(path: &str, bytes: &[u8], params: &SplitParams, ids: &ChunkIdScheme) -> Chunked {
     if is_plain_text(path) {
         let text = String::from_utf8_lossy(bytes);
         let lossy = matches!(text, std::borrow::Cow::Owned(_));
@@ -165,7 +170,7 @@ pub fn chunk_file(path: &str, bytes: &[u8], params: &SplitParams) -> Chunked {
             .map(|r| {
                 // Boundaries never fall inside a character, so this is valid UTF-8.
                 let piece = std::str::from_utf8(&data[r]).expect("split on a character boundary");
-                (chunk_id_xxhash64(piece), piece.to_string())
+                (ids.chunk_id(piece), piece.to_string())
             })
             .collect();
         Chunked {
@@ -180,7 +185,7 @@ pub fn chunk_file(path: &str, bytes: &[u8], params: &SplitParams) -> Chunked {
             .filter(|r| !r.is_empty())
             .map(|r| {
                 let piece = base64_encode(&bytes[r]);
-                (chunk_id_xxhash64(&piece), piece)
+                (ids.chunk_id(&piece), piece)
             })
             .collect();
         Chunked {

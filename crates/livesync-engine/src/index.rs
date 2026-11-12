@@ -768,6 +768,14 @@ impl Index {
         Ok(())
     }
 
+    /// Why a document is pending, if it is.
+    pub fn pending_reason(&self, doc_id: &str) -> rusqlite::Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row("SELECT reason FROM pending WHERE doc_id = ?1", [doc_id], |r| r.get(0))
+            .optional()
+    }
+
     pub fn remove_pending(&self, doc_id: &str) -> rusqlite::Result<()> {
         self.conn.execute("DELETE FROM pending WHERE doc_id = ?1", [doc_id])?;
         Ok(())

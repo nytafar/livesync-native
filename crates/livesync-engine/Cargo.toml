@@ -9,6 +9,7 @@ anyhow = "1.0.104"
 futures = "0.3.34"
 libc = "0.2"
 log = "0.4.34"
+livesync-crypto = { version = "0.1.0", path = "../livesync-crypto" }
 livesync-model = { version = "0.1.0", path = "../livesync-model" }
 livesync-remote = { version = "0.1.0", path = "../livesync-remote" }
 notify = "8.2"

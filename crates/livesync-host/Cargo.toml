@@ -30,6 +30,7 @@ secret-service = { version = "5.2", default-features = false, features = ["rt-to
 security-framework = { version = "3.7", default-features = false }
 
 [dev-dependencies]
+livesync-crypto = { version = "0.1.0", path = "../livesync-crypto" }
 axum = "0.8.9"
 futures = "0.3.34"
 tempfile = "3.27.0"

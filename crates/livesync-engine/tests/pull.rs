@@ -395,9 +395,16 @@ async fn gates_fail_closed() {
     let st = env.engine().status().unwrap();
     assert!(st.needs_full_fetch && st.resolve_owed, "{st:?}");
 
+    // An encrypted database without a passphrase for this vault.
+    let env = Env::new().await;
+    env.mock
+        .update_milestone(|m| m["tweak_values"]["PREFERRED"]["encrypt"] = json!(true));
+    let r = refused(env.engine().connect_gate(false).await);
+    assert!(matches!(r, Refusal::PassphraseMissing { .. }), "{r:?}");
+    assert!(r.to_string().contains("lsync vault passphrase"), "{r}");
+
     // Unsupported remote settings.
     for (k, v) in [
-        ("encrypt", json!(true)),
         ("usePathObfuscation", json!(true)),
         ("hashAlg", json!("sha1")),
         ("pathNormalizationVersion", json!(1)),

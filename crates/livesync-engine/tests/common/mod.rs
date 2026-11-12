@@ -4,6 +4,12 @@
 //! filtered `_changes` (normal and longpoll) and `_all_docs` (by keys, with
 //! or without bodies, and by key range). Records every request so tests can
 //! assert what the client wrote.
+//!
+//! Every write the client sends passes a guard: for a plaintext database
+//! nothing encrypted (an `h:+` chunk ID, `e_`, a sealed eden), for an
+//! encrypted one ([`Mock::start_encrypted`]) nothing with plaintext content
+//! or a plain `h:` chunk ID. A violation is refused with a 400 and fails the
+//! test when its `Mock` goes away.
 
 #![allow(dead_code)]
 
@@ -13,7 +19,8 @@ use axum::http::{Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use livesync_model::chunk::chunk_id_xxhash64;
+use livesync_crypto::DocumentCipher;
+use livesync_model::chunk::{ChunkIdScheme, PassphraseHash};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -123,6 +130,26 @@ pub struct MockState {
     /// Every request as (method, path, the client's address): one address
     /// per TCP connection, so a request on a new connection shows.
     pub conns: Vec<(String, String, std::net::SocketAddr)>,
+    /// The database's encryption, as the other clients use it: chunks the
+    /// helpers store are encrypted with it, and the write guard expects it.
+    pub cipher: Option<Arc<DocumentCipher>>,
+    pub ids: ChunkIdScheme,
+    /// Writes the guard refused, with why.
+    pub violations: Vec<String>,
+}
+
+/// Fails the test when the last handle on a mock goes and the write guard
+/// refused something.
+pub struct GuardCheck(Arc<Mutex<MockState>>);
+
+impl Drop for GuardCheck {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let v = std::mem::take(&mut self.0.lock().unwrap_or_else(|e| e.into_inner()).violations);
+        assert!(v.is_empty(), "the client wrote what the database must not hold: {v:#?}");
+    }
 }
 
 #[derive(Clone)]
@@ -130,6 +157,77 @@ pub struct Mock {
     pub state: Arc<Mutex<MockState>>,
     pub notify: Arc<Notify>,
     pub url: String,
+    pub guard: Arc<GuardCheck>,
+}
+
+/// The salt of [`Mock::start_encrypted`] (32 bytes, base64).
+pub const E2EE_SALT_B64: &str = "c2FsdC1mb3ItdGhlLWxzeW5jLWUyZWUtbW9jay0wMDE=";
+
+/// What the write guard says about one document the client sent.
+pub fn guard_violation(doc: &Value, encrypted: bool) -> Option<String> {
+    let id = doc.get("_id").and_then(Value::as_str).unwrap_or_default();
+    if id.starts_with("_local/") {
+        return None;
+    }
+    let children: Vec<&str> = doc
+        .get("children")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if encrypted {
+        if id.starts_with("h:") && !id.starts_with("h:+") {
+            return Some(format!("{id}: a plain chunk ID"));
+        }
+        if let Some(c) = children.iter().find(|c| !c.starts_with("h:+")) {
+            return Some(format!("{id}: refers to the plain chunk ID {c}"));
+        }
+        if let Err(e) = livesync_crypto::check_unencrypted_content(doc, false) {
+            return Some(format!("{id}: {e}"));
+        }
+        let deleted = doc.get("_deleted") == Some(&json!(true));
+        if id.starts_with("h:+")
+            && !deleted
+            && !(doc.get("e_") == Some(&json!(true))
+                && doc
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .is_some_and(|d| d.starts_with("%=")))
+        {
+            return Some(format!("{id}: a chunk that is not V2 ciphertext"));
+        }
+    } else {
+        let sealed_eden = doc
+            .get("eden")
+            .and_then(Value::as_object)
+            .is_some_and(|e| e.keys().any(|k| k.starts_with("h:++encrypted")));
+        if id.starts_with("h:+") || doc.get("e_").is_some() || sealed_eden {
+            return Some(format!("{id}: encrypted content in a plaintext database"));
+        }
+        if let Some(c) = children.iter().find(|c| c.starts_with("h:+")) {
+            return Some(format!(
+                "{id}: refers to the encrypted chunk ID {c} in a plaintext database"
+            ));
+        }
+    }
+    None
+}
+
+/// The guard over one write request; `Some(response)` refuses it.
+fn guard(s: &mut MockState, docs: &[Value]) -> Option<Response> {
+    let encrypted = s.cipher.is_some();
+    let found: Vec<String> = docs.iter().filter_map(|d| guard_violation(d, encrypted)).collect();
+    if found.is_empty() {
+        return None;
+    }
+    eprintln!("mock write guard: {found:?}");
+    s.violations.extend(found.iter().cloned());
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "bad_request", "reason": format!("mock write guard: {}", found.join("; "))})),
+        )
+            .into_response(),
+    )
 }
 
 fn rand_hex() -> String {
@@ -269,6 +367,17 @@ impl MockState {
         self.log_change(&id);
     }
 
+    /// A chunk's data, decrypted when the database is encrypted (`None`
+    /// when it is missing or does not decrypt).
+    pub fn chunk_data(&self, id: &str) -> Option<String> {
+        let d = self.docs.get(id)?.clone();
+        let d = match &self.cipher {
+            Some(c) => c.outgoing(d).ok()?,
+            None => d,
+        };
+        d["data"].as_str().map(str::to_string)
+    }
+
     fn body_with(&self, id: &str, conflicts: bool) -> Option<Value> {
         let mut d = self.docs.get(id)?.clone();
         if conflicts {
@@ -312,12 +421,60 @@ impl Mock {
         let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, svc).await.unwrap() });
         let m = Mock {
+            guard: Arc::new(GuardCheck(state.clone())),
             state,
             notify,
             url: format!("http://{addr}"),
         };
         m.put(json!({"_id": "obsydian_livesync_version", "type": "versioninfo", "version": 12}));
         m
+    }
+
+    /// An end-to-end encrypted database (V2, no path obfuscation) with
+    /// `passphrase`, as the official clients set it up: `encrypt` in the
+    /// milestone's tweaks, a 32-byte salt in the sync parameters. The
+    /// helpers store encrypted chunks under `h:+` IDs from here on.
+    pub async fn start_encrypted(passphrase: &str) -> Mock {
+        let m = Mock::start().await;
+        m.update_milestone(|ms| {
+            for k in ["PREFERRED", "desktop1"] {
+                ms["tweak_values"][k]["encrypt"] = json!(true);
+                ms["tweak_values"][k]["E2EEAlgorithm"] = json!("v2");
+            }
+        });
+        m.set_local(
+            "obsidian_livesync_sync_parameters",
+            json!({"_id": "_local/obsidian_livesync_sync_parameters", "_rev": "0-1", "type": "sync-parameters", "protocolVersion": 2, "pbkdf2salt": E2EE_SALT_B64}),
+        );
+        let salt = livesync_crypto::parse_pbkdf2_salt(&json!({"pbkdf2salt": E2EE_SALT_B64})).unwrap();
+        let key = livesync_crypto::KeyContext::derive(passphrase, &salt);
+        {
+            let mut st = m.state.lock().unwrap();
+            st.cipher = Some(Arc::new(DocumentCipher::new(key, true)));
+            st.ids = ChunkIdScheme::Encrypted(PassphraseHash::from_passphrase(passphrase));
+        }
+        m
+    }
+
+    /// A chunk document as the database stores it (encrypted when it is).
+    pub fn chunk_doc(&self, piece: &str) -> Value {
+        let st = self.state.lock().unwrap();
+        let id = st.ids.chunk_id(piece);
+        let doc = json!({"_id": id, "type": "leaf", "data": piece});
+        match &st.cipher {
+            Some(c) => c.incoming(doc).unwrap(),
+            None => doc,
+        }
+    }
+
+    /// The chunk ID of `piece` in this database.
+    pub fn chunk_id(&self, piece: &str) -> String {
+        self.state.lock().unwrap().ids.chunk_id(piece)
+    }
+
+    /// Writes the guard refused so far (and forget them).
+    pub fn take_violations(&self) -> Vec<String> {
+        std::mem::take(&mut self.state.lock().unwrap().violations)
     }
 
     /// Store a document as a new revision on top of the current winner (as
@@ -363,9 +520,10 @@ impl Mock {
         pieces
             .iter()
             .map(|p| {
-                let id = chunk_id_xxhash64(p);
+                let doc = self.chunk_doc(p);
+                let id = doc["_id"].as_str().unwrap().to_string();
                 if !self.state.lock().unwrap().docs.contains_key(&id) {
-                    self.put(json!({"_id": id, "type": "leaf", "data": p}));
+                    self.put(doc);
                 }
                 id
             })
@@ -467,7 +625,7 @@ impl Mock {
         }
         let mut out = Vec::new();
         for c in d["children"].as_array()? {
-            let data = st.docs.get(c.as_str()?)?["data"].as_str()?.to_string();
+            let data = st.chunk_data(c.as_str()?)?;
             if d["type"] == "plain" {
                 out.extend_from_slice(data.as_bytes());
             } else {
@@ -483,7 +641,7 @@ impl Mock {
         let body = st.trees.get(id)?.revs.get(rev)?.body.clone()?;
         let mut out = Vec::new();
         for c in body["children"].as_array()? {
-            let data = st.docs.get(c.as_str()?)?["data"].as_str()?.to_string();
+            let data = st.chunk_data(c.as_str()?)?;
             if body["type"] == "plain" {
                 out.extend_from_slice(data.as_bytes());
             } else {
@@ -659,6 +817,9 @@ async fn put_doc(State((st, notify)): S, Path(id): Path<String>, Json(mut body):
             .into_response();
     }
     body["_id"] = json!(id);
+    if let Some(refused) = guard(&mut s, std::slice::from_ref(&body)) {
+        return refused;
+    }
     let r = s.write(body);
     let lose = std::mem::take(&mut s.lose_next_put_response);
     drop(s);
@@ -687,6 +848,9 @@ async fn bulk_docs(State((st, notify)): S, Json(body): Json<Value>) -> Response 
     if s.fail_writes > 0 {
         s.fail_writes -= 1;
         return (StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
+    }
+    if let Some(refused) = guard(&mut s, body["docs"].as_array().unwrap()) {
+        return refused;
     }
     let mut out = Vec::new();
     for d in body["docs"].as_array().unwrap() {
