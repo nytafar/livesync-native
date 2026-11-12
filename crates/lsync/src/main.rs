@@ -1182,23 +1182,18 @@ fn two_way_allowed(sel: &Selected, what: &str) -> Result<()> {
 }
 
 async fn run_sync(engine: &Engine, json: bool, fetch: bool) -> Result<u8> {
-    if fetch {
-        // A fetch here is the start of a two-way sync: refused like one,
-        // before the index is reset for it.
-        match engine.check_plugin_guard().and_then(|()| engine.request_full_fetch()) {
-            Ok(()) => {}
-            Err(EngineError::Refused(r)) => {
-                eprintln!("fetch refused: {r}");
-                return Ok(2);
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
     let t0 = Instant::now();
-    let rep: SyncReport = match engine.sync_once().await {
+    // A fetch is the start of a two-way sync: the plugin guard and the gate
+    // refuse it before the index is reset for it.
+    let r = if fetch {
+        engine.sync_fetch().await
+    } else {
+        engine.sync_once().await
+    };
+    let rep: SyncReport = match r {
         Ok(r) => r,
         Err(EngineError::Refused(r)) => {
-            eprintln!("sync refused: {r}");
+            eprintln!("{} refused: {r}", if fetch { "fetch" } else { "sync" });
             return Ok(2);
         }
         Err(e) => return Err(e.into()),

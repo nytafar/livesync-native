@@ -15,7 +15,7 @@ use livesync_model::path::{is_internal_id, PathSkip};
 use livesync_model::scope::Scope;
 use livesync_model::splitter::SplitParams;
 use livesync_model::{FileDoc, FileKind};
-use livesync_remote::{Backoff, ChangeRow, ChangesQuery, Couch, DocFetch, PutOutcome, RemoteError};
+use livesync_remote::{Backoff, ChangeRow, ChangesQuery, Couch, DocFetch, Encryption, PutOutcome, RemoteError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -686,7 +686,6 @@ const ENCRYPTED_CHUNKS: (&str, &str) = ("h:+", "h:,");
 const PASSPHRASE_PROBES: usize = 3;
 /// How many encrypted chunks it looks at to find them.
 const PASSPHRASE_PROBE_PAGE: usize = 50;
-
 pub(crate) struct Inner {
     pub(crate) couch: Couch,
     pub(crate) cfg: EngineConfig,
@@ -1230,11 +1229,27 @@ impl Engine {
     // Connect gate
     // ------------------------------------------------------------------
 
-    /// Run the connect gate. Never writes to the remote. On first contact the
-    /// PREFERRED tweaks are adopted; later they must stay the same unless
-    /// `adopt_tweaks` is set. A changed milestone `created` resets the index.
+    /// Run the connect gate. Never writes to the remote, except a missing
+    /// encryption salt a session that may write creates once every other
+    /// check passed. On first contact the PREFERRED tweaks are adopted;
+    /// later they must stay the same unless `adopt_tweaks` is set. A changed
+    /// milestone `created` resets the index.
+    ///
+    /// The gate is the only thing that settles whether the database is
+    /// encrypted (see [`Encryption`]); a gate that fails, for whatever
+    /// reason, unsettles it at once, so a push pass in flight fails at its
+    /// next write instead of finishing with what may no longer be right.
     pub async fn connect_gate(&self, adopt_tweaks: bool) -> Result<GateReport> {
-        let r = self.connect_gate_inner(adopt_tweaks).await;
+        self.gate(adopt_tweaks, false).await
+    }
+
+    /// [`Engine::connect_gate`]; with `fetching`, as for a full fetch that
+    /// is about to be requested (a lock lets it through, as it does an owed one).
+    async fn gate(&self, adopt_tweaks: bool, fetching: bool) -> Result<GateReport> {
+        let r = self.connect_gate_inner(adopt_tweaks, fetching).await;
+        if r.is_err() {
+            self.inner.couch.set_encryption(Encryption::Undetermined);
+        }
         let summary = match &r {
             Ok(g) => format!("ok: version {} created {} locked {}", g.version, g.created, g.locked),
             Err(e) => format!("failed: {e}"),
@@ -1288,7 +1303,7 @@ impl Engine {
         }
     }
 
-    async fn connect_gate_inner(&self, adopt_tweaks: bool) -> Result<GateReport> {
+    async fn connect_gate_inner(&self, adopt_tweaks: bool, fetching: bool) -> Result<GateReport> {
         self.check_vault(&self.inner.index.lock().unwrap())?;
         let couch = &self.inner.couch;
         let root = match couch.server_root().await {
@@ -1302,7 +1317,12 @@ impl Engine {
             return Err(Refusal::NotCouchDb.into());
         }
         let info = couch.db_info().await?;
-        let version_doc = couch.get_doc(VERSION_DOC_ID, false).await?;
+        // As stored: it is never encrypted, and the encryption is not
+        // settled yet (it is what this gate is about to settle).
+        let version_doc = match couch.fetch_doc_raw(VERSION_DOC_ID).await? {
+            DocFetch::Found(d) => Some(d),
+            DocFetch::Deleted | DocFetch::Missing(_) => None,
+        };
         // Read before the version document is judged, so a refusal can name
         // the plugin versions the milestone lists.
         let milestone = couch.get_doc(&format!("_local/{MILESTONE_LOCAL_ID}"), false).await?;
@@ -1321,7 +1341,7 @@ impl Engine {
             (
                 stored.is_none(),
                 stored.is_some_and(|c| c != milestone.created),
-                ix.get_meta(meta::NEEDS_FETCH)?.is_some() || resolve_owed,
+                fetching || ix.get_meta(meta::NEEDS_FETCH)?.is_some() || resolve_owed,
             )
         };
         // A lock (after a rebuild elsewhere) is upstream's "fetch again":
@@ -1353,6 +1373,11 @@ impl Engine {
         })?;
         let preferred = milestone.preferred().ok_or(Refusal::MissingPreferredTweaks)?.clone();
         gate::assess_supported_tweaks(&preferred)?;
+        let label = couch.label().to_string();
+        // The index's refusals, read-only, before the encryption setup may
+        // create a salt: a vault pointed at the wrong database writes nothing
+        // to it. (Checked again below, under the lock, before recording.)
+        self.index_refusals(&self.inner.index.lock().unwrap(), &label, &preferred, adopt_tweaks)?;
         let params = couch.get_doc(&format!("_local/{SYNC_PARAMS_LOCAL_ID}"), false).await?;
         // Before anything else is decided or recorded: a wrong or missing
         // passphrase stops here.
@@ -1363,7 +1388,6 @@ impl Engine {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        let label = couch.label().to_string();
         let mut adopted_now = false;
         let mut rebuild = false;
         {
@@ -1374,27 +1398,9 @@ impl Engine {
             if ix.get_meta(meta::VAULT)?.is_none() {
                 ix.set_meta(meta::VAULT, &self.inner.vault_canon)?;
             }
-            match ix.get_meta(meta::REMOTE)? {
-                Some(r) if r != label => return Err(Refusal::ForeignIndex(r).into()),
-                Some(_) => {}
-                None => ix.set_meta(meta::REMOTE, &label)?,
-            }
-            let adopted: Option<Map<String, Value>> =
-                ix.get_meta(meta::TWEAKS)?.and_then(|s| serde_json::from_str(&s).ok());
-            // Settings a newer plugin added are refused like changed ones,
-            // also at first contact, until a person adopts them.
-            let unknown = gate::unknown_tweaks(adopted.as_ref(), &preferred);
-            let diff = adopted
-                .as_ref()
-                .map(|a| gate::compare_tweaks(a, &preferred))
-                .unwrap_or_default();
-            if !adopt_tweaks {
-                if !diff.is_empty() {
-                    return Err(Refusal::TweakMismatch(diff.join("; ")).into());
-                }
-                if !unknown.is_empty() {
-                    return Err(Refusal::UnknownTweaks(unknown.join(", ")).into());
-                }
+            let (adopted, diff, unknown) = self.index_refusals(&ix, &label, &preferred, adopt_tweaks)?;
+            if ix.get_meta(meta::REMOTE)?.is_none() {
+                ix.set_meta(meta::REMOTE, &label)?;
             }
             if adopted.is_none() || !diff.is_empty() || !unknown.is_empty() {
                 if !diff.is_empty() || !unknown.is_empty() {
@@ -1481,6 +1487,42 @@ impl Engine {
         })
     }
 
+    /// What the index refuses about this remote, without changing it: an
+    /// index made for another database, and PREFERRED tweaks that differ
+    /// from the adopted ones (or that it does not know) unless
+    /// `adopt_tweaks`. Returns the adopted tweaks, the differences and the
+    /// unknown ones.
+    #[allow(clippy::type_complexity)]
+    fn index_refusals(
+        &self,
+        ix: &Index,
+        label: &str,
+        preferred: &Map<String, Value>,
+        adopt_tweaks: bool,
+    ) -> Result<(Option<Map<String, Value>>, Vec<String>, Vec<String>)> {
+        if let Some(r) = ix.get_meta(meta::REMOTE)?.filter(|r| r != label) {
+            return Err(Refusal::ForeignIndex(r).into());
+        }
+        let adopted: Option<Map<String, Value>> =
+            ix.get_meta(meta::TWEAKS)?.and_then(|s| serde_json::from_str(&s).ok());
+        // Settings a newer plugin added are refused like changed ones,
+        // also at first contact, until a person adopts them.
+        let unknown = gate::unknown_tweaks(adopted.as_ref(), preferred);
+        let diff = adopted
+            .as_ref()
+            .map(|a| gate::compare_tweaks(a, preferred))
+            .unwrap_or_default();
+        if !adopt_tweaks {
+            if !diff.is_empty() {
+                return Err(Refusal::TweakMismatch(diff.join("; ")).into());
+            }
+            if !unknown.is_empty() {
+                return Err(Refusal::UnknownTweaks(unknown.join(", ")).into());
+            }
+        }
+        Ok((adopted, diff, unknown))
+    }
+
     // ------------------------------------------------------------------
     // End-to-end encryption
     // ------------------------------------------------------------------
@@ -1490,6 +1532,11 @@ impl Engine {
     /// when there is none), the key (derived once per salt, off the async
     /// threads), the passphrase checked against the database, then the
     /// transform and the chunk IDs. Returns the sync parameters as they are now.
+    ///
+    /// Settles the `Couch`'s [`Encryption`]. Whenever what it finds is not
+    /// what is in use (another salt, encryption turned on or off, a
+    /// refusal), it unsettles it first, before anything slow, so writes stop
+    /// at once rather than when a new key is ready.
     async fn setup_encryption(&self, preferred: &Map<String, Value>, params: Option<Value>) -> Result<Option<Value>> {
         use livesync_crypto::{parse_pbkdf2_salt, SyncParamsError};
         let couch = &self.inner.couch;
@@ -1499,21 +1546,32 @@ impl Engine {
         let pass = match (encrypt, passphrase) {
             (false, None) => {
                 *session = None;
-                couch.set_cipher(None);
                 self.inner.runtime.lock().unwrap().chunk_ids = livesync_model::chunk::ChunkIdScheme::Plain;
+                couch.set_encryption(Encryption::Plaintext);
                 return Ok(params);
             }
-            (false, Some(_)) => return Err(Refusal::PassphraseOnPlainDatabase.into()),
+            (false, Some(_)) => {
+                couch.set_encryption(Encryption::Undetermined);
+                return Err(Refusal::PassphraseOnPlainDatabase.into());
+            }
             (true, None) => {
+                couch.set_encryption(Encryption::Undetermined);
                 return Err(Refusal::PassphraseMissing {
                     how: self.inner.cfg.passphrase_how.clone(),
                 }
-                .into())
+                .into());
             }
             (true, Some(p)) => p,
         };
         let id = format!("_local/{SYNC_PARAMS_LOCAL_ID}");
         let parsed = params.as_ref().map(parse_pbkdf2_salt);
+        let same_salt = matches!((&parsed, session.as_ref()), (Some(Ok(salt)), Some(s)) if s.salt == *salt);
+        if !same_salt {
+            // Not the salt the transform in use was made for (or none, or
+            // the database was plaintext until now): no write goes out with
+            // it while the new one is set up, or after a refusal.
+            couch.set_encryption(Encryption::Undetermined);
+        }
         let (params, salt) = match parsed {
             Some(Ok(salt)) => (params, salt),
             Some(Err(SyncParamsError::InvalidSalt | SyncParamsError::NotAnObject)) => {
@@ -1556,7 +1614,7 @@ impl Engine {
             }
         };
         if let Some(sess) = session.as_ref().filter(|s| s.salt == salt) {
-            couch.set_cipher(Some(sess.cipher.clone()));
+            couch.set_encryption(Encryption::Encrypted(sess.cipher.clone()));
             return Ok(params);
         }
         if session.is_some() {
@@ -1576,7 +1634,7 @@ impl Engine {
             livesync_model::chunk::PassphraseHash::from_passphrase(pass.expose()),
         );
         self.inner.runtime.lock().unwrap().chunk_ids = ids;
-        couch.set_cipher(Some(cipher.clone()));
+        couch.set_encryption(Encryption::Encrypted(cipher.clone()));
         *session = Some(CryptoSession { salt, cipher });
         info!("end-to-end encryption: the passphrase opens the remote database");
         Ok(params)
@@ -3190,15 +3248,29 @@ impl Engine {
     /// next sync and mark this node resolved after it. This is how a lock
     /// that does not come with a rebuild (or `cleaned`) is cleared.
     ///
-    /// Not refused by the plugin guard: a pull-only vault fetches too. A
-    /// two-way caller checks [`Engine::check_plugin_guard`] first, so a
-    /// refused vault's index is not reset for a sync that cannot run.
+    /// Not refused by the plugin guard, nor by the gate: a pull-only vault
+    /// fetches too. A two-way fetch goes through [`Engine::sync_fetch`],
+    /// which runs both first, so a refused vault's index is not reset for a
+    /// sync that cannot run.
     pub fn request_full_fetch(&self) -> Result<()> {
         self.with_index(|ix| {
             ix.reset_for_rebuild()?;
             ix.set_meta(meta::NEEDS_FETCH, &vaultfs::now_ms().to_string())?;
             ix.set_meta(meta::RECONCILE, &vaultfs::now_ms().to_string())
         })
+    }
+
+    /// A two-way sync from a full fetch (`lsync fetch`, and the service's
+    /// fetch command): the plugin guard and the connect gate first, so a vault
+    /// they refuse (a wrong passphrase, an index made for another database)
+    /// keeps its index as it was; then the index is reset for the fetch
+    /// ([`Engine::request_full_fetch`]) and the sync runs.
+    pub async fn sync_fetch(&self) -> Result<SyncReport> {
+        self.check_plugin_guard()?;
+        self.inner.may_write.store(true, Ordering::SeqCst);
+        self.gate(false, true).await?;
+        self.request_full_fetch()?;
+        self.sync_once().await
     }
 
     /// Why pushes must wait, if they must: a full fetch is owed, or this

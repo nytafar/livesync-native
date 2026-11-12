@@ -13,7 +13,7 @@ use livesync_engine::{AdoptOptions, Engine, EngineConfig, EngineError, Index, St
 use livesync_model::path::path_to_id;
 use livesync_model::splitter::{chunk_file_with, SplitParams};
 use livesync_model::Refusal;
-use livesync_remote::{Couch, RemoteConfig};
+use livesync_remote::{Couch, RemoteConfig, RemoteError};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -608,6 +608,200 @@ async fn folders_are_listed_without_the_passphrase() {
     let l = livesync_engine::list_remote_folders(&env.couch()).await.unwrap();
     let names: Vec<&str> = l.folders.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, vec!["Home", "Work"], "{l:?}");
+}
+
+/// A salt other than the mock's (a database rebuilt elsewhere).
+const OTHER_SALT: &str = "b3RoZXItc2FsdC1vdGhlci1zYWx0LW90aGVyLXNhbHQ=";
+
+fn new_salt(m: &Mock) {
+    m.set_local(
+        "obsidian_livesync_sync_parameters",
+        json!({"_id": "_local/obsidian_livesync_sync_parameters", "_rev": "0-2", "type": "sync-parameters", "protocolVersion": 2, "pbkdf2salt": OTHER_SALT}),
+    );
+}
+
+/// Document writes the mock received (not `_local/` ones).
+fn doc_writes(m: &Mock) -> Vec<(String, String)> {
+    m.writes()
+        .into_iter()
+        .filter(|(_, p)| !p.contains("/_local/"))
+        .collect()
+}
+
+fn undetermined<T: std::fmt::Debug>(r: Result<T, EngineError>) {
+    assert!(
+        matches!(r, Err(EngineError::Remote(RemoteError::EncryptionUndetermined(_)))),
+        "{r:?}"
+    );
+}
+
+/// `push_all` runs no gate: on an engine whose gate never ran, whether the
+/// database is encrypted is not settled, and nothing is written, into an
+/// encrypted database or a plaintext one.
+#[tokio::test]
+async fn an_ungated_push_writes_nothing() {
+    for env in [Env::new().await, Env::plain().await] {
+        let pass = env.mock.state.lock().unwrap().cipher.is_some().then_some(PASS);
+        env.write("a.md", b"local text");
+        env.write("b.md", b"more local text");
+        env.mock.clear_requests();
+        undetermined(env.engine_with(pass, |_| {}).push_all(false).await);
+        assert!(env.mock.writes().is_empty(), "{:?}", env.mock.writes());
+        assert!(env.mock.take_violations().is_empty());
+        assert!(env.row("a.md").is_none(), "nothing recorded either");
+        // Gated, the same engine pushes, as the database wants it.
+        let e = env.engine_with(pass, |_| {});
+        e.sync_once().await.unwrap();
+        assert_eq!(env.remote("a.md").unwrap(), b"local text");
+        if pass.is_some() {
+            env.assert_all_chunks_sealed();
+        }
+    }
+}
+
+/// A gate that refuses unsettles the encryption at once: the push pass in
+/// flight in a running daemon fails at its next write instead of finishing
+/// with what may no longer be right.
+async fn refused_regate_stops_the_pass(change: impl FnOnce(&Mock), want: fn(&Refusal) -> bool) {
+    let env = Env::new().await;
+    env.mock.put_text("remote.md", &["from elsewhere"]);
+    let e = env.engine();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let run = tokio::spawn({
+        let e = e.clone();
+        async move { e.run(rx).await }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while env.read("remote.md").is_none() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(env.read("remote.md").is_some());
+    // A slow server and a long pass.
+    env.mock.state.lock().unwrap().write_delay = Some(Duration::from_millis(300));
+    env.mock.clear_requests();
+    for i in 0..12 {
+        env.write(
+            &format!("n{i:02}.md"),
+            format!("note {i}, long enough to be a chunk of its own").as_bytes(),
+        );
+    }
+    while doc_writes(&env.mock).is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!doc_writes(&env.mock).is_empty(), "the pass began");
+    change(&env.mock);
+    let r = refused(e.connect_gate(false).await);
+    assert!(want(&r), "{r:?}");
+    let at_refusal = doc_writes(&env.mock).len();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        doc_writes(&env.mock).len(),
+        at_refusal,
+        "no write was sent after the refusal: {:?}",
+        doc_writes(&env.mock)
+    );
+    let pushed = (0..12)
+        .filter(|i| env.mock.doc(&format!("n{i:02}.md")).is_some())
+        .count();
+    assert!(pushed < 12, "the pass did not finish ({pushed} pushed)");
+    tx.send(true).unwrap();
+    let _ = run.await.unwrap();
+}
+
+/// Rebuilt elsewhere with a new salt: the passphrase no longer opens it.
+#[tokio::test]
+async fn a_refused_regate_stops_the_push_pass_in_flight() {
+    refused_regate_stops_the_pass(new_salt, |r| matches!(r, Refusal::WrongPassphrase(_))).await;
+}
+
+/// A refusal that has nothing to do with encryption does the same.
+#[tokio::test]
+async fn a_tweak_mismatch_at_a_regate_stops_the_push_pass_in_flight() {
+    refused_regate_stops_the_pass(
+        |m| m.update_milestone(|ms| ms["tweak_values"]["PREFERRED"]["customChunkSize"] = json!(7)),
+        |r| matches!(r, Refusal::TweakMismatch(_)),
+    )
+    .await;
+}
+
+/// A changed salt unsettles the encryption as soon as the gate reads it,
+/// before the new key is derived and checked.
+#[tokio::test]
+async fn a_changed_salt_is_noticed_at_the_next_regate() {
+    let env = Env::new().await;
+    env.mock.put_text("a.md", &["one"]);
+    let e = env.engine();
+    e.sync_once().await.unwrap();
+    new_salt(&env.mock);
+    refused(e.connect_gate(false).await);
+    env.write("b.md", b"local");
+    env.mock.clear_requests();
+    // Not even a push that skips the gate gets through now.
+    undetermined(e.push_all(false).await);
+    assert!(doc_writes(&env.mock).is_empty(), "{:?}", env.mock.writes());
+}
+
+/// The index's refusals come before the encryption setup: a vault pointed
+/// at the wrong (empty, salt-less) database gets no salt written into it.
+#[tokio::test]
+async fn no_salt_is_written_to_a_database_the_gate_refuses() {
+    for foreign in [true, false] {
+        let env = Env::new().await;
+        env.mock
+            .state
+            .lock()
+            .unwrap()
+            .local
+            .remove("obsidian_livesync_sync_parameters");
+        {
+            std::fs::create_dir_all(env.index_path().parent().unwrap()).unwrap();
+            let ix = Index::open(&env.index_path()).unwrap();
+            if foreign {
+                ix.set_meta("remote", "http://127.0.0.1:1/another-db").unwrap();
+            } else {
+                let mut tweaks = common::preferred();
+                tweaks["customChunkSize"] = json!(7);
+                tweaks["encrypt"] = json!(true);
+                tweaks["E2EEAlgorithm"] = json!("v2");
+                ix.set_meta("adopted_tweaks", &tweaks.to_string()).unwrap();
+            }
+        }
+        env.write("first.md", b"a note");
+        env.mock.clear_requests();
+        let r = refused(env.engine().sync_once().await);
+        if foreign {
+            assert!(matches!(r, Refusal::ForeignIndex(_)), "{r:?}");
+        } else {
+            assert!(matches!(r, Refusal::TweakMismatch(_)), "{r:?}");
+        }
+        assert!(env.mock.local("obsidian_livesync_sync_parameters").is_none());
+        assert!(env.mock.writes().is_empty(), "{:?}", env.mock.writes());
+    }
+}
+
+/// `lsync fetch` with a wrong passphrase: refused by the gate before
+/// the index is reset for the fetch.
+#[tokio::test]
+async fn a_refused_fetch_leaves_the_index_as_it_was() {
+    let env = Env::new().await;
+    env.mock.put_text("a.md", &["synced"]);
+    env.engine().sync_once().await.unwrap();
+    let before = env.row("a.md").unwrap();
+    assert!(before.base_rev.is_some());
+    let ix = || Index::open(&env.index_path()).unwrap();
+    let since = ix().get_meta("since").unwrap();
+    assert!(since.is_some());
+    env.mock.clear_requests();
+    let r = refused(env.engine_with(Some(WRONG), |_| {}).sync_fetch().await);
+    assert!(matches!(r, Refusal::WrongPassphrase(_)), "{r:?}");
+    assert_eq!(env.row("a.md").unwrap().base_rev, before.base_rev);
+    assert_eq!(ix().get_meta("since").unwrap(), since);
+    assert!(ix().get_meta("needs_full_fetch").unwrap().is_none());
+    assert!(env.mock.writes().is_empty(), "{:?}", env.mock.writes());
+    // The right passphrase fetches.
+    env.engine().sync_fetch().await.unwrap();
+    assert!(ix().get_meta("needs_full_fetch").unwrap().is_none());
+    assert_eq!(env.read("a.md").unwrap(), b"synced");
 }
 
 #[test]

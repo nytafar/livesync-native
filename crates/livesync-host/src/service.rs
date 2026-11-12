@@ -1231,11 +1231,8 @@ impl Service {
         let report = match cmd {
             Command::Sync => engine.sync_once().await.map(|r| serde_json::to_value(&r)),
             // Two-way (a pull-only vault refuses `fetch` before this): the
-            // plugin guard first, before the index is reset for the sync.
-            Command::Fetch => match engine.check_plugin_guard().and_then(|()| engine.request_full_fetch()) {
-                Ok(()) => engine.sync_once().await.map(|r| serde_json::to_value(&r)),
-                Err(e) => Err(e),
-            },
+            // plugin guard and the gate first, before the index is reset.
+            Command::Fetch => engine.sync_fetch().await.map(|r| serde_json::to_value(&r)),
             Command::Pull => engine.pull_once().await.map(|r| serde_json::to_value(&r)),
             Command::Connect => engine
                 .connect_gate(adopt_tweaks)

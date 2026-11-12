@@ -319,6 +319,7 @@ async fn local_deletes_are_soft_deletes_against_the_synced_revision() {
     d["size"] = json!(12);
     env.mock.put(d);
     let engine = env.engine();
+    engine.connect_gate(false).await.unwrap();
     let rep = engine.push_all(false).await.unwrap();
     assert_eq!(rep.kept_remote, 1, "{rep:?}");
     assert!(!env.deleted("e.md"));
@@ -338,7 +339,10 @@ async fn deleting_a_file_that_is_not_clean_never_deletes_the_remote() {
     assert_eq!(env.row("d.md").unwrap().state, State::Dirty);
     // The user deletes the file before it was pushed.
     std::fs::remove_file(env.vault().join("d.md")).unwrap();
-    let rep = env.engine().push_all(false).await.unwrap();
+    let gated = env.engine();
+    gated.connect_gate(false).await.unwrap();
+    let rep = gated.push_all(false).await.unwrap();
+    drop(gated);
     assert_eq!(rep.kept_remote, 1);
     assert_eq!(rep.deleted, 0);
     assert!(!env.deleted("d.md"));
@@ -1498,7 +1502,10 @@ async fn a_server_outage_ends_the_pass_instead_of_flagging_every_file() {
         env.write(&format!("n{i}.md"), format!("{i}").as_bytes());
     }
     env.mock.state.lock().unwrap().fail_writes = 100;
-    assert!(env.engine().push_all(false).await.is_err());
+    let gated = env.engine();
+    gated.connect_gate(false).await.unwrap();
+    assert!(gated.push_all(false).await.is_err());
+    drop(gated);
     let st = env.engine().status().unwrap();
     assert!(st.local_issues.is_empty(), "{:?}", st.local_issues);
     env.mock.state.lock().unwrap().fail_writes = 0;
@@ -1647,7 +1654,10 @@ async fn a_lost_put_response_does_not_make_a_conflict_with_ourselves() {
     env.engine().sync_once().await.unwrap();
     env.write("p.md", b"v2");
     env.mock.state.lock().unwrap().lose_next_put_response = true;
-    let rep = env.engine().push_all(false).await.unwrap();
+    let gated = env.engine();
+    gated.connect_gate(false).await.unwrap();
+    let rep = gated.push_all(false).await.unwrap();
+    drop(gated);
     assert_eq!(rep.failed, 1, "{rep:?}");
     let rep = env.engine().sync_once().await.unwrap();
     assert_eq!(rep.push.conflicts, 0, "{rep:?}");
@@ -2738,7 +2748,10 @@ async fn a_wipe_beside_newly_ignored_files_still_stops() {
     }
     // A pass without the filter catch-up before it (as when the ignore
     // file changes just before the walk).
-    let rep = env.engine_with(ignoring).push_all(false).await.unwrap();
+    let gated = env.engine_with(ignoring);
+    gated.connect_gate(false).await.unwrap();
+    let rep = gated.push_all(false).await.unwrap();
+    drop(gated);
     assert_eq!(rep.deleted, 0, "{rep:?}");
     assert_eq!(rep.safety_stops, 1);
     let stop = env.meta("safety_stop").unwrap();

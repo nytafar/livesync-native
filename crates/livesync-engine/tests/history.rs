@@ -221,23 +221,35 @@ async fn nothing_is_recorded_when_an_apply_or_push_fails() {
     // A push the server refuses, and one whose metadata write fails.
     env.mock.state.lock().unwrap().reject_puts.insert("r.md".into());
     env.write("r.md", b"refused");
-    let rep = env.engine().push_all(false).await.unwrap();
+    let gated = env.engine();
+    gated.connect_gate(false).await.unwrap();
+    let rep = gated.push_all(false).await.unwrap();
+    drop(gated);
     assert_eq!(rep.failed, 1, "{rep:?}");
     assert!(env.history("r.md").is_empty());
     assert!(env.index().by_doc("r.md").unwrap().is_none());
     env.mock.state.lock().unwrap().reject_puts.clear();
     env.write("p.md", b"v1");
-    env.engine().push_all(false).await.unwrap();
+    let gated = env.engine();
+    gated.connect_gate(false).await.unwrap();
+    gated.push_all(false).await.unwrap();
+    drop(gated);
     env.write("p.md", b"v2");
     env.mock.state.lock().unwrap().fail_writes = 100;
-    assert!(env.engine().push_all(false).await.is_err());
+    let gated = env.engine();
+    gated.connect_gate(false).await.unwrap();
+    assert!(gated.push_all(false).await.is_err());
+    drop(gated);
     env.mock.state.lock().unwrap().fail_writes = 0;
     assert_eq!(env.history("p.md").len(), 1);
 
     // Stored on the server, but the answer is lost: the index never took
     // the revision, so neither does the history.
     env.mock.state.lock().unwrap().lose_next_put_response = true;
-    let rep = env.engine().push_all(false).await.unwrap();
+    let gated = env.engine();
+    gated.connect_gate(false).await.unwrap();
+    let rep = gated.push_all(false).await.unwrap();
+    drop(gated);
     assert_eq!(rep.failed, 1, "{rep:?}");
     let on_server = env.mock.doc("p.md").unwrap()["_rev"].as_str().unwrap().to_string();
     let h = env.history("p.md");

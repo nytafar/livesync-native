@@ -664,6 +664,9 @@ pub(crate) const PUSH_FAILED: &str = "push-failed";
 fn pass_fatal(e: &EngineError) -> bool {
     match e {
         EngineError::Remote(RemoteError::Transport { .. } | RemoteError::Silent { .. } | RemoteError::Url(_)) => true,
+        // Whether the database is encrypted is not settled (no gate yet, or
+        // a regate refused meanwhile): no document can be written.
+        EngineError::Remote(RemoteError::EncryptionUndetermined(_)) => true,
         // The server or its proxy is down or throttling: not this document.
         EngineError::Remote(RemoteError::Http {
             status: 502 | 503 | 504 | 429 | 408,
