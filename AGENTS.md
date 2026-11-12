@@ -26,6 +26,8 @@ node generate.mjs ../../fixtures/golden
 
 Bump the pinned version in `tools/golden/package.json` and every assertion of it together: `crates/livesync-model/tests/golden.rs`, `crates/livesync-model/tests/golden_ignore.rs`, `crates/livesync-merge/tests/golden.rs` and `crates/livesync-merge/src/tests.rs` (`grep -rn 'meta"\]\["version' crates` finds them all). A bump can change upstream's merge results; the merge corpus test then says which cases differ.
 
+`overrides` in `tools/golden/package.json` pins commonlib's matcher dependencies (`minimatch`, `@isaacs/nonrecursive-glob-match`, `brace-expansion`) to the versions in the `package-lock.json` of the upstream release that ships the pinned commonlib, so the ignore vectors are what that plugin and CLI do; update them with the pin. The weekly upstream job fails when npm has a newer commonlib than the pin.
+
 ## Android app (APK)
 
 ```sh
@@ -53,7 +55,7 @@ The binary links only `libc`, `libm` and `libdl`. TLS is rustls with bundled web
 
 `.github/workflows/ci.yml` runs the gate on Linux and macOS, the Android gate (`scripts/build-apk.sh --unsigned`) and the universal macOS binary (both architectures, `scripts/ci/macos-universal.sh`, then `install.sh` from the built archives) on every push and PR.
 
-`.github/workflows/upstream-interop.yml` runs `scripts/interop.sh` weekly (and by hand: `gh workflow run upstream-interop.yml [-f tag=1.0.46]`) against the official CLI built from the latest upstream release (`scripts/ci/upstream-cli.sh`), on a throwaway CouchDB service container published on 127.0.0.1:8411 and set up by `scripts/ci/couchdb-init.sh`. It publishes nothing. When it fails, or a new upstream release is tested, update `COMPATIBILITY.md` and `TESTED_PLUGIN_VERSION` (`crates/livesync-model/src/gate.rs`) together. To try a release locally: `scripts/ci/upstream-cli.sh ~/scratch/upstream-cli [TAG]`, then `LSYNC_CLI_JS=<the cli_js it prints> scripts/interop.sh`.
+`.github/workflows/upstream-interop.yml` runs `scripts/interop.sh` weekly (and by hand: `gh workflow run upstream-interop.yml [-f tag=1.0.46]`) against the official CLI built from the latest upstream release (`scripts/ci/upstream-cli.sh`), on a throwaway CouchDB service container published on 127.0.0.1:8411 and set up by `scripts/ci/couchdb-init.sh`. It publishes nothing. When it fails, or a new upstream release is tested, update `COMPATIBILITY.md`, `TESTED_PLUGIN_VERSION` (`crates/livesync-model/src/gate.rs`) and `UPSTREAM_TAG` in `scripts/interop.sh` together. To try a release locally: `scripts/ci/upstream-cli.sh ~/scratch/upstream-cli [TAG]`, then `LSYNC_CLI_JS=<the cli_js it prints> scripts/interop.sh`.
 
 A release is a pushed tag; `.github/workflows/release.yml` does the rest:
 
@@ -110,7 +112,9 @@ scripts/interop.sh                 # every scenario; drops its throwaway databas
 KEEP=1 ONLY="S4 S6" scripts/interop.sh
 ```
 
-It creates `lsync-it-<run>` on the dev container, drives the official CLI (`~/code/ref/obsidian-livesync/src/apps/cli/dist/index.cjs`, run with `node` directly) and `lsync` through the M2 scenarios, and prints PASS/FAIL lines. It refuses any URL other than `127.0.0.1:8411`.
+It creates `lsync-it-<run>` on the dev container, drives the official CLI (run with `node` directly) and `lsync` through the M2 scenarios, and prints PASS/FAIL lines. It refuses any URL other than `127.0.0.1:8411`.
+
+The official CLI is `$LSYNC_CLI_JS` when set; otherwise the build of the release `COMPATIBILITY.md` lists as tested (`UPSTREAM_TAG` in the script, `LSYNC_UPSTREAM_TAG` overrides) from `~/code/ref/obsidian-livesync-<tag>`, then `${LSYNC_UPSTREAM_DIR:-~/scratch/upstream-cli}/obsidian-livesync` (what `scripts/ci/upstream-cli.sh ~/scratch/upstream-cli <tag>` builds), then `~/code/ref/obsidian-livesync`; with none at that release it falls back to `~/code/ref/obsidian-livesync` and warns which release it runs. Raise `UPSTREAM_TAG` with `TESTED_PLUGIN_VERSION`.
 
 ## Benchmark against the official clients
 

@@ -24,7 +24,7 @@ pub const PREFERRED: &str = "PREFERRED";
 /// that an upstream change causes; keep it in step with `COMPATIBILITY.md`.
 macro_rules! tested_plugin_version {
     () => {
-        "1.0.46"
+        "1.0.49"
     };
 }
 /// That release's version (written once, in the macro, for `concat!`).
