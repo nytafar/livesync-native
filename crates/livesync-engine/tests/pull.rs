@@ -307,6 +307,55 @@ async fn missing_chunks_are_deferred_and_retried() {
     assert_eq!(env.read("late.md").unwrap(), b"part1part2");
 }
 
+/// commonlib (`reflection.ts`, `processSizeMismatchedFiles` off by default)
+/// refuses to write a file whose content does not have the byte length of
+/// the document's `size`, except for a `size` of 0; since commonlib 0.4.0
+/// (Self-hosted LiveSync 1.0.47) writers store that byte length.
+#[tokio::test]
+async fn a_size_that_does_not_match_the_content_is_not_written() {
+    let env = Env::new().await;
+    let m = &env.mock;
+    let ids = m.put_chunks(&["æøå", "12345"]); // 11 bytes
+    m.put(json!({"_id": "wrong.md", "path": "wrong.md", "type": "plain", "children": ids, "mtime": 1, "ctime": 1, "size": 8, "eden": {}}));
+    m.put(json!({"_id": "zero.md", "path": "zero.md", "type": "plain", "children": ids, "mtime": 1, "ctime": 1, "size": 0, "eden": {}}));
+    m.put(json!({"_id": "right.md", "path": "right.md", "type": "plain", "children": ids, "mtime": 1, "ctime": 1, "size": 11, "eden": {}}));
+    let rep = env.engine().pull_once().await.unwrap();
+    assert_eq!(rep.pending, 1, "{rep:?}");
+    assert!(env.read("wrong.md").is_none());
+    assert_eq!(env.read("zero.md").unwrap(), "æøå12345".as_bytes());
+    assert_eq!(env.read("right.md").unwrap(), "æøå12345".as_bytes());
+    let st = env.engine().status().unwrap();
+    assert_eq!(st.pending.len(), 1);
+    assert!(
+        st.pending[0].reason.contains("size 8 but the content is 11 bytes"),
+        "{}",
+        st.pending[0].reason
+    );
+
+    // A writer that stores the right size makes it apply.
+    m.put(json!({"_id": "wrong.md", "path": "wrong.md", "type": "plain", "children": ids, "mtime": 2, "ctime": 1, "size": 11, "eden": {}}));
+    let rep = env.engine().pull_once().await.unwrap();
+    assert_eq!(rep.pending, 0, "{rep:?}");
+    assert_eq!(env.read("wrong.md").unwrap(), "æøå12345".as_bytes());
+}
+
+/// commonlib 0.4.3 takes only `type: "leaf"` documents with string `data`
+/// as chunks; anything else under a chunk's ID counts as missing.
+#[tokio::test]
+async fn only_leaf_documents_are_chunks() {
+    let env = Env::new().await;
+    let m = &env.mock;
+    let ids = m.put_chunks(&["part1", "part2"]);
+    // Not a chunk, under the second chunk's ID (served by `_all_docs` only).
+    m.replace_silently(&ids[1], json!({"_id": ids[1], "_rev": "1-x", "data": "part2"}));
+    m.put(json!({"_id": "odd.md", "path": "odd.md", "type": "plain", "children": ids, "mtime": 1, "ctime": 1, "size": 10, "eden": {}}));
+    let rep = env.engine().pull_once().await.unwrap();
+    assert_eq!(rep.pending, 1, "{rep:?}");
+    assert!(env.read("odd.md").is_none());
+    let st = env.engine().status().unwrap();
+    assert!(st.pending[0].reason.contains("missing"), "{}", st.pending[0].reason);
+}
+
 #[tokio::test]
 async fn gates_fail_closed() {
     // Version document above 13.

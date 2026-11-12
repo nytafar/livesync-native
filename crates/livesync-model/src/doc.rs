@@ -164,7 +164,6 @@ pub fn classify_doc(doc: &Value) -> Classified {
 pub struct ChunkDoc {
     #[serde(rename = "_id")]
     pub id: String,
-    #[serde(default)]
     pub data: String,
     #[serde(rename = "type", default)]
     pub kind: Option<String>,

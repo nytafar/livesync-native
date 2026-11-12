@@ -2289,6 +2289,12 @@ impl Engine {
                         continue;
                     }
                 };
+                if chunk.kind.as_deref() != Some("leaf") || chunk.id.starts_with("_local/") {
+                    // commonlib 0.4.3 (`isValidChunk`): anything else under a
+                    // chunk's ID is not one, and the chunk counts as missing.
+                    warn!("not a chunk: {:?} (type {:?})", row.key, chunk.kind);
+                    continue;
+                }
                 if chunk.encrypted == Some(true) || chunk.id.starts_with("h:+") {
                     return Err(Refusal::EncryptedContent(format!("chunk {}", chunk.id)).into());
                 }
@@ -2331,7 +2337,8 @@ impl Engine {
         doc: &FileDoc,
         chunks: &HashMap<String, String>,
     ) -> std::result::Result<Vec<u8>, String> {
-        let mut out = Vec::with_capacity(doc.size as usize);
+        // `size` is the remote's word: reserve no more than 64 MiB on it.
+        let mut out = Vec::with_capacity(doc.size.min(64 << 20) as usize);
         let mut missing = 0usize;
         let mut id_mismatch = 0u64;
         for c in &doc.children {
@@ -2371,6 +2378,16 @@ impl Engine {
                 doc.size,
                 out.len()
             );
+            // commonlib's reflection (`processSizeMismatchedFiles` off, the
+            // default) does not write such a file: it may be corrupted. A
+            // size of 0 is let through, as some writers leave it at 0.
+            if doc.size != 0 {
+                return Err(format!(
+                    "size {} but the content is {} bytes; not written, as the plugin does not write it either",
+                    doc.size,
+                    out.len()
+                ));
+            }
         }
         Ok(out)
     }
