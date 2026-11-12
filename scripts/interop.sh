@@ -49,6 +49,8 @@
 #       a new CLI device reads what it wrote
 #   E6  plaintext content injected into the encrypted database stops lsync's
 #       pull (status shows it); once it is gone, syncing resumes
+#   E7  a file whose chunk is damaged in place on the server is held: left
+#       as it was on disk, a local edit of it not pushed, other files syncing
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -663,7 +665,7 @@ fi
 fi
 
 # --- E1-E6: end-to-end encryption ------------------------------------------------
-if want E1 || want E2 || want E3 || want E4 || want E5 || want E6; then
+if want E1 || want E2 || want E3 || want E4 || want E5 || want E6 || want E7; then
 DBE="$DB-e2ee"
 # A throwaway, never logged.
 E2EE_PASS="interop-throwaway-$RUN"
@@ -782,21 +784,46 @@ fi
 
 if want E4; then
 log "E4 a wrong passphrase on either side"
+# What lsync could write besides documents: the milestone and the sync
+# parameters (`_local`, which update_seq does not count).
+e_locals() { for n in obsydian_livesync_milestone obsidian_livesync_sync_parameters; do couch "$LSYNC_URL/$DBE/_local/$n"; echo; done; }
+# Every file in a vault folder (lsync's own lock files aside) with its size,
+# mtime and content hash.
+tree_sum() { (cd "$1" && find . -type f ! -name '.lsync.lock' ! -name '.lsync.holder' -printf '%P %s %T@\n' | sort \
+  && find . -type f ! -name '.lsync.lock' ! -name '.lsync.holder' -exec sha256sum {} + | sort); }
+# The vault is not empty: a file the remote has too (other content), and one of its own.
+mkdir -p "$W/vault-e4/e" "$W/vault-e4/e4"
+printf 'a local copy, older\n' > "$W/vault-e4/e/init.md"
+printf 'only here\n' > "$W/vault-e4/e4/local.md"
+tree_before=$(tree_sum "$W/vault-e4")
 seq_before=$(couch "$LSYNC_URL/$DBE" | jfield '["update_seq"]')
-rc=0
-LSYNC_DB=$DBE LSYNC_VAULT=$W/vault-e4 LSYNC_STATE_DIR=$W/state-e4 LSYNC_CONFIG=$W/e4.toml LSYNC_DEVICE_NAME=interop-e4 \
-  LSYNC_PASSPHRASE="wrong-$RUN" "$BIN" sync >/dev/null 2>"$W/lsync-e4.log" || rc=$?
-check "lsync refuses a wrong passphrase (exit $rc)" test "$rc" -eq 2
-check "  ... saying so" grep -q "does not decrypt" "$W/lsync-e4.log"
-check "  ... without writing a file (lsync's own lock files aside)" bash -c "[[ -z \"\$(find '$W/vault-e4' -type f ! -name '.lsync.lock' ! -name '.lsync.holder' 2>/dev/null)\" ]]"
-check "  ... or anything to the database" test "$(couch "$LSYNC_URL/$DBE" | jfield '["update_seq"]')" == "$seq_before"
-check "  ... and never prints the passphrase" bash -c "! grep -q -- 'wrong-$RUN' '$W/lsync-e4.log'"
-# The CLI with another passphrase cannot read what lsync wrote.
+locals_before=$(e_locals)
+for how in sync fetch; do
+  rc=0
+  LSYNC_DB=$DBE LSYNC_VAULT=$W/vault-e4 LSYNC_STATE_DIR=$W/state-e4 LSYNC_CONFIG=$W/e4.toml LSYNC_DEVICE_NAME=interop-e4 \
+    LSYNC_PASSPHRASE="wrong-$RUN" "$BIN" "$how" >/dev/null 2>"$W/lsync-e4.log" || rc=$?
+  check "lsync $how refuses a wrong passphrase (exit $rc)" test "$rc" -eq 2
+  check "  ... saying so" grep -q "does not decrypt" "$W/lsync-e4.log"
+  check "  ... leaving the vault's files as they were" test "$(tree_sum "$W/vault-e4")" == "$tree_before"
+  check "  ... writing no document to the database" test "$(couch "$LSYNC_URL/$DBE" | jfield '["update_seq"]')" == "$seq_before"
+  check "  ... nor its milestone or sync parameters" test "$(e_locals)" == "$locals_before"
+  check "  ... and never prints the passphrase" bash -c "! grep -q -- 'wrong-$RUN' '$W/lsync-e4.log'"
+done
+# The CLI with another passphrase cannot read what lsync wrote. It does not
+# say why (`cat` just fails), so the other causes are ruled out: it did
+# replicate (the file's metadata, which is not encrypted, is listed), and the
+# same steps with the right passphrase on a fresh CLI database read it.
 cli_settings "$W/cli-defaults.json" "$W/cli-e4.json" "$DBE" "{$E2EE_TWEAKS, \"passphrase\": \"wrong-$RUN\"}"
-mkdir -p "$W/clidb-e4"
-node "$CLI_JS" "$W/clidb-e4" --settings "$W/cli-e4.json" sync >/dev/null 2>>"$W/cli-e4.log" || true
-got=$(node "$CLI_JS" "$W/clidb-e4" --settings "$W/cli-e4.json" cat e/init.md 2>>"$W/cli-e4.log" | sed '/^\[CLIWatchAdapter\]/d' || true)
+mkdir -p "$W/clidb-e4" "$W/clidb-e4ok"
+cli4() { node "$CLI_JS" "$1" --settings "$2" "${@:3}" 2>>"$W/cli-e4.log"; }
+cli4 "$W/clidb-e4" "$W/cli-e4.json" sync >/dev/null || true
+got=$(cli4 "$W/clidb-e4" "$W/cli-e4.json" cat e/init.md | sed '/^\[CLIWatchAdapter\]/d' || true)
 check "the CLI with a wrong passphrase does not get the content" test "$got" != "encrypted init"
+check "  ... though it replicated the database (it lists the file)" bash -c \
+  "node '$CLI_JS' '$W/clidb-e4' --settings '$W/cli-e4.json' ls e/ 2>/dev/null | grep -q '^e/init.md'"
+cli4 "$W/clidb-e4ok" "$W/cli-e.json" sync >/dev/null || true
+got=$(cli4 "$W/clidb-e4ok" "$W/cli-e.json" cat e/init.md | sed '/^\[CLIWatchAdapter\]/d' || true)
+check "  ... and the right passphrase, the same way, reads it" test "$got" == "encrypted init"
 fi
 
 if want E5; then
@@ -851,6 +878,41 @@ couch -X DELETE "$LSYNC_URL/$DBE/e6%2Fleak.md?rev=$rev" >/dev/null
 lse sync >/dev/null
 st=$(LSYNC_DB=$DBE LSYNC_VAULT=$W/vault-e LSYNC_STATE_DIR=$W/state-e LSYNC_CONFIG=$W/e.toml "$BIN" status --json 2>/dev/null || true)
 check "once it is gone, the pull gets past it and the stop lifts" test "$(echo "$st" | jfield '.get("upstream_stop") is None')" == true
+fi
+
+if want E7; then
+log "E7 a file whose chunk is damaged on the server is held"
+printf 'held, readable\n' | clie put e7/held.md >/dev/null
+printf 'other\n' | clie put e7/other.md >/dev/null
+clie sync >/dev/null
+lse sync >/dev/null
+check "the file arrives" file_is "$W/vault-e/e7/held.md" "held, readable"
+printf 'held, then damaged on the server\n' | clie put e7/held.md >/dev/null
+clie sync >/dev/null
+# One character of the new revision's chunk changed in place.
+cid=$(edoc e7/held.md | jfield '["children"][0]' | tr -d '"')
+cid_url=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1],safe=""))' "$cid")
+couch "$LSYNC_URL/$DBE/$cid_url" | python3 -c '
+import json, sys
+d = json.load(sys.stdin); s = d["data"]; i = len(s) - 6
+d["data"] = s[:i] + ("B" if s[i] == "A" else "A") + s[i + 1:]
+print(json.dumps(d))' | couch -X PUT "$LSYNC_URL/$DBE/$cid_url" -H 'Content-Type: application/json' -d @- >/dev/null
+held_rev=$(edoc e7/held.md | jfield '["_rev"]')
+printf 'written after\n' | clie put e7/after.md >/dev/null
+clie sync >/dev/null
+lse sync >/dev/null
+check "the held file is left as it was on disk" file_is "$W/vault-e/e7/held.md" "held, readable"
+st=$(LSYNC_DB=$DBE LSYNC_VAULT=$W/vault-e LSYNC_STATE_DIR=$W/state-e LSYNC_CONFIG=$W/e.toml "$BIN" status --json 2>/dev/null || true)
+check "  ... and status lists it as held" bash -c "echo '$(echo "$st" | jfield '["pending"]')' | grep -q 'e7/held.md'"
+check "other files keep coming down" file_is "$W/vault-e/e7/after.md" "written after"
+printf 'edited here\n' > "$W/vault-e/e7/held.md"
+printf 'mine\n' > "$W/vault-e/e7/mine.md"
+lse sync >/dev/null
+check "a local edit of the held file is not pushed" test "$(edoc e7/held.md | jfield '["_rev"]')" == "$held_rev"
+check "  ... nor a branch made of it" test "$(edoc e7/held.md '?conflicts=true' | jfield '.get("_conflicts", [])')" == "[]"
+check "  ... and it stays on disk" file_is "$W/vault-e/e7/held.md" "edited here"
+clie sync >/dev/null
+check "other files keep going up" test "$(clie_cat e7/mine.md)" == "mine"
 fi
 
 [[ $FAIL -eq 0 ]]

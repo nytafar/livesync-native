@@ -863,6 +863,60 @@ async fn the_passphrase_must_open_the_most_recent_files() {
     assert_eq!(env.engine().status().unwrap().pending.len(), 1);
 }
 
+/// A file in sync whose remote moves on to a revision this device cannot
+/// read is held: a local edit pushes nothing, and a local delete neither
+/// removes nor branches the remote revision.
+#[tokio::test]
+async fn a_synced_file_whose_remote_turns_unreadable_is_held() {
+    let env = Env::new().await;
+    let m = &env.mock;
+    m.put_text("a.md", &["first"]);
+    m.put_text("other.md", &["other"]);
+    env.engine().sync_once().await.unwrap();
+    assert_eq!(env.read("a.md").unwrap(), b"first");
+    // Another device writes a new revision; its chunk is damaged in place.
+    m.put_text("a.md", &["second, unreadable"]);
+    let cid = m.doc("a.md").unwrap()["children"][0].as_str().unwrap().to_string();
+    let mut chunk = m.doc(&cid).unwrap();
+    let data = chunk["data"].as_str().unwrap().to_string();
+    let mut bytes = data.into_bytes();
+    let i = bytes.len() - 6;
+    bytes[i] = if bytes[i] == b'A' { b'B' } else { b'A' };
+    chunk["data"] = json!(String::from_utf8(bytes).unwrap());
+    m.replace_silently(&cid, chunk);
+    let held_rev = m.doc("a.md").unwrap()["_rev"].as_str().unwrap().to_string();
+    env.engine().sync_once().await.unwrap();
+    assert_eq!(env.read("a.md").unwrap(), b"first", "the file is left alone");
+    let st = env.engine().status().unwrap();
+    assert!(st.pending.iter().any(|p| p.doc_id == "a.md"), "{st:?}");
+
+    // A local edit: nothing is pushed for it; other files keep syncing.
+    env.write("a.md", b"edited here");
+    env.write("new.md", b"a new note");
+    m.clear_requests();
+    let rep = env.engine().sync_once().await.unwrap();
+    let a = m.doc("a.md").unwrap();
+    assert_eq!(a["_rev"], json!(held_rev), "{rep:?}");
+    assert!(a.get("_conflicts").is_none(), "{a}");
+    assert!(
+        !m.writes().iter().any(|(_, p)| p.ends_with("/a.md")),
+        "{:?}",
+        m.writes()
+    );
+    assert_eq!(env.remote("new.md").unwrap(), b"a new note");
+    assert_eq!(env.read("a.md").unwrap(), b"edited here");
+
+    // A local delete: the remote revision stays the winner, alone, live.
+    std::fs::remove_file(env.vault().join("a.md")).unwrap();
+    let rep = env.engine().sync_once().await.unwrap();
+    let a = m.doc("a.md").unwrap();
+    assert_eq!(a["_rev"], json!(held_rev), "{rep:?}");
+    assert!(a.get("_conflicts").is_none(), "{a}");
+    assert!(a.get("deleted").is_none() && a.get("_deleted").is_none(), "{a}");
+    assert_eq!(m.state.lock().unwrap().trees["a.md"].leaves().len(), 1);
+    assert_eq!(rep.push.deleted, 0, "{rep:?}");
+}
+
 #[test]
 fn the_mock_guard_refuses_plaintext_and_ciphertext_where_they_do_not_belong() {
     use common::guard_violation;
