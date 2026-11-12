@@ -686,6 +686,22 @@ const ENCRYPTED_CHUNKS: (&str, &str) = ("h:+", "h:,");
 const PASSPHRASE_PROBES: usize = 3;
 /// How many encrypted chunks it looks at to find them.
 const PASSPHRASE_PROBE_PAGE: usize = 50;
+/// How many of the most recently changed documents it reads to find the
+/// latest files, and of how many files it checks a chunk.
+const PASSPHRASE_RECENT_DOCS: usize = 25;
+const PASSPHRASE_RECENT_FILES: usize = 5;
+
+/// A chunk as stored that is V2 ciphertext (the only kind that tells a
+/// passphrase).
+fn is_v2_chunk(doc: &Value) -> bool {
+    doc.get("type").and_then(Value::as_str) == Some("leaf")
+        && doc.get("e_") == Some(&Value::Bool(true))
+        && doc
+            .get("data")
+            .and_then(Value::as_str)
+            .is_some_and(|d| d.starts_with(livesync_crypto::HKDF_PREFIX))
+}
+
 pub(crate) struct Inner {
     pub(crate) couch: Couch,
     pub(crate) cfg: EngineConfig,
@@ -1640,12 +1656,25 @@ impl Engine {
         Ok(params)
     }
 
-    /// The passphrase against what the database holds: the `syncinfo`
-    /// document when there is one, else the first V2 chunks. An empty
-    /// database has nothing to check.
+    /// The passphrase against what the database holds, read-only and in a
+    /// handful of requests:
+    ///
+    /// - the `syncinfo` document, when there is one: it decrypts, or the
+    ///   passphrase is wrong;
+    /// - one chunk of each of the most recently changed files (what the
+    ///   other devices write now): these must decrypt. One that does not,
+    ///   beside others that do or beside a `syncinfo` or older chunk that
+    ///   does, is taken for damage (its file is held when it is pulled);
+    ///   none decrypting, or more failing than decrypting, is a wrong
+    ///   passphrase;
+    /// - without recent V2 chunks, the first V2 chunks in key order, any one
+    ///   of which decrypting proves it (a damaged one does not disprove it).
+    ///
+    /// An empty database has nothing to check.
     async fn verify_passphrase(&self, cipher: &livesync_crypto::DocumentCipher) -> Result<()> {
         use livesync_crypto::CryptoError;
         let couch = &self.inner.couch;
+        let mut anchored = false;
         if let DocFetch::Found(info) = couch.fetch_doc_raw(livesync_crypto::ids::SYNCINFO_ID).await? {
             let sealed = info
                 .get("data")
@@ -1653,7 +1682,7 @@ impl Engine {
                 .is_some_and(|d| d.starts_with(livesync_crypto::HKDF_PREFIX));
             if sealed {
                 match cipher.outgoing(info) {
-                    Ok(_) => return Ok(()),
+                    Ok(_) => anchored = true,
                     Err(CryptoError::Authentication) => {
                         return Err(Refusal::WrongPassphrase("the `syncinfo` document".into()).into())
                     }
@@ -1661,7 +1690,78 @@ impl Engine {
                 }
             }
         }
-        let rows = couch
+
+        // The most recently changed files, one chunk each.
+        let mut keys: Vec<String> = Vec::new();
+        for doc in couch.recent_docs_raw(PASSPHRASE_RECENT_DOCS).await? {
+            let file = matches!(doc.get("type").and_then(Value::as_str), Some("plain" | "newnote"))
+                && doc.get("deleted").and_then(Value::as_bool) != Some(true);
+            let first = doc.get("children").and_then(Value::as_array).and_then(|c| {
+                c.iter()
+                    .filter_map(Value::as_str)
+                    .find(|c| livesync_crypto::ids::is_encrypted_chunk_id(c))
+            });
+            if let Some(c) = first.filter(|_| file) {
+                if !keys.iter().any(|k| k == c) {
+                    keys.push(c.to_string());
+                }
+            }
+            if keys.len() >= PASSPHRASE_RECENT_FILES {
+                break;
+            }
+        }
+        let (mut ok, mut bad) = (0usize, Vec::new());
+        if !keys.is_empty() {
+            for doc in couch
+                .all_docs_by_keys_raw(&keys)
+                .await?
+                .into_iter()
+                .filter_map(|r| r.doc)
+                .filter(|d| !d.is_null())
+            {
+                if !is_v2_chunk(&doc) {
+                    continue;
+                }
+                let id = doc.get("_id").and_then(Value::as_str).unwrap_or_default().to_string();
+                match cipher.outgoing(doc) {
+                    Ok(_) => ok += 1,
+                    Err(CryptoError::Authentication) => bad.push(id),
+                    Err(e) => debug!("chunk {id} does not tell the passphrase ({e})"),
+                }
+            }
+        }
+        if !bad.is_empty() {
+            let named = || format!("encrypted chunk {} of the most recently changed files", bad.join(", "));
+            if ok < bad.len() && (bad.len() > 1 || ok > 0) {
+                return Err(Refusal::WrongPassphrase(named()).into());
+            }
+            if ok == 0 && !anchored {
+                // One recent file, and its chunk fails: damage, or the
+                // wrong passphrase. Older chunks tell.
+                anchored = self.verify_by_first_chunks(cipher).await.is_ok();
+                if !anchored {
+                    return Err(Refusal::WrongPassphrase(named()).into());
+                }
+            }
+            warn!(
+                "{} does not decrypt, but the passphrase opens the rest; taken for damage (the file is held)",
+                named()
+            );
+            return Ok(());
+        }
+        if ok > 0 || anchored {
+            return Ok(());
+        }
+        self.verify_by_first_chunks(cipher).await
+    }
+
+    /// The passphrase against the first V2 chunks in key order: any one that
+    /// decrypts proves it (one damaged chunk does not make it wrong).
+    async fn verify_by_first_chunks(&self, cipher: &livesync_crypto::DocumentCipher) -> Result<()> {
+        use livesync_crypto::CryptoError;
+        let rows = self
+            .inner
+            .couch
             .all_docs_page_raw(
                 Some(ENCRYPTED_CHUNKS.0),
                 Some(ENCRYPTED_CHUNKS.1),
@@ -1672,14 +1772,8 @@ impl Engine {
         let mut tried = Vec::new();
         let mut seen = 0usize;
         for doc in rows.into_iter().filter_map(|r| r.doc).filter(|d| !d.is_null()) {
-            let v2 = doc.get("type").and_then(Value::as_str) == Some("leaf")
-                && doc.get("e_") == Some(&Value::Bool(true))
-                && doc
-                    .get("data")
-                    .and_then(Value::as_str)
-                    .is_some_and(|d| d.starts_with(livesync_crypto::HKDF_PREFIX));
             seen += 1;
-            if !v2 {
+            if !is_v2_chunk(&doc) {
                 continue;
             }
             let id = doc.get("_id").and_then(Value::as_str).unwrap_or_default().to_string();

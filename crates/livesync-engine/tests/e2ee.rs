@@ -804,6 +804,65 @@ async fn a_refused_fetch_leaves_the_index_as_it_was() {
     assert_eq!(env.read("a.md").unwrap(), b"synced");
 }
 
+/// The passphrase must open what the other devices write now: chunks of
+/// the most recently changed files, not only the first chunks in key order.
+#[tokio::test]
+async fn the_passphrase_must_open_the_most_recent_files() {
+    let env = Env::new().await;
+    let m = &env.mock;
+    // Older notes, under this passphrase.
+    m.put_text("old1.md", &["old one"]);
+    m.put_text("old2.md", &["old two"]);
+    // Then devices with another passphrase (same salt) wrote the latest.
+    let other = Mock::start_encrypted(WRONG).await;
+    for (i, p) in ["new1.md", "new2.md", "new3.md"].iter().enumerate() {
+        let chunk = other.chunk_doc(&format!("newer text {i}"));
+        let cid = chunk["_id"].as_str().unwrap().to_string();
+        // Sorted after the old chunks, so the old key-order check would not see it.
+        let cid = format!("h:+zz{cid}");
+        let mut chunk = chunk;
+        chunk["_id"] = json!(cid);
+        m.put(chunk);
+        m.put(json!({"_id": p, "path": p, "type": "plain", "children": [cid], "mtime": 2, "ctime": 2, "size": 12, "eden": {}}));
+    }
+    let r = refused(env.engine().pull_once().await);
+    assert!(
+        matches!(&r, Refusal::WrongPassphrase(w) if w.contains("most recently changed")),
+        "{r:?}"
+    );
+    assert!(env.read("old1.md").is_none());
+
+    // One damaged chunk on the latest file, the others fine: damage, not a
+    // wrong passphrase; the file is held.
+    let env = Env::new().await;
+    let m = &env.mock;
+    m.put_text("a.md", &["aaa"]);
+    m.put_text("b.md", &["bbb"]);
+    m.put_text("latest.md", &["the latest"]);
+    let cid = m.doc("latest.md").unwrap()["children"][0].as_str().unwrap().to_string();
+    let mut chunk = m.doc(&cid).unwrap();
+    chunk["data"] = json!(format!("%={}", "A".repeat(80)));
+    m.put(chunk);
+    m.put(json!({"_id": "latest.md", "path": "latest.md", "type": "plain", "children": [cid], "mtime": 3, "ctime": 3, "size": 10, "eden": {}}));
+    env.engine().pull_once().await.unwrap();
+    assert_eq!(env.read("a.md").unwrap(), b"aaa");
+    assert!(env.read("latest.md").is_none());
+    assert_eq!(env.engine().status().unwrap().pending.len(), 1);
+
+    // A database of one file whose only chunk is damaged, with older
+    // chunks that decrypt: still damage.
+    let env = Env::new().await;
+    let m = &env.mock;
+    m.put_chunks(&["an older chunk the passphrase opens"]);
+    m.put_text("only.md", &["only"]);
+    let cid = m.doc("only.md").unwrap()["children"][0].as_str().unwrap().to_string();
+    let mut chunk = m.doc(&cid).unwrap();
+    chunk["data"] = json!(format!("%={}", "A".repeat(80)));
+    m.put(chunk);
+    env.engine().pull_once().await.unwrap();
+    assert_eq!(env.engine().status().unwrap().pending.len(), 1);
+}
+
 #[test]
 fn the_mock_guard_refuses_plaintext_and_ciphertext_where_they_do_not_belong() {
     use common::guard_violation;

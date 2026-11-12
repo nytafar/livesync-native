@@ -821,6 +821,29 @@ impl Couch {
         Ok(resp)
     }
 
+    /// The most recently changed documents (chunks excluded, as in
+    /// [`Couch::changes`]), newest first, as stored: no transform. At most
+    /// `limit`; deletions are left out. For the connect gate's own checks.
+    pub async fn recent_docs_raw(&self, limit: usize) -> Result<Vec<Value>> {
+        let mut url = self.doc_url(&["_changes"]);
+        url.query_pairs_mut()
+            .append_pair("filter", "_selector")
+            .append_pair("include_docs", "true")
+            .append_pair("descending", "true")
+            .append_pair("limit", &limit.to_string());
+        let r = self
+            .send("_changes", self.http().post(url).json(&changes_selector()))
+            .await?;
+        let resp: ChangesResponse = self.json("_changes", r).await?;
+        Ok(resp
+            .results
+            .into_iter()
+            .filter(|r| !r.deleted)
+            .filter_map(|r| r.doc)
+            .filter(|d| !d.is_null())
+            .collect())
+    }
+
     /// `POST /{db}/_all_docs?include_docs=true` with `keys`.
     pub async fn all_docs_by_keys(&self, keys: &[String]) -> Result<Vec<AllDocsRow>> {
         let e = self.settled(None, || "to read _all_docs".into())?;

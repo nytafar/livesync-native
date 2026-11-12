@@ -931,6 +931,8 @@ async fn changes(State((st, notify)): S, Query(q): Query<HashMap<String, String>
     let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(usize::MAX);
     let longpoll = q.get("feed").map(String::as_str) == Some("longpoll");
     let conflicts = q.get("conflicts").map(String::as_str) == Some("true");
+    // Newest first (CouchDB's `descending=true`; `since` is not combined with it here).
+    let descending = q.get("descending").map(String::as_str) == Some("true");
     let page = move |s: &MockState| {
         // Latest change per doc only, like CouchDB.
         let mut latest: BTreeMap<String, u64> = BTreeMap::new();
@@ -941,6 +943,9 @@ async fn changes(State((st, notify)): S, Query(q): Query<HashMap<String, String>
         }
         let mut rows: Vec<(u64, String)> = latest.into_iter().map(|(id, seq)| (seq, id)).collect();
         rows.sort();
+        if descending {
+            rows.reverse();
+        }
         let rows: Vec<(u64, String)> = rows
             .into_iter()
             .filter(|(_, id)| s.docs.get(id).is_some_and(selected))
