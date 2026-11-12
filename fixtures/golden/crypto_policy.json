@@ -1,0 +1,938 @@
+{
+ "meta": {
+  "generator": "tools/golden/crypto.mjs",
+  "package": "@vrtmrz/livesync-commonlib",
+  "version": "0.4.3"
+ },
+ "upstream": {
+  "commonlib": "0.4.3",
+  "octagonalWheels": "0.1.56"
+ },
+ "cases": [
+  {
+   "doc": {
+    "_id": "h:+c",
+    "type": "leaf",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "chunk",
+    "documentId": "h:+c"
+   }
+  },
+  {
+   "doc": {
+    "_id": "h:+c",
+    "type": "leaf",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "h:+c",
+    "type": "leaf",
+    "data": "%=x",
+    "e_": true
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "h:+c",
+    "type": "leaf",
+    "data": "%=x",
+    "e_": true
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "h:+c",
+    "type": "leaf"
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "h:+c",
+    "type": "leaf"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "h:+c",
+    "type": "leaf",
+    "data": null
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "chunk",
+    "documentId": "h:+c"
+   }
+  },
+  {
+   "doc": {
+    "_id": "h:+c",
+    "type": "leaf",
+    "data": null
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "h:+c",
+    "_deleted": true,
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "h:+c",
+    "_deleted": true,
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "h:c",
+    "type": "leaf",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "chunk",
+    "documentId": "h:c"
+   }
+  },
+  {
+   "doc": {
+    "_id": "h:c",
+    "type": "leaf",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "h:c",
+    "type": "leaf",
+    "data": "x",
+    "e_": true
+   },
+   "accept": false,
+   "verdict": {
+    "error": "unsupported",
+    "unsupported": "UnreadableEncryptedContent"
+   }
+  },
+  {
+   "doc": {
+    "_id": "h:c",
+    "type": "leaf",
+    "data": "x",
+    "e_": true
+   },
+   "accept": true,
+   "verdict": {
+    "error": "unsupported",
+    "unsupported": "UnreadableEncryptedContent"
+   }
+  },
+  {
+   "doc": {
+    "_id": "x",
+    "type": "leaf",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "chunk",
+    "documentId": "x"
+   }
+  },
+  {
+   "doc": {
+    "_id": "x",
+    "type": "leaf",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "x",
+    "type": "chunkpack",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "chunk",
+    "documentId": "x"
+   }
+  },
+  {
+   "doc": {
+    "_id": "x",
+    "type": "chunkpack",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "x",
+    "type": "chunkpack",
+    "data": "x",
+    "e_": true
+   },
+   "accept": false,
+   "verdict": {
+    "error": "unsupported",
+    "unsupported": "UnreadableEncryptedContent"
+   }
+  },
+  {
+   "doc": {
+    "_id": "x",
+    "type": "chunkpack",
+    "data": "x",
+    "e_": true
+   },
+   "accept": true,
+   "verdict": {
+    "error": "unsupported",
+    "unsupported": "UnreadableEncryptedContent"
+   }
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": []
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": []
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": {}
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": {}
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": {
+     "h:+e": {
+      "data": "x",
+      "epoch": 1
+     }
+    }
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "eden",
+    "documentId": "note.md"
+   }
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": {
+     "h:+e": {
+      "data": "x",
+      "epoch": 1
+     }
+    }
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": {
+     "h:++encrypted-hkdf": {
+      "data": "%=x",
+      "epoch": 999999
+     }
+    }
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": {
+     "h:++encrypted-hkdf": {
+      "data": "%=x",
+      "epoch": 999999
+     }
+    }
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": {
+     "h:++encrypted": {
+      "data": "%x",
+      "epoch": 999999
+     }
+    }
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": {
+     "h:++encrypted": {
+      "data": "%x",
+      "epoch": 999999
+     }
+    }
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": {
+     "h:++encrypted-hkdf": {
+      "data": "%=x",
+      "epoch": 999999
+     },
+     "h:+e": {}
+    }
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "eden",
+    "documentId": "note.md"
+   }
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": {
+     "h:++encrypted-hkdf": {
+      "data": "%=x",
+      "epoch": 999999
+     },
+     "h:+e": {}
+    }
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": []
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": []
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": [
+     1
+    ]
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "eden",
+    "documentId": "note.md"
+   }
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": [
+     1
+    ]
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": null
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": null
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": "s"
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "children": [],
+    "eden": "s"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "inline-note",
+    "documentId": "note.md"
+   }
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "data": "x",
+    "e_": true
+   },
+   "accept": false,
+   "verdict": {
+    "error": "unsupported",
+    "unsupported": "UnreadableEncryptedContent"
+   }
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "data": "x",
+    "e_": true
+   },
+   "accept": true,
+   "verdict": {
+    "error": "unsupported",
+    "unsupported": "UnreadableEncryptedContent"
+   }
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "data": "x",
+    "deleted": true
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "data": "x",
+    "deleted": true
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "newnote",
+    "data": "x",
+    "deleted": true
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "newnote",
+    "data": "x",
+    "deleted": true
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "internalfile",
+    "data": "x",
+    "deleted": true
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "internalfile",
+    "data": "x",
+    "deleted": true
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "notes",
+    "data": "x",
+    "deleted": true
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "inline-note",
+    "documentId": "note.md"
+   }
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "notes",
+    "data": "x",
+    "deleted": true
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "eden": {
+     "h:+e": {}
+    },
+    "deleted": true
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "eden": {
+     "h:+e": {}
+    },
+    "deleted": true
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "eden": {
+     "h:+e": {}
+    },
+    "data": "x",
+    "e_": true
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "eden",
+    "documentId": "note.md"
+   }
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "eden": {
+     "h:+e": {}
+    },
+    "data": "x",
+    "e_": true
+   },
+   "accept": true,
+   "verdict": {
+    "error": "unsupported",
+    "unsupported": "UnreadableEncryptedContent"
+   }
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "eden": {
+     "h:+e": {}
+    },
+    "_deleted": true
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "type": "plain",
+    "eden": {
+     "h:+e": {}
+    },
+    "_deleted": true
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "inline-note",
+    "documentId": "note.md"
+   }
+  },
+  {
+   "doc": {
+    "_id": "note.md",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "_local/x",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "_local/x",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "syncinfo",
+    "type": "syncinfo",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "syncinfo",
+    "type": "syncinfo",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "syncinfo",
+    "type": "other",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "inline-note",
+    "documentId": "syncinfo"
+   }
+  },
+  {
+   "doc": {
+    "_id": "syncinfo",
+    "type": "other",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "syncinfo",
+    "data": "x",
+    "e_": true
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "syncinfo",
+    "data": "x",
+    "e_": true
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "_local/obsidian_livesync_sync_parameters",
+    "type": "sync-parameters",
+    "pbkdf2salt": "x"
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "_local/obsidian_livesync_sync_parameters",
+    "type": "sync-parameters",
+    "pbkdf2salt": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "obsydian_livesync_version",
+    "type": "versioninfo",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "obsydian_livesync_version",
+    "type": "versioninfo",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "obsydian_livesync_version",
+    "type": "leaf",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "chunk",
+    "documentId": "obsydian_livesync_version"
+   }
+  },
+  {
+   "doc": {
+    "_id": "obsydian_livesync_version",
+    "type": "leaf",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "f:abc",
+    "type": "plain",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "inline-note",
+    "documentId": "f:abc"
+   }
+  },
+  {
+   "doc": {
+    "_id": "f:abc",
+    "type": "plain",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "f:abc",
+    "type": "plain",
+    "data": "x",
+    "e_": true
+   },
+   "accept": false,
+   "verdict": {
+    "error": "unsupported",
+    "unsupported": "UnreadableEncryptedContent"
+   }
+  },
+  {
+   "doc": {
+    "_id": "f:abc",
+    "type": "plain",
+    "data": "x",
+    "e_": true
+   },
+   "accept": true,
+   "verdict": {
+    "error": "unsupported",
+    "unsupported": "UnreadableEncryptedContent"
+   }
+  },
+  {
+   "doc": {
+    "_id": "f:abc",
+    "type": "plain",
+    "children": []
+   },
+   "accept": false,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "f:abc",
+    "type": "plain",
+    "children": []
+   },
+   "accept": true,
+   "verdict": "ok"
+  },
+  {
+   "doc": {
+    "_id": "i:f:abc",
+    "type": "newnote",
+    "data": "x"
+   },
+   "accept": false,
+   "verdict": {
+    "error": "rejected",
+    "contentKind": "inline-note",
+    "documentId": "i:f:abc"
+   }
+  },
+  {
+   "doc": {
+    "_id": "i:f:abc",
+    "type": "newnote",
+    "data": "x"
+   },
+   "accept": true,
+   "verdict": "ok"
+  }
+ ]
+}
