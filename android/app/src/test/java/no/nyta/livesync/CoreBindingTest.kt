@@ -127,6 +127,8 @@ class CoreBindingTest {
         val state = File(tmp.root, "state/p1").path
         val cfg = Core.toConfig(p, state, "secret-pw")
         assertEquals(ScopeKind.EXCLUDE, cfg.scopeKind)
+        assertEquals("no passphrase unless one is given", "", cfg.passphrase)
+        assertEquals("open-sesame", Core.toConfig(p, state, "secret-pw", "open-sesame").passphrase)
 
         val gate = host.connectTest(cfg, File(tmp.root, "cache").path)
         assertEquals(gate.message, GateOutcome.UNREACHABLE, gate.outcome)

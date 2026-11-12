@@ -1,7 +1,7 @@
 //! A profile as the app hands it over. The checks that apply before an
 //! engine is opened for it are the host's (`livesync_host::RunConfig`).
 
-use livesync_engine::EngineConfig;
+use livesync_engine::{EngineConfig, Passphrase};
 use livesync_host::{Handover, RunConfig, Tuning, WhatSyncs};
 use livesync_model::scope::{Scope, ScopeMode};
 use livesync_remote::RemoteConfig;
@@ -15,8 +15,9 @@ pub enum ScopeKind {
     Exclude,
 }
 
-/// Everything one engine needs. The app resolves the password from its
-/// SecretStore just before handing this over; it is never stored here.
+/// Everything one engine needs. The app resolves the password and the
+/// passphrase from its SecretStore just before handing this over; they are
+/// never stored here.
 #[derive(Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ProfileConfig {
     /// Stable profile ID (also keys the app's secret and state folder).
@@ -29,6 +30,9 @@ pub struct ProfileConfig {
     pub database: String,
     pub username: String,
     pub password: String,
+    /// The remote database's end-to-end encryption passphrase; empty for a
+    /// database that is not encrypted.
+    pub passphrase: String,
     pub scope_kind: ScopeKind,
     pub scope_folders: Vec<String>,
     /// Follow the remote read-only (`lsync daemon --pull-only`).
@@ -49,6 +53,7 @@ impl std::fmt::Debug for ProfileConfig {
             .field("database", &self.database)
             .field("username", &self.username)
             .field("password", &"***")
+            .field("passphrase", &if self.passphrase.is_empty() { "" } else { "***" })
             .field("scope_kind", &self.scope_kind)
             .field("scope_folders", &self.scope_folders)
             .field("pull_only", &self.pull_only)
@@ -58,7 +63,7 @@ impl std::fmt::Debug for ProfileConfig {
 }
 
 /// The refusal's advice for an end-to-end encrypted database in the app.
-pub const APP_PASSPHRASE_HOW: &str = "this app does not sync end-to-end encrypted databases yet; the desktop lsync command line does (`lsync vault passphrase NAME`)";
+pub const APP_PASSPHRASE_HOW: &str = "enter the passphrase the database was encrypted with under \"End-to-end encryption passphrase\" in this vault's settings";
 
 impl ProfileConfig {
     /// What the host runs: this profile, with a phone's fewer chunk fetches
@@ -77,9 +82,7 @@ impl ProfileConfig {
             database: self.database.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
-            // No passphrase UI in the app yet: an encrypted database is
-            // refused, with where it is supported.
-            passphrase: None,
+            passphrase: (!self.passphrase.is_empty()).then(|| Passphrase::new(self.passphrase.clone())),
             accept_unencrypted_content: false,
             scope_mode,
             scope_folders: self.scope_folders.clone(),
@@ -148,6 +151,7 @@ pub fn check_scope(kind: ScopeKind, folders: Vec<String>) -> Result<Vec<String>,
         database: String::new(),
         username: String::new(),
         password: String::new(),
+        passphrase: String::new(),
         scope_kind: kind,
         scope_folders: folders,
         pull_only: true,
@@ -217,6 +221,7 @@ mod tests {
             database: "vault".into(),
             username: "u".into(),
             password: "secret".into(),
+            passphrase: String::new(),
             scope_kind: ScopeKind::All,
             scope_folders: vec![],
             pull_only: true,
@@ -248,8 +253,22 @@ mod tests {
     }
 
     #[test]
-    fn debug_never_shows_the_password() {
-        assert!(!format!("{:?}", cfg()).contains("secret"));
+    fn debug_never_shows_the_password_or_the_passphrase() {
+        let mut c = cfg();
+        c.passphrase = "open-sesame-throwaway".into();
+        let shown = format!("{c:?}");
+        assert!(!shown.contains("secret"));
+        assert!(!shown.contains("open-sesame"));
+    }
+
+    #[test]
+    fn the_passphrase_reaches_the_engine_only_when_set() {
+        assert!(cfg().engine_config().unwrap().passphrase.is_none());
+        let mut c = cfg();
+        c.passphrase = "open-sesame-throwaway".into();
+        let ec = c.engine_config().unwrap();
+        assert_eq!(ec.passphrase.unwrap().expose(), "open-sesame-throwaway");
+        assert!(ec.passphrase_how.contains("this vault's settings"));
     }
 
     #[test]

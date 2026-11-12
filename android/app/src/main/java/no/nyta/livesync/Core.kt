@@ -34,7 +34,7 @@ class Core(
     private val secrets: SecretStore,
     private val scratchDir: File,
 ) {
-    /** Thrown when a profile cannot be started because its password is gone. */
+    /** Thrown when a profile cannot be started because its password or passphrase is gone. */
     class MissingSecretException(message: String) : Exception(message)
 
     val engine: LiveSync get() = host
@@ -42,11 +42,19 @@ class Core(
     fun configFor(p: Profile, password: String? = null): ProfileConfig {
         val pw = password ?: secrets.get(p.id, SecretStore.PASSWORD)
             ?: throw MissingSecretException("No stored password for \"${p.name}\"; enter it again in Settings")
-        return toConfig(p, profiles.stateDir(p.id).path, pw)
+        return toConfig(p, profiles.stateDir(p.id).path, pw, storedPassphrase(p))
     }
 
-    fun connectTest(p: Profile, password: String): GateResult =
-        host.connectTest(toConfig(p, profiles.stateDir(p.id).path, password), scratchDir.path)
+    /** The stored passphrase of an encrypted profile; empty for any other. */
+    fun storedPassphrase(p: Profile): String {
+        if (!p.encrypted) return ""
+        return secrets.get(p.id, SecretStore.PASSPHRASE)
+            ?: throw MissingSecretException("No stored encryption passphrase for \"${p.name}\"; enter it again in Settings")
+    }
+
+    /** [passphrase] is the database's end-to-end encryption passphrase; empty for none. */
+    fun connectTest(p: Profile, password: String, passphrase: String): GateResult =
+        host.connectTest(toConfig(p, profiles.stateDir(p.id).path, password, passphrase), scratchDir.path)
 
     /**
      * The server's top-level folders (files and size each) for the scope
@@ -54,8 +62,8 @@ class Core(
      * and never writes to the server. Throws `LiveSyncException`; `Other`
      * when [cancel] was cancelled, which ends the download at once.
      */
-    fun listFolders(p: Profile, password: String, cancel: Cancel?): FolderList =
-        host.listFolders(toConfig(p, profiles.stateDir(p.id).path, password), cancel)
+    fun listFolders(p: Profile, password: String, passphrase: String, cancel: Cancel?): FolderList =
+        host.listFolders(toConfig(p, profiles.stateDir(p.id).path, password, passphrase), cancel)
 
     fun status(p: Profile): ProfileStatus = host.status(p.id, p.vaultPath, profiles.stateDir(p.id).path)
 
@@ -68,7 +76,7 @@ class Core(
     }
 
     companion object {
-        fun toConfig(p: Profile, stateDir: String, password: String) = ProfileConfig(
+        fun toConfig(p: Profile, stateDir: String, password: String, passphrase: String = "") = ProfileConfig(
             id = p.id,
             vaultPath = p.vaultPath,
             stateDir = stateDir,
@@ -76,6 +84,7 @@ class Core(
             database = p.database.trim(),
             username = p.username.trim(),
             password = password,
+            passphrase = passphrase,
             scopeKind = when (p.scopeMode) {
                 ScopeMode.ALL -> ScopeKind.ALL
                 ScopeMode.INCLUDE -> ScopeKind.INCLUDE

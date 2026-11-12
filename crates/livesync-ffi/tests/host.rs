@@ -20,12 +20,21 @@ struct Env {
 
 impl Env {
     fn new() -> Env {
+        Env::with(|| Box::pin(Mock::start()))
+    }
+
+    /// Against a database encrypted with `passphrase`.
+    fn encrypted(passphrase: &'static str) -> Env {
+        Env::with(move || Box::pin(Mock::start_encrypted(passphrase)))
+    }
+
+    fn with(start: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = Mock>>>) -> Env {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .unwrap();
-        let mock = rt.block_on(Mock::start());
+        let mock = rt.block_on(start());
         let dir = tempfile::tempdir().unwrap();
         // Only the logging test sets a log folder: the log file is process-wide.
         let host = LiveSync::new(String::new()).unwrap();
@@ -46,6 +55,7 @@ impl Env {
             database: DB.into(),
             username: "u".into(),
             password: "p".into(),
+            passphrase: String::new(),
             scope_kind: ScopeKind::All,
             scope_folders: vec![],
             pull_only: true,
@@ -191,19 +201,64 @@ fn invalid_profiles_are_refused_before_starting() {
     assert!(env.host.active_profiles().is_empty());
 }
 
+/// An obvious throwaway.
+const PASS: &str = "correct horse battery staple (test only)";
+
 #[test]
-fn an_encrypted_database_is_refused_with_where_it_is_supported() {
-    let env = Env::new();
-    env.mock.update_milestone(|m| {
-        m["tweak_values"]["PREFERRED"]["encrypt"] = serde_json::json!(true);
-    });
+fn an_encrypted_database_needs_its_passphrase() {
+    let env = Env::encrypted(PASS);
+    env.mock.put_text("notes/a.md", &["hello"]);
+    env.mock.clear_requests();
     let scratch = env.dir.path().join("cache").display().to_string();
     let p = env.profile("e", "vault-e");
+
+    let g = env.host.connect_test(p.clone(), scratch.clone());
+    assert_eq!(g.outcome, GateOutcome::Refused, "{}", g.message);
+    assert!(g.message.contains("this vault's settings"), "{}", g.message);
+
+    let mut wrong = p.clone();
+    wrong.passphrase = "not the passphrase (test only)".into();
+    let g = env.host.connect_test(wrong, scratch.clone());
+    assert_eq!(g.outcome, GateOutcome::Refused, "{}", g.message);
+    assert!(g.message.contains("passphrase"), "{}", g.message);
+
+    let mut right = p;
+    right.passphrase = PASS.into();
+    let g = env.host.connect_test(right, scratch);
+    assert_eq!(g.outcome, GateOutcome::Passed, "{}", g.message);
+    assert!(env.mock.writes().is_empty());
+}
+
+#[test]
+fn a_passphrase_for_a_plain_database_is_refused() {
+    let env = Env::new();
+    let scratch = env.dir.path().join("cache").display().to_string();
+    let mut p = env.profile("e", "vault-e");
+    p.passphrase = PASS.into();
     let g = env.host.connect_test(p, scratch);
     assert_eq!(g.outcome, GateOutcome::Refused, "{}", g.message);
-    assert!(g.message.contains("end-to-end encrypted"), "{}", g.message);
-    assert!(g.message.contains("desktop lsync command line"), "{}", g.message);
     assert!(env.mock.writes().is_empty());
+}
+
+#[test]
+fn an_encrypted_profile_pulls_plain_files_and_pushes_ciphertext() {
+    let env = Env::encrypted(PASS);
+    env.mock.put_text("notes/a.md", &["hello ", "world"]);
+    let mut p = env.profile("e", "vault-e");
+    p.passphrase = PASS.into();
+    p.pull_only = false;
+    env.host.start(p.clone()).unwrap();
+    wait_until("a.md decrypted", Duration::from_secs(20), || {
+        read(&p, "notes/a.md").as_deref() == Some("hello world") && env.status(&p).since.is_some()
+    });
+    // The mock's write guard refuses plaintext content and plain chunk IDs,
+    // and fails the test for one when the mock goes away.
+    std::fs::write(Path::new(&p.vault_path).join("notes/mine.md"), "from the phone").unwrap();
+    env.host.sync_now("e".into()).unwrap();
+    wait_until("mine.md pushed", Duration::from_secs(20), || {
+        env.mock.doc("notes/mine.md").is_some()
+    });
+    env.host.stop("e".into());
 }
 
 #[test]

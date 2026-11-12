@@ -165,13 +165,13 @@ Run the other commands in the running container (`docker exec lsync lsync vault 
 
 ## Android app
 
-A foreground service keeps one or more vault folders on the phone in sync, whether or not Obsidian is open. Edits from other devices land in under a second, phone edits are pushed about 2 s after Obsidian saves them, and it comes back by itself after a reboot or an app update. It keeps only a small index and fetches content on demand: the first sync of 2,458 files took 62 s. The password is encrypted with a key in the Android Keystore.
+A foreground service keeps one or more vault folders on the phone in sync, whether or not Obsidian is open. Edits from other devices land in under a second, phone edits are pushed about 2 s after Obsidian saves them, and it comes back by itself after a reboot or an app update. It keeps only a small index and fetches content on demand: the first sync of 2,458 files took 62 s. The password and the end-to-end encryption passphrase are encrypted with a key in the Android Keystore.
 
 Requires Android 11 or later. Each release has a signed APK, `livesync-android-<version>.apk`; to build it yourself, see `scripts/build-apk.sh` in [AGENTS.md](AGENTS.md). Install it, then:
 
 1. Grant all-files access, notifications and the battery exemption on the setup screen.
 2. Pick a **new** folder under `Documents/Obsidian/`.
-3. Enter your CouchDB URL, database, user and password, then press Test connection.
+3. Enter your CouchDB URL, database, user and password (and the passphrase, for an end-to-end encrypted database), then press Test connection.
 4. Choose the folders to sync: a passing test lists the server's top-level folders with their file counts and sizes (on mobile data only when you tap "List the folders on the server", since it reads about 1 KB per file); tick them, or type a path.
 5. Save. Once the first sync finishes, open the folder in Obsidian ("Open folder as vault") and leave the LiveSync plugin off there.
 
@@ -202,7 +202,7 @@ To rerun: `scripts/bench/snapshot.sh` once, then `scripts/bench/run.sh --contend
 
 Working: pull-only and two-way sync, the service with its control socket and installers, and the Android app, tested against the official CLI on every scenario and on a Samsung S22+ (Android 16) syncing a real 10,000-file vault. The macOS build passes the test suite in CI.
 
-End-to-end encryption (V2, as the plugin and CLI write it by default) works in every command, desktop only: the Android app refuses an encrypted database and says the desktop CLI syncs it.
+End-to-end encryption (V2, as the plugin and CLI write it by default) works in every command and in the Android app, which takes the passphrase in a vault's setup and settings.
 
 Not yet:
 - path obfuscation, V1 encryption, encrypted internal metadata and NFC path identity; such databases are refused;

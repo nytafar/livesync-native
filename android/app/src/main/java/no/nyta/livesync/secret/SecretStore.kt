@@ -62,7 +62,7 @@ class KeystoreCipher : SecretCipher {
 }
 
 /**
- * Per-profile secrets (the CouchDB password; later the E2EE passphrase),
+ * Per-profile secrets (the CouchDB password and the E2EE passphrase),
  * sealed under a Keystore key whose alias derives from the profile ID
  * (spec "Credentials are stored per profile"). The file holds only
  * `version | iv length | iv | ciphertext`.
@@ -114,6 +114,7 @@ class SecretStore(private val dir: File, private val cipher: SecretCipher) {
 
     companion object {
         const val PASSWORD = "couchdb-password"
+        const val PASSPHRASE = "e2ee-passphrase"
         private const val VERSION: Byte = 1
     }
 }

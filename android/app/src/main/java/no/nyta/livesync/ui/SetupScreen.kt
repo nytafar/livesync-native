@@ -86,6 +86,9 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
     var username by remember { mutableStateOf(existing?.username ?: "") }
     var password by remember { mutableStateOf("") }
     var showPassword by remember { mutableStateOf(false) }
+    var passphrase by remember { mutableStateOf("") }
+    var showPassphrase by remember { mutableStateOf(false) }
+    val wasEncrypted = existing?.encrypted == true
     var deviceName by remember { mutableStateOf(existing?.deviceName ?: LiveSyncApp.deviceNameDefault()) }
     var scopeMode by remember { mutableStateOf(existing?.scopeMode ?: ScopeMode.ALL) }
     var foldersText by remember { mutableStateOf(existing?.scopeFolders?.joinToString("\n") ?: "") }
@@ -128,6 +131,7 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
         pullOnly = pullOnly,
         paused = existing?.paused ?: false,
         deviceName = deviceName.trim(),
+        encrypted = wasEncrypted || passphrase.isNotEmpty(),
         createdAtMs = existing?.createdAtMs ?: System.currentTimeMillis(),
     )
     // Equal to, inside or above another vault's folder: said here, before
@@ -136,13 +140,23 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
     val urlProblem = ProfileRules.urlProblem(url)
     val scopeProblem = ProfileRules.scopeProblem(scopeMode, draft.scopeFolders)
     // What a connect test vouches for.
-    val testKey = listOf(draft.url, draft.database, draft.username, password).joinToString("\u0000")
-    val credentialsChanged = !editing || password.isNotEmpty() || draft.username != existing?.username
+    val testKey = listOf(draft.url, draft.database, draft.username, password, passphrase).joinToString("\u0000")
+    val credentialsChanged = !editing || password.isNotEmpty() || passphrase.isNotEmpty() ||
+        draft.username != existing?.username
+
+    // The typed secrets, else the stored ones of the profile being edited.
+    fun secretsNow(typedPassword: String, typedPassphrase: String): Pair<String, String> {
+        val pw = typedPassword.ifEmpty { existing?.let { app.secrets.get(it.id, SecretStore.PASSWORD) } ?: "" }
+        val pp = typedPassphrase.ifEmpty {
+            existing?.takeIf { it.encrypted }?.let { app.secrets.get(it.id, SecretStore.PASSPHRASE) } ?: ""
+        }
+        return pw to pp
+    }
     val testPassed = gate?.outcome == GateOutcome.PASSED && testedKey == testKey
     val vaultOk = report?.errors?.isEmpty() == true && overlap == null
     val canTest = urlProblem == null && draft.database.isNotEmpty() && (password.isNotEmpty() || editing) && !testing
 
-    fun loadFolders(pw: String, key: String) {
+    fun loadFolders(pw: String, pp: String, key: String) {
         val gen = ++folderGen
         val p = draft.copy(id = existing?.id ?: "connect-test")
         val cancel = Cancel()
@@ -151,7 +165,7 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
         folderKey = key
         folderLoad = FolderLoad.Loading
         scope.launch {
-            val r = withContext(Dispatchers.IO) { runCatching { core.listFolders(p, pw, cancel) } }
+            val r = withContext(Dispatchers.IO) { runCatching { core.listFolders(p, pw, pp, cancel) } }
             if (gen != folderGen) return@launch
             folderLoad = r.fold({ FolderLoad.Loaded(it) }, { FolderLoad.Failed(it.message ?: it.toString()) })
         }
@@ -160,11 +174,10 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
     fun reloadFolders() {
         val key = testKey
         val typed = password
+        val typedPassphrase = passphrase
         scope.launch {
-            val pw = typed.ifEmpty {
-                existing?.let { withContext(Dispatchers.IO) { app.secrets.get(it.id, SecretStore.PASSWORD) } } ?: ""
-            }
-            loadFolders(pw, key)
+            val (pw, pp) = withContext(Dispatchers.IO) { secretsNow(typed, typedPassphrase) }
+            loadFolders(pw, pp, key)
         }
     }
 
@@ -248,7 +261,26 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
                     TextButton(onClick = { showPassword = !showPassword }) { Text(if (showPassword) "Hide" else "Show") }
                 },
             )
-            Text("The password is stored encrypted with a key in this phone's Android Keystore.", style = MaterialTheme.typography.bodySmall)
+            OutlinedTextField(
+                value = passphrase, onValueChange = { passphrase = it },
+                label = {
+                    Text(
+                        if (wasEncrypted) "End-to-end encryption passphrase (leave empty to keep)"
+                        else "End-to-end encryption passphrase (if encrypted)"
+                    )
+                },
+                singleLine = true, modifier = Modifier.fillMaxWidth(),
+                visualTransformation = if (showPassphrase) VisualTransformation.None else PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                trailingIcon = {
+                    TextButton(onClick = { showPassphrase = !showPassphrase }) { Text(if (showPassphrase) "Hide" else "Show") }
+                },
+            )
+            Text(
+                "Leave the passphrase empty for a database without end-to-end encryption. The password and the " +
+                    "passphrase are stored encrypted with a key in this phone's Android Keystore.",
+                style = MaterialTheme.typography.bodySmall,
+            )
             OutlinedTextField(
                 value = deviceName, onValueChange = { deviceName = it }, label = { Text("Device name (shown to other LiveSync clients)") },
                 singleLine = true, modifier = Modifier.fillMaxWidth(),
@@ -261,10 +293,12 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
                     testing = true
                     gate = null
                     val key = testKey
+                    val typed = password
+                    val typedPassphrase = passphrase
                     scope.launch {
-                        val pw = password.ifEmpty { existing?.let { app.secrets.get(it.id, SecretStore.PASSWORD) } ?: "" }
+                        val (pw, pp) = withContext(Dispatchers.IO) { secretsNow(typed, typedPassphrase) }
                         val r = withContext(Dispatchers.IO) {
-                            runCatching { core.connectTest(draft.copy(id = existing?.id ?: "connect-test"), pw) }
+                            runCatching { core.connectTest(draft.copy(id = existing?.id ?: "connect-test"), pw, pp) }
                         }
                         val g = r.getOrElse { e ->
                             GateResult(GateOutcome.FAILED, e.message ?: e.toString(), "", 0, 0, 0, false, 0, false, false, 0, false)
@@ -274,7 +308,7 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
                         testing = false
                         // Before anything syncs: what is on the server, to pick
                         // folders from. On mobile data only when asked.
-                        if (g.outcome == GateOutcome.PASSED && !Perms.metered(ctx)) loadFolders(pw, key)
+                        if (g.outcome == GateOutcome.PASSED && !Perms.metered(ctx)) loadFolders(pw, pp, key)
                     }
                 }) { Text("Test connection") }
                 if (testing) {
@@ -283,7 +317,7 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
                 }
             }
             gate?.let { GateCard(it) }
-            if (!credentialsChanged) Text("Not needed unless you change the user name or password.", style = MaterialTheme.typography.bodySmall)
+            if (!credentialsChanged) Text("Not needed unless you change the user name, password or passphrase.", style = MaterialTheme.typography.bodySmall)
         }
 
         SectionCard("5. Folders to sync") {
@@ -374,7 +408,7 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
                 saveError = null
                 scope.launch {
                     val id = existing?.id ?: newId
-                    val err = withContext(Dispatchers.IO) { save(app, existing, draft.copy(id = id), password) }
+                    val err = withContext(Dispatchers.IO) { save(app, existing, draft.copy(id = id), password, passphrase) }
                     if (err == null) {
                         SyncService.start(ctx, if (editing) "profile edited" else "profile created")
                         // Stays "Saving…" (and disabled) until the screen is gone.
@@ -421,13 +455,14 @@ fun SetupScreen(app: LiveSyncApp, existing: Profile?, onDone: (String) -> Unit, 
     }
 }
 
-/** Store the secret, then the profile. Returns an error message or null. */
-private fun save(app: LiveSyncApp, existing: Profile?, profile: Profile, password: String): String? {
+/** Store the secrets, then the profile. Returns an error message or null. */
+private fun save(app: LiveSyncApp, existing: Profile?, profile: Profile, password: String, passphrase: String): String? {
     val id = profile.id
     return try {
         if (password.isNotEmpty()) app.secrets.put(id, SecretStore.PASSWORD, password)
+        if (passphrase.isNotEmpty()) app.secrets.put(id, SecretStore.PASSPHRASE, passphrase)
         app.profiles.put(profile)
-        app.core.getOrNull()?.log("profile $id saved (${profile.vaultPath}, ${if (profile.pullOnly) "pull-only" else "two-way"}, scope ${profile.scopeMode})")
+        app.core.getOrNull()?.log("profile $id saved (${profile.vaultPath}, ${if (profile.pullOnly) "pull-only" else "two-way"}, scope ${profile.scopeMode}${if (profile.encrypted) ", encrypted" else ""})")
         null
     } catch (e: ProfileStore.OverlapException) {
         if (existing == null) app.secrets.removeProfile(id)

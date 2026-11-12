@@ -8,8 +8,8 @@ import java.net.URI
 enum class ScopeMode { ALL, INCLUDE, EXCLUDE }
 
 /**
- * One synced vault. The password is not here: it lives in the SecretStore
- * under the profile's ID.
+ * One synced vault. The password and the end-to-end encryption passphrase
+ * are not here: they live in the SecretStore under the profile's ID.
  */
 @Serializable
 data class Profile(
@@ -29,6 +29,12 @@ data class Profile(
     val paused: Boolean = false,
     /** Device name advertised to the other LiveSync clients. */
     val deviceName: String = "",
+    /**
+     * The database is end-to-end encrypted, and its passphrase is in the
+     * SecretStore. Never set for a database that is not: the engine refuses
+     * a passphrase there.
+     */
+    val encrypted: Boolean = false,
     val createdAtMs: Long = 0,
 )
 
