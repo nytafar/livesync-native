@@ -10,6 +10,7 @@ pub mod milestone;
 pub mod path;
 pub mod scope;
 pub mod splitter;
+pub mod upstream;
 
 pub use doc::{ChunkDoc, FileDoc, FileKind};
 pub use gate::Refusal;

@@ -9,5 +9,7 @@ version.workspace = true
 yaml-rust2 = { version = "0.13.0", default-features = false }
 
 [dev-dependencies]
+# The pinned upstream versions (livesync_model::upstream) for the golden tests.
+livesync-model = { version = "0.1.0", path = "../livesync-model" }
 proptest = "1.11.0"
 serde_json = "1.0.154"

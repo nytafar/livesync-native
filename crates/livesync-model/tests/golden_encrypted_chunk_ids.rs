@@ -8,8 +8,15 @@ use std::path::PathBuf;
 fn encrypted_chunk_ids_match_upstream() {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/golden/crypto_chunk_ids.json");
     let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
-    assert_eq!(v["meta"]["version"], "0.4.3", "fixtures must come from commonlib 0.4.3");
-    assert_eq!(v["upstream"]["octagonalWheels"], "0.1.56");
+    assert_eq!(
+        v["meta"]["version"],
+        livesync_model::upstream::COMMONLIB,
+        "fixtures must come from the pinned commonlib (upstream.env)"
+    );
+    assert_eq!(
+        v["upstream"]["octagonalWheels"],
+        livesync_model::upstream::OCTAGONAL_WHEELS
+    );
     let cases = v["cases"].as_array().unwrap();
     assert!(cases.len() >= 40);
     let mut ids = 0;

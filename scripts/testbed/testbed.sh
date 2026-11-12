@@ -10,7 +10,10 @@
 #                                       copy of the matching vault folder into $TESTBED/real-copy
 #   testbed.sh new NAME [--from empty|snapshot] [--machines a,b] [--adopt M]
 #                                       database tb-NAME and one folder per machine. `empty` (default)
-#                                       is initialised by the official CLI; `snapshot` clones real-snap.
+#                                       is initialised by the official CLI of the pinned release
+#                                       (upstream.env), with the path identity of databases set up
+#                                       before 1.0.46 (pathNormalizationVersion 0), which lsync syncs;
+#                                       `snapshot` clones real-snap.
 #                                       --adopt M starts machine M's vault as a copy of real-copy (the
 #                                       folder matching the snapshot)
 #   testbed.sh run NAME M [ARGS...]     run $LSYNC_BIN (default target/release/lsync) as machine M
@@ -44,7 +47,11 @@ SNAP_DB=real-snap
 COPY_DIR=$TESTBED/real-copy
 REAL_VAULT_DIR=${TESTBED_SOURCE_VAULT:-}
 BIN=${LSYNC_BIN:-$REPO/target/release/lsync}
-CLI_JS=${LSYNC_CLI_JS:-$HOME/code/ref/obsidian-livesync/src/apps/cli/dist/index.cjs}
+# The official CLI of the pinned release (upstream.env), resolved (and built
+# on first use) by scripts/upstream.sh when a command needs it; LSYNC_CLI_JS
+# or LSYNC_UPSTREAM_TAG run another one, and it says so.
+CLI_JS=
+need_cli() { [[ -n "$CLI_JS" ]] || CLI_JS=$("$REPO/scripts/upstream.sh" cli) || die "no official CLI"; }
 
 die() { echo "testbed: $*" >&2; exit 1; }
 couch() { curl -sS -u "$DEV_USER:$DEV_PASSWORD" "$@"; }
@@ -121,12 +128,13 @@ PY
 
 cli_node() { # cli_node NAME ARGS... : the official CLI on its own PouchDB and vault
   local dir="$TESTBED/$1/cli"; shift
+  need_cli
   node "$CLI_JS" "$dir/db" --settings "$dir/settings.json" --vault "$dir/vault" "$@"
 }
 
 init_cli_node() { # init_cli_node NAME
   local name=$1 dir="$TESTBED/$1/cli"
-  [[ -f "$CLI_JS" ]] || die "official CLI not found at $CLI_JS"
+  need_cli
   mkdir -p "$dir/db" "$dir/vault"
   node "$CLI_JS" init-settings --force "$dir/settings.json" >>"$dir/cli.log" 2>&1
   SETTINGS="$dir/settings.json" DBN="tb-$name" URL="$DEV_URL" node -e '
@@ -134,7 +142,7 @@ const fs = require("fs"); const p = process.env.SETTINGS; const d = JSON.parse(f
 Object.assign(d, { couchDB_URI: process.env.URL, couchDB_USER: process.env.LSYNC_USER,
   couchDB_PASSWORD: process.env.LSYNC_PASSWORD, couchDB_DBNAME: process.env.DBN, remoteType: "",
   customChunkSize: 60, isConfigured: true, liveSync: false, syncOnStart: false, syncOnSave: false,
-  usePluginSync: false, syncIgnoreRegEx: "\\/\\.git\\/" });
+  usePluginSync: false, syncIgnoreRegEx: "\\/\\.git\\/", pathNormalizationVersion: 0 });
 fs.writeFileSync(p, JSON.stringify(d, null, 2), { mode: 0o600 });'
 }
 
@@ -247,5 +255,5 @@ case ${1:-} in
   cli) shift; name=${1:?usage: cli NAME [ARGS...]}; shift; cli_node "$name" "$@" ;;
   status) shift; cmd_status ;;
   drop) shift; cmd_drop "$@" ;;
-  *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

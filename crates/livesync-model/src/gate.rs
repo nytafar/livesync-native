@@ -20,20 +20,15 @@ pub const PREFERRED: &str = "PREFERRED";
 
 /// The newest Self-hosted LiveSync release this client was checked against
 /// (the interop scenarios against the official CLI of the same release tag,
-/// which shares the plugin's `livesync-commonlib`). Named in every refusal
-/// that an upstream change causes; keep it in step with `COMPATIBILITY.md`.
-macro_rules! tested_plugin_version {
-    () => {
-        "1.0.49"
-    };
-}
-/// That release's version (written once, in the macro, for `concat!`).
-pub const TESTED_PLUGIN_VERSION: &str = tested_plugin_version!();
+/// which shares the plugin's `livesync-commonlib`): the pinned release
+/// ([`crate::upstream::PLUGIN_RELEASE`], from `upstream.env`). Named in every
+/// refusal that an upstream change causes.
+pub const TESTED_PLUGIN_VERSION: &str = crate::upstream::PLUGIN_RELEASE;
 
 /// What a refusal caused by an upstream change says about known-good versions.
 const KNOWN_GOOD: &str = concat!(
     "Self-hosted LiveSync ",
-    tested_plugin_version!(),
+    env!("LSYNC_UPSTREAM_PLUGIN_RELEASE"),
     " is the newest version known to work with lsync, as long as it does not turn on what is named here (see COMPATIBILITY.md)"
 );
 

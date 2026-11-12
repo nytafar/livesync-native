@@ -32,6 +32,26 @@ const pkgDir = join(here, "node_modules", "@vrtmrz", "livesync-commonlib");
 const pkg = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8"));
 const { compressDoc, decompressDoc } = await import(pathToFileURL(join(pkgDir, "dist", "pouchdb", "compress.js")).href);
 
+// The installed packages must be the upstream pin (../../upstream.env, KEY=value
+// lines), or the fixtures would claim a release they do not come from.
+const pin = Object.fromEntries(
+    readFileSync(join(here, "..", "..", "upstream.env"), "utf8")
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#"))
+        .map((l) => l.split("=", 2))
+);
+const installed = (name) => JSON.parse(readFileSync(join(here, "node_modules", name, "package.json"), "utf8")).version;
+for (const [name, key] of [
+    ["@vrtmrz/livesync-commonlib", "COMMONLIB"],
+    ["octagonal-wheels", "OCTAGONAL_WHEELS"],
+]) {
+    if (installed(name) !== pin[key]) {
+        console.error(`${name} ${installed(name)} is installed, but upstream.env pins ${key}=${pin[key]}; run npm ci (or scripts/bump-upstream.sh)`);
+        process.exit(1);
+    }
+}
+
 const outDir = process.argv[2] ?? join(here, "..", "..", "fixtures", "golden");
 mkdirSync(outDir, { recursive: true });
 const meta = { generator: "tools/golden/generate.mjs", package: pkg.name, version: pkg.version };

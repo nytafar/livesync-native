@@ -1291,6 +1291,7 @@ dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
  "hkdf",
+ "livesync-model",
  "pbkdf2",
  "serde_json",
  "sha2",
@@ -1375,6 +1376,7 @@ dependencies = [
 name = "livesync-merge"
 version = "0.1.0"
 dependencies = [
+ "livesync-model",
  "proptest",
  "serde_json",
  "yaml-rust2",

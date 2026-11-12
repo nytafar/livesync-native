@@ -42,6 +42,8 @@ URL, USER, PASSWORD = E["LSYNC_URL"].rstrip("/"), E["LSYNC_USER"], E["LSYNC_PASS
 assert URL.startswith(("http://127.0.0.1:8411", "http://localhost:8411")), "dev container only"
 BIN, CLI_JS = E["BIN"], E["CLI_JS"]
 WORK = E["BENCH_WORK"]
+# The release folder the CLI was built in (scripts/upstream.sh), with the
+# plug-in's main.js and upstream's E2E runner beside it.
 REF = os.path.abspath(os.path.join(os.path.dirname(CLI_JS), "../../../.."))
 SCOPE_EXCLUDE, SCOPE_RE, BASE_RE = E["SCOPE_EXCLUDE"], E["SCOPE_IGNORE_REGEX"], E["BASE_IGNORE_REGEX"]
 CONTAINER = E.get("DEV_CONTAINER", "lsync-dev-couchdb")

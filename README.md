@@ -554,7 +554,7 @@ Beyond the plugin:
 - **Edits apply while running.** Changing an ignore file takes effect at once in `lsync daemon` and `lsync serve` (the plugin rechecks only when its settings change).
 - **A path that becomes ignored** is no longer tracked: its file stays, its remote document stays, and deleting it here deletes nothing remotely. **A path that stops being ignored** is fetched, as when a folder scope widens.
 - **Fails closed.** An ignore file that cannot be read, or that uses a pattern lsync does not evaluate (extglobs like `+(a|b)`, POSIX classes like `[[:alpha:]]`), stops everything in its folder and below: nothing there is pushed, written, untracked or treated as deleted until it is fixed. `lsync status` lists the folder, and a running daemon or service watches it, so the fix takes effect at once. (The plugin skips such a file.)
-- **The vault-root ignore file counts.** commonlib asks for it as `/.gitignore`; the plugin reads it, and so does lsync. The official CLI (1.0.40) does not: its storage layer refuses a path with a leading slash, so it pushes what only the root file ignores.
+- **The vault-root ignore file counts.** commonlib asks for it as `/.gitignore`; the plugin reads it, and so does lsync. The official CLI (1.0.40 to 1.0.49) does not: its storage layer refuses a path with a leading slash, so it pushes what only the root file ignores.
 - **Ignored folders are not looked into.** A folder that is surely ignored as a whole (`**/node_modules/`, or a `*` in the folder's own ignore file, as virtualenvs write) is neither scanned nor watched, which keeps code folders cheap. Ignore files inside it are not read, so a `!` rule in one of them is not honoured here, where the plugin would honour it: neither for local files nor for documents arriving from the remote, which stay unwritten. (Writing them would track files that no scan here ever looks at again.)
 
 `lsync check-ignore PATH...` says what decides each path, like `git check-ignore -v`: `source<TAB>path`, where the source is `file:line:pattern` for an ignore file and `[reason]` for the other rules (`dot-path`, `ignore-regex`, `sync-only-regex`, `out-of-scope`, ...). Synced paths are listed with `-n` (`::` when nothing matched, or the `!` rule that accepted them). `--json` gives every path with `synced`, `reason`, `source` and `detail`. It reads only the vault folder, and exits 0 when some path is not synced, 1 when all are.
@@ -644,8 +644,8 @@ Exit codes:
 | `crates/livesync-ffi` | UniFFI surface for the app over `livesync-host`: one engine per profile, connect test, status, logs |
 | `crates/uniffi-bindgen` | UniFFI's Kotlin binding generator, pinned to the same version |
 | `android/` | The Android app (Kotlin, Compose): foreground service, onboarding, vault list, status screens |
-| `tools/golden` | Node program pinned to `@vrtmrz/livesync-commonlib` 0.2.1; it emits the fixtures in `fixtures/golden` |
-| `scripts/` | APK and Termux builds, dev-database environment, a vault comparison script, and `interop.sh` (the M2 scenarios against the official CLI) |
+| `tools/golden` | Node program on the `@vrtmrz/livesync-commonlib` that `upstream.env` pins; it emits the fixtures in `fixtures/golden` |
+| `scripts/` | APK and Termux builds, dev-database environment, a vault comparison script, `interop.sh` (the M2 scenarios against the official CLI), and `upstream.sh` and `bump-upstream.sh` (the upstream release pinned in `upstream.env`) |
 | `install.sh`, `pkg/` | The install script, and the AUR package, Homebrew formula and Docker image, published at each release ([`pkg/README.md`](pkg/README.md)) |
 
 Build and test instructions are in [AGENTS.md](AGENTS.md).

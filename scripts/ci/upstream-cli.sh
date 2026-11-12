@@ -57,7 +57,7 @@ if [[ -d "$SRC/.git" && "$(git -C "$SRC" describe --tags --exact-match 2>/dev/nu
   echo "upstream-cli: reusing $SRC at $TAG" >&2
 else
   rm -rf -- "$SRC"
-  git clone -q --depth 1 --branch "$TAG" "$REPO_URL" "$SRC"
+  git -c advice.detachedHead=false clone -q --depth 1 --branch "$TAG" "$REPO_URL" "$SRC"
 fi
 (
   cd "$SRC"
