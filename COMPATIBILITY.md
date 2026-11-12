@@ -4,18 +4,20 @@ lsync writes every document in the format of the [Self-hosted LiveSync](https://
 
 ## Tested versions
 
+The release lsync is built and tested against is pinned in [`upstream.env`](upstream.env); the versions below that state it follow the pin (AGENTS.md, "Bumping upstream").
+
 | Client | Version | How |
 |---|---|---|
-| Self-hosted LiveSync plugin | 1.0.49 (the newest known to work), on databases set up before 1.0.46 | shares `livesync-commonlib` 0.4.3 with the official CLI of the same release |
-| Official LiveSync CLI | 1.0.49-cli (release tag `1.0.49`) | `scripts/interop.sh`, every scenario (its default) |
+| Self-hosted LiveSync plugin | <!--pin:PLUGIN_RELEASE-->1.0.49 (the newest known to work), on databases set up before 1.0.46 | shares `livesync-commonlib` <!--pin:COMMONLIB-->0.4.3 with the official CLI of the same release |
+| Official LiveSync CLI | <!--pin:PLUGIN_RELEASE-->1.0.49-cli (release tag <!--pin:PLUGIN_RELEASE-->1.0.49) | `scripts/interop.sh`, every scenario (its default) |
 | Official LiveSync CLI | 1.0.46-cli (release tag `1.0.46`) | `scripts/interop.sh`, every scenario |
 | Official LiveSync CLI | 1.0.40-cli | `scripts/interop.sh`, every scenario |
-| `livesync-commonlib` | 0.4.3 | the golden vectors (`tools/golden`, with the matcher versions 1.0.49 ships) |
+| `livesync-commonlib` | <!--pin:COMMONLIB-->0.4.3 | the golden vectors (`tools/golden`, with the matcher versions <!--pin:PLUGIN_RELEASE-->1.0.49 ships) |
 | CouchDB | 3.x | the dev container and the weekly job (3.5) |
 
 Databases at generation 12 (no feature list) and 13 with an empty `used_features` are supported. Plugin releases from 0.25 on have written databases lsync syncs with.
 
-**End-to-end encryption** is supported as the plugin and CLI write it by default (`E2EEAlgorithm` V2, HKDF; `%=` envelopes; passphrase-mixed `h:+` chunk IDs with `hashAlg` xxhash64), without path obfuscation, byte-compatible with `livesync-commonlib` 0.4.3 (the golden vectors, and the opt-in check that upstream decrypts what lsync encrypts, `tools/golden/crypto-verify.mjs`). Interop scenarios E1 to E6 run it against the official CLI both ways, on a database the CLI encrypts as 1.0.49 does (generation 12, no `syncinfo`), and with lsync as the first writer. Refused: path obfuscation (`usePathObfuscation`), V1 and ForceV1 (`E2EEAlgorithm` other than `v2`), `useDynamicIterationCount`, `encryptInternalMetadata`, `idDerivationVersion` other than 0 (commonlib 0.4's keyed chunk IDs), a V1 eden; and per document, held rather than refused: V1 ciphertext and anything that does not authenticate. Turning encryption on or off for an existing database (a rebuild) is not done by lsync.
+**End-to-end encryption** is supported as the plugin and CLI write it by default (`E2EEAlgorithm` V2, HKDF; `%=` envelopes; passphrase-mixed `h:+` chunk IDs with `hashAlg` xxhash64), without path obfuscation, byte-compatible with `livesync-commonlib` <!--pin:COMMONLIB-->0.4.3 (the golden vectors, and the opt-in check that upstream decrypts what lsync encrypts, `tools/golden/crypto-verify.mjs`). Interop scenarios E1 to E6 run it against the official CLI both ways, on a database the CLI encrypts as 1.0.49 does (generation 12, no `syncinfo`), and with lsync as the first writer. Refused: path obfuscation (`usePathObfuscation`), V1 and ForceV1 (`E2EEAlgorithm` other than `v2`), `useDynamicIterationCount`, `encryptInternalMetadata`, `idDerivationVersion` other than 0 (commonlib 0.4's keyed chunk IDs), a V1 eden; and per document, held rather than refused: V1 ciphertext and anything that does not authenticate. Turning encryption on or off for an existing database (a rebuild) is not done by lsync.
 
 **New databases from 1.0.46 on.** A plugin or CLI from 1.0.46 that sets up a new, empty database gives it NFC path identity (`pathNormalizationVersion` 1, the feature `nfc-path-identity-v1`, generation 13). lsync does not implement that yet and refuses such a database (interop scenario S11 checks the message). A 1.0.46 device that joins an existing database keeps that database's path identity, so databases set up before 1.0.46 stay compatible. To set up a new database that lsync can sync, set `pathNormalizationVersion` to 0 in the first device's settings before its first sync, as `scripts/interop.sh` does.
 
@@ -26,9 +28,9 @@ Databases at generation 12 (no feature list) and 13 with an empty `used_features
 - Ignore files are matched with minimatch 11, on Unicode code points and with Unicode case folding: `?` matches one emoji, `K` (the Kelvin sign) matches `k`, `ς` matches `σ`, and an escaped `\|` is a literal `|`. A path segment that is `.` or `..` matches only literal dots.
 - With end-to-end encryption on, 1.0.49 rejects documents with unencrypted content unless "Accept unencrypted content" is set: its replication fails at such a document (it is neither skipped nor written), and an on-demand chunk read leaves the chunk missing. lsync does the same: the pull stops before the document (`UPSTREAM STOP` in `lsync status` until it is gone), unless the vault sets `accept_unencrypted_content`. Devices older than 1.0.49 know nothing of this and may have written such documents.
 
-`TESTED_PLUGIN_VERSION` in `crates/livesync-model/src/gate.rs` is the version the refusals name; change it with this table (and `UPSTREAM_TAG` in `scripts/interop.sh`, the release the interop scenarios run against by default).
+`TESTED_PLUGIN_VERSION` in `crates/livesync-model/src/gate.rs`, the version the refusals name, is the pinned release, read from `upstream.env` at build time; so is the official CLI the interop scenarios, the testbed and the benchmark run by default.
 
-**The weekly upstream job** (`.github/workflows/upstream-interop.yml`, Mondays, and by hand from the Actions tab with an optional release tag) builds the official CLI from the latest upstream release and runs every interop scenario against it on a throwaway CouchDB. A breaking release shows up as a failed run before any device updates: a format change in what the CLI writes, a setting lsync does not know in the milestone, or a database feature in the CLI's defaults that lsync has never heard of. The same workflow fails when npm has a newer `livesync-commonlib` than the golden vectors pin. It never publishes anything.
+**The weekly upstream job** (`.github/workflows/upstream-interop.yml`, Mondays, and by hand from the Actions tab with an optional release tag) builds the official CLI of the pinned release, and of the latest upstream release when that is newer, and runs every interop scenario against each on a throwaway CouchDB. A breaking release shows up as a failed run before any device updates: a format change in what the CLI writes, a setting lsync does not know in the milestone, or a database feature in the CLI's defaults that lsync has never heard of. The same workflow fails when upstream has a newer release, or npm a newer `livesync-commonlib`, than the pin. It never publishes anything.
 
 ## What the gates check
 

@@ -16,17 +16,37 @@ cargo test
 
 ## Golden vectors
 
-`fixtures/golden/` is generated. Don't edit it by hand. To regenerate it, for example when upstream bumps `@vrtmrz/livesync-commonlib`:
+`fixtures/golden/` is generated. Don't edit it by hand. To regenerate it from the pinned commonlib (a bump does this itself, below):
 
 ```sh
 cd tools/golden
-npm ci                           # installs the pinned commonlib (see package.json)
-node generate.mjs ../../fixtures/golden
+npm ci --ignore-scripts          # the commonlib and matcher versions of upstream.env (package.json)
+node generate.mjs ../../fixtures/golden   # refuses packages other than the pin
 ```
 
-Bump the pinned version in `tools/golden/package.json` and every assertion of it together: `crates/livesync-model/tests/golden.rs`, `crates/livesync-model/tests/golden_ignore.rs`, `crates/livesync-merge/tests/golden.rs` and `crates/livesync-merge/src/tests.rs` (`grep -rn 'meta"\]\["version' crates` finds them all). A bump can change upstream's merge results; the merge corpus test then says which cases differ.
+`overrides` in `tools/golden/package.json` pins commonlib's matcher dependencies (`minimatch`, `@isaacs/nonrecursive-glob-match`, `brace-expansion`) to what commonlib resolves to in the `package-lock.json` of the pinned release, so the ignore vectors are what that plugin and CLI do. The golden tests compare each fixture's recorded versions with the pin (`livesync_model::upstream`). A bump can change upstream's merge results; the merge corpus test then says which cases differ.
 
-`overrides` in `tools/golden/package.json` pins commonlib's matcher dependencies (`minimatch`, `@isaacs/nonrecursive-glob-match`, `brace-expansion`) to the versions in the `package-lock.json` of the upstream release that ships the pinned commonlib, so the ignore vectors are what that plugin and CLI do; update them with the pin. The weekly upstream job fails when npm has a newer commonlib than the pin.
+## Bumping upstream
+
+`upstream.env` is the single source of truth for the upstream release lsync is built and tested against: the plugin and CLI release tag (`PLUGIN_RELEASE`), the commonlib that release pins, the octagonal-wheels that commonlib pins and the glob matcher it resolves to. Everything else derives from it or is checked against it:
+
+- Rust reads it at compile time (`crates/livesync-model/build.rs` -> `livesync_model::upstream`): `TESTED_PLUGIN_VERSION`, the version every refusal names, and the golden tests' version checks.
+- Scripts ask `scripts/upstream.sh` (`get KEY`, `cli`, `ref`, `ls`): `scripts/interop.sh`, `scripts/testbed/testbed.sh`, `scripts/bench/*` and the weekly workflow run the official CLI of the pinned release, built on first use. `LSYNC_CLI_JS` (a CLI build) or `LSYNC_UPSTREAM_TAG` (another release) override it, and every override is announced in the output.
+- `tools/golden/generate.mjs` refuses to generate from packages other than the pin.
+
+To move to a new release (default: the latest; `--dry-run` shows what would change):
+
+```sh
+scripts/bump-upstream.sh [TAG]
+```
+
+It derives the versions from the release's own `package.json` and `package-lock.json`, writes `upstream.env` and `tools/golden/package.json`, installs (lockfile), regenerates `fixtures/golden`, rewrites the pin markers in the docs, fetches the reference source and builds the CLI, shows which fixtures changed beyond their version stamp, and prints what is left: the gate, `scripts/interop.sh`, reading upstream's changes between the two tags, and the notes in `COMPATIBILITY.md`. It is safe to re-run and never commits.
+
+The gate test `crates/livesync-model/tests/upstream_pin.rs` fails, naming the file, when any of these disagree with the pin: `tools/golden/package.json` and its lockfile (as node would resolve each package), the versions recorded in `fixtures/golden/*.json`, the tested-versions table in `COMPATIBILITY.md`, the pin markers in `README.md`, `AGENTS.md` and `COMPATIBILITY.md`, and the scripts and workflow (no version defaults, no unversioned reference checkout, the CLI from `scripts/upstream.sh`).
+
+- **Pins and history.** In the docs a version that states the pin is written after a hidden marker, `<!--pin:KEY-->VALUE`; the bump rewrites those, and the test fails on a version right after "pinned to", "tested against" or "known to work" without one. Every other version is history ("new in 1.0.46", "unchanged since 0.2.1") and stays. Prefer pointing at `upstream.env` to repeating a number.
+- **Cite by the pinned version.** Code and docs that describe upstream behaviour cite the release it was read or checked in (the pin at the time), e.g. "commonlib 0.4.3 `isValidChunk`"; read it in the pinned reference source, not in an older checkout.
+- **Reference source, one folder per release**, under `~/code/ref` (`LSYNC_REF_DIR` overrides): `obsidian-livesync-<tag>` (the release, with its CLI and the plug-in built), `livesync-commonlib-<version>` (its tag) and `octagonal-wheels-<version>` (the npm package). `scripts/upstream.sh ref` fetches those of the pin. Each is built aside and renamed into place, then never changed, so a bump never touches files another session uses; `scripts/upstream.sh ls` lists them, and old ones are removed by hand. The unversioned `~/code/ref/obsidian-livesync` and `~/code/ref/livesync-commonlib` checkouts are not used by any script.
 
 ## Android app (APK)
 
@@ -55,7 +75,7 @@ The binary links only `libc`, `libm` and `libdl`. TLS is rustls with bundled web
 
 `.github/workflows/ci.yml` runs the gate on Linux and macOS, the Android gate (`scripts/build-apk.sh --unsigned`) and the universal macOS binary (both architectures, `scripts/ci/macos-universal.sh`, then `install.sh` from the built archives) on every push and PR.
 
-`.github/workflows/upstream-interop.yml` runs `scripts/interop.sh` weekly (and by hand: `gh workflow run upstream-interop.yml [-f tag=1.0.46]`) against the official CLI built from the latest upstream release (`scripts/ci/upstream-cli.sh`), on a throwaway CouchDB service container published on 127.0.0.1:8411 and set up by `scripts/ci/couchdb-init.sh`. It publishes nothing. When it fails, or a new upstream release is tested, update `COMPATIBILITY.md`, `TESTED_PLUGIN_VERSION` (`crates/livesync-model/src/gate.rs`) and `UPSTREAM_TAG` in `scripts/interop.sh` together. To try a release locally: `scripts/ci/upstream-cli.sh ~/scratch/upstream-cli [TAG]`, then `LSYNC_CLI_JS=<the cli_js it prints> scripts/interop.sh`.
+`.github/workflows/upstream-interop.yml` runs `scripts/interop.sh` weekly (and by hand: `gh workflow run upstream-interop.yml [-f tag=<release>]`) against the official CLI of the pinned release and, when upstream has a newer one, of that release too (built by `scripts/upstream.sh cli`), on a throwaway CouchDB service container published on 127.0.0.1:8411 and set up by `scripts/ci/couchdb-init.sh`. Its pin job fails when upstream has a newer release or npm a newer commonlib than `upstream.env`: run `scripts/bump-upstream.sh` ("Bumping upstream"). It publishes nothing. To try another release locally: `LSYNC_UPSTREAM_TAG=<tag> scripts/interop.sh` (it builds that release into its own reference folder and says it is not the pin).
 
 A release is a pushed tag; `.github/workflows/release.yml` does the rest:
 
@@ -86,7 +106,7 @@ The desktop and server work is built and checked here, on this machine (`scripts
 
 ```sh
 scripts/testbed/testbed.sh up                                   # start the dev container (it survives reboots)
-scripts/testbed/testbed.sh new t1 --machines a,b                # tb-t1, initialised by the official CLI
+scripts/testbed/testbed.sh new t1 --machines a,b                # tb-t1, initialised by the pinned official CLI
 scripts/testbed/testbed.sh new big --from snapshot --adopt a    # a clone of the real database (about 70 s for 440k docs);
                                                                 # machine a starts from the matching folder
 scripts/testbed/testbed.sh run t1 a sync                        # target/release/lsync as machine a
@@ -101,6 +121,7 @@ scripts/testbed/testbed.sh drop t1
   - Clone it with `new … --from snapshot`; never write to `real-snap` itself.
   - `snapshot --force` re-takes both. It is the one command that reads the real server and the desktop vault, and only reads them. Run the nightly backup first.
   - Which folder and database: `~/.config/livesync-android/testbed.env` (`TESTBED_SOURCE_VAULT`, optionally `REAL_DB`), outside the repo.
+- **The official CLI** is the pinned release's (`scripts/upstream.sh cli`). A new empty database gets `pathNormalizationVersion` 0 from it, the path identity lsync syncs (a CLI from 1.0.46 on would otherwise set up NFC path identity, which lsync refuses).
 - **Limits.** Writes go only to `tb-*` databases on the dev container and only under `~/scratch/lsync-testbed`. Keep vault folders there, never in `/tmp`, which is tmpfs.
 
 ## Interop check against the official CLI
@@ -114,7 +135,7 @@ KEEP=1 ONLY="S4 S6" scripts/interop.sh
 
 It creates `lsync-it-<run>` on the dev container, drives the official CLI (run with `node` directly) and `lsync` through the M2 scenarios, and prints PASS/FAIL lines. It refuses any URL other than `127.0.0.1:8411`.
 
-The official CLI is `$LSYNC_CLI_JS` when set; otherwise the build of the release `COMPATIBILITY.md` lists as tested (`UPSTREAM_TAG` in the script, `LSYNC_UPSTREAM_TAG` overrides) from `~/code/ref/obsidian-livesync-<tag>`, then `${LSYNC_UPSTREAM_DIR:-~/scratch/upstream-cli}/obsidian-livesync` (what `scripts/ci/upstream-cli.sh ~/scratch/upstream-cli <tag>` builds), then `~/code/ref/obsidian-livesync`; with none at that release it falls back to `~/code/ref/obsidian-livesync` and warns which release it runs. Raise `UPSTREAM_TAG` with `TESTED_PLUGIN_VERSION`.
+The official CLI is the pinned release's (`upstream.env`), from its reference folder, built on first use by `scripts/upstream.sh cli`. `LSYNC_UPSTREAM_TAG=<tag>` runs another release (built into its own folder) and `LSYNC_CLI_JS=<dist/index.cjs>` a given build; both are announced, and the run's header line says whether the CLI is the pinned release.
 
 ## Benchmark against the official clients
 
@@ -129,7 +150,7 @@ python3 scripts/bench/summarise.py "$BENCH_WORK"
 - `snapshot.sh` is the one script allowed to touch port 8410, and only to read: the dev container replicates from it with `use_checkpoints: false` (nothing is written to the source) and the `_local` LiveSync docs are copied with GETs.
 - Every run writes to its own `bench-*` clone on the dev container, re-cloned for each repetition.
 - lsync runs as the `lsync-bench` systemd user unit (`scripts/bench/install-unit.sh` installs it, never enables it; profile in `~/.config/lsync/bench.toml`, mode 0600).
-- The plug-in contender needs `npm run build` in the official repo and an extracted Obsidian AppImage at `~/scratch/lsync-bench/obsidian/squashfs-root` (`OBSIDIAN_DIR` overrides). It uses its own `--user-data-dir`, HOME and remote-debugging port (9333, never 9222).
+- The official CLI and the plug-in contender are the pinned release's (`scripts/upstream.sh cli` builds both into the release's reference folder, which the plug-in driver runs from). The plug-in contender also needs an extracted Obsidian AppImage at `~/scratch/lsync-bench/obsidian/squashfs-root` (`OBSIDIAN_DIR` overrides). It uses its own `--user-data-dir`, HOME and remote-debugging port (9333, never 9222).
 - `run.sh` turns on CORS on the dev container (the same origins as the real server), which the plug-in needs.
 
 ## End-to-end check against the dev database
