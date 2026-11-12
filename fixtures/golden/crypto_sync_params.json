@@ -1,6 +1,6 @@
 {
  "meta": {
-  "generator": "tools/golden/crypto.mjs",
+  "generator": "tools/golden/generate.mjs",
   "package": "@vrtmrz/livesync-commonlib",
   "version": "0.4.3"
  },

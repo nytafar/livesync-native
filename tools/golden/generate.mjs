@@ -24,6 +24,7 @@ import { path2id_base, shouldBeIgnored, isPlainText } from "@vrtmrz/livesync-com
 import { HashManager } from "@vrtmrz/livesync-commonlib/hashing";
 import { generateIgnore } from "./ignore.mjs";
 import { generateSettings } from "./settings.mjs";
+import { generateCrypto } from "./crypto.mjs";
 
 // compress.js is not in the package's export map; import it by file URL.
 const here = dirname(fileURLToPath(import.meta.url));
@@ -318,6 +319,7 @@ for (const c of splitCases) {
 emit("splitter.json", splitOut);
 
 await generateIgnore(emit);
+await generateCrypto(emit);
 
 {
     const { extra, files } = await generateSettings();
