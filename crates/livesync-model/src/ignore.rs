@@ -2,16 +2,18 @@
 //! files", `useIgnoreFiles` / `ignoreFiles`).
 //!
 //! Upstream: commonlib `string_and_binary/path.ts` (`isAccepted`,
-//! `isAcceptedAll`), which matches with minimatch 10 (`dot`, `nocase`,
-//! `flipNegate`, platform `linux`) and brace-expansion 5. This is a port of
-//! the parts of both that those calls reach: brace expansion, `*`, `?`,
-//! `**`, character classes and escapes, the minimatch fast paths for common
-//! segment shapes, and its JavaScript case folding (`/i` without `/u`, on
-//! UTF-16 code units). Extglobs (`+(a|b)` and friends), POSIX classes
-//! (`[[:alpha:]]`) and an escaped `|` are not ported: a pattern that uses
-//! them is [`Unsupported`], and the caller treats its ignore file as one it
-//! cannot read (it fails closed). Golden vectors from commonlib itself pin
-//! the rest (`fixtures/golden/ignore_*.json`).
+//! `isAcceptedAll`), which matches with minimatch 11 (`dot`, `nocase`,
+//! `flipNegate`, platform `linux`; commonlib 0.4.3 as Self-hosted LiveSync
+//! 1.0.49 ships it, minimatch 11.0.4 with `@isaacs/nonrecursive-glob-match`
+//! 1.0.3) and brace-expansion 5. This is a port of the parts of both that
+//! those calls reach: brace expansion, `*`, `?`, `**`, character classes and
+//! escapes, on code points, with Unicode simple case folding (what a `/iu`
+//! regular expression compares: `?` is one emoji, `K` (Kelvin) folds to `k`,
+//! `ς` to `σ`). Extglobs (`+(a|b)` and friends) and POSIX classes
+//! (`[[:alpha:]]`) are not ported: a pattern that uses them is
+//! [`Unsupported`], and the caller treats its ignore file as one it cannot
+//! read (it fails closed). Golden vectors from commonlib itself pin the rest
+//! (`fixtures/golden/ignore_*.json`).
 //!
 //! These are not git's rules: a pattern is matched against the path relative
 //! to its ignore file's folder, so `*.log` ignores only files beside the
@@ -56,48 +58,6 @@ fn js_is_space(c: char) -> bool {
 
 pub fn js_trim(s: &str) -> &str {
     s.trim_matches(js_is_space)
-}
-
-fn utf16(s: &str) -> Vec<u16> {
-    s.encode_utf16().collect()
-}
-
-/// `Canonicalize` for a `/i` regular expression without `/u` (ECMA-262):
-/// the code unit upper-cased, unless that is not one code unit or would map
-/// a non-ASCII unit to ASCII.
-fn canon(u: u16) -> u16 {
-    let Some(c) = char::from_u32(u as u32) else {
-        return u; // a lone surrogate
-    };
-    let mut up = c.to_uppercase();
-    match (up.next(), up.next()) {
-        (Some(x), None) => {
-            let x = x as u32;
-            if x > 0xFFFF || (u >= 128 && x < 128) {
-                u
-            } else {
-                x as u16
-            }
-        }
-        _ => u,
-    }
-}
-
-/// Code units whose canonical form may equal `canon(u)` (for class
-/// membership under `/i`): the unit, its canonical form and that form's
-/// lower case.
-fn canon_candidates(u: u16) -> [u16; 3] {
-    let cu = canon(u);
-    let lower = char::from_u32(cu as u32)
-        .map(|c| {
-            let mut l = c.to_lowercase();
-            match (l.next(), l.next()) {
-                (Some(x), None) if (x as u32) <= 0xFFFF => x as u16,
-                _ => cu,
-            }
-        })
-        .unwrap_or(cu);
-    [u, cu, lower]
 }
 
 // ----------------------------------------------------------------------
@@ -478,37 +438,47 @@ fn mm_brace_expand(pattern: &str) -> Vec<String> {
 }
 
 // ----------------------------------------------------------------------
-// minimatch 10: segments
+// minimatch 11: segments
 // ----------------------------------------------------------------------
 
+/// Code points closed under Unicode simple case folding, which is what a
+/// `/iu` regular expression compares (`nocase` in minimatch 11), or the
+/// complement of such a set.
 #[derive(Debug, Clone)]
-enum Tok {
-    /// One code unit, compared case-insensitively.
-    Lit(u16),
-    /// `?`: any one code unit.
-    Any,
-    /// `*`: any run of code units (`+` when `nonempty`).
-    Star {
-        nonempty: bool,
-    },
-    Class {
-        negate: bool,
-        ranges: Vec<(u16, u16)>,
-    },
+struct FoldSet {
+    negate: bool,
+    ranges: Vec<(char, char)>,
+}
+
+impl FoldSet {
+    fn new(negate: bool, ranges: &[(char, char)]) -> FoldSet {
+        use regex_syntax::hir::{ClassUnicode, ClassUnicodeRange};
+        let mut class = ClassUnicode::new(ranges.iter().map(|(a, b)| ClassUnicodeRange::new(*a, *b)));
+        class.case_fold_simple();
+        FoldSet {
+            negate,
+            ranges: class.ranges().iter().map(|r| (r.start(), r.end())).collect(),
+        }
+    }
+
+    fn hit(&self, c: char) -> bool {
+        // The ranges are sorted and do not overlap.
+        let i = self.ranges.partition_point(|(_, hi)| *hi < c);
+        let inside = self.ranges.get(i).is_some_and(|(lo, _)| *lo <= c);
+        inside != self.negate
+    }
 }
 
 #[derive(Debug, Clone)]
-enum FastTest {
-    /// `*` (and `**` inside a segment): non-empty, not `.` or `..`.
+enum Tok {
+    /// One code point, compared with case folding.
+    Lit(FoldSet),
+    /// `?`: any one code point.
+    Any,
+    /// `*`: any run of code points.
     Star,
-    /// `*<ext>`: ends with ext (lower-cased).
-    StarDotExt(String),
-    /// `?..?<ext>`: this many code units, not `.`/`..`, ends with ext.
-    Qmarks(usize, String),
-    /// `*.*`
-    StarDotStar,
-    /// `.*`
-    DotStar,
+    /// `[...]`: one code point of the class (case folded).
+    Class(FoldSet),
 }
 
 #[derive(Debug, Clone)]
@@ -516,32 +486,10 @@ enum Seg {
     Globstar,
     /// Matches nothing (an empty character class poisons the pattern).
     Never,
-    Fast(FastTest),
-    Toks {
-        no_traversal: bool,
-        toks: Vec<Tok>,
-    },
-}
-
-fn is_reserved_char(c: u16) -> bool {
-    // reSpecials in minimatch's ast.ts
-    matches!(
-        char::from_u32(c as u32),
-        Some('(' | ')' | '.' | '*' | '{' | '}' | '+' | '?' | '[' | ']' | '^' | '$' | '\\' | '!')
-    )
-}
-
-/// regExpEscape of one code unit, as source text (for the start-of-pattern
-/// checks, which look at the regular expression's first characters).
-fn re_escaped(c: u16) -> String {
-    let s = String::from_utf16_lossy(&[c]);
-    match s.as_str() {
-        "-" | "[" | "]" | "{" | "}" | "(" | ")" | "*" | "+" | "?" | "." | "," | "\\" | "^" | "$" | "|" | "#" => {
-            format!("\\{s}")
-        }
-        _ if s.chars().all(js_is_space) => format!("\\{s}"),
-        _ => s,
-    }
+    /// A pattern without magic or cased characters: compared as a string.
+    Literal(String),
+    /// The other patterns: minimatch's `Matcher`.
+    Toks(Vec<Tok>),
 }
 
 const POSIX_CLASSES: [&str; 14] = [
@@ -564,55 +512,46 @@ const POSIX_CLASSES: [&str; 14] = [
 enum ClassParse {
     /// Not a class: `[` is literal.
     NotAClass,
-    /// The class poisons the whole pattern (`$.`); consumes the rest.
+    /// The class poisons the whole pattern (`/$./`); consumes the rest.
     Never,
-    /// One literal code unit; consumed units.
-    Literal(u16, usize),
     Class {
         negate: bool,
-        ranges: Vec<(u16, u16)>,
+        ranges: Vec<(char, char)>,
         consumed: usize,
     },
 }
 
-fn starts_with_units(g: &[u16], at: usize, s: &str) -> bool {
-    let u = utf16(s);
-    g.len() >= at + u.len() && g[at..at + u.len()] == u[..]
+fn starts_with_chars(g: &[char], at: usize, s: &str) -> bool {
+    (at..).zip(s.chars()).all(|(i, c)| g.get(i) == Some(&c))
 }
 
-/// minimatch's `parseClass` (brace-expressions.ts) on code units.
-fn parse_class(g: &[u16], pos: usize) -> Result<ClassParse, Unsupported> {
-    const BANG: u16 = b'!' as u16;
-    const CARET: u16 = b'^' as u16;
-    const CLOSE: u16 = b']' as u16;
-    const BSLASH: u16 = b'\\' as u16;
-    const OPEN: u16 = b'[' as u16;
-    const DASH: u16 = b'-' as u16;
-    let mut ranges: Vec<(u16, u16)> = Vec::new();
+/// `parseClass` (`@isaacs/nonrecursive-glob-match`) on code points.
+fn parse_class(g: &[char], pos: usize) -> Result<ClassParse, Unsupported> {
+    let mut ranges: Vec<(char, char)> = Vec::new();
     let mut i = pos + 1;
     let mut saw_start = false;
     let mut escaping = false;
     let mut negate = false;
     let mut end_pos = pos;
-    let mut range_start: Option<u16> = None;
+    let mut range_start: Option<char> = None;
     while i < g.len() {
         let c = g[i];
-        if (c == BANG || c == CARET) && i == pos + 1 {
+        if (c == '!' || c == '^') && i == pos + 1 {
             negate = true;
             i += 1;
             continue;
         }
-        if c == CLOSE && saw_start && !escaping {
+        if c == ']' && saw_start && !escaping {
             end_pos = i + 1;
             break;
         }
         saw_start = true;
-        if c == BSLASH && !escaping {
+        if c == '\\' && !escaping {
             escaping = true;
             i += 1;
             continue;
         }
-        if c == OPEN && !escaping && POSIX_CLASSES.iter().any(|cls| starts_with_units(g, i, cls)) {
+        if c == '[' && !escaping && POSIX_CLASSES.iter().any(|cls| starts_with_chars(g, i, cls)) {
             return Err(Unsupported(
                 "POSIX character classes such as [[:alpha:]] are not supported".into(),
             ));
@@ -627,13 +566,13 @@ fn parse_class(g: &[u16], pos: usize) -> Result<ClassParse, Unsupported> {
             i += 1;
             continue;
         }
-        if g.get(i + 1) == Some(&DASH) && g.get(i + 2) == Some(&CLOSE) {
+        if g.get(i + 1) == Some(&'-') && g.get(i + 2) == Some(&']') {
             ranges.push((c, c));
-            ranges.push((DASH, DASH));
+            ranges.push(('-', '-'));
             i += 2;
             continue;
         }
-        if g.get(i + 1) == Some(&DASH) {
+        if g.get(i + 1) == Some(&'-') {
             range_start = Some(c);
             i += 2;
             continue;
@@ -647,13 +586,6 @@ fn parse_class(g: &[u16], pos: usize) -> Result<ClassParse, Unsupported> {
     if ranges.is_empty() {
         return Ok(ClassParse::Never);
     }
-    // `c-]` pushed two entries above where upstream pushes one escaped
-    // string (`c\-`); that only matters for the single-literal shortcut,
-    // which needs exactly one one-character entry.
-    let single = ranges.len() == 1 && ranges[0].0 == ranges[0].1 && !negate;
-    if single {
-        return Ok(ClassParse::Literal(ranges[0].0, end_pos - pos));
-    }
     Ok(ClassParse::Class {
         negate,
         ranges,
@@ -661,245 +593,219 @@ fn parse_class(g: &[u16], pos: usize) -> Result<ClassParse, Unsupported> {
     })
 }
 
-/// The glob regexes minimatch tries before building a segment's regexp.
-fn fast_test(p: &str) -> Option<FastTest> {
-    let bad = |c: char| matches!(c, '+' | '@' | '!' | '?' | '*' | '[' | '(');
-    if !p.is_empty() && p.chars().all(|c| c == '*') {
-        return Some(FastTest::Star);
+/// minimatch's `classEnd`: the index of the `]` that closes the class at
+/// `start`, if any (code units, as `charAt` walks them).
+fn class_end(p: &[u16], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    if matches!(p.get(i), Some(&c) if c == b'!' as u16 || c == b'^' as u16) {
+        i += 1;
     }
-    // ^\*+([^+@!?*[(]*)$
-    let stars = p.chars().take_while(|c| *c == '*').count();
-    if stars > 0 {
-        let ext = &p[stars..];
-        if !ext.chars().any(bad) {
-            return Some(FastTest::StarDotExt(crate::path::js_to_lower_case(ext)));
+    let mut saw_start = false;
+    while i < p.len() {
+        let c = p[i];
+        if c == b']' as u16 && saw_start {
+            return Some(i);
         }
-    }
-    // ^\?+([^+@!?*[(]*)?$
-    let q = p.chars().take_while(|c| *c == '?').count();
-    if q > 0 {
-        let ext = &p[q..];
-        if !ext.chars().any(bad) {
-            return Some(FastTest::Qmarks(js_len(p), crate::path::js_to_lower_case(ext)));
+        saw_start = true;
+        if c == b'\\' as u16 {
+            i += 1;
         }
-    }
-    // ^\*+\.\*+$
-    if let Some((a, b)) = p.split_once('.') {
-        if !a.is_empty() && !b.is_empty() && a.chars().all(|c| c == '*') && b.chars().all(|c| c == '*') {
-            return Some(FastTest::StarDotStar);
-        }
-    }
-    // ^\.\*+$
-    if let Some(rest) = p.strip_prefix('.') {
-        if !rest.is_empty() && rest.chars().all(|c| c == '*') {
-            return Some(FastTest::DotStar);
-        }
+        i += 1;
     }
     None
 }
 
-/// Whether a segment uses extglob syntax (`?(`, `*(`, `+(`, `@(`, `!(`)
-/// outside a character class and not escaped, or an escaped `|` (which
-/// minimatch leaves unescaped in its regexp).
-fn uses_extglob(g: &[u16]) -> Option<&'static str> {
-    let mut escaping = false;
-    let mut in_brace = false;
-    let mut brace_start = 0usize;
-    let mut brace_neg = false;
+/// minimatch's `literal`: the string a portion pattern matches when it has
+/// no magic (escapes resolved, one-character classes such as `[*]` taken
+/// as their character).
+fn literal(p: &str) -> Option<String> {
+    if p == "+()" || p == "@()" {
+        return Some(p.to_string());
+    }
+    let g: Vec<u16> = p.encode_utf16().collect();
+    let mut lit: Vec<u16> = Vec::new();
     let mut i = 0;
     while i < g.len() {
         let c = g[i];
-        i += 1;
-        if escaping {
-            escaping = false;
-            if c == b'|' as u16 {
-                return Some("an escaped | is not supported");
-            }
-            continue;
-        }
         if c == b'\\' as u16 {
-            escaping = true;
-            continue;
-        }
-        if in_brace {
-            if i == brace_start + 1 {
-                if c == b'^' as u16 || c == b'!' as u16 {
-                    brace_neg = true;
-                }
-            } else if c == b']' as u16 && !(i == brace_start + 2 && brace_neg) {
-                in_brace = false;
-            }
-            continue;
+            i += 1;
+            lit.push(g.get(i).copied().unwrap_or(c));
+        } else if c == b'*' as u16 || c == b'?' as u16 {
+            return None;
         } else if c == b'[' as u16 {
-            in_brace = true;
-            brace_start = i;
-            brace_neg = false;
-            continue;
+            let Some(close) = class_end(&g, i) else {
+                lit.push(c);
+                i += 1;
+                continue;
+            };
+            let mut body = &g[i + 1..close];
+            if body.first() == Some(&(b'\\' as u16)) {
+                body = &body[1..];
+            }
+            let one = String::from_utf16_lossy(body).chars().count() == 1;
+            if !one || matches!(g.get(i + 1), Some(&x) if x == b'!' as u16 || x == b'^' as u16) {
+                return None;
+            }
+            lit.extend_from_slice(body);
+            i = close;
+        } else if (c == b'+' as u16 || c == b'@' as u16 || c == b'!' as u16)
+            && g.get(i + 1) == Some(&(b'(' as u16))
+            && g[(i + 2).min(g.len())..].contains(&(b')' as u16))
+        {
+            return None;
+        } else {
+            lit.push(c);
         }
-        if matches!(char::from_u32(c as u32), Some('!' | '?' | '+' | '*' | '@')) && g.get(i) == Some(&(b'(' as u16)) {
-            return Some("extglob patterns such as +(a|b) are not supported");
-        }
+        i += 1;
     }
-    None
+    Some(String::from_utf16_lossy(&lit))
 }
 
-/// minimatch's `parse` of one path portion.
+/// Whether a portion pattern uses extglob syntax (`?(`, `*(`, `+(`, `@(`,
+/// `!(`) outside a character class and not escaped.
+fn uses_extglob(g: &[char]) -> bool {
+    let mut i = 0;
+    while i < g.len() {
+        let c = g[i];
+        if c == '\\' {
+            i += 2;
+            continue;
+        }
+        if c == '[' {
+            if let Ok(ClassParse::Class { consumed, .. }) = parse_class(g, i) {
+                i += consumed;
+                continue;
+            }
+        }
+        if matches!(c, '!' | '?' | '+' | '*' | '@') && g.get(i + 1) == Some(&'(') {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// minimatch's `parse` of one path portion (`nocase`, `dot`).
 fn parse_segment(p: &str) -> Result<Seg, Unsupported> {
     if p == "**" {
         return Ok(Seg::Globstar);
     }
     if p.is_empty() {
-        return Ok(Seg::Toks {
-            no_traversal: false,
-            toks: vec![],
-        });
+        return Ok(Seg::Literal(String::new()));
     }
-    let g = utf16(p);
-    if let Some(why) = uses_extglob(&g) {
-        return Err(Unsupported(format!("{p:?}: {why}")));
+    // A literal without cased characters is compared as it is; one with
+    // them still needs case folding.
+    if let Some(lit) = literal(p) {
+        if p.to_uppercase() == p.to_lowercase() {
+            return Ok(Seg::Literal(lit));
+        }
     }
-    let fast = fast_test(p);
-    // #parseGlob
+    let g: Vec<char> = p.chars().collect();
+    if uses_extglob(&g) {
+        return Err(Unsupported(format!(
+            "{p:?}: extglob patterns such as +(a|b) are not supported"
+        )));
+    }
+    let lit = |c: char| Tok::Lit(FoldSet::new(false, &[(c, c)]));
     let mut toks: Vec<Tok> = Vec::new();
-    let mut src = String::new();
-    let mut escaping = false;
-    let mut in_star = false;
-    let only_stars = p.chars().all(|c| c == '*');
     let mut i = 0;
     while i < g.len() {
         let c = g[i];
-        if escaping {
-            escaping = false;
-            if is_reserved_char(c) {
-                src.push('\\');
-            }
-            src.push_str(&String::from_utf16_lossy(&[c]));
-            toks.push(Tok::Lit(c));
-            i += 1;
+        if c == '\\' {
+            // A trailing `\` is a literal `\`.
+            toks.push(lit(g.get(i + 1).copied().unwrap_or(c)));
+            i += 2;
             continue;
         }
-        if c == b'*' as u16 {
-            if !in_star {
-                in_star = true;
-                toks.push(Tok::Star { nonempty: only_stars });
-                src.push_str(if only_stars { "[^/]+?" } else { "[^/]*?" });
-            }
-            i += 1;
-            continue;
-        }
-        in_star = false;
-        if c == b'\\' as u16 {
-            if i == g.len() - 1 {
-                src.push_str("\\\\");
-                toks.push(Tok::Lit(c));
-            } else {
-                escaping = true;
-            }
-            i += 1;
-            continue;
-        }
-        if c == b'[' as u16 {
+        if c == '[' {
             match parse_class(&g, i)? {
                 ClassParse::NotAClass => {}
-                ClassParse::Never => {
-                    return Ok(match fast {
-                        Some(f) => Seg::Fast(f),
-                        None => Seg::Never,
-                    })
-                }
-                ClassParse::Literal(u, consumed) => {
-                    src.push_str(&re_escaped(u));
-                    toks.push(Tok::Lit(u));
-                    i += consumed;
-                    continue;
-                }
+                ClassParse::Never => return Ok(Seg::Never),
                 ClassParse::Class {
                     negate,
                     ranges,
                     consumed,
                 } => {
-                    src.push('[');
-                    toks.push(Tok::Class { negate, ranges });
+                    toks.push(Tok::Class(FoldSet::new(negate, &ranges)));
                     i += consumed;
                     continue;
                 }
             }
         }
-        if c == b'?' as u16 {
-            src.push_str("[^/]");
-            toks.push(Tok::Any);
-            i += 1;
-            continue;
-        }
-        src.push_str(&re_escaped(c));
-        toks.push(Tok::Lit(c));
+        toks.push(match c {
+            '*' => Tok::Star,
+            '?' => Tok::Any,
+            _ => lit(c),
+        });
         i += 1;
     }
-    if let Some(f) = fast {
-        return Ok(Seg::Fast(f));
-    }
-    // The start-of-pattern guard (dot: true): `.` and `..` match only a
-    // pattern that is exactly that.
-    let dot_trav_allowed = p == "." || p == "..";
-    let aps = |c: Option<char>| matches!(c, Some('[' | '.'));
-    let ch = |n: usize| src.chars().nth(n);
-    let no_traversal = !dot_trav_allowed
-        && (aps(ch(0)) || (src.starts_with("\\.") && aps(ch(2))) || (src.starts_with("\\.\\.") && aps(ch(4))));
-    Ok(Seg::Toks { no_traversal, toks })
+    Ok(Seg::Toks(toks))
 }
 
-fn class_hit(negate: bool, ranges: &[(u16, u16)], u: u16) -> bool {
-    let cu = canon(u);
-    let hit = canon_candidates(u)
-        .iter()
-        .any(|m| canon(*m) == cu && ranges.iter().any(|(lo, hi)| *lo <= *m && *m <= *hi));
-    hit != negate
+/// One code point against a token that consumes exactly one.
+fn tok_hit(t: &Tok, c: char) -> bool {
+    match t {
+        Tok::Lit(s) | Tok::Class(s) => s.hit(c),
+        Tok::Any => true,
+        Tok::Star => false,
+    }
 }
 
-fn toks_match(toks: &[Tok], f: &[u16]) -> bool {
-    match toks.first() {
-        None => f.is_empty(),
-        Some(Tok::Lit(c)) => !f.is_empty() && canon(f[0]) == canon(*c) && toks_match(&toks[1..], &f[1..]),
-        Some(Tok::Any) => !f.is_empty() && f[0] != b'/' as u16 && toks_match(&toks[1..], &f[1..]),
-        Some(Tok::Class { negate, ranges }) => {
-            !f.is_empty() && class_hit(*negate, ranges, f[0]) && toks_match(&toks[1..], &f[1..])
+/// `testLinear`: a chain of tokens, backtracking to the last `*` only.
+fn toks_match(toks: &[Tok], f: &[char]) -> bool {
+    let (mut ti, mut fi) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while fi < f.len() {
+        match toks.get(ti) {
+            Some(Tok::Star) => {
+                star = Some((ti, fi));
+                ti += 1;
+                continue;
+            }
+            Some(t) if tok_hit(t, f[fi]) => {
+                ti += 1;
+                fi += 1;
+                continue;
+            }
+            _ => {}
         }
-        Some(Tok::Star { nonempty }) => {
-            let min = usize::from(*nonempty);
-            (min..=f.len()).any(|k| toks_match(&toks[1..], &f[k..]))
-        }
+        let Some((sti, sfi)) = star else {
+            return false;
+        };
+        ti = sti + 1;
+        fi = sfi + 1;
+        star = Some((sti, sfi + 1));
     }
+    toks[ti.min(toks.len())..].iter().all(|t| matches!(t, Tok::Star))
 }
 
 impl Seg {
+    /// `portionMatch`: one pattern portion against one path portion.
     fn test(&self, f: &str) -> bool {
         match self {
-            Seg::Globstar => false,
-            Seg::Never => false,
-            Seg::Fast(t) => match t {
-                FastTest::Star => !f.is_empty() && f != "." && f != "..",
-                FastTest::StarDotExt(ext) => crate::path::js_to_lower_case(f).ends_with(ext.as_str()),
-                FastTest::Qmarks(len, ext) => {
-                    js_len(f) == *len
-                        && f != "."
-                        && f != ".."
-                        && (ext.is_empty() || crate::path::js_to_lower_case(f).ends_with(ext.as_str()))
-                }
-                FastTest::StarDotStar => f != "." && f != ".." && f.contains('.'),
-                FastTest::DotStar => f != "." && f != ".." && f.starts_with('.'),
-            },
-            Seg::Toks { no_traversal, toks } => {
-                if *no_traversal && (f == "." || f == "..") {
+            Seg::Globstar | Seg::Never => false,
+            Seg::Literal(s) => f == s,
+            Seg::Toks(toks) => {
+                if f.is_empty() {
                     return false;
                 }
-                toks_match(toks, &utf16(f))
+                let chars: Vec<char> = f.chars().collect();
+                if f == "." || f == ".." {
+                    // Even with `dot`, only literal dots match them.
+                    return toks.len() == chars.len()
+                        && toks
+                            .iter()
+                            .zip(&chars)
+                            .all(|(t, c)| matches!(t, Tok::Lit(s) if s.hit(*c)));
+                }
+                toks_match(toks, &chars)
             }
         }
     }
 }
 
 // ----------------------------------------------------------------------
-// minimatch 10: whole patterns
+// minimatch 11: whole patterns
 // ----------------------------------------------------------------------
 
 /// One minimatch pattern with the options commonlib uses (`dot`, `nocase`,
@@ -1021,26 +927,24 @@ impl Glob {
             return true;
         }
         let file = slash_split(f);
-        self.set.iter().any(|p| match_one(&file, p, partial))
+        self.set.iter().any(|p| match_row(&file, p, partial))
     }
 }
 
-fn match_one(file: &[String], pattern: &[Seg], partial: bool) -> bool {
+fn match_row(file: &[String], pattern: &[Seg], partial: bool) -> bool {
     if pattern.iter().any(|s| matches!(s, Seg::Globstar)) {
         return match_globstar(file, pattern, partial, 0, 0);
     }
-    match_parts(file, pattern, partial, 0, 0)
+    match_one(file, pattern, partial, 0, 0, file.len())
 }
 
-fn match_parts(file: &[String], pattern: &[Seg], partial: bool, fi0: usize, pi0: usize) -> bool {
+/// `#matchOne`, on the file portions before `file_end`.
+fn match_one(file: &[String], pattern: &[Seg], partial: bool, fi0: usize, pi0: usize, file_end: usize) -> bool {
     let (mut fi, mut pi) = (fi0, pi0);
-    let (fl, pl) = (file.len(), pattern.len());
+    let (fl, pl) = (file_end.min(file.len()), pattern.len());
     while fi < fl && pi < pl {
         let p = &pattern[pi];
-        if matches!(p, Seg::Globstar) {
-            return false;
-        }
-        if !p.test(&file[fi]) {
+        if matches!(p, Seg::Globstar) || !p.test(&file[fi]) {
             return false;
         }
         fi += 1;
@@ -1060,7 +964,8 @@ fn bad_dot(f: &str) -> bool {
     f == "." || f == ".."
 }
 
-fn match_globstar(file: &[String], pattern: &[Seg], partial: bool, mut fi: usize, mut pi: usize) -> bool {
+/// `#matchGlobstar`.
+fn match_globstar(file: &[String], pattern: &[Seg], partial: bool, mut fi: usize, pi: usize) -> bool {
     let firstgs = pattern
         .iter()
         .enumerate()
@@ -1069,43 +974,32 @@ fn match_globstar(file: &[String], pattern: &[Seg], partial: bool, mut fi: usize
         .map(|(i, _)| i)
         .unwrap();
     let lastgs = pattern.iter().rposition(|s| matches!(s, Seg::Globstar)).unwrap();
-    let (head, body, tail): (&[Seg], &[Seg], &[Seg]) = if partial {
-        (&pattern[pi..firstgs], &pattern[firstgs + 1..], &[])
+    let head = &pattern[pi..firstgs];
+    let (body, tail): (&[Seg], &[Seg]) = if partial {
+        (&pattern[firstgs + 1..], &[])
     } else {
-        (
-            &pattern[pi..firstgs],
-            if lastgs > firstgs {
-                &pattern[firstgs + 1..lastgs]
-            } else {
-                &[]
-            },
-            &pattern[lastgs + 1..],
-        )
+        (&pattern[firstgs + 1..lastgs.max(firstgs + 1)], &pattern[lastgs + 1..])
     };
     if !head.is_empty() {
-        let end = (fi + head.len()).min(file.len());
-        let file_head = &file[fi.min(end)..end];
-        if !match_parts(file_head, head, partial, 0, 0) {
+        if !match_one(file, head, partial, fi, 0, fi + head.len()) {
             return false;
         }
         fi += head.len();
-        pi += head.len();
     }
-    let _ = pi;
     let mut file_tail_match = 0usize;
     if !tail.is_empty() {
         if tail.len() + fi > file.len() {
             return false;
         }
-        let mut tail_start = file.len() - tail.len();
-        if match_parts(file, tail, partial, tail_start, 0) {
+        let tail_start = file.len() - tail.len();
+        if match_one(file, tail, partial, tail_start, 0, file.len()) {
             file_tail_match = tail.len();
         } else {
+            // `a/**/*` matches `a/b/`: try again without the last ''.
             if !file[file.len() - 1].is_empty() || fi + tail.len() == file.len() {
                 return false;
             }
-            tail_start -= 1;
-            if !match_parts(file, tail, partial, tail_start, 0) {
+            if !match_one(file, tail, partial, tail_start - 1, 0, file.len()) {
                 return false;
             }
             file_tail_match = tail.len() + 1;
@@ -1122,79 +1016,95 @@ fn match_globstar(file: &[String], pattern: &[Seg], partial: bool, mut fi: usize
         }
         return partial || saw_some;
     }
-    // Body sections between globstars, with the last index each may start at.
-    let mut sections: Vec<Vec<Seg>> = vec![vec![]];
+    // The body's sections between globstars, each with the number of
+    // portions it and the sections after it need.
+    let mut sections: Vec<(Vec<Seg>, usize)> = vec![(vec![], 0)];
     let mut non_gs = 0usize;
     let mut sums = vec![0usize];
     for b in body {
         if matches!(b, Seg::Globstar) {
             sums.push(non_gs);
-            sections.push(vec![]);
+            sections.push((vec![], 0));
         } else {
-            sections.last_mut().unwrap().push(b.clone());
+            sections.last_mut().unwrap().0.push(b.clone());
             non_gs += 1;
         }
     }
-    let file_length = file.len() as i64 - file_tail_match as i64;
-    let n = sections.len();
-    let afters: Vec<i64> = sections
-        .iter()
-        .enumerate()
-        .map(|(k, sec)| file_length - (sums[n - 1 - k] as i64 + sec.len() as i64))
-        .collect();
-    body_sections(file, &sections, &afters, fi, 0, partial, 0, file_tail_match > 0) == Tri::True
+    for (k, s) in sections.iter_mut().enumerate() {
+        s.1 = non_gs - sums[k];
+    }
+    let mut walk = BodyWalk {
+        file,
+        sections: &sections,
+        file_length: file.len() - file_tail_match,
+        partial,
+        tried: HashSet::new(),
+    };
+    walk.run(fi, 0, 0, file_tail_match > 0) == Tri::True
 }
 
-#[allow(clippy::too_many_arguments)]
-fn body_sections(
-    file: &[String],
-    sections: &[Vec<Seg>],
-    afters: &[i64],
-    mut fi: usize,
-    bi: usize,
+/// `#matchGlobStarBodySections`.
+struct BodyWalk<'a> {
+    file: &'a [String],
+    sections: &'a [(Vec<Seg>, usize)],
+    /// The end of the file portions that the body can match.
+    file_length: usize,
     partial: bool,
-    depth: usize,
-    mut saw_tail: bool,
-) -> Tri {
-    const MAX_GLOBSTAR_RECURSION: usize = 200;
-    let Some(body) = sections.get(bi) else {
-        for f in file.iter().skip(fi) {
-            saw_tail = true;
-            if bad_dot(f) {
+    /// (section, file index) walks already tried: one from the same place
+    /// does the same, and it only comes back when it found no match.
+    tried: HashSet<(usize, usize)>,
+}
+
+impl BodyWalk<'_> {
+    fn run(&mut self, mut fi: usize, bi: usize, depth: usize, mut saw_tail: bool) -> Tri {
+        const MAX_GLOBSTAR_RECURSION: usize = 200;
+        let (file, file_length) = (self.file, self.file_length);
+        let Some((body, need)) = self.sections.get(bi) else {
+            if self.partial {
+                // The body is the rest of the pattern: it matches if no
+                // portions are left, or only the '' of a trailing `/`.
+                let done = fi >= file_length || (fi + 1 == file_length && file[fi].is_empty());
+                return if done { Tri::True } else { Tri::False };
+            }
+            for f in file.iter().take(file_length).skip(fi) {
+                saw_tail = true;
+                if bad_dot(f) {
+                    return Tri::False;
+                }
+            }
+            return if saw_tail { Tri::True } else { Tri::False };
+        };
+        // With partial, the path can end before the body does.
+        let after = if self.partial {
+            file_length as i64
+        } else {
+            file_length as i64 - *need as i64
+        };
+        while fi as i64 <= after {
+            if !self.tried.insert((bi, fi)) {
                 return Tri::False;
             }
-        }
-        return if saw_tail { Tri::True } else { Tri::False };
-    };
-    let after = afters[bi];
-    while (fi as i64) <= after {
-        let end = (fi + body.len()).min(file.len());
-        let m = match_parts(&file[..end], body, partial, fi, 0);
-        if m && depth < MAX_GLOBSTAR_RECURSION {
-            let sub = body_sections(
-                file,
-                sections,
-                afters,
-                fi + body.len(),
-                bi + 1,
-                partial,
-                depth + 1,
-                saw_tail,
-            );
-            if sub != Tri::False {
-                return sub;
+            let m = match_one(file, body, self.partial, fi, 0, fi + body.len());
+            if m && depth < MAX_GLOBSTAR_RECURSION {
+                let sub = self.run(fi + body.len(), bi + 1, depth + 1, saw_tail);
+                if sub != Tri::False {
+                    return sub;
+                }
             }
+            // The ** does not walk past the last place the body can start.
+            if fi as i64 == after {
+                break;
+            }
+            if bad_dot(&file[fi]) {
+                return Tri::False;
+            }
+            fi += 1;
         }
-        match file.get(fi) {
-            Some(f) if bad_dot(f) => return Tri::False,
-            _ => {}
+        if self.partial {
+            Tri::True
+        } else {
+            Tri::Null
         }
-        fi += 1;
-    }
-    if partial {
-        Tri::True
-    } else {
-        Tri::Null
     }
 }
 

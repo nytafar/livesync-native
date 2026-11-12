@@ -1158,7 +1158,7 @@ fn split_diff(src: Vec<(Op, String)>) -> Vec<(Op, String)> {
     ret
 }
 
-/// A port of upstream's walk (commonlib 0.2.1 `ConflictManager.mergeSensibly`),
+/// A port of upstream's walk (commonlib 0.4.3 `ConflictManager.mergeSensibly`, unchanged since 0.2.1),
 /// line for line, including its "weird condition" exit that returns what it
 /// merged so far. The corpus test checks it against upstream's own output.
 pub(crate) fn upstream(base: &str, ours: &str, theirs: &str, ours_first: bool) -> Upstream {

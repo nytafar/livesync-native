@@ -1,5 +1,5 @@
 //! Ignore-file decisions against commonlib's own `isAccepted` and
-//! `isAcceptedAll` (fixtures from `tools/golden/ignore.mjs`, commonlib 0.2.1).
+//! `isAcceptedAll` (fixtures from `tools/golden/ignore.mjs`, commonlib 0.4.3).
 use livesync_model::ignore::{decide, IgnoreList, Lookup};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ fn fixture(name: &str) -> Value {
         .join(name);
     let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
     let v: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["meta"]["version"], "0.2.1", "fixtures must come from commonlib 0.2.1");
+    assert_eq!(v["meta"]["version"], "0.4.3", "fixtures must come from commonlib 0.4.3");
     v
 }
 

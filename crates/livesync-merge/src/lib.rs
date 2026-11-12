@@ -696,7 +696,7 @@ fn merge_lines(b: &str, o: &str, t: &str, ours_first: bool, budget: &mut Budget)
     (m, View::Walk(w))
 }
 
-/// Upstream's line merge (commonlib 0.2.1 `mergeSensibly`), as this crate
+/// Upstream's line merge (commonlib 0.4.3 `mergeSensibly`, unchanged since 0.2.1), as this crate
 /// models it: the merged text, or `None` where upstream does not merge. For
 /// tests that check the model against upstream's own output; not part of the
 /// interface.
@@ -737,7 +737,7 @@ pub fn line_merge_trace(base: &str, ours: &str, theirs: &str, ours_first: bool) 
     })
 }
 
-/// Upstream's object merge (commonlib 0.2.1 `mergeObject`), as this crate
+/// Upstream's object merge (commonlib 0.4.3 `mergeObject`, unchanged since 0.2.1), as this crate
 /// models it, written as `JSON.stringify` would (keys in this crate's order):
 /// `Some(None)` where upstream does not merge, `None` where the model does not
 /// cover the input. For tests; not part of the interface.

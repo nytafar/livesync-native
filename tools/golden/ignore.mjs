@@ -114,6 +114,20 @@ const single = [
     "[n]otes/",
     "cach?/",
     "!sub/",
+    // minimatch 11 (commonlib 0.4): code points and Unicode simple case
+    // folding (`/iu`), `.`/`..` only for literal dots, an escaped `|`.
+    "σ.md",
+    "[σ].md",
+    "[^σ].md",
+    "İ.md",
+    "😀.md",
+    "[😀].md",
+    "[😀-😂].md",
+    "[.]",
+    ".?",
+    "..",
+    "a\\|b.md",
+    "a|b.md",
 ];
 const multi = [
     ["*.log", "!keep.log"],
@@ -279,6 +293,15 @@ const paths = [
     "cachy/x",
     "sub/cache2/x",
     "sub/z",
+    "σ.md",
+    "ς.md",
+    "Σ.md",
+    "İ.md",
+    "i.md",
+    "😁.md",
+    "a|b.md",
+    ".",
+    "..",
 ];
 
 export function generateIgnore(emit) {

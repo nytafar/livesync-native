@@ -58,7 +58,7 @@ fn md(base: &str, ours: &str, theirs: &str) -> Merge {
 fn line_diffs_match_diff_match_patch() {
     let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/golden/line_diff.json");
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
-    assert_eq!(v["meta"]["version"], "0.2.1", "fixtures must come from commonlib 0.2.1");
+    assert_eq!(v["meta"]["version"], "0.4.3", "fixtures must come from commonlib 0.4.3");
     let cases = v["cases"].as_array().unwrap();
     assert!(cases.len() > 400);
     for c in cases {

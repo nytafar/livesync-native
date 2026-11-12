@@ -2,7 +2,7 @@
  "meta": {
   "generator": "tools/golden/generate.mjs",
   "package": "@vrtmrz/livesync-commonlib",
-  "version": "0.2.1"
+  "version": "0.4.3"
  },
  "cases": [
   {

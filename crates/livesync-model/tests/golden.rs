@@ -1,4 +1,4 @@
-//! Tests driven by fixtures from `tools/golden` (upstream commonlib 0.2.1).
+//! Tests driven by fixtures from `tools/golden` (upstream commonlib 0.4.3).
 use livesync_model::splitter::{chunk_file, SplitParams};
 use livesync_model::{chunk, codec, path, FileKind};
 use serde_json::Value;
@@ -10,7 +10,7 @@ fn fixture(name: &str) -> Vec<Value> {
         .join(name);
     let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
     let v: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(v["meta"]["version"], "0.2.1", "fixtures must come from commonlib 0.2.1");
+    assert_eq!(v["meta"]["version"], "0.4.3", "fixtures must come from commonlib 0.4.3");
     v["cases"].as_array().unwrap().clone()
 }
 
