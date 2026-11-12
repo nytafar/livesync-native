@@ -192,6 +192,21 @@ fn invalid_profiles_are_refused_before_starting() {
 }
 
 #[test]
+fn an_encrypted_database_is_refused_with_where_it_is_supported() {
+    let env = Env::new();
+    env.mock.update_milestone(|m| {
+        m["tweak_values"]["PREFERRED"]["encrypt"] = serde_json::json!(true);
+    });
+    let scratch = env.dir.path().join("cache").display().to_string();
+    let p = env.profile("e", "vault-e");
+    let g = env.host.connect_test(p, scratch);
+    assert_eq!(g.outcome, GateOutcome::Refused, "{}", g.message);
+    assert!(g.message.contains("end-to-end encrypted"), "{}", g.message);
+    assert!(g.message.contains("desktop lsync command line"), "{}", g.message);
+    assert!(env.mock.writes().is_empty());
+}
+
+#[test]
 fn connect_test_reports_the_gate_without_touching_the_vault() {
     let env = Env::new();
     let scratch = env.dir.path().join("cache").display().to_string();

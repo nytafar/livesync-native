@@ -194,7 +194,8 @@ impl LiveSync {
     /// folder's own top-level folders are merged in (local-only ones marked)
     /// when it exists. Reads file metadata documents only, never chunks, and
     /// never writes to the remote. Works for settings that are not saved yet
-    /// (no engine, no index). Refuses a database with encrypted paths.
+    /// (no engine, no index). Refuses a database with obfuscated paths (an
+    /// end-to-end encrypted one without them lists as any other).
     /// [`Cancel::cancel`] on `cancel` ends it at once with `Other`.
     pub fn list_folders(&self, cfg: ProfileConfig, cancel: Option<Arc<Cancel>>) -> Result<FolderList, LiveSyncError> {
         let run = cfg.run_config();

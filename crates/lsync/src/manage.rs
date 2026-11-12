@@ -71,6 +71,8 @@ pub enum VaultCmd {
         /// Add it disabled (the service does not run it)
         #[arg(long)]
         disabled: bool,
+        #[command(flatten)]
+        e2ee: E2eeArgs,
     },
     /// List the vaults
     Ls {
@@ -89,6 +91,27 @@ pub enum VaultCmd {
         /// sync_only_regex, sync_dot_paths, trash); repeatable
         #[arg(long, value_name = "KEY")]
         unset: Vec<String>,
+        /// Accept plaintext content in the end-to-end encrypted database
+        /// (true or false; the plugin's acceptUnencryptedContent)
+        #[arg(long, value_name = "BOOL")]
+        accept_unencrypted_content: Option<bool>,
+    },
+    /// Set, change or remove the end-to-end encryption passphrase of a
+    /// vault whose database is encrypted (asked for, or --passphrase-stdin;
+    /// never from the command line). Vaults on one database share it
+    Passphrase {
+        name: String,
+        /// Read the passphrase from stdin instead of asking
+        #[arg(long, conflicts_with = "remove")]
+        passphrase_stdin: bool,
+        /// Where to keep it: file:KEY (default: the vault's key, or
+        /// file:e2ee.ACCOUNT.DATABASE), keyring:KEY, credential:NAME or env:VAR
+        #[arg(long, value_name = "STORE:KEY", conflicts_with = "remove")]
+        secret: Option<String>,
+        /// Remove it from the vault (a plaintext database); the stored
+        /// passphrase goes too unless another vault uses it
+        #[arg(long)]
+        remove: bool,
     },
     /// Let the service run the vault
     Enable { name: String },
@@ -96,6 +119,60 @@ pub enum VaultCmd {
     Disable { name: String },
     /// Remove the vault from lsync.toml (its folder and its index are kept)
     Rm { name: String },
+}
+
+/// `vault add`'s end-to-end encryption options.
+#[derive(clap::Args, Debug, Default)]
+pub struct E2eeArgs {
+    /// The database is end-to-end encrypted: ask for its passphrase, kept in
+    /// the secret store (never taken from the command line)
+    #[arg(long)]
+    pub e2ee: bool,
+    /// Read the passphrase from stdin instead of asking (implies --e2ee)
+    #[arg(long)]
+    pub passphrase_stdin: bool,
+    /// Where to keep the passphrase: file:KEY (default
+    /// file:e2ee.ACCOUNT.DATABASE, shared by the vaults on that database),
+    /// keyring:KEY, credential:NAME or env:VAR (implies --e2ee)
+    #[arg(long, value_name = "STORE:KEY")]
+    pub passphrase_secret: Option<String>,
+    /// Accept plaintext content in the encrypted database (the plugin's
+    /// acceptUnencryptedContent; off by default: such content stops the pull)
+    #[arg(long)]
+    pub accept_unencrypted_content: bool,
+}
+
+/// Put a vault's passphrase into its store: asked for (or read from stdin)
+/// unless the store holds one already and `ask` is off. Returns what it
+/// replaced, for undoing (`None` and false when nothing was stored).
+fn store_passphrase(ctx: &Setup, name: &str, r: &SecretRef, stdin: bool, ask: bool) -> Result<(bool, Option<Secret>)> {
+    system_credential(ctx, r)?;
+    let stores = ctx.secrets();
+    if !stores.writable(r) {
+        if stdin {
+            bail!(
+                "the passphrase of vault {name} comes from the {}; lsync does not store it",
+                stores.describe(r)
+            );
+        }
+        return Ok((false, None));
+    }
+    let previous = stores.get(r)?;
+    if previous.is_some() && !ask && !stdin {
+        return Ok((false, previous));
+    }
+    let p = prompt::new_passphrase(stdin, &format!("end-to-end encryption passphrase for {name}"))?;
+    stores.set(r, &p)?;
+    Ok((true, previous))
+}
+
+/// The vaults other than `name` whose passphrase is `r`.
+fn sharing_passphrase(cfg: &Config, name: &str, r: &SecretRef) -> Vec<String> {
+    cfg.vault
+        .iter()
+        .filter(|(n, v)| *n != name && v.passphrase_ref().ok().flatten().as_ref() == Some(r))
+        .map(|(n, _)| n.clone())
+        .collect()
 }
 
 /// Which of the global options were given on the command line, as opposed
@@ -437,6 +514,7 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
             account,
             mode,
             disabled,
+            e2ee,
         } => {
             refuse_account_options(given, "add")?;
             check_name("vault", &name).map_err(|e| anyhow!(e))?;
@@ -503,8 +581,34 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
             if given.has("trash") {
                 v.trash = o.trash.clone();
             }
+            v.accept_unencrypted_content = e2ee.accept_unencrypted_content;
+            let encrypted = e2ee.e2ee || e2ee.passphrase_stdin || e2ee.passphrase_secret.is_some();
+            let pass_ref = match &e2ee.passphrase_secret {
+                Some(s) => Some(SecretRef::parse(s).map_err(|e| anyhow!("--passphrase-secret: {e}"))?),
+                None => encrypted.then(|| Vault::default_passphrase_ref(&v.account, &v.database)),
+            };
+            v.passphrase = pass_ref.as_ref().map(|r| r.to_string());
             file.add_vault(&name, &v, None).map_err(|e| anyhow!(e))?;
-            let cfg = file.save(&ctx.dirs).map_err(|e| anyhow!(e))?;
+            // Checked as a whole before a passphrase is stored.
+            file.config(&ctx.dirs).map_err(|e| anyhow!(e))?;
+            let mut stored = None;
+            if let Some(r) = &pass_ref {
+                let (did, previous) = store_passphrase(ctx, &name, r, e2ee.passphrase_stdin, false)?;
+                if did {
+                    stored = Some(previous);
+                } else if previous.is_some() {
+                    println!("uses the passphrase already in {}", ctx.secrets().describe(r));
+                }
+            }
+            let cfg = match file.save(&ctx.dirs) {
+                Ok(c) => c,
+                Err(e) => {
+                    if let (Some(r), Some(previous)) = (&pass_ref, &stored) {
+                        undo_password(&ctx.secrets(), r, previous.as_ref());
+                    }
+                    bail!(e);
+                }
+            };
             println!("added vault {name} to {}", ctx.config_file.display());
             print_vault(ctx, &name, &cfg.vault[&name]);
             let named = crate::install::Named {
@@ -541,6 +645,10 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
                             "mode": v.mode.as_str(),
                             "enabled": v.enabled,
                             "device_name": v.device_name,
+                            // Where it is and whether it is there; never the passphrase.
+                            "passphrase": v.passphrase,
+                            "passphrase_state": v.passphrase_ref().ok().flatten().map(|r| store_line(ctx, &r).1),
+                            "accept_unencrypted_content": v.accept_unencrypted_content,
                         })
                     })
                     .collect();
@@ -572,6 +680,7 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
             account,
             mode,
             unset,
+            accept_unencrypted_content,
         } => {
             refuse_account_options(given, "edit")?;
             let mut file = open(ctx)?;
@@ -651,6 +760,9 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
             if given.has("trash") {
                 set("trash", o.trash.clone().map(Into::into))?;
             }
+            if let Some(a) = accept_unencrypted_content {
+                set("accept_unencrypted_content", a.then(|| true.into()))?;
+            }
             const UNSETTABLE: [&str; 10] = [
                 "state_dir",
                 "ignore_regex",
@@ -692,6 +804,79 @@ pub fn vault(ctx: &Setup, cmd: VaultCmd, given: &Given) -> Result<u8> {
                 state: given.has("state_dir"),
             };
             service::config_changed_naming(ctx, &Change::Vault(name), &named);
+            Ok(0)
+        }
+        VaultCmd::Passphrase {
+            name,
+            passphrase_stdin,
+            secret,
+            remove,
+        } => {
+            given.refuse_password()?;
+            let mut file = open(ctx)?;
+            let cfg = file.config(&ctx.dirs).map_err(|e| anyhow!(e))?;
+            let Some(v) = cfg.vault.get(&name).cloned() else {
+                bail!("no vault named {name:?} in {}", ctx.config_file.display());
+            };
+            let current = v.passphrase_ref().map_err(|e| anyhow!("[vault.{name}]: {e}"))?;
+            let stores = ctx.secrets();
+            if remove {
+                let Some(r) = current else {
+                    bail!("vault {name} has no passphrase");
+                };
+                file.set("vault", &name, "passphrase", None).map_err(|e| anyhow!(e))?;
+                file.save(&ctx.dirs).map_err(|e| anyhow!(e))?;
+                // After the file: a crash in between leaves an unused secret.
+                let others = sharing_passphrase(&cfg, &name, &r);
+                if others.is_empty() && stores.writable(&r) && system_credential(ctx, &r).is_ok() {
+                    stores.delete(&r)?;
+                    println!("removed the passphrase of vault {name} ({})", stores.describe(&r));
+                } else {
+                    println!(
+                        "removed the passphrase from vault {name}; {} keeps it{}",
+                        stores.describe(&r),
+                        if others.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" for vault(s) {}", others.join(", "))
+                        }
+                    );
+                }
+                service::config_changed(ctx, &Change::Vault(name));
+                return Ok(0);
+            }
+            let r = match (&secret, &current) {
+                (Some(s), _) => SecretRef::parse(s).map_err(|e| anyhow!("--secret: {e}"))?,
+                (None, Some(r)) => r.clone(),
+                (None, None) => Vault::default_passphrase_ref(&v.account, &v.database),
+            };
+            let others = sharing_passphrase(&cfg, &name, &r);
+            let (stored, previous) = store_passphrase(ctx, &name, &r, passphrase_stdin, true)?;
+            if current.as_ref() != Some(&r) {
+                file.set("vault", &name, "passphrase", Some(r.to_string().into()))
+                    .map_err(|e| anyhow!(e))?;
+                if let Err(e) = file.save(&ctx.dirs) {
+                    if stored {
+                        undo_password(&stores, &r, previous.as_ref());
+                    }
+                    bail!(e);
+                }
+            }
+            if stored {
+                println!("set the passphrase of vault {name} ({})", stores.describe(&r));
+            } else {
+                println!(
+                    "vault {name} reads its passphrase from the {}; lsync does not store it",
+                    stores.describe(&r)
+                );
+            }
+            if !others.is_empty() {
+                println!("  shared with vault(s) {}", others.join(", "));
+            }
+            service::config_changed(ctx, &Change::Vault(name));
+            for o in others {
+                service::config_changed(ctx, &Change::Vault(o));
+            }
             Ok(0)
         }
         VaultCmd::Enable { name } => set_enabled(ctx, &name, true),
@@ -763,6 +948,17 @@ pub(crate) fn print_vault(ctx: &Setup, name: &str, v: &Vault) {
         Err(e) => println!("  folders   INVALID: {e}"),
     }
     println!("  mode      {}", v.mode.as_str());
+    match v.passphrase_ref() {
+        Ok(Some(r)) => {
+            let (where_, state) = store_line(ctx, &r);
+            println!("  e2ee      passphrase in {where_} ({state})");
+        }
+        Ok(None) => {}
+        Err(e) => println!("  e2ee      INVALID: {e}"),
+    }
+    if v.accept_unencrypted_content {
+        println!("  accepts   unencrypted content in the encrypted database");
+    }
     if let Some(d) = &v.device_name {
         println!("  device    {d}");
     }

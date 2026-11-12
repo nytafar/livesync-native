@@ -249,6 +249,42 @@ pub fn checks(ctx: &Setup) -> Vec<Check> {
         }
     }
 
+    // Each vault's end-to-end encryption passphrase, where it has one.
+    if let Some(cfg) = &cfg {
+        for (name, v) in &cfg.vault {
+            let r = match v.passphrase_ref() {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(e) => {
+                    out.push(check(Level::Error, "vault", format!("{name}: {e}")));
+                    continue;
+                }
+            };
+            let (level, state) = match stores.get(&r) {
+                Ok(Some(p)) if p.expose().is_empty() => (
+                    Level::Error,
+                    format!("empty; set it with `lsync vault passphrase {name}`"),
+                ),
+                Ok(Some(_)) => (Level::Ok, "readable".to_string()),
+                Ok(None) => (
+                    Level::Error,
+                    format!("missing; set it with `lsync vault passphrase {name}`"),
+                ),
+                Err(e) if e.is_temporary() => (Level::Warn, e.to_string()),
+                Err(e) if r.kind == StoreKind::Credential => (Level::Info, e.to_string()),
+                Err(e) => (Level::Error, e.to_string()),
+            };
+            out.push(check(
+                level,
+                "vault",
+                format!(
+                    "{name}: end-to-end encryption passphrase in {} ({state})",
+                    stores.describe(&r)
+                ),
+            ));
+        }
+    }
+
     // The vault folders, and what watching them takes.
     let mut watched = 0u64;
     if let Some(cfg) = &cfg {

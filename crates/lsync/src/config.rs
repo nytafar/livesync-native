@@ -146,6 +146,12 @@ pub struct Selected {
     pub tuning: Tuning,
     /// Why the account's password could not be read, if it could not.
     pub password_error: Option<String>,
+    /// The vault's end-to-end encryption passphrase, from its secret store.
+    pub passphrase: Option<livesync_engine::Passphrase>,
+    /// Why it could not be read, if the vault has one and it could not.
+    pub passphrase_error: Option<String>,
+    /// The vault accepts plaintext content in an encrypted database.
+    pub accept_unencrypted_content: bool,
     /// Vaults there was no telling apart (nothing was named).
     pub ambiguous: Vec<String>,
 }
@@ -340,6 +346,9 @@ impl Setup {
                 mode: Mode::TwoWay,
                 tuning: Tuning::default(),
                 password_error: None,
+                passphrase: None,
+                passphrase_error: None,
+                accept_unencrypted_content: false,
                 ambiguous: vec![],
             })
         };
@@ -435,6 +444,21 @@ impl Setup {
             },
             Err(e) => (None, Some(e)),
         };
+        let (passphrase, passphrase_error) = match v.passphrase_ref() {
+            Ok(None) => (None, None),
+            Ok(Some(r)) => match self.secrets().get(&r) {
+                Ok(Some(s)) => (Some(livesync_engine::Passphrase::new(s.expose())), None),
+                Ok(None) => (
+                    None,
+                    Some(format!(
+                        "vault {chosen:?} has no end-to-end encryption passphrase in its secret store ({}); set it with `lsync vault passphrase {chosen}`",
+                        self.secrets().describe(&r)
+                    )),
+                ),
+                Err(e) => (None, Some(format!("vault {chosen:?}: the passphrase: {e}"))),
+            },
+            Err(e) => (None, Some(format!("[vault.{chosen}]: {e}"))),
+        };
         let file = FileConfig {
             url: Some(a.url.trim().to_string()),
             database: Some(v.database.clone()),
@@ -463,6 +487,9 @@ impl Setup {
             mode: v.mode,
             tuning: v.tuning(),
             password_error,
+            passphrase,
+            passphrase_error,
+            accept_unencrypted_content: v.accept_unencrypted_content,
             ambiguous: vec![],
         })
     }
@@ -488,7 +515,15 @@ pub struct Resolved {
     pub scope: livesync_model::scope::Scope,
     pub device_name: Option<String>,
     pub what_syncs: livesync_host::WhatSyncs,
+    /// The end-to-end encryption passphrase: `LSYNC_PASSPHRASE`, else the
+    /// vault's from its secret store.
+    pub passphrase: Option<livesync_engine::Passphrase>,
+    pub accept_unencrypted_content: bool,
 }
+
+/// The environment variable that gives the passphrase to a run (for runs
+/// without a vault in `lsync.toml`; a vault's `passphrase` is the usual way).
+pub const PASSPHRASE_ENV: &str = "LSYNC_PASSPHRASE";
 
 pub fn default_state_dir(dirs: &Dirs, name: &str) -> PathBuf {
     dirs.default_state_dir(name)
@@ -528,6 +563,16 @@ pub fn resolve(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, need_remote: bool)
             bail!("{e} (or give LSYNC_PASSWORD)");
         }
     }
+    let passphrase = std::env::var(PASSPHRASE_ENV)
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(livesync_engine::Passphrase::new)
+        .or_else(|| sel.passphrase.clone());
+    if need_remote && passphrase.is_none() {
+        if let Some(e) = &sel.passphrase_error {
+            bail!("{e} (or give {PASSPHRASE_ENV})");
+        }
+    }
     Ok(Resolved {
         remote: livesync_remote::RemoteConfig {
             url,
@@ -546,6 +591,8 @@ pub fn resolve(sel: &Selected, cfg: &FileConfig, dirs: &Dirs, need_remote: bool)
         scope: cfg.scope().map_err(|e| anyhow!(e))?,
         device_name: cfg.device_name.clone(),
         what_syncs: what_syncs(cfg)?,
+        passphrase,
+        accept_unencrypted_content: sel.accept_unencrypted_content,
     })
 }
 

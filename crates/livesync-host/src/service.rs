@@ -131,7 +131,22 @@ impl Source for ConfigSource {
                 Err(_) if !has_user => Ok(None),
                 Err(e) => Err(format!("account {:?}: {e}", v.account)),
             });
-            let run = password.and_then(|pw| v.run_config(name, a, pw.as_ref().map(|s| s.expose()), &self.dirs));
+            let passphrase = v.passphrase_ref().and_then(|r| match r {
+                None => Ok(None),
+                Some(r) => match self.secrets.get(&r) {
+                    Ok(Some(s)) => Ok(Some(livesync_engine::Passphrase::new(s.expose()))),
+                    Ok(None) => Err(format!(
+                        "vault {name:?} has no end-to-end encryption passphrase in its secret store ({}); set it with `lsync vault passphrase {name}`",
+                        self.secrets.describe(&r)
+                    )),
+                    Err(e) => Err(format!("vault {name:?}: the passphrase: {e}")),
+                },
+            });
+            let run = password.and_then(|pw| {
+                let mut run = v.run_config(name, a, pw.as_ref().map(|s| s.expose()), &self.dirs)?;
+                run.passphrase = passphrase?;
+                Ok(run)
+            });
             out.push(Planned {
                 name: name.clone(),
                 account: Some(v.account.clone()),

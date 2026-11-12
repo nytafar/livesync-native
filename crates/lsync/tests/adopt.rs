@@ -367,3 +367,74 @@ async fn a_dot_folder_that_cannot_be_checked_stops_a_real_adopt_without_blaming_
         .unwrap()
         .is_empty());
 }
+
+/// An end-to-end encrypted database through the binary: the plugin's file
+/// (passphrase in plain text, as older plugins saved it) imported, the
+/// folder adopted and synced, the passphrase never shown; with a wrong one,
+/// nothing happens.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_encrypted_vault_is_imported_adopted_and_synced() {
+    const PASS: &str = "synthetic-e2ee-passphrase (test only)";
+    let mock = Mock::start_encrypted(PASS).await;
+    let m = Machine::new();
+    mock.put_text("remote.md", &["only on the encrypted server"]);
+    m.write("local.md", b"only here");
+    for i in 0..3 {
+        both(
+            &m,
+            &mock,
+            &format!("same-{i}.md"),
+            &format!("# Same {i}\n{}", "text ".repeat(40 * i)),
+        );
+    }
+    let plugin = m.vault().join(".obsidian/plugins/obsidian-livesync");
+    std::fs::create_dir_all(&plugin).unwrap();
+    let data = json!({
+        "settingVersion": 10, "remoteType": "", "configPassphraseStore": "",
+        "couchDB_URI": mock.url, "couchDB_USER": "u", "couchDB_PASSWORD": "synthetic-pw",
+        "couchDB_DBNAME": DB, "encryptedCouchDBConnection": "", "remoteConfigurations": {},
+        "activeConfigurationId": "", "encrypt": true, "passphrase": PASS, "E2EEAlgorithm": "v2",
+        "usePathObfuscation": false, "hashAlg": "xxhash64", "syncIgnoreRegEx": "", "syncOnlyRegEx": "",
+        "useIgnoreFiles": false, "ignoreFiles": ".gitignore"
+    });
+    std::fs::write(plugin.join("data.json"), data.to_string()).unwrap();
+    let out = m.ok(&["import", plugin.join("data.json").to_str().unwrap(), "--name", "notes"]);
+    assert!(out.contains("e2ee      passphrase in"), "{out}");
+    assert!(!out.contains(PASS));
+
+    let (code, out, err) = m.code(&["--vault", "notes", "adopt", "--json"]);
+    assert!(code == 0 || code == 3, "{out}\n{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["identical"], 3, "matched by their encrypted chunk IDs: {v}");
+    assert_eq!(
+        std::fs::read(m.vault().join("remote.md")).unwrap(),
+        b"only on the encrypted server"
+    );
+    let id = path_to_id("local.md", true);
+    let d = mock.doc(&id).expect("pushed");
+    assert!(d["children"][0].as_str().unwrap().starts_with("h:+"), "{d}");
+    assert_eq!(mock.content(&id).unwrap(), b"only here");
+    let status = m.ok(&["--vault", "notes", "status", "--json"]);
+    assert!(!status.contains(PASS), "{status}");
+
+    // A wrong passphrase from the environment: refused, nothing written.
+    m.write("another.md", b"not sent");
+    mock.clear_requests();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_lsync"));
+    let out = c
+        .env_clear()
+        .env("HOME", m.root.join("home"))
+        .env("XDG_CONFIG_HOME", m.root.join("config"))
+        .env("XDG_STATE_HOME", m.root.join("state"))
+        .env("LSYNC_RUNTIME_DIR", m.root.join("run"))
+        .env("LSYNC_PASSPHRASE", "wrong-synthetic-guess")
+        .args(["--vault", "notes", "sync"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("does not decrypt"), "{err}");
+    assert!(!err.contains("wrong-synthetic-guess") && !err.contains(PASS), "{err}");
+    assert!(mock.writes().is_empty(), "{:?}", mock.writes());
+    assert!(mock.doc(&path_to_id("another.md", true)).is_none());
+}

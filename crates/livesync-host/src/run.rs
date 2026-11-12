@@ -51,6 +51,11 @@ pub struct RunConfig {
     pub database: String,
     pub username: String,
     pub password: String,
+    /// The remote database's end-to-end encryption passphrase, when it is
+    /// encrypted.
+    pub passphrase: Option<livesync_engine::Passphrase>,
+    /// Accept plaintext content in an encrypted database.
+    pub accept_unencrypted_content: bool,
     pub scope_mode: ScopeMode,
     pub scope_folders: Vec<String>,
     /// Follow the remote read-only (`lsync daemon --pull-only`).
@@ -99,6 +104,9 @@ pub struct Tuning {
     /// Whether this front-end has a handover switch to name when the plugin
     /// guard refuses (`lsync` has; the Android app has not).
     pub handover: Handover,
+    /// How this front-end sets an end-to-end encryption passphrase, for the
+    /// refusal when an encrypted database has none (`None`: the CLI's).
+    pub passphrase_how: Option<String>,
 }
 
 /// How a front-end lets a vault run beside an enabled plugin, for the plugin
@@ -179,6 +187,9 @@ impl Tuning {
             Handover::Flag => Some(livesync_engine::engine::PLUGIN_HANDOVER_CLI.into()),
             Handover::Unavailable => None,
         };
+        if let Some(how) = &self.passphrase_how {
+            ec.passphrase_how = how.clone();
+        }
         ec.regate_interval = regate;
         ec.heartbeat = heartbeat;
         ec.longpoll_timeout = timeout;
@@ -197,6 +208,8 @@ impl std::fmt::Debug for RunConfig {
             .field("database", &self.database)
             .field("username", &self.username)
             .field("password", &"***")
+            .field("passphrase", &self.passphrase.as_ref().map(|_| "***"))
+            .field("accept_unencrypted_content", &self.accept_unencrypted_content)
             .field("scope_mode", &self.scope_mode)
             .field("scope_folders", &self.scope_folders)
             .field("pull_only", &self.pull_only)
@@ -297,6 +310,8 @@ impl RunConfig {
         }
         ec.allow_mass_delete = self.allow_mass_delete;
         ec.remove_out_of_scope_copies = self.remove_out_of_scope_copies;
+        ec.passphrase = self.passphrase.clone();
+        ec.accept_unencrypted_content = self.accept_unencrypted_content;
         if let Some(q) = self.rebuild_quiet {
             ec.rebuild_quiet = q;
         }
@@ -401,6 +416,8 @@ mod tests {
             database: "vault".into(),
             username: "u".into(),
             password: "secret".into(),
+            passphrase: None,
+            accept_unencrypted_content: false,
             scope_mode: ScopeMode::All,
             scope_folders: vec![],
             pull_only: true,

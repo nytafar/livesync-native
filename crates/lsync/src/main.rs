@@ -1056,6 +1056,8 @@ fn run_config_for(
         database: r.remote.database,
         username: r.remote.username.unwrap_or_default(),
         password: r.remote.password.unwrap_or_default(),
+        passphrase: r.passphrase,
+        accept_unencrypted_content: r.accept_unencrypted_content,
         scope_mode: r.scope.mode,
         scope_folders: r.scope.prefixes,
         pull_only,
@@ -1554,6 +1556,8 @@ fn engine_with_index(
     ec.max_size_mb = r.max_size_mb;
     ec.scope = r.scope;
     ec.device_name = r.device_name;
+    ec.passphrase = r.passphrase;
+    ec.accept_unencrypted_content = r.accept_unencrypted_content;
     let w = r.what_syncs;
     ec.use_ignore_files = w.use_ignore_files;
     ec.ignore_files = w.ignore_files;

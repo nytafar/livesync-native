@@ -707,6 +707,27 @@ pub fn dropin_for(ctx: &Ctx, cfg: &Config, home: Option<&Path>) -> (String, Vec<
             )),
         }
     }
+    // The vaults' end-to-end encryption passphrases, the same way.
+    for (name, v) in &cfg.vault {
+        let Ok(Some(r)) = v.passphrase_ref() else { continue };
+        if r.kind != StoreKind::Credential {
+            continue;
+        }
+        if let Some(why) = livesync_host::secret::foreign_credential(&r.key) {
+            missing.push(format!(
+                "vault {name}: its passphrase is not loaded into the service: {why}"
+            ));
+            continue;
+        }
+        match credential_file(&ctx.etc, &r) {
+            Some(c) => creds.push(c),
+            None => missing.push(format!(
+                "vault {name}: no credential {key:?} in {etc}/credstore.encrypted or {etc}/credstore for its passphrase; set it with `sudo lsync --system vault passphrase {name}`, then run `sudo lsync service install --system` again",
+                key = r.key,
+                etc = ctx.etc.display()
+            )),
+        }
+    }
     creds.sort_by(|a, b| a.name.cmp(&b.name));
     creds.dedup_by(|a, b| a.name == b.name);
     (unit::system_dropin(&writable, &creds), missing)
@@ -1096,6 +1117,20 @@ fn file_store_accounts(cfg: &Config) -> Vec<String> {
         .collect()
 }
 
+/// Vaults whose end-to-end encryption passphrase is in secrets.toml.
+fn file_store_passphrases(cfg: &Config) -> Vec<String> {
+    cfg.vault
+        .iter()
+        .filter(|(_, v)| {
+            v.passphrase_ref()
+                .ok()
+                .flatten()
+                .is_some_and(|r| r.kind == StoreKind::File)
+        })
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
 /// Why the system unit should not run `exe`: it, or a folder above it, can
 /// be changed by a user other than root (who could then run code as the
 /// service's user, at every start and reload). `None` when only root can.
@@ -1335,6 +1370,15 @@ fn install_system(
         warnings.push(format!(
             "account(s) {} keep the password in plain text in {}, which the service's group {group_name} reads; systemd credentials keep it encrypted, for the service alone: give the account `secret = \"credential:lsync-NAME\"` (edit {} as root), then `sudo lsync --system account passwd NAME`",
             files.join(", "),
+            config_dir.join(livesync_host::config::SECRETS_FILE).display(),
+            config_dir.join(livesync_host::config::CONFIG_FILE).display()
+        ));
+    }
+    let passphrases = file_store_passphrases(cfg);
+    if !passphrases.is_empty() {
+        warnings.push(format!(
+            "vault(s) {} keep the end-to-end encryption passphrase in plain text in {}, which the service's group {group_name} reads; systemd credentials keep it encrypted, for the service alone: give the vault `passphrase = \"credential:lsync-NAME\"` (edit {} as root), then `sudo lsync --system vault passphrase VAULT`",
+            passphrases.join(", "),
             config_dir.join(livesync_host::config::SECRETS_FILE).display(),
             config_dir.join(livesync_host::config::CONFIG_FILE).display()
         ));
@@ -2736,6 +2780,35 @@ mod tests {
         );
         let r = SecretRef::parse("credential:mysql-root").unwrap();
         assert!(credential_file(&c.etc, &r).is_none());
+    }
+
+    #[test]
+    fn a_vaults_passphrase_credential_is_loaded_and_a_plain_one_warned_of() {
+        let h = home(true);
+        let creds = h.root.join("etc/credstore.encrypted");
+        std::fs::create_dir_all(&creds).unwrap();
+        std::fs::write(creds.join("lsync-notes-e2ee"), "x").unwrap();
+        let f = Fake::default();
+        let c = ctx(&h, &f, Manager::SystemdSystem);
+        let mut cfg = c.setup.load_accounts().unwrap().unwrap();
+        cfg.vault.get_mut("notes").unwrap().passphrase = Some("credential:lsync-notes-e2ee".into());
+        cfg.vault.get_mut("work").unwrap().passphrase = Some("credential:lsync-work-e2ee".into());
+        let (dropin, missing) = dropin_for(&c, &cfg, None);
+        assert!(
+            dropin.contains(&format!(
+                "LoadCredentialEncrypted=lsync-notes-e2ee:{}\n",
+                creds.join("lsync-notes-e2ee").display()
+            )),
+            "{dropin}"
+        );
+        assert!(
+            missing
+                .iter()
+                .any(|m| m.contains("vault work") && m.contains("lsync --system vault passphrase work")),
+            "{missing:?}"
+        );
+        cfg.vault.get_mut("work").unwrap().passphrase = Some("file:e2ee.home.work".into());
+        assert_eq!(file_store_passphrases(&cfg), vec!["work".to_string()]);
     }
 
     #[test]

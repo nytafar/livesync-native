@@ -195,6 +195,15 @@ pub struct Vault {
     /// taken for sleep: reconnect and rescan (default 10; 0 turns it off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_jump_secs: Option<u64>,
+    /// Where the remote database's end-to-end encryption passphrase is
+    /// (`STORE:KEY`, as an account's `secret`), for an encrypted database.
+    /// Vaults on one database may share it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<String>,
+    /// Accept plaintext content in an encrypted database (the plugin's
+    /// `acceptUnencryptedContent`; default off: it stops the pull).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub accept_unencrypted_content: bool,
 }
 
 impl Vault {
@@ -223,7 +232,34 @@ impl Vault {
             heartbeat_secs: None,
             longpoll_timeout_secs: None,
             clock_jump_secs: None,
+            passphrase: None,
+            accept_unencrypted_content: false,
         }
+    }
+
+    /// Where the passphrase is, when the vault has one.
+    pub fn passphrase_ref(&self) -> Result<Option<SecretRef>, String> {
+        self.passphrase
+            .as_deref()
+            .map(|s| SecretRef::parse(s).map_err(|e| format!("passphrase: {e}")))
+            .transpose()
+    }
+
+    /// The passphrase key a vault on `database` gets by default (shared by
+    /// the vaults of one account on one database).
+    pub fn default_passphrase_ref(account: &str, database: &str) -> SecretRef {
+        let db: String = database
+            .trim()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        SecretRef::file(&format!("e2ee.{account}.{db}"))
     }
 
     /// The plugin guard's switch and the timings, as the host runs them.
@@ -235,6 +271,7 @@ impl Vault {
             longpoll_timeout_secs: self.longpoll_timeout_secs,
             clock_jump_secs: self.clock_jump_secs,
             handover: Default::default(),
+            passphrase_how: None,
         }
     }
 
@@ -299,6 +336,9 @@ impl Vault {
             rebuild_quiet: None,
             what_syncs: self.what_syncs()?,
             tuning: self.tuning(),
+            // Looked up by the caller, from `passphrase_ref`.
+            passphrase: None,
+            accept_unencrypted_content: self.accept_unencrypted_content,
         })
     }
 }
@@ -525,6 +565,7 @@ impl Config {
             }
             check_state_placement(&folder, &state).map_err(at)?;
             check_scope_lists(v).map_err(at)?;
+            v.passphrase_ref().map_err(at)?;
             v.what_syncs().map_err(at)?;
             v.tuning().check().map_err(at)?;
         }

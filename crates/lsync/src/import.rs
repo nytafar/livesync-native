@@ -18,9 +18,15 @@
 //! - As upstream loads the file, the active remote profile
 //!   (`activeConfigurationId`) wins over the connection fields.
 //!
+//! - With `encrypt` on, the E2EE passphrase (`encryptedPassphrase`, or
+//!   `passphrase` in older files) goes into the secret store too, and the
+//!   vault refers to it; `acceptUnencryptedContent` becomes the vault's
+//!   `accept_unencrypted_content`.
+//!
 //! Settings lsync cannot honour stop the import with the reason, never
-//! ignored: another kind of remote, end-to-end encryption, path
-//! obfuscation, authentication lsync does not do. The settings whose effect
+//! ignored: another kind of remote, end-to-end encryption other than V2
+//! (or with encrypted internal metadata), path obfuscation, authentication
+//! lsync does not do. The settings whose effect
 //! lsync leaves out on purpose (hidden-file sync, customisation sync,
 //! resolving conflicts by the newer file, P2P) also stop it, unless the user
 //! accepts going on without them (`--accept KEY`).
@@ -177,6 +183,9 @@ pub struct Imported {
     pub url: String,
     pub username: Option<String>,
     pub password: Option<Secret>,
+    /// The end-to-end encryption passphrase, when `encrypt` is on.
+    pub passphrase: Option<Secret>,
+    pub accept_unencrypted_content: bool,
     pub database: String,
     pub ignore_regex: Option<String>,
     pub sync_only_regex: Option<String>,
@@ -243,9 +252,6 @@ fn hard_refusals(s: &Map<String, Value>) -> Vec<String> {
         other => out.push(format!("remoteType={other}: lsync syncs only with CouchDB")),
     }
     let on = |k: &str| s.get(k).and_then(Value::as_bool).unwrap_or(false);
-    if on("encrypt") {
-        out.push("encrypt=true: the database uses end-to-end encryption, which lsync does not support yet (P7)".into());
-    }
     if on("useJWT") {
         out.push("useJWT=true: lsync signs in with a user and password only".into());
     }
@@ -257,14 +263,15 @@ fn hard_refusals(s: &Map<String, Value>) -> Vec<String> {
     if !string(s, "encryptedIdDerivationKey").is_empty() {
         out.push("encryptedIdDerivationKey is set: keyed document IDs are not supported".into());
     }
-    // The connect gate's rules, on the values this file was set up with.
+    // The connect gate's rules, on the values this file was set up with
+    // (end-to-end encryption with V2 passes them, without path obfuscation
+    // or encrypted internal metadata).
     // `encryptInternalMetadata` only takes effect with `encrypt`
-    // (upstream `usesEncryptedInternalMetadata`), which is refused above.
+    // (upstream `usesEncryptedInternalMetadata`).
     let mut tweaks = s.clone();
     if !on("encrypt") {
         tweaks.remove("encryptInternalMetadata");
     }
-    tweaks.remove("encrypt");
     out.extend(
         livesync_model::gate::unsupported_tweaks(&tweaks)
             .into_iter()
@@ -400,6 +407,24 @@ pub fn parse(v: &Value, config_passphrase: Option<&str>, accept: &[String]) -> s
             }
         }
     }
+    // The E2EE passphrase, decrypted the same way.
+    let encrypt = s.get("encrypt").and_then(Value::as_bool).unwrap_or(false);
+    let passphrase = if encrypt {
+        let enc = string(s, "encryptedPassphrase").to_string();
+        let p = if !enc.is_empty() {
+            decrypt("encryptedPassphrase", &enc)?
+        } else {
+            string(s, "passphrase").to_string()
+        };
+        if p.is_empty() {
+            return Err("lsync cannot honour these settings:\n  - encrypt=true, but the file holds no end-to-end encryption passphrase (neither encryptedPassphrase nor passphrase); save the settings with the passphrase in the plugin, or add the vault by hand and set it with `lsync vault passphrase NAME`".into());
+        }
+        Some(Secret::new(p))
+    } else {
+        None
+    };
+    let accept_unencrypted_content =
+        encrypt && s.get("acceptUnencryptedContent").and_then(Value::as_bool) == Some(true);
     let active = string(s, "activeConfigurationId").to_string();
     if !active.is_empty() {
         if let Some(p) = s.get("remoteConfigurations").and_then(|r| r.get(&active)) {
@@ -496,7 +521,19 @@ pub fn parse(v: &Value, config_passphrase: Option<&str>, accept: &[String]) -> s
         "trashInsteadDelete",
         "files deleted elsewhere go to the folder's .trash/ (the vault's trash setting)",
     );
-    if s.get("encryptInternalMetadata").and_then(Value::as_bool) == Some(true) {
+    if encrypt {
+        carried.push((
+            "encryptedPassphrase".into(),
+            "the secret store (the vault's passphrase)".into(),
+        ));
+        if accept_unencrypted_content {
+            carried.push((
+                "acceptUnencryptedContent".into(),
+                "vault accept_unencrypted_content true".into(),
+            ));
+        }
+    }
+    if !encrypt && s.get("encryptInternalMetadata").and_then(Value::as_bool) == Some(true) {
         not_used.push((
             "encryptInternalMetadata".into(),
             "has no effect without end-to-end encryption".into(),
@@ -506,6 +543,8 @@ pub fn parse(v: &Value, config_passphrase: Option<&str>, accept: &[String]) -> s
         url,
         username,
         password: password.map(Secret::new),
+        passphrase,
+        accept_unencrypted_content,
         database,
         ignore_regex,
         sync_only_regex,
@@ -714,6 +753,30 @@ pub fn run(ctx: &Setup, a: ImportArgs, given: &Given) -> Result<u8> {
     // Added disabled: the folder is taken over with `lsync adopt` first, so
     // a running service does not start it before that.
     vault.enabled = false;
+    vault.accept_unencrypted_content = imp.accept_unencrypted_content;
+    // The passphrase: the key the vaults on this database share. A key that
+    // holds another passphrase is never replaced unasked.
+    let pass_ref = imp
+        .passphrase
+        .as_ref()
+        .map(|_| Vault::default_passphrase_ref(&account, &imp.database));
+    let mut store_passphrase = false;
+    let passphrase_line = match (&imp.passphrase, &pass_ref) {
+        (Some(p), Some(r)) => {
+            vault.passphrase = Some(r.to_string());
+            match stores.get(r)? {
+                Some(old) if old == *p => format!("{} (unchanged)", stores.describe(r)),
+                Some(_) => bail!(
+                    "the key {r} holds another passphrase for this database already; check which is right (`lsync vault passphrase VAULT` changes it) before importing"
+                ),
+                None => {
+                    store_passphrase = true;
+                    stores.describe(r)
+                }
+            }
+        }
+        _ => String::new(),
+    };
     if new_account {
         file.add_account(
             &account,
@@ -738,7 +801,9 @@ pub fn run(ctx: &Setup, a: ImportArgs, given: &Given) -> Result<u8> {
         "dry_run": a.dry_run,
         "account": {"name": account, "new": new_account, "url": imp.url, "username": imp.username, "password": password_line},
         "vault": {"name": name, "database": imp.database, "folder": folder_text, "enabled": false,
-                  "ignore_regex": imp.ignore_regex, "sync_only_regex": imp.sync_only_regex, "ignore_files": imp.ignore_files},
+                  "ignore_regex": imp.ignore_regex, "sync_only_regex": imp.sync_only_regex, "ignore_files": imp.ignore_files,
+                  "passphrase": pass_ref.as_ref().map(|r| r.to_string()),
+                  "accept_unencrypted_content": imp.accept_unencrypted_content},
         "carried": imp.carried.iter().map(|(k, v)| json!({"setting": k, "to": v})).collect::<Vec<_>>(),
         "not_used": imp.not_used.iter().map(|(k, v)| json!({"setting": k, "why": v})).collect::<Vec<_>>(),
         "accepted": imp.accepted.iter().map(|(k, v)| json!({"setting": k, "why": v})).collect::<Vec<_>>(),
@@ -751,9 +816,22 @@ pub fn run(ctx: &Setup, a: ImportArgs, given: &Given) -> Result<u8> {
                 stores.set(&secret_ref, pw)?;
             }
         }
+        let mut stored_passphrase = false;
+        if let (true, Some(p), Some(r)) = (store_passphrase, &imp.passphrase, &pass_ref) {
+            if let Err(e) = stores.set(r, p) {
+                if let Some(previous) = &previous {
+                    manage::undo_password(&stores, &secret_ref, previous.as_ref());
+                }
+                bail!(e);
+            }
+            stored_passphrase = true;
+        }
         if let Err(e) = file.save(&ctx.dirs) {
             if let Some(previous) = previous {
                 manage::undo_password(&stores, &secret_ref, previous.as_ref());
+            }
+            if let (true, Some(r)) = (stored_passphrase, &pass_ref) {
+                manage::undo_password(&stores, r, None);
             }
             bail!(e);
         }
@@ -776,6 +854,9 @@ pub fn run(ctx: &Setup, a: ImportArgs, given: &Given) -> Result<u8> {
     println!("{verb} vault {name} (disabled until it is adopted)");
     println!("  database  {}", imp.database);
     println!("  folder    {}", folder.display());
+    if !passphrase_line.is_empty() {
+        println!("  e2ee      passphrase in {passphrase_line}");
+    }
     for (k, v) in &imp.carried {
         if !k.starts_with("couchDB_") {
             println!("  {k:<16} -> {v}");

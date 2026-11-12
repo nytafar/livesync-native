@@ -31,6 +31,31 @@ pub fn ask_new(what: &str) -> Result<Secret> {
     Ok(a)
 }
 
+/// An end-to-end encryption passphrase: `--passphrase-stdin`, else asked
+/// twice on the terminal with echo off.
+pub fn new_passphrase(stdin: bool, what: &str) -> Result<Secret> {
+    if stdin {
+        let mut s = String::new();
+        std::io::stdin()
+            .read_to_string(&mut s)
+            .context("reading the passphrase from stdin")?;
+        let s = s.trim_end_matches(['\n', '\r']);
+        if s.is_empty() {
+            bail!("no passphrase on stdin");
+        }
+        return Ok(Secret::new(s));
+    }
+    let a = ask(&format!("{what}: "))?;
+    let b = ask("again: ")?;
+    if a != b {
+        bail!("the two passphrases differ; nothing was changed");
+    }
+    if a.expose().is_empty() {
+        bail!("an empty passphrase; nothing was changed");
+    }
+    Ok(a)
+}
+
 /// `--password-stdin`, else the terminal.
 pub fn new_password(password_stdin: bool, what: &str) -> Result<Secret> {
     if password_stdin {

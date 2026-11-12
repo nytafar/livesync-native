@@ -227,12 +227,156 @@ fn a_configuration_passphrase_is_needed_when_the_plugin_keeps_one() {
 }
 
 #[test]
-fn end_to_end_encryption_stops_the_import() {
+fn end_to_end_encryption_imports_the_passphrase_into_the_secret_store() {
     let m = Machine::new();
     let f = m.plugin_file("vault", &case("plugin-e2ee"));
-    let e = m.fails(&["import", s(&f)], None);
-    assert!(e.contains("encrypt=true") && e.contains("end-to-end encryption"), "{e}");
-    assert!(m.config().is_empty() && m.secrets().is_empty(), "nothing is written");
+    let out = m.ok(&["import", s(&f)], None);
+    assert!(out.contains("e2ee      passphrase in"), "{out}");
+    let t = toml(&m);
+    let v = &t["vault"]["vault"];
+    let r = v["passphrase"].as_str().unwrap();
+    assert!(r.starts_with("file:e2ee."), "{r}");
+    assert!(v.get("accept_unencrypted_content").is_none());
+    // The passphrase upstream's SettingService encrypted into the file is in
+    // secrets.toml, never in lsync.toml or the output.
+    assert!(m.secrets().contains("synthetic-e2ee-passphrase"), "{}", m.secrets());
+    assert!(!m.config().contains("synthetic-e2ee-passphrase"));
+    assert!(!out.contains("synthetic-e2ee-passphrase"));
+    // `vault ls --json` and doctor say where it is, never what it is.
+    let ls = m.ok(&["vault", "ls", "--json"], None);
+    assert!(ls.contains("\"passphrase_state\": \"set\""), "{ls}");
+    assert!(!ls.contains("synthetic-e2ee-passphrase"));
+    let doctor = String::from_utf8_lossy(&m.run(&["doctor", "--json"], None).stdout).into_owned();
+    assert!(doctor.contains("end-to-end encryption passphrase in"), "{doctor}");
+    assert!(!doctor.contains("synthetic-e2ee-passphrase"));
+
+    // acceptUnencryptedContent comes along.
+    let mut d = case("plugin-e2ee");
+    d["acceptUnencryptedContent"] = true.into();
+    let m = Machine::new();
+    m.ok(&["import", s(&m.plugin_file("vault", &d))], None);
+    assert_eq!(
+        toml(&m)["vault"]["vault"]["accept_unencrypted_content"].as_bool(),
+        Some(true)
+    );
+
+    // What lsync still cannot read is refused by name; nothing is written.
+    for (k, v, expect) in [
+        ("E2EEAlgorithm", Value::from(""), "E2EEAlgorithm"),
+        ("E2EEAlgorithm", Value::from("forceV1"), "E2EEAlgorithm"),
+        ("usePathObfuscation", Value::from(true), "usePathObfuscation"),
+        ("encryptInternalMetadata", Value::from(true), "encryptInternalMetadata"),
+        (
+            "useDynamicIterationCount",
+            Value::from(true),
+            "useDynamicIterationCount",
+        ),
+    ] {
+        let mut d = case("plugin-e2ee");
+        d[k] = v;
+        let m = Machine::new();
+        let e = m.fails(&["import", s(&m.plugin_file("vault", &d))], None);
+        assert!(e.contains(expect), "{expect}: {e}");
+        assert!(
+            m.config().is_empty() && m.secrets().is_empty(),
+            "{expect}: nothing is written"
+        );
+    }
+    // A file that holds no passphrase.
+    let mut d = case("plugin-e2ee");
+    d["encryptedPassphrase"] = "".into();
+    let m = Machine::new();
+    let e = m.fails(&["import", s(&m.plugin_file("vault", &d))], None);
+    assert!(e.contains("no end-to-end encryption passphrase"), "{e}");
+    assert!(m.config().is_empty() && m.secrets().is_empty());
+}
+
+#[test]
+fn a_vault_passphrase_is_set_changed_shared_and_removed() {
+    let m = Machine::new();
+    m.ok(
+        &[
+            "account",
+            "add",
+            "home",
+            "--url",
+            "https://couch.example.invalid",
+            "--user",
+            "u",
+            "--password-stdin",
+        ],
+        Some("synthetic-password"),
+    );
+    let folder = m.root.join("notes");
+    let folder2 = m.root.join("notes2");
+    m.ok(
+        &[
+            "vault",
+            "add",
+            "notes",
+            "--db",
+            "enc",
+            "--folder",
+            s(&folder),
+            "--passphrase-stdin",
+        ],
+        Some("synthetic-first-passphrase\n"),
+    );
+    let t = toml(&m);
+    assert_eq!(t["vault"]["notes"]["passphrase"].as_str(), Some("file:e2ee.home.enc"));
+    assert!(m.secrets().contains("synthetic-first-passphrase"));
+    assert!(!m.config().contains("synthetic-first-passphrase"));
+    // A second vault on the same database shares it, without being asked.
+    let out = m.ok(
+        &[
+            "vault",
+            "add",
+            "notes2",
+            "--db",
+            "enc",
+            "--folder",
+            s(&folder2),
+            "--e2ee",
+        ],
+        None,
+    );
+    assert!(out.contains("uses the passphrase already in"), "{out}");
+    assert_eq!(
+        toml(&m)["vault"]["notes2"]["passphrase"].as_str(),
+        Some("file:e2ee.home.enc")
+    );
+    // Changed for both.
+    let out = m.ok(
+        &["vault", "passphrase", "notes", "--passphrase-stdin"],
+        Some("synthetic-second-passphrase"),
+    );
+    assert!(out.contains("shared with vault(s) notes2"), "{out}");
+    assert!(m.secrets().contains("synthetic-second-passphrase"));
+    assert!(!m.secrets().contains("synthetic-first-passphrase"));
+    // Never from the command line.
+    let e = m.fails(&["vault", "passphrase", "notes", "--password", "x"], None);
+    assert!(e.contains("never taken from the command line"), "{e}");
+    // Removed from one vault: the other keeps it.
+    m.ok(&["vault", "passphrase", "notes", "--remove"], None);
+    assert!(toml(&m)["vault"]["notes"].get("passphrase").is_none());
+    assert!(m.secrets().contains("synthetic-second-passphrase"));
+    // From the last: gone.
+    m.ok(&["vault", "passphrase", "notes2", "--remove"], None);
+    assert!(!m.secrets().contains("synthetic-second-passphrase"));
+    // The accept switch.
+    m.ok(
+        &["vault", "edit", "notes", "--accept-unencrypted-content", "true"],
+        None,
+    );
+    assert_eq!(
+        toml(&m)["vault"]["notes"]["accept_unencrypted_content"].as_bool(),
+        Some(true)
+    );
+    m.ok(
+        &["vault", "edit", "notes", "--accept-unencrypted-content", "false"],
+        None,
+    );
+    assert!(toml(&m)["vault"]["notes"].get("accept_unencrypted_content").is_none());
 }
 
 #[test]

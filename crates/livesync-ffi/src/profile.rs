@@ -57,6 +57,9 @@ impl std::fmt::Debug for ProfileConfig {
     }
 }
 
+/// The refusal's advice for an end-to-end encrypted database in the app.
+pub const APP_PASSPHRASE_HOW: &str = "this app does not sync end-to-end encrypted databases yet; the desktop lsync command line does (`lsync vault passphrase NAME`)";
+
 impl ProfileConfig {
     /// What the host runs: this profile, with a phone's fewer chunk fetches
     /// in flight than a desktop's.
@@ -74,6 +77,10 @@ impl ProfileConfig {
             database: self.database.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
+            // No passphrase UI in the app yet: an encrypted database is
+            // refused, with where it is supported.
+            passphrase: None,
+            accept_unencrypted_content: false,
             scope_mode,
             scope_folders: self.scope_folders.clone(),
             pull_only: self.pull_only,
@@ -92,6 +99,7 @@ impl ProfileConfig {
             // guard's refusal names no switch.
             tuning: Tuning {
                 handover: Handover::Unavailable,
+                passphrase_how: Some(APP_PASSPHRASE_HOW.into()),
                 ..Tuning::default()
             },
         }
