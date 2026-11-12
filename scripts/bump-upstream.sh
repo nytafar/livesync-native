@@ -38,7 +38,9 @@ for a in "$@"; do
   esac
 done
 
-step() { printf '\n== %s\n' "$*"; }
+STEP=0
+step() { STEP=${1%%.*}; printf '\n== %s\n' "$*"; }
+trap 'echo "bump: stopped in step $STEP; fix what it says and run it again (it is safe to re-run; git diff shows what it wrote so far)" >&2' ERR
 KEYS=(PLUGIN_RELEASE COMMONLIB OCTAGONAL_WHEELS MINIMATCH NONRECURSIVE_GLOB_MATCH BRACE_EXPANSION)
 
 if [[ -z "$TAG" ]]; then
